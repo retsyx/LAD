@@ -139,6 +139,9 @@ final class CADSceneView: SCNView {
     private let edgeNode = SCNNode()
     private let gridNode = SCNNode()
     private let featureNode = SCNNode()
+    private let silhouetteNode = SCNNode()
+    private var partSilhouettes = [Int: SCNNode]()
+    private var silhouetteSlots = [SCNNode]()
     private var rig = CameraRig()
     private var loadedPath: String?
     private var loadedNativePath: String?
@@ -165,7 +168,6 @@ final class CADSceneView: SCNView {
     private var faceIDsBySolid = [Int: [CADFeatureID?]]()
     private var faceIndices = [CADFeatureID: [Int32]]()
     private var meshSources = [SCNGeometrySource]()
-    private var edgeSurfaces = [CADFeatureID: [CADStrokeSurface]]()
     private var featureNodes = [CADFeatureID: SCNNode]()
     private var featureCreationOrder = [CADFeatureID]()
     private var featureSelectionStyles = [CADFeatureID: Bool]()
@@ -190,6 +192,7 @@ final class CADSceneView: SCNView {
     private let redrawDriver = ViewportRedrawDriver()
     private var opaqueHighlightTechnique: SCNTechnique?
     private var translucentHighlightTechnique: SCNTechnique?
+    private var highlightSilhouetteCount = 0
     private var techniqueFrameObserver: ViewportTechniqueFrameObserver?
     private var redrawDelegateInstalled = false
     private var redrawPauseTask: Task<Void, Never>?
@@ -271,7 +274,7 @@ final class CADSceneView: SCNView {
         usesReverseZ = true
         let highlightTechnique = CADHighlightTechnique.make(viewportHeight: bounds.height, selected: Self.selectionColor,
             hover: Self.hoveredFeatureColor, hoverHalo: Self.hoveredFeatureHalo, ink: Self.edgeInk,
-            frameCompletion: true, vertexHighlights: false)
+            frameCompletion: true, vertexHighlights: false, silhouetteCount: 0)
         if let highlightTechnique {
             opaqueHighlightTechnique = highlightTechnique
             redrawDriver.setTechniqueCompletionEnabled(true)
@@ -300,10 +303,12 @@ final class CADSceneView: SCNView {
         scene.rootNode.addChildNode(edgeNode)
         scene.rootNode.addChildNode(gridNode)
         scene.rootNode.addChildNode(featureNode)
+        scene.rootNode.addChildNode(silhouetteNode)
         modelNode.categoryBitMask = 1
         edgeNode.categoryBitMask = 2
         gridNode.categoryBitMask = 2
         featureNode.categoryBitMask = 4
+        silhouetteNode.categoryBitMask = CADHighlightTechnique.silhouetteCategory
         featureNode.renderingOrder = 3
         addLight(type: .ambient, intensity: 480, color: NSColor(srgbRed: 0.63, green: 0.70, blue: 0.82, alpha: 1), parent: scene.rootNode)
         // Camera-local studio lights keep the main illumination above-right
@@ -427,6 +432,10 @@ final class CADSceneView: SCNView {
         }
         modelNode.childNodes.forEach { $0.removeFromParentNode() }
         modelNode.geometry = nil
+        silhouetteNode.childNodes.forEach { $0.removeFromParentNode() }
+        partSilhouettes.removeAll()
+        silhouetteSlots.removeAll()
+        highlightSilhouetteCount = -1
         for solid in groups.keys.sorted() {
             let geometry = SCNGeometry(sources: [source, normalSource],
                                        elements: [SCNGeometryElement(indices: groups[solid]!, primitiveType: .triangles)])
@@ -441,6 +450,12 @@ final class CADSceneView: SCNView {
             node.name = "solid:\(solid)"
             node.categoryBitMask = 1
             modelNode.addChildNode(node)
+            // Share the prepared mesh buffers, but keep projection masks
+            // independent of wireframe visibility and surface materials.
+            let silhouette = makeSilhouette(geometry)
+            silhouette.isHidden = true
+            silhouetteNode.addChildNode(silhouette)
+            partSilhouettes[solid] = silhouette
         }
         installEdges(mesh)
         edgeNode.renderingOrder = 1
@@ -461,10 +476,15 @@ final class CADSceneView: SCNView {
         modelNode.childNodes.forEach { $0.removeFromParentNode() }
         edgeNode.geometry = nil
         edgeNode.childNodes.forEach { $0.removeFromParentNode() }
+        silhouetteNode.childNodes.forEach { $0.removeFromParentNode() }
+        partSilhouettes.removeAll()
+        silhouetteSlots.removeAll()
+        highlightSilhouetteCount = -1
         ownedEdgeSolids.removeAll()
         hasOwnedEdges = false
         hasModel = false
         appliedStyle = nil
+        updateHighlightTechnique(silhouetteCount: 0)
         updateModelVisibility()
     }
 
@@ -504,6 +524,10 @@ final class CADSceneView: SCNView {
         let edgesHidden = hidden || mode == .shaded
         if edgeNode.isHidden != edgesHidden { edgeNode.isHidden = edgesHidden }
         if featureNode.isHidden != hidden { featureNode.isHidden = hidden }
+        if silhouetteNode.isHidden != hidden {
+            silhouetteNode.isHidden = hidden
+            updateSilhouettes(active: highlightedFeatures)
+        }
     }
 
     private func faceID(forTriangle index: Int, in mesh: PreviewMesh, solid: Int) -> CADFeatureID? {
@@ -527,7 +551,6 @@ final class CADSceneView: SCNView {
         faceIDsBySolid.removeAll()
         faceIndices.removeAll()
         meshSources.removeAll()
-        edgeSurfaces.removeAll()
         topology = nil
     }
 
@@ -535,11 +558,8 @@ final class CADSceneView: SCNView {
     private func updateFeatureHighlights() -> Bool {
         let selected = Set(selectedFeatures)
         var active = selectedFeatures
-        if let hoveredFeature, !selected.contains(hoveredFeature) { active.append(hoveredFeature) }
-        if let technique {
-            CADHighlightTechnique.setVertexHighlightsEnabled(active.contains {
-                $0.kind == .vertex && !hiddenSolids.contains($0.solidIndex)
-            }, on: technique)
+        if let hoveredFeature, !selected.contains(hoveredFeature), !selectedSolids.contains(hoveredFeature.solidIndex) {
+            active.append(hoveredFeature)
         }
         var changed = highlightedFeatures != active || highlightedSelection != selected
         highlightedFeatures = active
@@ -549,49 +569,11 @@ final class CADSceneView: SCNView {
             guard let geometry = featureGeometry(for: feature) else { continue }
             let node = SCNNode(geometry: geometry)
             node.name = "feature:\(feature.kind.rawValue):\(feature.solidIndex):\(feature.localIndex)"
-            node.categoryBitMask = feature.kind != .face && technique != nil ? CADHighlightTechnique.hiddenEdgeCategory : 4
-            node.renderingOrder = feature.kind == .face ? 3 : feature.kind == .edge ? 6 : 8
-            if feature.kind == .edge || feature.kind == .vertex {
-                // Draw the complete outline before the core, including every
-                // segment of a curve, so joined segments cannot notch the gold.
-                let outline = SCNGeometry(sources: geometry.sources, elements: geometry.elements)
-                outline.shaderModifiers = geometry.shaderModifiers
-                if feature.kind == .edge {
-                    CADStrokeGeometry.copyParameters(from: geometry, to: outline)
-                    CADStrokeGeometry.setWidth(CADStrokeGeometry.selectedHaloWidth, on: outline)
-                } else {
-                    CADVertexGeometry.copyParameters(from: geometry, to: outline)
-                    CADVertexGeometry.setDiameter(CADVertexGeometry.selectedHaloDiameter, on: outline)
-                }
-                let material = SCNMaterial()
-                material.lightingModel = .constant
-                material.diffuse.contents = Self.edgeInk
-                material.isDoubleSided = true
-                material.readsFromDepthBuffer = true
-                material.writesToDepthBuffer = false
-                outline.materials = [material]
-                let halo = SCNNode(geometry: outline)
-                halo.name = feature.kind == .edge ? "edge-halo" : "vertex-halo"
-                halo.categoryBitMask = node.categoryBitMask
-                halo.renderingOrder = feature.kind == .edge ? 5 : 7
-                node.addChildNode(halo)
-            }
-            if feature.kind == .edge, technique != nil,
-               let edge = topology?.edge(for: feature) {
-                let segments = zip(edge.polyline, edge.polyline.dropFirst()).map { $0.0 + $0.1 }
-                let seed = SCNNode(geometry: CADStrokeSeedGeometry.make(segments))
-                seed.name = "edge-seed"
-                seed.categoryBitMask = CADHighlightTechnique.seedCategory
-                seed.renderingOrder = 6
-                node.addChildNode(seed)
-            }
-            if feature.kind == .vertex, technique != nil,
-               let vertex = topology?.vertices.first(where: { $0.id == feature }) {
-                let seed = SCNNode(geometry: CADVertexSeedGeometry.make(vertex.position))
-                seed.name = "vertex-seed"
-                seed.categoryBitMask = CADHighlightTechnique.seedCategory
-                seed.renderingOrder = 8
-                node.addChildNode(seed)
+            node.categoryBitMask = feature.kind == .face ? 4 : CADHighlightTechnique.seedCategory
+            node.renderingOrder = feature.kind == .face ? 3 : 6
+            if feature.kind == .face {
+                let silhouette = makeSilhouette(geometry, triangleIndices: faceIndices[feature])
+                node.addChildNode(silhouette)
             }
             node.isHidden = true
             featureNode.addChildNode(node)
@@ -615,28 +597,15 @@ final class CADSceneView: SCNView {
         for (feature, node) in featureNodes {
             let isSelected = selected.contains(feature)
             if featureSelectionStyles[feature] != isSelected {
-                if feature.kind == .edge, let geometry = node.geometry {
-                    node.childNode(withName: "edge-seed", recursively: false)?.geometry?.firstMaterial?.diffuse.contents =
-                        isSelected ? NSColor.red : NSColor.green
-                    CADStrokeGeometry.setWidth(isSelected ? CADStrokeGeometry.selectedWidth : CADStrokeGeometry.hoverWidth, on: geometry)
-                    geometry.firstMaterial?.diffuse.contents = isSelected ? Self.selectionColor : Self.hoveredFeatureColor
-                    geometry.firstMaterial?.transparency = 1
-                    if let outline = node.childNode(withName: "edge-halo", recursively: false)?.geometry {
-                        CADStrokeGeometry.setWidth(isSelected ? CADStrokeGeometry.selectedHaloWidth : CADStrokeGeometry.hoverHaloWidth, on: outline)
-                        outline.firstMaterial?.diffuse.contents = isSelected ? Self.edgeInk : Self.hoveredFeatureHalo
-                    }
-                } else if feature.kind == .vertex, let geometry = node.geometry {
-                    node.childNode(withName: "vertex-seed", recursively: false)?.geometry?.firstMaterial?.diffuse.contents =
-                        isSelected ? NSColor.blue : NSColor.red
-                    CADVertexGeometry.setDiameter(isSelected ? CADVertexGeometry.selectedDiameter : CADVertexGeometry.hoverDiameter, on: geometry)
-                    geometry.firstMaterial?.diffuse.contents = isSelected ? Self.selectionColor : Self.hoveredFeatureColor
-                    geometry.firstMaterial?.transparency = 1
-                    if let outline = node.childNode(withName: "vertex-halo", recursively: false)?.geometry {
-                        CADVertexGeometry.setDiameter(isSelected ? CADVertexGeometry.selectedHaloDiameter : CADVertexGeometry.hoverHaloDiameter, on: outline)
-                        outline.firstMaterial?.diffuse.contents = isSelected ? Self.edgeInk : Self.hoveredFeatureHalo
-                    }
-                } else {
-                    node.geometry?.firstMaterial?.transparency = isSelected ? 1 : feature.kind == .face ? 0.35 : 0.65
+                switch feature.kind {
+                case .edge:
+                    node.geometry?.firstMaterial?.diffuse.contents = isSelected ? NSColor.red : NSColor.green
+                case .vertex:
+                    node.geometry?.firstMaterial?.diffuse.contents = isSelected ? NSColor.blue : NSColor.red
+                case .face:
+                    node.geometry?.firstMaterial?.diffuse.contents = isSelected ? Self.selectionColor : Self.hoveredFeatureColor
+                    node.childNodes.first { $0.categoryBitMask == CADHighlightTechnique.silhouetteCategory }?
+                        .geometry?.firstMaterial?.diffuse.contents = isSelected ? NSColor.red : NSColor.green
                 }
                 featureSelectionStyles[feature] = isSelected
                 changed = true
@@ -644,6 +613,7 @@ final class CADSceneView: SCNView {
             let hidden = !activeSet.contains(feature) || hiddenSolids.contains(feature.solidIndex) || !preparedFeatures.contains(feature)
             if node.isHidden != hidden { node.isHidden = hidden; changed = true }
         }
+        updateSilhouettes(active: active)
         if !newNodes.isEmpty {
             let token = featurePreparationID
             // Hover and selection reuse preview geometry. Upload an overlay once,
@@ -677,27 +647,107 @@ final class CADSceneView: SCNView {
             let points = edge.polyline.filter { validFeaturePoint($0) }
             guard points.count > 1 else { return nil }
             let segments = zip(points, points.dropFirst()).map { pair in pair.0 + pair.1 }
-            geometry = CADStrokeGeometry.make(segments, color: Self.selectionColor,
-                width: CADStrokeGeometry.selectedWidth, viewportHeight: bounds.height, surfaces: edgeSurfaces[feature])
+            return CADStrokeSeedGeometry.make(segments)
         case .vertex:
             guard let vertex = topology.vertices.first(where: { $0.id == feature }), validFeaturePoint(vertex.position) else { return nil }
-            geometry = CADVertexGeometry.make(vertex.position, color: Self.selectionColor,
-                diameter: CADVertexGeometry.selectedDiameter, viewportHeight: bounds.height)
+            return CADVertexSeedGeometry.make(vertex.position)
         }
         let material = SCNMaterial()
-        material.lightingModel = feature.kind == .face ? .physicallyBased : .constant
+        material.lightingModel = .physicallyBased
         material.diffuse.contents = Self.selectionColor
         material.transparencyMode = .singleLayer
-        if feature.kind == .face {
-            material.metalness.contents = 0.28
-            material.roughness.contents = 0.42
-            material.emission.contents = NSColor(srgbRed: 0.12, green: 0.05, blue: 0.005, alpha: 1)
-        }
-        material.isDoubleSided = feature.kind != .face
+        material.metalness.contents = 0.28
+        material.roughness.contents = 0.42
+        material.emission.contents = NSColor(srgbRed: 0.12, green: 0.05, blue: 0.005, alpha: 1)
+        material.isDoubleSided = false
         material.readsFromDepthBuffer = true
         material.writesToDepthBuffer = false
         geometry.materials = [material]
         return geometry
+    }
+
+    private func makeSilhouette(_ source: SCNGeometry, triangleIndices: [Int32]? = nil) -> SCNNode {
+        var elements = source.elements
+        if let indices = triangleIndices {
+            // A face viewed edge-on has no filled pixels. Explicit lines keep
+            // its degenerate projection; filled coverage swallows these mesh
+            // seams at ordinary view angles. Polygon line mode still drops
+            // zero-area triangles, so use native line primitives here.
+            var lines = [Int32]()
+            lines.reserveCapacity(indices.count * 2)
+            for index in stride(from: 0, to: indices.count - 2, by: 3) {
+                let a = indices[index], b = indices[index + 1], c = indices[index + 2]
+                lines.append(contentsOf: [a, b, b, c, c, a])
+            }
+            elements.append(SCNGeometryElement(indices: lines, primitiveType: .line))
+        }
+        let geometry = SCNGeometry(sources: source.sources, elements: elements)
+        let material = SCNMaterial()
+        material.lightingModel = .constant
+        // Mask channels carry selected/hovered coverage, never lit face color.
+        material.diffuse.contents = NSColor.red
+        material.isDoubleSided = true
+        material.readsFromDepthBuffer = false
+        material.writesToDepthBuffer = false
+        geometry.materials = [material]
+        let node = SCNNode(geometry: geometry)
+        node.categoryBitMask = CADHighlightTechnique.silhouetteCategory
+        return node
+    }
+
+    private func updateSilhouettes(active: [CADFeatureID]) {
+        var masks = [SCNNode]()
+        for (solid, node) in partSilhouettes {
+            let hidden = !selectedSolids.contains(solid) || hiddenSolids.contains(solid)
+            if node.isHidden != hidden { node.isHidden = hidden }
+        }
+        masks = selectedSolids.sorted().compactMap { hiddenSolids.contains($0) ? nil : partSilhouettes[$0] }
+        for feature in active where feature.kind == .face && !hiddenSolids.contains(feature.solidIndex) {
+            if let node = featureNodes[feature]?.childNodes.first(where: {
+                $0.categoryBitMask == CADHighlightTechnique.silhouetteCategory
+            }) { masks.append(node) }
+        }
+        // DRAW_NODE binds an actual node when the technique is installed.
+        // Permanent slots keep those bindings stable as hover targets change.
+        while silhouetteSlots.count < masks.count {
+            let slot = SCNNode()
+            slot.categoryBitMask = CADHighlightTechnique.silhouetteCategory
+            slot.name = CADHighlightTechnique.silhouetteNodeName(silhouetteSlots.count)
+            silhouetteNode.addChildNode(slot)
+            silhouetteSlots.append(slot)
+        }
+        for (index, slot) in silhouetteSlots.enumerated() {
+            let mask = masks.indices.contains(index) ? masks[index] : nil
+            if slot.geometry !== mask?.geometry { slot.geometry = mask?.geometry }
+            let hidden = !hasModel || isPreparingResources || mask == nil || mask?.isHidden == true ||
+                (mask?.parent !== silhouetteNode && mask?.parent?.isHidden == true)
+            if slot.isHidden != hidden { slot.isHidden = hidden }
+        }
+        updateHighlightTechnique(silhouetteCount: masks.count)
+    }
+
+    private func updateHighlightTechnique(silhouetteCount: Int) {
+        if silhouetteCount != highlightSilhouetteCount {
+            highlightSilhouetteCount = silhouetteCount
+            opaqueHighlightTechnique = nil
+            translucentHighlightTechnique = nil
+        }
+        func make(translucent: Bool) -> SCNTechnique? {
+            CADHighlightTechnique.make(viewportHeight: bounds.height, selected: Self.selectionColor,
+                hover: Self.hoveredFeatureColor, hoverHalo: Self.hoveredFeatureHalo, ink: Self.edgeInk,
+                frameCompletion: true, vertexHighlights: false, translucentFaces: translucent,
+                silhouetteCount: silhouetteCount)
+        }
+        if opaqueHighlightTechnique == nil { opaqueHighlightTechnique = make(translucent: false) }
+        if mode == .translucent, translucentHighlightTechnique == nil {
+            translucentHighlightTechnique = make(translucent: true)
+        }
+        guard let next = mode == .translucent ? translucentHighlightTechnique ?? opaqueHighlightTechnique : opaqueHighlightTechnique else { return }
+        CADHighlightTechnique.setViewportHeight(bounds.height, on: next)
+        CADHighlightTechnique.setVertexHighlightsEnabled(highlightedFeatures.contains {
+            $0.kind == .vertex && !hiddenSolids.contains($0.solidIndex)
+        }, on: next)
+        if technique !== next { technique = next }
     }
 
     private func validFeaturePoint(_ point: [Double]) -> Bool {
@@ -720,10 +770,6 @@ final class CADSceneView: SCNView {
             let solid = owners?[index] ?? -1
             groups[solid, default: []].append(segment)
             surfaceGroups[solid, default: []].append(surfaces[index])
-            if let features = mesh.edgeFeatures, features.count == mesh.edges.count,
-               let topology, topology.edges.indices.contains(features[index]) {
-                edgeSurfaces[topology.edges[features[index]].id, default: []].append(surfaces[index])
-            }
         }
         for solid in groups.keys.sorted() {
             let node = SCNNode(geometry: CADStrokeGeometry.make(groups[solid]!, color: Self.edgeInk,
@@ -760,35 +806,22 @@ final class CADSceneView: SCNView {
         let previous = appliedStyle
         appliedStyle = style
         let translucent = mode == .translucent
-        if previous?.mode != mode, let opaqueHighlightTechnique {
-            if translucent, translucentHighlightTechnique == nil {
-                translucentHighlightTechnique = CADHighlightTechnique.make(viewportHeight: bounds.height,
-                    selected: Self.selectionColor, hover: Self.hoveredFeatureColor, hoverHalo: Self.hoveredFeatureHalo,
-                    ink: Self.edgeInk, frameCompletion: true, vertexHighlights: false, translucentFaces: true)
-            }
-            let nextTechnique = translucent ? translucentHighlightTechnique ?? opaqueHighlightTechnique : opaqueHighlightTechnique
-            CADHighlightTechnique.setViewportHeight(bounds.height, on: nextTechnique)
-            if technique !== nextTechnique { technique = nextTechnique }
-        }
+        if previous?.mode != mode { updateHighlightTechnique(silhouetteCount: max(0, highlightSilhouetteCount)) }
         let coloredLegacyWire = !hasOwnedEdges && mode == .wireframe && !solidColors.isEmpty
         let selectionColor = Self.selectionColor
         for node in edgeNode.childNodes {
             let solid = solidIndex(of: node, prefix: "edges:")
-            let selected = solid.map { selectedSolids.contains($0) } == true
             let hidden = solid.map { hiddenSolids.contains($0) } ?? (!hiddenSolids.isEmpty || coloredLegacyWire)
             if let previous, previous.mode == mode,
-               solid.map({ previous.selected.contains($0) }) == solid.map({ selectedSolids.contains($0) }),
                (solid.map { previous.hidden.contains($0) } ?? (!previous.hidden.isEmpty ||
                     (!hasOwnedEdges && previous.mode == .wireframe && !previous.colors.isEmpty))) == hidden,
-               mode != .wireframe || selected || solid.map({ previous.colors[$0] == solidColors[$0] }) != false {
+               mode != .wireframe || solid.map({ previous.colors[$0] == solidColors[$0] }) != false {
                 continue
             }
             // Older projects have one combined edge buffer. Never keep that
             // buffer visible after hiding a part, since its lines include it.
             node.isHidden = hidden
-            node.geometry?.firstMaterial?.diffuse.contents = selected
-                ? selectionColor
-                : mode == .wireframe ? solid.flatMap { assignedColor(for: $0) } ?? NSColor(srgbRed: 0.73, green: 0.80, blue: 0.88, alpha: 1)
+            node.geometry?.firstMaterial?.diffuse.contents = mode == .wireframe ? solid.flatMap { assignedColor(for: $0) } ?? NSColor(srgbRed: 0.73, green: 0.80, blue: 0.88, alpha: 1)
                 : Self.edgeInk
             node.geometry?.firstMaterial?.readsFromDepthBuffer = mode != .wireframe
             node.geometry?.firstMaterial?.transparency = translucent ? 0.8 : 1
@@ -807,7 +840,7 @@ final class CADSceneView: SCNView {
             // solid's triangle wireframe when edge ownership is unavailable,
             // so hidden legacy solids cannot leave ghost edges behind.
             let needsTriangleWire = hasOwnedEdges ? !ownedEdgeSolids.contains(solid)
-                : !hiddenSolids.isEmpty || selected || coloredLegacyWire || edgeNode.childNodes.isEmpty
+                : !hiddenSolids.isEmpty || coloredLegacyWire || edgeNode.childNodes.isEmpty
             node.isHidden = hiddenSolids.contains(solid) || (mode == .wireframe && !needsTriangleWire)
             node.geometry?.firstMaterial?.fillMode = mode == .wireframe ? .lines : .fill
             // Let interior parts show through the filled surfaces. Restore
@@ -820,10 +853,10 @@ final class CADSceneView: SCNView {
             node.geometry?.firstMaterial?.transparencyMode = .aOne
             node.geometry?.firstMaterial?.writesToDepthBuffer = !translucent
             node.geometry?.firstMaterial?.isDoubleSided = translucent
-            node.geometry?.firstMaterial?.diffuse.contents = selected
+            node.geometry?.firstMaterial?.diffuse.contents = selected && mode != .wireframe
                 ? selectionColor
                 : assignedColor(for: solid) ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
-            node.geometry?.firstMaterial?.emission.contents = selected
+            node.geometry?.firstMaterial?.emission.contents = selected && mode != .wireframe
                 ? NSColor(srgbRed: 0.12, green: 0.05, blue: 0.005, alpha: 1) : NSColor.black
         }
         return true
@@ -1017,18 +1050,6 @@ final class CADSceneView: SCNView {
         if let technique { CADHighlightTechnique.setViewportHeight(bounds.height, on: technique) }
         for node in edgeNode.childNodes {
             if let geometry = node.geometry { CADStrokeGeometry.setViewportHeight(bounds.height, on: geometry) }
-        }
-        for (feature, node) in featureNodes where feature.kind == .edge {
-            if let geometry = node.geometry { CADStrokeGeometry.setViewportHeight(bounds.height, on: geometry) }
-            if let geometry = node.childNode(withName: "edge-halo", recursively: false)?.geometry {
-                CADStrokeGeometry.setViewportHeight(bounds.height, on: geometry)
-            }
-        }
-        for (feature, node) in featureNodes where feature.kind == .vertex {
-            if let geometry = node.geometry { CADVertexGeometry.setViewportHeight(bounds.height, on: geometry) }
-            if let geometry = node.childNode(withName: "vertex-halo", recursively: false)?.geometry {
-                CADVertexGeometry.setViewportHeight(bounds.height, on: geometry)
-            }
         }
     }
 

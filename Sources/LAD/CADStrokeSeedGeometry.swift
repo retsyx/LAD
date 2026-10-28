@@ -1,17 +1,10 @@
 import AppKit
 import SceneKit
 
-/// Visibility is rasterized on the actual native edge, before its highlight
-/// is expanded in screen space. Curved faces cannot trim the expanded width.
+/// Rasterize native edge centerlines for the unoccluded highlight overlay.
+/// The screen-space technique supplies their constant core and halo widths.
 @MainActor
 enum CADStrokeSeedGeometry {
-    private static let modifier = """
-    #pragma body
-    float4 cadClip = scn_node.modelViewProjectionTransform * _geometry.position;
-    cadClip.z += 2e-6 * cadClip.w;
-    _geometry.position = scn_node.inverseModelViewProjectionTransform * cadClip;
-    """
-
     static func make(_ segments: [[Double]]) -> SCNGeometry {
         var positions = [SCNVector3](), indices = [Int32]()
         positions.reserveCapacity(segments.count * 2)
@@ -26,15 +19,14 @@ enum CADStrokeSeedGeometry {
         }
         let geometry = SCNGeometry(sources: [SCNGeometrySource(vertices: positions)],
                                    elements: [SCNGeometryElement(indices: indices, primitiveType: .line)])
-        geometry.shaderModifiers = [.geometry: modifier]
         let material = SCNMaterial()
         material.lightingModel = .constant
         material.diffuse.contents = NSColor.red
         material.isDoubleSided = true
-        material.readsFromDepthBuffer = true
+        material.readsFromDepthBuffer = false
         material.writesToDepthBuffer = false
         material.blendMode = .add
-        // RG carries edge visibility; BA is reserved for vertex centers.
+        // RG carries edge coverage; BA is reserved for vertex centers.
         material.shaderModifiers = [.fragment: "#pragma body\n_output.color.a = 0.0;"]
         geometry.materials = [material]
         return geometry

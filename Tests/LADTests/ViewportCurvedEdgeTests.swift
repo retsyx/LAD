@@ -58,8 +58,8 @@ final class ViewportCurvedEdgeTests: XCTestCase {
             let occluded = try selectedBoss(orthographic: orthographic, occluder: true)
             try write(occluded.image, to: "/tmp/lad-curved-selected-\(label)-occluded.png")
             XCTAssertGreaterThan(goldPixels(in: shot.image), 500, "The surface-aware selected ring must actually render.")
-            XCTAssertEqual(goldPixels(in: occluded.image), 0,
-                "An independent face just in front of the complete ring must hide the surface-aware stroke (\(label)).")
+            XCTAssertGreaterThanOrEqual(goldPixels(in: occluded.image), goldPixels(in: shot.image) - 10,
+                "The complete selected curve remains visible through an independent nearer face (\(label)).")
         }
     }
 

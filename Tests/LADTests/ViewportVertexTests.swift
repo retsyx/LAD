@@ -66,7 +66,7 @@ final class ViewportVertexTests: XCTestCase {
     }
 
     @MainActor
-    func testViewportVertexHoverAndSelectionReuseRoundCoreAndHaloAndCaptureVisibleArtifacts() async throws {
+    func testViewportVertexHoverAndSelectionReuseNativeCenterAndCaptureVisibleArtifacts() async throws {
         let view = try makeView()
         let preview = cornerPreview()
         let colors = [0: PartColor(red: 0.38, green: 0.67, blue: 0.82)]
@@ -80,12 +80,15 @@ final class ViewportVertexTests: XCTestCase {
         view.mouseMoved(with: try mouse(.mouseMoved, at: point))
         let overlay = try featureNode(vertex, in: view)
         try await visible(overlay)
-        let core = try XCTUnwrap(overlay.geometry)
-        let halo = try XCTUnwrap(overlay.childNode(withName: "vertex-halo", recursively: false)?.geometry)
-        XCTAssertEqual(try number(core, CADVertexGeometry.diameterKey), 7)
-        XCTAssertEqual(try number(halo, CADVertexGeometry.diameterKey), 11)
-        XCTAssertTrue(try XCTUnwrap(core.firstMaterial).isDoubleSided)
-        XCTAssertTrue(try XCTUnwrap(halo.firstMaterial).readsFromDepthBuffer)
+        let center = try XCTUnwrap(overlay.geometry)
+        XCTAssertEqual(center.elements.first?.primitiveType, .point)
+        XCTAssertEqual(overlay.categoryBitMask, CADHighlightTechnique.seedCategory)
+        XCTAssertTrue(overlay.childNodes.isEmpty, "Screen-space circles need only the native vertex center.")
+        let material = try XCTUnwrap(center.firstMaterial)
+        XCTAssertEqual(material.diffuse.contents as? NSColor, .red)
+        XCTAssertFalse(material.readsFromDepthBuffer,
+                       "Highlight overlays remain visible through other geometry.")
+        XCTAssertFalse(material.writesToDepthBuffer)
         let hover = try await CADAgentRenderer.capturePNG(view: view)
         try hover.write(to: URL(fileURLWithPath: "/tmp/lad-vertex-hover.png"))
         XCTAssertGreaterThan(try markerPixels(hover, around: point, in: view), 35,
@@ -94,10 +97,8 @@ final class ViewportVertexTests: XCTestCase {
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [], projection: .isometric, solidColors: colors, selectedFeatures: [vertex])
         try await ready(view)
-        XCTAssertTrue(overlay.geometry === core)
-        XCTAssertTrue(overlay.childNode(withName: "vertex-halo", recursively: false)?.geometry === halo)
-        XCTAssertEqual(try number(core, CADVertexGeometry.diameterKey), 9)
-        XCTAssertEqual(try number(halo, CADVertexGeometry.diameterKey), 12)
+        XCTAssertTrue(overlay.geometry === center)
+        XCTAssertEqual(material.diffuse.contents as? NSColor, .blue)
         let selected = try await CADAgentRenderer.capturePNG(view: view)
         try selected.write(to: URL(fileURLWithPath: "/tmp/lad-vertex-selected.png"))
         XCTAssertGreaterThan(try markerPixels(selected, around: point, in: view), 45)
@@ -109,18 +110,15 @@ final class ViewportVertexTests: XCTestCase {
         try await ready(view)
         let selectedEdge = try featureNode(edge, in: view)
         try await visible(selectedEdge)
-        let partMaterial = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry?.firstMaterial)
-        XCTAssertEqual(core.firstMaterial?.diffuse.contents as? NSColor, selectedEdge.geometry?.firstMaterial?.diffuse.contents as? NSColor)
-        XCTAssertEqual(core.firstMaterial?.diffuse.contents as? NSColor, partMaterial.diffuse.contents as? NSColor,
-                       "Vertices, edges, and whole-part selection must share the same gold.")
+        XCTAssertEqual(selectedEdge.geometry?.firstMaterial?.diffuse.contents as? NSColor, .red)
+        XCTAssertEqual(material.diffuse.contents as? NSColor, .blue)
         view.mouseMoved(with: try mouse(.mouseMoved, at: point))
-        XCTAssertEqual(try number(core, CADVertexGeometry.diameterKey), 9, "Hover cannot downgrade a selected dot.")
+        XCTAssertEqual(material.diffuse.contents as? NSColor, .blue, "Hover cannot downgrade a selected dot.")
         view.mouseExited(with: try mouse(.mouseExited, at: NSPoint(x: -1, y: -1)))
         XCTAssertFalse(overlay.isHidden)
         view.setFrameSize(NSSize(width: 800, height: 600))
         view.layout()
-        XCTAssertEqual(try number(core, CADVertexGeometry.viewportHeightKey), 600)
-        XCTAssertEqual(try number(halo, CADVertexGeometry.viewportHeightKey), 600)
+        XCTAssertEqual((view.technique?.value(forKey: "cadReferenceHeight") as? NSNumber)?.doubleValue, 600)
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [0], hiddenSolids: [0], projection: .isometric, solidColors: colors,
                     selectedFeatures: [vertex, edge])

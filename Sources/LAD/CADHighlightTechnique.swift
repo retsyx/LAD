@@ -2,15 +2,17 @@ import AppKit
 import Metal
 import SceneKit
 
-/// Visibility is resolved on thin native centerlines and vertex centers.
-/// Screen-space distance expansion gives highlights stable widths and circles
-/// without letting adjacent sloping surfaces clip their expanded footprints.
+/// The scene owns surface shading; highlights are a separate, unoccluded overlay.
+/// Projected surface masks contribute only their silhouettes, while native
+/// centerlines and vertex centers retain stable screen-point widths and circles.
 @MainActor
 enum CADHighlightTechnique {
     static let hiddenEdgeCategory = 16
     static let seedCategory = 32
     static let completionCategory = 64
+    static let silhouetteCategory = 128
     static let completionNodeName = "ladHighlightFrameCompleted"
+    static func silhouetteNodeName(_ index: Int) -> String { "ladHighlightSilhouette\(index)" }
     private static let heightKey = "cadReferenceHeight"
     private static let verticesKey = "cadVertexHighlightsEnabled"
     private static let translucentKey = "cadTranslucentFaces"
@@ -19,10 +21,12 @@ enum CADHighlightTechnique {
 
     static func make(viewportHeight: CGFloat, selected: NSColor, hover: NSColor,
                      hoverHalo: NSColor, ink: NSColor, frameCompletion: Bool = false,
-                     vertexHighlights: Bool = true, translucentFaces: Bool = false) -> SCNTechnique? {
+                     vertexHighlights: Bool = true, translucentFaces: Bool = false,
+                     silhouetteCount: Int = 0) -> SCNTechnique? {
         guard let device = MTLCreateSystemDefaultDevice(), let library = library(for: device),
               let technique = SCNTechnique(dictionary: definition(frameCompletion: frameCompletion,
-                                                                 translucentFaces: translucentFaces)) else { return nil }
+                                                                 translucentFaces: translucentFaces,
+                                                                 silhouetteCount: silhouetteCount)) else { return nil }
         technique.library = library
         setViewportHeight(viewportHeight, on: technique)
         setVertexHighlightsEnabled(vertexHighlights, on: technique)
@@ -75,7 +79,7 @@ enum CADHighlightTechnique {
                                              linear(color.blueComponent), Float(color.alphaComponent)))
     }
 
-    private static func definition(frameCompletion: Bool, translucentFaces: Bool) -> [String: Any] {
+    private static func definition(frameCompletion: Bool, translucentFaces: Bool, silhouetteCount: Int) -> [String: Any] {
         var symbols: [String: Any] = [heightKey: ["type": "float"], verticesKey: ["type": "float"], translucentKey: ["type": "float"]]
         for key in colorKeys { symbols[key] = ["type": "vec4"] }
         let nearest: (String) -> [String: Any] = { ["target": $0, "minificationFilter": "nearest", "magnificationFilter": "nearest"] }
@@ -86,24 +90,10 @@ enum CADHighlightTechnique {
         compositeInputs["cadDecorationsColor"] = nearest("cadSceneColor")
         compositeInputs["cadBackgroundColor"] = nearest(translucentFaces ? "cadBackgroundColor" : "cadSceneColor")
         for key in colorKeys { compositeInputs[key] = key }
-        return [
-            "sequence": (translucentFaces ? ["cadBackground", "cadVisibility", "cadAccumulate", "cadReveal"] : ["cadBase"])
-                + ["cadDecorations", "cadSeeds", "cadHorizontal", "cadComposite"] + (frameCompletion ? ["cadCompleted"] : []),
-            "symbols": symbols,
-            "targets": [
-                "cadSceneColor": ["type": "color"],
-                "cadVisibilityColor": ["type": "color"],
-                "cadAccumulatedColor": ["type": "color", "format": "rgba16f"],
-                "cadRevealage": ["type": "color", "format": "rgba16f"],
-                "cadBackgroundColor": ["type": "color"],
-                "cadSceneDepth": ["type": "depth", "format": "depth32f"],
-                "cadSeedMask": ["type": "color", "format": "rgba8"],
-                "cadHorizontalDistances": ["type": "color", "format": "rgba16f"]
-            ],
-            "passes": [
-                // Only solid faces own visibility depth. Technique-level
-                // depth states override material writesToDepthBuffer, so a
-                // single mixed pass would let expanded ink occlude its seeds.
+        var passes: [String: Any] = [
+                // Only solid faces write scene depth. Ordinary edges and grid
+                // decorations read it without hiding each other; highlights
+                // use independent color masks and never read scene depth.
                 "cadBase": ["draw": "DRAW_SCENE", "includeCategoryMask": 1, "cullMode": "none",
                     "outputs": ["color": "cadSceneColor", "depth": "cadSceneDepth"], "samples": 4,
                     "colorStates": ["clear": true, "clearColor": "sceneBackground"],
@@ -112,7 +102,7 @@ enum CADHighlightTechnique {
                     "outputs": ["color": "cadBackgroundColor"],
                     "colorStates": ["clear": true, "clearColor": "sceneBackground"],
                     "depthStates": ["clear": false, "enableRead": false, "enableWrite": false]],
-                // Nearest solid depth belongs only to decorations/highlights;
+                // Nearest solid depth belongs only to ordinary decorations;
                 // it must never reject a transparent color contribution.
                 "cadVisibility": ["draw": "DRAW_SCENE", "includeCategoryMask": 1, "cullMode": "none",
                     "outputs": ["color": "cadVisibilityColor", "depth": "cadSceneDepth"], "samples": 4,
@@ -138,9 +128,9 @@ enum CADHighlightTechnique {
                     "colorStates": ["clear": translucentFaces, "clearColor": "0 0 0 0"],
                     "depthStates": ["clear": false, "enableRead": true, "enableWrite": false]],
                 "cadSeeds": ["draw": "DRAW_SCENE", "includeCategoryMask": seedCategory, "cullMode": "none",
-                    "outputs": ["color": "cadSeedMask", "depth": "cadSceneDepth"], "samples": 4,
+                    "outputs": ["color": "cadSeedMask"], "samples": 4,
                     "colorStates": ["clear": true, "clearColor": "0 0 0 0"],
-                    "depthStates": ["clear": false, "enableRead": true, "enableWrite": false],
+                    "depthStates": ["enableRead": false, "enableWrite": false],
                     "blendStates": ["enable": true, "colorSrc": "one", "colorDst": "one", "colorOp": "max",
                                     "alphaSrc": "one", "alphaDst": "one", "alphaOp": "max"]],
                 "cadHorizontal": ["draw": "DRAW_QUAD", "samples": 1,
@@ -159,7 +149,47 @@ enum CADHighlightTechnique {
                     "includeCategoryMask": completionCategory,
                     "outputs": ["color": "COLOR"], "colorStates": ["clear": false],
                     "depthStates": ["enableRead": false, "enableWrite": false]]
-            ]
+        ]
+        var silhouettePasses = [String]()
+        for index in 0..<max(0, silhouetteCount) {
+            let projection = "cadSilhouette\(index)", contour = "cadContour\(index)"
+            let mask: [String: Any] = ["draw": "DRAW_NODE", "node": silhouetteNodeName(index),
+                "includeCategoryMask": silhouetteCategory, "cullMode": "none",
+                "outputs": ["color": "cadSilhouetteMask"], "samples": 4,
+                "colorStates": ["clear": true, "clearColor": "0 0 0 0"],
+                "depthStates": ["enableRead": false, "enableWrite": false],
+                "blendStates": ["enable": true, "colorSrc": "one", "colorDst": "one", "colorOp": "max",
+                                "alphaSrc": "one", "alphaDst": "one", "alphaOp": "max"]]
+            // Each item's complete projection owns its contour. Reusing the
+            // scratch mask preserves nested/overlapping item outlines without
+            // exposing any internal triangle or part edges.
+            passes[projection] = mask
+            passes[contour] = ["draw": "DRAW_QUAD", "samples": 1,
+                "metalVertexShader": "cad_highlight_quad", "metalFragmentShader": "cad_highlight_contours",
+                "inputs": ["cadSurfaces": nearest("cadSilhouetteMask")], "outputs": ["color": "cadSeedMask"],
+                "colorStates": ["clear": false],
+                "depthStates": ["enableRead": false, "enableWrite": false],
+                "blendStates": ["enable": true, "colorSrc": "one", "colorDst": "one", "colorOp": "max",
+                                "alphaSrc": "one", "alphaDst": "one", "alphaOp": "max"]]
+            silhouettePasses += [projection, contour]
+        }
+        return [
+            "sequence": (translucentFaces ? ["cadBackground", "cadVisibility", "cadAccumulate", "cadReveal"] : ["cadBase"])
+                + ["cadDecorations", "cadSeeds"] + silhouettePasses + ["cadHorizontal", "cadComposite"]
+                + (frameCompletion ? ["cadCompleted"] : []),
+            "symbols": symbols,
+            "targets": [
+                "cadSceneColor": ["type": "color"],
+                "cadVisibilityColor": ["type": "color"],
+                "cadAccumulatedColor": ["type": "color", "format": "rgba16f"],
+                "cadRevealage": ["type": "color", "format": "rgba16f"],
+                "cadBackgroundColor": ["type": "color"],
+                "cadSceneDepth": ["type": "depth", "format": "depth32f"],
+                "cadSilhouetteMask": ["type": "color", "format": "rgba8"],
+                "cadSeedMask": ["type": "color", "format": "rgba8"],
+                "cadHorizontalDistances": ["type": "color", "format": "rgba16f"]
+            ],
+            "passes": passes
         ]
     }
 
@@ -193,6 +223,21 @@ enum CADHighlightTechnique {
         CADQuadOutput out;
         out.position = float4(in.position, 1.0);
         return out;
+    }
+    fragment float4 cad_highlight_contours(
+        CADQuadOutput in [[stage_in]],
+        texture2d<float, access::read> cadSurfaces [[texture(0)]]) {
+        int2 size = int2(cadSurfaces.get_width(), cadSurfaces.get_height());
+        int2 center = int2(in.position.xy);
+        float2 covered = step(0.5f, cadSurfaces.read(uint2(center)).rg);
+        float2 interior = covered;
+        // Clamp at the viewport boundary: clipping a large surface must not
+        // invent an outline along the edge of the viewport itself.
+        interior = min(interior, step(0.5f, cadSurfaces.read(uint2(max(center - int2(1, 0), int2(0)))).rg));
+        interior = min(interior, step(0.5f, cadSurfaces.read(uint2(min(center + int2(1, 0), size - 1))).rg));
+        interior = min(interior, step(0.5f, cadSurfaces.read(uint2(max(center - int2(0, 1), int2(0)))).rg));
+        interior = min(interior, step(0.5f, cadSurfaces.read(uint2(min(center + int2(0, 1), size - 1))).rg));
+        return float4(covered - interior, 0.0f, 0.0f);
     }
     fragment float4 cad_highlight_horizontal(
         CADQuadOutput in [[stage_in]],

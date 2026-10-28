@@ -17,6 +17,9 @@ final class ViewportPartsTests: XCTestCase {
         XCTAssertFalse(second.isHidden)
         XCTAssertTrue(try node("edges:0", in: view).isHidden)
         XCTAssertFalse(try node("edges:1", in: view).isHidden)
+        let edgeColor = try XCTUnwrap((node("edges:1", in: view).geometry?.firstMaterial?.diffuse.contents as? NSColor)?.usingColorSpace(.sRGB))
+        XCTAssertLessThan(edgeColor.redComponent, 0.1,
+            "Selecting a part must leave ordinary interior edges dark; only its projected silhouette receives the highlight stroke.")
         let firstColor = try XCTUnwrap(first.geometry?.firstMaterial?.diffuse.contents as? NSColor)
         let secondColor = try XCTUnwrap(second.geometry?.firstMaterial?.diffuse.contents as? NSColor)
         XCTAssertEqual(firstColor, secondColor, "All selected parts receive the selection material.")

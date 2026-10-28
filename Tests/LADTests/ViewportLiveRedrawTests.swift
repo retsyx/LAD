@@ -9,6 +9,13 @@ final class ViewportLiveRedrawTests: XCTestCase {
     func testIdleNativeViewportRendersDisplayAndCameraChangesIntoItsWindow() async throws {
         guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for live viewport drawing.") }
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        // XCTest does not run LAD's application launch lifecycle. Initialize
+        // it here so the window can activate and receive visibility events.
+        let application = NSApplication.shared
+        let previousPolicy = application.activationPolicy()
+        XCTAssertTrue(application.setActivationPolicy(.regular))
+        defer { _ = application.setActivationPolicy(previousPolicy) }
+        application.finishLaunching()
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360), options: [
             SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
         ])
@@ -38,6 +45,25 @@ final class ViewportLiveRedrawTests: XCTestCase {
         XCTAssertFalse(view.isPreparingResources)
         guard try await waitForFrame(frames, after: 0, reason: "A hosted viewport must draw its initial scene.") else { return }
         guard try await waitForIdle(frames) else { return }
+
+        // Adding and removing a projected part outline changes the multipass
+        // technique. Each new pipeline must finish its live frame and release
+        // the redraw burst through the final completion marker.
+        let beforeSelection = frames.count
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [0], hiddenSolids: [])
+        guard try await waitForFrame(frames, after: beforeSelection,
+                                    reason: "Selecting a part after idle must draw its silhouette in a fresh live frame.") else { return }
+        guard try await waitForIdle(frames) else { return }
+        XCTAssertFalse(view.rendersContinuously, "A completed silhouette frame must let the viewport pause.")
+
+        let beforeDeselection = frames.count
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [])
+        guard try await waitForFrame(frames, after: beforeDeselection,
+                                    reason: "Deselecting a part after idle must remove its silhouette in a fresh live frame.") else { return }
+        guard try await waitForIdle(frames) else { return }
+        XCTAssertFalse(view.rendersContinuously, "Removing the silhouette must retain normal viewport pausing.")
 
         // Cold display links must restart after app/display lifecycle events,
         // even when no CAD geometry or camera property changes at that instant.

@@ -62,7 +62,7 @@ final class ViewportHoverTests: XCTestCase {
     }
 
     @MainActor
-    func testSelectedFeaturesUseThePartSelectionGoldAndFaceFinish() async throws {
+    func testSelectedFacesUseThePartFinishAndFeatureSeedsRetainTheirSelectionChannels() async throws {
         let view = try makeView()
         view.update(mesh: mesh(), mode: .edges, grid: false, command: ViewportCommand(.top),
                     selectedSolids: [0], hiddenSolids: [], selectedFeatures: [vertex, edge, face])
@@ -73,7 +73,13 @@ final class ViewportHoverTests: XCTestCase {
             let highlight = try node(feature, in: view)
             try await waitForHighlight(highlight)
             let material = try XCTUnwrap(highlight.geometry?.firstMaterial)
-            assertEqualColor(try color(material.diffuse.contents), partColor)
+            if feature.kind == .face {
+                assertEqualColor(try color(material.diffuse.contents), partColor)
+            } else {
+                XCTAssertEqual(material.diffuse.contents as? NSColor, feature.kind == .vertex ? .blue : .red)
+                XCTAssertFalse(material.readsFromDepthBuffer)
+                XCTAssertFalse(material.writesToDepthBuffer)
+            }
             XCTAssertEqual(material.transparency, 1, accuracy: 1e-6)
         }
         let faceMaterial = try XCTUnwrap(node(face, in: view).geometry?.firstMaterial)
@@ -102,8 +108,8 @@ final class ViewportHoverTests: XCTestCase {
                     selectedSolids: [], hiddenSolids: [], selectedFeatures: [])
         view.mouseMoved(with: try event(.mouseMoved, at: point([0, 0, 0], in: view)))
         try await waitForHighlight(selected)
-        XCTAssertEqual(try XCTUnwrap(selected.geometry?.firstMaterial).transparency, 0.35, accuracy: 1e-6)
-        XCTAssertEqual(selected.geometry?.firstMaterial?.transparencyMode, .singleLayer)
+        XCTAssertEqual(try XCTUnwrap(selected.geometry?.firstMaterial).transparency, 1, accuracy: 1e-6,
+                       "Hovered faces use their highlight color in the normal surface pass.")
         view.mouseMoved(with: try event(.mouseMoved, at: NSPoint(x: 2, y: 2)))
         XCTAssertTrue(selected.isHidden, "Empty-space hover must clear only preselection.")
     }

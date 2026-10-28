@@ -91,7 +91,7 @@ final class ViewportStrokeTests: XCTestCase {
     }
 
     @MainActor
-    func testViewportEdgeHoverAndSelectionReusePreparedCoreAndHaloWithSelectionPrecedence() async throws {
+    func testViewportEdgeHoverAndSelectionReusePreparedCenterlinesWithSelectionPrecedence() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), options: [
             SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
@@ -107,29 +107,27 @@ final class ViewportStrokeTests: XCTestCase {
         view.mouseMoved(with: try mouse(.mouseMoved, at: point))
         let overlay = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "feature:edge:0:0", recursively: true))
         try await visible(overlay)
-        let core = try XCTUnwrap(overlay.geometry)
-        let halo = try XCTUnwrap(overlay.childNode(withName: "edge-halo", recursively: false)?.geometry)
-        XCTAssertEqual(try number(core, key: CADStrokeGeometry.widthKey), 3)
-        XCTAssertEqual(try number(halo, key: CADStrokeGeometry.widthKey), 5)
-        XCTAssertTrue(try XCTUnwrap(core.firstMaterial).isDoubleSided)
-        XCTAssertTrue(try XCTUnwrap(halo.firstMaterial).readsFromDepthBuffer)
-        XCTAssertEqual(core.sources(for: .vertex).first?.data, halo.sources(for: .vertex).first?.data)
+        let centerline = try XCTUnwrap(overlay.geometry)
+        XCTAssertEqual(centerline.elements.first?.primitiveType, .line)
+        XCTAssertEqual(overlay.categoryBitMask, CADHighlightTechnique.seedCategory)
+        XCTAssertTrue(overlay.childNodes.isEmpty, "The overlay needs only native centerlines; screen-space passes supply its width.")
+        let material = try XCTUnwrap(centerline.firstMaterial)
+        XCTAssertEqual(material.diffuse.contents as? NSColor, .green)
+        XCTAssertFalse(material.readsFromDepthBuffer,
+                       "Highlight overlays remain visible through other geometry.")
+        XCTAssertFalse(material.writesToDepthBuffer)
 
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [0], hiddenSolids: [], selectedFeatures: [edge])
-        XCTAssertTrue(overlay.geometry === core)
-        XCTAssertTrue(overlay.childNode(withName: "edge-halo", recursively: false)?.geometry === halo)
-        XCTAssertEqual(try number(core, key: CADStrokeGeometry.widthKey), 4)
-        XCTAssertEqual(try number(halo, key: CADStrokeGeometry.widthKey), 5.5)
-        let part = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry?.firstMaterial)
-        XCTAssertEqual(core.firstMaterial?.diffuse.contents as? NSColor, part.diffuse.contents as? NSColor)
+        XCTAssertTrue(overlay.geometry === centerline)
+        XCTAssertEqual(material.diffuse.contents as? NSColor, .red)
         view.mouseMoved(with: try mouse(.mouseMoved, at: point))
-        XCTAssertEqual(try number(core, key: CADStrokeGeometry.widthKey), 4, "Hover must not soften selected styling.")
+        XCTAssertEqual(material.diffuse.contents as? NSColor, .red, "Hover must not soften selected styling.")
         view.mouseExited(with: try mouse(.mouseExited, at: NSPoint(x: -1, y: -1)))
         XCTAssertFalse(overlay.isHidden, "Leaving the view must preserve the selected edge.")
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [0], hiddenSolids: [0], selectedFeatures: [edge])
-        XCTAssertTrue(overlay.isHidden, "Both core and halo must disappear with their owning part.")
+        XCTAssertTrue(overlay.isHidden, "The highlight must disappear with its owning part.")
     }
 
     @MainActor

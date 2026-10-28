@@ -22,7 +22,7 @@ final class ViewportVertexVisibilityTests: XCTestCase {
                         XCTAssertEqual(Double(mark.width), Double(mark.height), accuracy: 1, context)
                         XCTAssertGreaterThan(Double(mark.count), expected * expected * 0.60,
                             "The full disc must survive its own sloped face, rather than rendering as a half-disc: \(context)")
-                        XCTAssertLessThan(Double(mark.count), expected * expected * 1.05,
+                        XCTAssertLessThan(Double(mark.count), Double(mark.width * mark.height) * 0.93,
                             "The smaller marker must retain a round footprint: \(context)")
                         if scale == 2, !zoomedOut {
                             let projection = orthographic ? "ortho" : "perspective"
@@ -36,14 +36,18 @@ final class ViewportVertexVisibilityTests: XCTestCase {
     }
 
     @MainActor
-    func testASeparateNearerFaceStillHidesTheVertexCenterAndEntireMarker() throws {
+    func testASeparateNearerFaceDoesNotOccludeTheVertexOverlay() throws {
         for orthographic in [false, true] {
             for hover in [false, true] {
                 for distance in [0.01, 0.5] {
                     let shot = try render(orthographic: orthographic, scale: 2, hover: hover,
                                           independentOccluderDistance: distance)
-                    XCTAssertEqual(try footprint(shot.image, hover: hover).count, 0,
-                        "A fully round overlay must not reveal a vertex behind an independent nearer face (distance \(distance)).")
+                    let mark = try footprint(shot.image, hover: hover)
+                    let diameter = Double(hover ? CADVertexGeometry.hoverDiameter : CADVertexGeometry.selectedDiameter) * 2
+                    XCTAssertGreaterThan(Double(mark.count), diameter * diameter * 0.60,
+                        "The complete vertex overlay must remain visible behind a nearer face (distance \(distance)).")
+                    XCTAssertEqual(Double(mark.width), diameter, accuracy: 2)
+                    XCTAssertEqual(Double(mark.height), diameter, accuracy: 2)
                 }
             }
         }

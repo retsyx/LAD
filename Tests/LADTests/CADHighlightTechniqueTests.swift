@@ -34,7 +34,7 @@ final class CADHighlightTechniqueTests: XCTestCase {
     }
 
     @MainActor
-    func testScreenPointWidthsScaleAtTwoTimesOutputResolutionAndOccludedSeedsStayHidden() throws {
+    func testScreenPointWidthsScaleAtTwoTimesOutputResolutionAndOccludedSeedsRemainVisible() throws {
         let one = try render(scale: 1), two = try render(scale: 2)
         let first = try coreWidths(one), second = try coreWidths(two)
         XCTAssertGreaterThanOrEqual(first.selected, 3)
@@ -47,10 +47,10 @@ final class CADHighlightTechniqueTests: XCTestCase {
         let hidden = try render(scale: 2, occluded: true)
         let selectedReference = try sample(two, at: SCNVector3(0, 0.5, 0))
         let hoverReference = try sample(two, at: SCNVector3(0, -0.5, 0))
-        XCTAssertEqual(countPixels(hidden.image, near: selectedReference), 0,
-            "An independent nearer face must hide every selected seed before dilation")
-        XCTAssertEqual(countPixels(hidden.image, near: hoverReference), 0,
-            "An independent nearer face must hide every hover seed before dilation")
+        XCTAssertGreaterThan(countPixels(hidden.image, near: selectedReference), 100,
+            "The overlay must retain the complete selected line behind an independent nearer face")
+        XCTAssertGreaterThan(countPixels(hidden.image, near: hoverReference), 100,
+            "The overlay must retain the complete hovered line behind an independent nearer face")
     }
 
     @MainActor
@@ -80,16 +80,16 @@ final class CADHighlightTechniqueTests: XCTestCase {
     }
 
     @MainActor
-    func testTranslucentColorPassRetainsSolidDepthOcclusionForHighlights() throws {
+    func testTranslucentColorPassDoesNotOccludeHighlightOverlays() throws {
         let visible = try render(scale: 2, translucent: true)
         let selected = try sample(visible, at: SCNVector3(0, 0.5, 0))
         let hovered = try sample(visible, at: SCNVector3(0, -0.5, 0))
         XCTAssertGreaterThan(countPixels(visible.image, near: selected), 100)
         let occluded = try render(scale: 2, occluded: true, translucent: true)
-        XCTAssertEqual(countPixels(occluded.image, near: selected), 0,
-            "Translucency must not let a selected highlight leak through an independent nearer solid.")
-        XCTAssertEqual(countPixels(occluded.image, near: hovered), 0,
-            "The separate solid depth pass must also retain hover occlusion.")
+        XCTAssertGreaterThan(countPixels(occluded.image, near: selected), 100,
+            "The selected overlay ignores geometry depth in translucent mode too.")
+        XCTAssertGreaterThan(countPixels(occluded.image, near: hovered), 100,
+            "The hover overlay ignores geometry depth in translucent mode too.")
     }
 
     private var selectedColor: NSColor { NSColor(srgbRed: 0.96, green: 0.63, blue: 0.23, alpha: 1) }

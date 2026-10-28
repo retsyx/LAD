@@ -1,22 +1,15 @@
 import AppKit
 import SceneKit
 
-/// Resolve visibility only at the native vertex center. The highlight
-/// technique expands that visible pixel into a complete screen-space circle.
+/// Rasterize the native vertex center for the unoccluded highlight overlay.
+/// The technique expands that pixel into a complete screen-space circle.
 @MainActor
 enum CADVertexSeedGeometry {
-    private static let modifier = """
-    #pragma body
-    float4 cadClip = scn_node.modelViewProjectionTransform * _geometry.position;
-    cadClip.z += 2e-6 * cadClip.w;
-    _geometry.position = scn_node.inverseModelViewProjectionTransform * cadClip;
-    """
-
     private static let channels = """
     #pragma body
     // Opaque blue selects a vertex; opaque red previews a hovered vertex.
     // Write the mask channels explicitly so material opacity never changes
-    // the alpha channel used to carry hover visibility.
+    // the alpha channel used to carry hover coverage.
     _output.color = float4(0.0, 0.0, _output.color.b, _output.color.r);
     """
 
@@ -28,12 +21,12 @@ enum CADVertexSeedGeometry {
         element.minimumPointScreenSpaceRadius = 1
         element.maximumPointScreenSpaceRadius = 1
         let geometry = SCNGeometry(sources: [SCNGeometrySource(vertices: vertices)], elements: [element])
-        geometry.shaderModifiers = [.geometry: modifier, .fragment: channels]
+        geometry.shaderModifiers = [.fragment: channels]
         let material = SCNMaterial()
         material.lightingModel = .constant
         material.diffuse.contents = NSColor.blue
         material.isDoubleSided = true
-        material.readsFromDepthBuffer = true
+        material.readsFromDepthBuffer = false
         material.writesToDepthBuffer = false
         material.blendMode = .add
         geometry.materials = [material]
