@@ -165,7 +165,6 @@ private final class CADAgentSceneSnapshot: @unchecked Sendable {
             if let geometry = original.geometry?.copy() as? SCNGeometry {
                 if let originalGeometry = original.geometry {
                     CADStrokeGeometry.copyParameters(from: originalGeometry, to: geometry)
-                    CADVertexGeometry.copyParameters(from: originalGeometry, to: geometry)
                 }
                 geometry.materials = original.geometry?.materials.map { ($0.copy() as? SCNMaterial) ?? $0 } ?? []
                 copy.geometry = geometry

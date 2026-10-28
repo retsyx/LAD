@@ -7,19 +7,14 @@ import simd
 /// camera distance and in both the viewport and independent image renders.
 @MainActor
 enum CADStrokeGeometry {
-    static let widthKey = "cadEdgeWidth"
     static let viewportHeightKey = "cadEdgeViewportHeight"
     static let normalWidth: CGFloat = 1.6
-    static let hoverWidth: CGFloat = 3
-    static let selectedWidth: CGFloat = 4
-    static let hoverHaloWidth: CGFloat = 5
-    static let selectedHaloWidth: CGFloat = 5.5
 
     private static let modifier = """
     #pragma arguments
-    float cadEdgeWidth;
     float cadEdgeViewportHeight;
     #pragma body
+    float cadEdgeWidth = \(Float(normalWidth));
     float4 cadClip = scn_node.modelViewProjectionTransform * _geometry.position;
     float4 cadDirection = scn_node.modelViewProjectionTransform * float4(_geometry.normal, 0.0);
     float2 cadPixels = (cadDirection.xy * cadClip.w - cadClip.xy * cadDirection.w) * scn_frame.viewportSize.xy;
@@ -32,7 +27,7 @@ enum CADStrokeGeometry {
         float2 cadClipOffset = cadOffset * cadEdgeWidth * cadScale * scn_frame.inverseResolution * cadClip.w;
         // Square caps extend the endpoint along the projected edge. Extend
         // its depth by the same tangent, otherwise every curved-edge joint
-        // cuts into the surface and leaves a tooth in a wide highlight.
+        // cuts into the surface and leaves a tooth in the expanded stroke.
         float cadDepthTangent = (cadDirection.z * cadClip.w - cadClip.z * cadDirection.w) * rsqrt(cadLengthSquared);
         float cadDepthOffset = _geometry.texcoords[0].y * cadEdgeWidth * cadScale * cadDepthTangent * cadClip.w;
         // Match the actual adjacent triangle planes across the complete width
@@ -80,7 +75,7 @@ enum CADStrokeGeometry {
     }
     """
 
-    static func make(_ segments: [[Double]], color: NSColor, width: CGFloat, viewportHeight: CGFloat,
+    static func make(_ segments: [[Double]], color: NSColor, viewportHeight: CGFloat,
                      surfaces: [CADStrokeSurface]? = nil) -> SCNGeometry {
         var vertices = [SCNVector3]()
         var directions = [SCNVector3]()
@@ -128,7 +123,6 @@ enum CADStrokeGeometry {
                                              SCNGeometrySource(textureCoordinates: secondNormalYZ)],
                                    elements: [SCNGeometryElement(indices: indices, primitiveType: .triangles)])
         geometry.shaderModifiers = [.geometry: modifier]
-        setWidth(width, on: geometry)
         setViewportHeight(viewportHeight, on: geometry)
         let material = SCNMaterial()
         material.lightingModel = .constant
@@ -140,18 +134,12 @@ enum CADStrokeGeometry {
         return geometry
     }
 
-    static func setWidth(_ width: CGFloat, on geometry: SCNGeometry) {
-        geometry.setValue(NSNumber(value: Double(width.isFinite ? max(0.1, min(20, width)) : normalWidth)), forKey: widthKey)
-    }
-
     static func setViewportHeight(_ height: CGFloat, on geometry: SCNGeometry) {
         geometry.setValue(NSNumber(value: Double(height.isFinite ? max(1, height) : 1)), forKey: viewportHeightKey)
     }
 
     static func copyParameters(from source: SCNGeometry, to destination: SCNGeometry) {
         guard source.shaderModifiers?[.geometry] == modifier else { return }
-        for key in [widthKey, viewportHeightKey] {
-            if let value = source.value(forKey: key) { destination.setValue(value, forKey: key) }
-        }
+        if let value = source.value(forKey: viewportHeightKey) { destination.setValue(value, forKey: viewportHeightKey) }
     }
 }

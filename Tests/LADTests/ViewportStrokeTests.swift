@@ -13,7 +13,7 @@ final class ViewportStrokeTests: XCTestCase {
             [0, 0, 0, .nan, 1, 0],
             [0, 0, 0, 1, 0],
             [0, 0, 0, .infinity, 0, 0]
-        ], color: .white, width: 4, viewportHeight: 192)
+        ], color: .white, viewportHeight: 192)
         let positions = try XCTUnwrap(geometry.sources(for: .vertex).first)
         XCTAssertGreaterThan(positions.vectorCount, 0)
         for source in geometry.sources {
@@ -34,35 +34,29 @@ final class ViewportStrokeTests: XCTestCase {
                 XCTAssertLessThan(index, positions.vectorCount)
             }
         }
-        let empty = CADStrokeGeometry.make([[0, 0, 0, 0, 0, 0]], color: .white, width: 4, viewportHeight: 192)
+        let empty = CADStrokeGeometry.make([[0, 0, 0, 0, 0, 0]], color: .white, viewportHeight: 192)
         XCTAssertEqual(empty.elements.reduce(0) { $0 + $1.primitiveCount }, 0)
     }
 
     @MainActor
-    func testMetalStrokeHasVisibleWidthGainAndConstantWidthThroughBothProjectionZooms() throws {
+    func testOrdinaryEdgeRetainsItsScreenWidthThroughBothProjectionZooms() throws {
         for orthographic in [false, true] {
-            let thin = CADStrokeGeometry.make([[-1, 0, 0, 1, 0, 0]], color: .white, width: 1.4, viewportHeight: 192)
-            let thick = CADStrokeGeometry.make([[-1, 0, 0, 1, 0, 0]], color: .white, width: 4, viewportHeight: 192)
-            let thinWidth = try strokeWidth(render(thin, orthographic: orthographic, zoomedOut: false))
-            let nearWidth = try strokeWidth(render(thick, orthographic: orthographic, zoomedOut: false))
-            let farWidth = try strokeWidth(render(thick, orthographic: orthographic, zoomedOut: true))
-            XCTAssertGreaterThan(thinWidth, 0, "The ordinary CAD edge must render on Metal.")
-            XCTAssertGreaterThanOrEqual(nearWidth, thinWidth + 2, "Selection must be visibly wider than an ordinary edge.")
-            XCTAssertGreaterThanOrEqual(nearWidth, 3)
-            XCTAssertLessThanOrEqual(nearWidth, 6)
+            let geometry = CADStrokeGeometry.make([[-1, 0, 0, 1, 0, 0]], color: .white, viewportHeight: 192)
+            let nearWidth = try strokeWidth(render(geometry, orthographic: orthographic, zoomedOut: false))
+            let farWidth = try strokeWidth(render(geometry, orthographic: orthographic, zoomedOut: true))
+            XCTAssertGreaterThan(nearWidth, 0, "Ordinary CAD ink must render on Metal.")
+            XCTAssertEqual(Double(nearWidth), Double(CADStrokeGeometry.normalWidth), accuracy: 1.5)
             XCTAssertEqual(Double(nearWidth), Double(farWidth), accuracy: 1,
-                           "Screen-space strokes must retain their width while zooming either projection.")
+                "Ordinary edges must retain their screen width while zooming either projection.")
         }
     }
 
     @MainActor
     func testCopiedStrokeParametersRespectLogicalViewportAndRenderTargetResolution() throws {
-        let original = CADStrokeGeometry.make([[-1, 0, 0, 1, 0, 0]], color: .white, width: 1.4, viewportHeight: 192)
-        CADStrokeGeometry.setWidth(4, on: original)
+        let original = CADStrokeGeometry.make([[-1, 0, 0, 1, 0, 0]], color: .white, viewportHeight: 192)
         CADStrokeGeometry.setViewportHeight(192, on: original)
         let copy = try XCTUnwrap(original.copy() as? SCNGeometry)
         CADStrokeGeometry.copyParameters(from: original, to: copy)
-        XCTAssertEqual(try number(copy, key: CADStrokeGeometry.widthKey), 4)
         XCTAssertEqual(try number(copy, key: CADStrokeGeometry.viewportHeightKey), 192)
         let normal = try strokeWidth(render(copy, orthographic: true, zoomedOut: false))
         let retina = try strokeWidth(render(copy, orthographic: true, zoomedOut: false, size: CGSize(width: 512, height: 384)))
@@ -74,17 +68,17 @@ final class ViewportStrokeTests: XCTestCase {
     }
 
     @MainActor
-    func testThickEdgesRemainOccludedByFrontFaces() throws {
+    func testOrdinaryEdgesRemainOccludedByFrontFaces() throws {
         for orthographic in [false, true] {
             for z in [-0.5, -0.01] {
-                let behind = CADStrokeGeometry.make([[-0.7, 0, z, 0.7, 0, z]], color: .white, width: 6, viewportHeight: 192)
+                let behind = CADStrokeGeometry.make([[-0.7, 0, z, 0.7, 0, z]], color: .white, viewportHeight: 192)
                 XCTAssertTrue(try XCTUnwrap(behind.firstMaterial).readsFromDepthBuffer)
                 XCTAssertEqual(try strokeWidth(render(behind, orthographic: orthographic, zoomedOut: false, occluder: true)), 0,
-                               "A thicker overlay must not expose an edge even just behind a solid face (z=\(z)).")
+                               "Ordinary CAD ink must not reveal an edge just behind a solid face (z=\(z)).")
             }
             for z in [0.0, 0.1] {
-                let visible = CADStrokeGeometry.make([[-0.7, 0, z, 0.7, 0, z]], color: .white, width: 6, viewportHeight: 192)
-                XCTAssertGreaterThan(try strokeWidth(render(visible, orthographic: orthographic, zoomedOut: false, occluder: true)), 3,
+                let visible = CADStrokeGeometry.make([[-0.7, 0, z, 0.7, 0, z]], color: .white, viewportHeight: 192)
+                XCTAssertGreaterThan(try strokeWidth(render(visible, orthographic: orthographic, zoomedOut: false, occluder: true)), 0,
                                      "Front-facing and exactly coplanar edges must remain visible (z=\(z)).")
             }
         }

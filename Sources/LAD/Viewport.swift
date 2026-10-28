@@ -309,7 +309,6 @@ final class CADSceneView: SCNView {
         gridNode.categoryBitMask = 2
         featureNode.categoryBitMask = 4
         silhouetteNode.categoryBitMask = CADHighlightTechnique.silhouetteCategory
-        featureNode.renderingOrder = 3
         addLight(type: .ambient, intensity: 480, color: NSColor(srgbRed: 0.63, green: 0.70, blue: 0.82, alpha: 1), parent: scene.rootNode)
         // Camera-local studio lights keep the main illumination above-right
         // and the softer fill above-left throughout orbit, pan, and zoom.
@@ -570,8 +569,8 @@ final class CADSceneView: SCNView {
             let node = SCNNode(geometry: geometry)
             node.name = "feature:\(feature.kind.rawValue):\(feature.solidIndex):\(feature.localIndex)"
             node.categoryBitMask = feature.kind == .face ? 4 : CADHighlightTechnique.seedCategory
-            node.renderingOrder = feature.kind == .face ? 3 : 6
             if feature.kind == .face {
+                node.renderingOrder = 3
                 let silhouette = makeSilhouette(geometry, triangleIndices: faceIndices[feature])
                 node.addChildNode(silhouette)
             }
@@ -773,7 +772,7 @@ final class CADSceneView: SCNView {
         }
         for solid in groups.keys.sorted() {
             let node = SCNNode(geometry: CADStrokeGeometry.make(groups[solid]!, color: Self.edgeInk,
-                width: CADStrokeGeometry.normalWidth, viewportHeight: bounds.height, surfaces: surfaceGroups[solid]))
+                viewportHeight: bounds.height, surfaces: surfaceGroups[solid]))
             node.name = solid < 0 ? "legacy-edges" : "edges:\(solid)"
             node.categoryBitMask = 2
             node.renderingOrder = 1

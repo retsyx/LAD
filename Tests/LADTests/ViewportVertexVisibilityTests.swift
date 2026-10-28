@@ -14,7 +14,7 @@ final class ViewportVertexVisibilityTests: XCTestCase {
                         let shot = try render(orthographic: orthographic, zoomedOut: zoomedOut,
                                               scale: scale, hover: hover)
                         let mark = try footprint(shot.image, hover: hover)
-                        let diameter = Double(hover ? CADVertexGeometry.hoverDiameter : CADVertexGeometry.selectedDiameter)
+                        let diameter = Double(hover ? CADHighlightStyle.hoverVertexDiameter : CADHighlightStyle.selectedVertexDiameter)
                         let expected = diameter * Double(scale)
                         let context = "orthographic=\(orthographic), far=\(zoomedOut), scale=\(scale), hover=\(hover)"
                         XCTAssertEqual(Double(mark.width), expected, accuracy: 2, context)
@@ -43,7 +43,7 @@ final class ViewportVertexVisibilityTests: XCTestCase {
                     let shot = try render(orthographic: orthographic, scale: 2, hover: hover,
                                           independentOccluderDistance: distance)
                     let mark = try footprint(shot.image, hover: hover)
-                    let diameter = Double(hover ? CADVertexGeometry.hoverDiameter : CADVertexGeometry.selectedDiameter) * 2
+                    let diameter = Double(hover ? CADHighlightStyle.hoverVertexDiameter : CADHighlightStyle.selectedVertexDiameter) * 2
                     XCTAssertGreaterThan(Double(mark.count), diameter * diameter * 0.60,
                         "The complete vertex overlay must remain visible behind a nearer face (distance \(distance)).")
                     XCTAssertEqual(Double(mark.width), diameter, accuracy: 2)

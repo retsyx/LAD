@@ -7,7 +7,6 @@ import SceneKit
 /// centerlines and vertex centers retain stable screen-point widths and circles.
 @MainActor
 enum CADHighlightTechnique {
-    static let hiddenEdgeCategory = 16
     static let seedCategory = 32
     static let completionCategory = 64
     static let silhouetteCategory = 128
@@ -209,16 +208,19 @@ enum CADHighlightTechnique {
         float4 cadHoverHaloColor;
         float4 cadInkColor;
     };
-    // Share the logical diameters with fallback geometry rather than letting
-    // independently copied shader constants drift from the live marker style.
-    constant float cadVertexHoverRadius = \(Float(CADVertexGeometry.hoverDiameter / 2))f;
-    constant float cadVertexSelectedRadius = \(Float(CADVertexGeometry.selectedDiameter / 2))f;
-    constant float cadVertexHoverHaloRadius = \(Float(CADVertexGeometry.hoverHaloDiameter / 2))f;
-    constant float cadVertexSelectedHaloRadius = \(Float(CADVertexGeometry.selectedHaloDiameter / 2))f;
-    constant float cadMaximumRadius = \(Float(max(2.75, max(CADVertexGeometry.hoverHaloDiameter, CADVertexGeometry.selectedHaloDiameter) / 2)))f;
+    constant float cadEdgeHoverRadius = \(Float(CADHighlightStyle.hoverEdgeWidth / 2))f;
+    constant float cadEdgeSelectedRadius = \(Float(CADHighlightStyle.selectedEdgeWidth / 2))f;
+    constant float cadEdgeHoverHaloRadius = \(Float(CADHighlightStyle.hoverEdgeHaloWidth / 2))f;
+    constant float cadEdgeSelectedHaloRadius = \(Float(CADHighlightStyle.selectedEdgeHaloWidth / 2))f;
+    constant float cadVertexHoverRadius = \(Float(CADHighlightStyle.hoverVertexDiameter / 2))f;
+    constant float cadVertexSelectedRadius = \(Float(CADHighlightStyle.selectedVertexDiameter / 2))f;
+    constant float cadVertexHoverHaloRadius = \(Float(CADHighlightStyle.hoverVertexHaloDiameter / 2))f;
+    constant float cadVertexSelectedHaloRadius = \(Float(CADHighlightStyle.selectedVertexHaloDiameter / 2))f;
+    constant float cadMaximumEdgeRadius = \(Float(CADHighlightStyle.maximumEdgeRadius))f;
+    constant float cadMaximumRadius = \(Float(CADHighlightStyle.maximumRadius))f;
     // Bound the kernel while retaining complete circles at the largest
     // supported independent-capture scale (8×), including antialias coverage.
-    constant int cadMaximumKernelRadius = \(Int(ceil(Double(max(2.75, max(CADVertexGeometry.hoverHaloDiameter, CADVertexGeometry.selectedHaloDiameter) / 2)) * 8 + 0.5)));
+    constant int cadMaximumKernelRadius = \(Int(ceil(Double(CADHighlightStyle.maximumRadius) * 8 + 0.5)));
     vertex CADQuadOutput cad_highlight_quad(CADQuadInput in [[stage_in]]) {
         CADQuadOutput out;
         out.position = float4(in.position, 1.0);
@@ -247,7 +249,7 @@ enum CADHighlightTechnique {
         int2 center = int2(in.position.xy);
         float scale = clamp(float(size.y) / max(params.cadReferenceHeight, 1.0f), 0.125f, 8.0f);
         bool verticesEnabled = params.cadVertexHighlightsEnabled > 0.5f;
-        float maximumRadius = verticesEnabled ? cadMaximumRadius : 2.75f;
+        float maximumRadius = verticesEnabled ? cadMaximumRadius : cadMaximumEdgeRadius;
         int radius = min(min(size.x - 1, cadMaximumKernelRadius), int(ceil(maximumRadius * scale + 0.5f)));
         float4 best = float4(65504.0f);
         int first = max(-radius, -center.x);
@@ -278,7 +280,7 @@ enum CADHighlightTechnique {
         int2 center = int2(in.position.xy);
         float scale = clamp(float(size.y) / max(params.cadReferenceHeight, 1.0f), 0.125f, 8.0f);
         bool verticesEnabled = params.cadVertexHighlightsEnabled > 0.5f;
-        float maximumRadius = verticesEnabled ? cadMaximumRadius : 2.75f;
+        float maximumRadius = verticesEnabled ? cadMaximumRadius : cadMaximumEdgeRadius;
         int radius = min(min(size.y - 1, cadMaximumKernelRadius), int(ceil(maximumRadius * scale + 0.5f)));
         float4 best = float4(65504.0f);
         int first = max(-radius, -center.y);
@@ -302,10 +304,10 @@ enum CADHighlightTechnique {
         }
         // A one-pixel transition preserves the same logical widths on Retina
         // and independent agent captures, without changing the seed geometry.
-        float hoverHalo = saturate(2.5f * scale + 0.5f - distance.g);
-        float hoverCore = saturate(1.5f * scale + 0.5f - distance.g);
-        float selectedHalo = saturate(2.75f * scale + 0.5f - distance.r);
-        float selectedCore = saturate(2.0f * scale + 0.5f - distance.r);
+        float hoverHalo = saturate(cadEdgeHoverHaloRadius * scale + 0.5f - distance.g);
+        float hoverCore = saturate(cadEdgeHoverRadius * scale + 0.5f - distance.g);
+        float selectedHalo = saturate(cadEdgeSelectedHaloRadius * scale + 0.5f - distance.r);
+        float selectedCore = saturate(cadEdgeSelectedRadius * scale + 0.5f - distance.r);
         float vertexHoverHalo = saturate(cadVertexHoverHaloRadius * scale + 0.5f - distance.a);
         float vertexHoverCore = saturate(cadVertexHoverRadius * scale + 0.5f - distance.a);
         float vertexSelectedHalo = saturate(cadVertexSelectedHaloRadius * scale + 0.5f - distance.b);
