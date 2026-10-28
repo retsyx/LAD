@@ -1,0 +1,6 @@
+{
+  "title": "Desk tray",
+  "summary": "A 100 × 70 × 16 mm open tray with 2.5 mm walls and a rounded rectangular footprint.",
+  "units": "mm",
+  "script": "# Complete CadQuery construction.\npart_0 = cq.Workplane('XY').box(*[100, 70, 16], centered=(True, True, False)).val()\npart_1 = cq.Workplane('XY').newObject([part_0]).edges('|Z').fillet(6).val()\npart_2 = cq.Workplane('XY').newObject([part_1]).faces('>Z').shell(-2.5).val()\nresult = part_2\n"
+}

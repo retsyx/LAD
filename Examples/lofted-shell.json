@@ -1,0 +1,6 @@
+{
+  "title": "Lofted shell and kernel assembly",
+  "summary": "An elliptical loft with 1.5 mm inward shell, plus a separate 5 mm box constructed through direct OpenCascade. Dimensions are millimeters.",
+  "units": "mm",
+  "script": "from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox\nfrom OCP.gp import gp_Pnt\n\n# A smooth elliptical loft, opened and shelled through CadQuery.\nbody = (cq.Workplane('XY').ellipse(20, 12)\n        .workplane(offset=8).ellipse(16, 10).loft()\n        .faces('>Z').shell(-1.5))\n\n# A second positioned part created directly with the OpenCascade bindings.\nkernel_box = cq.Shape.cast(BRepPrimAPI_MakeBox(gp_Pnt(35, 0, 0), 5, 5, 5).Shape())\nresult = cq.Assembly().add(body, name='lofted_shell').add(kernel_box, name='kernel_box')\n"
+}

@@ -1,0 +1,6 @@
+{
+  "title": "Mounting bracket",
+  "summary": "An 80 × 50 mm angle bracket with a 6 mm wall, rounded vertical corners, and four 6.5 mm clearance holes. All dimensions are in millimeters.",
+  "units": "mm",
+  "script": "# Complete CadQuery construction.\npart_0 = cq.Workplane('XY').box(*[80, 50, 6], centered=(True, True, False)).val()\npart_1 = cq.Workplane('XY').box(*[80, 6, 44], centered=(True, True, False)).val()\npart_2 = part_1.translate([0, 22, 6])\npart_3 = part_0.fuse(part_2).clean()\npart_4 = cq.Workplane('XY').newObject([part_3]).edges('|Z').fillet(1).val()\npart_5 = cq.Solid.makeCylinder(*[3.25, 8])\npart_6 = part_5.translate([-25, -6, -1])\npart_7 = cq.Solid.makeCylinder(*[3.25, 10])\npart_8 = part_7.rotate((0, 0, 0), [1, 0, 0], 90)\npart_9 = part_8.translate([-25, 28, 30])\npart_10 = cq.Solid.makeCylinder(*[3.25, 8])\npart_11 = part_10.translate([25, -6, -1])\npart_12 = cq.Solid.makeCylinder(*[3.25, 10])\npart_13 = part_12.rotate((0, 0, 0), [1, 0, 0], 90)\npart_14 = part_13.translate([25, 28, 30])\npart_15 = part_4.cut(part_6, part_11, part_9, part_14).clean()\nresult = part_15\n"
+}

@@ -1,0 +1,6 @@
+{
+  "title": "Flanged hub",
+  "summary": "A 60 mm flange with a 24 mm hub, 12 mm center bore, and four 6 mm bolt holes on a 40 mm pitch circle.",
+  "units": "mm",
+  "script": "# Complete CadQuery construction.\npart_0 = cq.Solid.makeCylinder(*[30, 8])\npart_1 = cq.Solid.makeCylinder(*[12, 24])\npart_2 = part_0.fuse(part_1).clean()\npart_3 = cq.Solid.makeCylinder(*[6, 26])\npart_4 = part_3.translate([0, 0, -1])\npart_5 = cq.Solid.makeCylinder(*[3, 10])\npart_6 = part_5.translate([20, 0, -1])\npart_7 = cq.Solid.makeCylinder(*[3, 10])\npart_8 = part_7.translate([-20, 0, -1])\npart_9 = cq.Solid.makeCylinder(*[3, 10])\npart_10 = part_9.translate([0, 20, -1])\npart_11 = cq.Solid.makeCylinder(*[3, 10])\npart_12 = part_11.translate([0, -20, -1])\npart_13 = part_2.cut(part_4, part_6, part_8, part_10, part_12).clean()\nresult = part_13\n"
+}

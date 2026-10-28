@@ -1,0 +1,46 @@
+# Swift Package Manager and Xcode build/user state
+/.build/
+/.swiftpm/
+/build/
+/DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# Local Python/CAD runtime and caches
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaged applications, generated icons, and CAD exports
+/dist/
+/Outputs/
+*.lad.autosave
+
+# Machine-local Codex configuration and environment variables
+/.codex/
+/.vscode/
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# macOS metadata and editor temporary files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+*.swp
+*.swo
+*~
+
+# Keep Package.resolved, requirements-lock.txt, editor launch configurations,
+# and example/test CAD assets eligible for version control.

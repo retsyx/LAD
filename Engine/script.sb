@@ -1,0 +1,48 @@
+(version 1)
+(deny default)
+
+; LAD runs Python models in a separate native process. Only the installed
+; runtime, system libraries/fonts, bundled worker and this build's scratch
+; directory are readable. Network and process-fork remain denied.
+(allow file-read-metadata)
+(allow file-map-executable
+    (subpath (param "RUNTIME"))
+    (subpath (param "PYTHON_BASE"))
+    (subpath "/System")
+    (subpath "/usr/lib")
+    (subpath "/Library/Apple/System/Library")
+    (subpath "/opt/homebrew/Cellar")
+    (subpath "/opt/homebrew/opt")
+    (subpath "/opt/homebrew/lib")
+    (subpath "/usr/local/Cellar")
+    (subpath "/usr/local/opt")
+    (subpath "/usr/local/lib"))
+(allow file-read*
+    ; dyld/libignition opens the root directory as its openat(2) base.
+    (literal "/")
+    (subpath (param "RUNTIME"))
+    (subpath (param "PYTHON_BASE"))
+    (subpath (param "WORKER"))
+    (subpath (param "OUTPUT"))
+    (subpath "/System")
+    (subpath "/usr/lib")
+    (subpath "/usr/share")
+    (subpath "/Library/Fonts")
+    (subpath "/Library/Apple/System/Library")
+    (subpath "/opt/homebrew/Cellar")
+    (subpath "/opt/homebrew/opt")
+    (subpath "/opt/homebrew/lib")
+    (subpath "/usr/local/Cellar")
+    (subpath "/usr/local/opt")
+    (subpath "/usr/local/lib")
+    (literal "/dev/null")
+    (literal "/dev/random")
+    (literal "/dev/urandom"))
+(allow file-write* (subpath (param "OUTPUT")) (literal "/dev/null"))
+(allow process-exec (literal (param "PYTHON")) (literal (param "ENTRY_PYTHON")))
+(allow signal (target self))
+(allow sysctl-read)
+(allow mach-lookup
+    (global-name "com.apple.system.logger")
+    (global-name "com.apple.logd")
+    (global-name "com.apple.FontObjectsServer"))

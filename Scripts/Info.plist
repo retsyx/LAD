@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>LAD</string>
+    <key>CFBundleDisplayName</key><string>LAD</string>
+    <key>CFBundleIdentifier</key><string>studio.lad.cad</string>
+    <key>CFBundleExecutable</key><string>LAD</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.3.0</string>
+    <key>CFBundleVersion</key><string>99</string>
+    <key>CFBundleIconFile</key><string>LAD</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>CFBundleDocumentTypes</key>
+    <array><dict>
+        <key>CFBundleTypeName</key><string>LAD Design</string>
+        <key>CFBundleTypeIconFile</key><string>LADDocument.icns</string>
+        <key>CFBundleTypeRole</key><string>Editor</string>
+        <key>LSHandlerRank</key><string>Owner</string>
+        <key>LSItemContentTypes</key><array><string>studio.lad.project</string></array>
+    </dict></array>
+    <key>UTExportedTypeDeclarations</key>
+    <array><dict>
+        <key>UTTypeIdentifier</key><string>studio.lad.project</string>
+        <key>UTTypeDescription</key><string>LAD Design</string>
+        <key>UTTypeIconFile</key><string>LADDocument.icns</string>
+        <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+        <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>lad</string></array></dict>
+    </dict></array>
+</dict>
+</plist>
