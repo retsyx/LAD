@@ -104,7 +104,8 @@ them before the worker request.
 private filenames such as `input-000.step`. The worker loads these shapes as
 `imported_assets[id]`. STEP and BREP retain their native boundary representation;
 closed STL/OBJ meshes are sewn into faceted BRep solids, retaining closed nested
-cavities. These are required recipe inputs, stored once in the design's shared
+cavities. Intersecting or touching shells are rejected rather than misclassified
+as cavities. These are required recipe inputs, stored once in the design's shared
 asset table. Arbitrary paths, links, open/invalid meshes and unsupported kinds
 are rejected. This does not allow generated replay programs to read user files.
 

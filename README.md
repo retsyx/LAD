@@ -115,7 +115,7 @@ Designs are saved in **iCloud Drive/LAD** as `.lad` files. Filenames use the des
 
 Click the filename at the top of the window to rename a design in place. Return applies the name; Escape cancels. The `.lad` file is renamed automatically, and your chosen name stays with the design when you change revisions or ask Codex for further changes. Existing files are preserved when names collide.
 
-The interface shows a save status only while changes are pending or when saving fails; there is no "saved" or "autosaved" confirmation. Design encoding, ZIP compression, and disk work run off the main UI thread. The file reader validates ZIP structure and checksums, file hashes and references, IDs, programs, hierarchy, and STEP headers. Both compressed and expanded design data have a 256 MB size limit.
+The interface shows a save status only while changes are pending or when saving fails; there is no "saved" or "autosaved" confirmation. A failed autosave leaves the design unsaved, including after its window closes. On quit, LAD offers a save dialog for each unsaved design; canceling that dialog quits without saving that design. Design encoding, ZIP compression, and disk work run off the main UI thread. The file reader validates ZIP structure and checksums, file hashes and references, IDs, programs, hierarchy, and STEP headers. Both compressed and expanded design data have a 256 MB size limit.
 
 Try `Examples/Mounting Bracket.lad`: it includes two complete modeling recipes and four conversation messages. `Examples/*.json` are CadQuery program examples, not complete designs.
 

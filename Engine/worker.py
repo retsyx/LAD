@@ -904,6 +904,7 @@ def mesh_to_solid(polygons, cq):
     """Sew closed faceted surfaces into exact BRep faces, retaining voids."""
     from OCP.BRep import BRep_Tool
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
     from OCP.ShapeFix import ShapeFix_Solid
     sewing = BRepBuilderAPI_Sewing(1e-7)
     try:
@@ -920,16 +921,38 @@ def mesh_to_solid(polygons, cq):
         solids = [cq.Shape.cast(ShapeFix_Solid().SolidFromShell(shell.wrapped)) for shell in shells]
         if any(not solid.isValid() or solid.Volume() <= 1e-10 for solid in solids):
             raise ModelError("The imported mesh could not be converted to valid closed solids.")
-        # A sealed cavity is a second shell, not a second filled body. Classify
-        # nesting and subtract odd-depth voids rather than silently filling them.
-        depths = [sum(1 for j, outer in enumerate(solids) if i != j and
-                      outer.isInside(solid.Vertices()[0].Center(), 1e-7)) for i, solid in enumerate(solids)]
+        # A sealed cavity is a second shell, not a second filled body. First
+        # prove that shell surfaces are disjoint: one inside vertex alone can
+        # misclassify an intersecting body as a cavity and discard its exterior.
+        # Once connected closed boundaries cannot cross or touch, a point on
+        # either boundary classifies the containment of that entire shell.
+        tolerance = 1e-7
+        samples = [solid.Vertices()[0].Center() for solid in solids]
+        bounds = []
+        for solid in solids:
+            box = solid.BoundingBox()
+            bounds.append((box.xmin, box.ymin, box.zmin, box.xmax, box.ymax, box.zmax))
+        containers = [set() for _ in solids]
+        for i, solid in enumerate(solids):
+            for j in range(i):
+                a, b = bounds[i], bounds[j]
+                if any(a[axis + 3] < b[axis] - tolerance or b[axis + 3] < a[axis] - tolerance for axis in range(3)):
+                    continue
+                distance = BRepExtrema_DistShapeShape(shells[i].wrapped, shells[j].wrapped)
+                if not distance.IsDone() or not math.isfinite(distance.Value()):
+                    raise ModelError("The imported mesh's closed shells could not be classified reliably.")
+                if distance.Value() <= tolerance:
+                    raise ModelError("The imported mesh contains intersecting or touching closed shells; use disjoint bodies or fully enclosed cavities.")
+                if solids[j].isInside(samples[i], tolerance):
+                    containers[i].add(j)
+                if solid.isInside(samples[j], tolerance):
+                    containers[j].add(i)
+        depths = [len(owners) for owners in containers]
         bodies = []
         for index, solid in enumerate(solids):
             if depths[index] % 2:
                 continue
-            voids = [other for j, other in enumerate(solids) if depths[j] == depths[index] + 1
-                     and solid.isInside(other.Vertices()[0].Center(), 1e-7)]
+            voids = [other for j, other in enumerate(solids) if depths[j] == depths[index] + 1 and index in containers[j]]
             bodies.append(solid.cut(*voids) if voids else solid)
         result = bodies[0] if len(bodies) == 1 else cq.Compound.makeCompound(bodies)
         return validate_shape(result)

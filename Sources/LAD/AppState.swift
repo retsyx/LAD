@@ -58,6 +58,7 @@ final class AppState: ObservableObject {
     @Published var viewportCommand: ViewportCommand?
     @Published var projectURL: URL?
     @Published var saveStatus: String?
+    @Published private(set) var hasUnsavedChanges = false
     @Published var notice: String?
     @Published var selectedSolids: Set<Int> = [] {
         didSet { if selectedSolids != oldValue { refreshMeasurements() } }
@@ -330,6 +331,7 @@ final class AppState: ObservableObject {
 
     func prepareToQuit() async {
         cancel()
+        auditSaveTask?.cancel(); auditSaveTask = nil
         draftSaveTask?.cancel(); draftSaveTask = nil
         await waitForPromptAttachments()
         await waitForQueuedSources()
@@ -352,21 +354,46 @@ final class AppState: ObservableObject {
     private func flushProject() async throws {
         guard projectReady, !preserveUnreadableSession else { return }
         autosaveSequence += 1
-        let sequence = autosaveSequence
+        let sequence = autosaveSequence, sessionID = projectSessionID
+        hasUnsavedChanges = true
         let preferExactName = pendingProjectRename
         do {
             let url = try await autosaveStore.write(project: projectSnapshot(), projectID: projectID, title: autosaveTitle,
                                                    sequence: sequence, preferredURL: autosavedProjectURL,
                                                    preferExactName: preferExactName)
+            guard projectSessionID == sessionID else { return }
             autosavedProjectURL = url
             rememberAutosavedProject(url)
             if sequence == autosaveSequence {
                 projectURL = url
                 pendingProjectRename = false
+                hasUnsavedChanges = false
+                saveStatus = nil
             }
-            saveStatus = nil
         } catch {
-            saveStatus = "Not saved: \(error.localizedDescription)"
+            if projectSessionID == sessionID, autosaveSequence == sequence {
+                saveStatus = "Not saved: \(error.localizedDescription)"
+            }
+            throw error
+        }
+    }
+
+    /// A quit-time recovery copy preserves the complete design. Unlike the
+    /// ordinary Save As action, it is awaited and does not retry cloud autosave.
+    func saveProjectForQuit(to url: URL) async throws {
+        draftSaveTask?.cancel(); draftSaveTask = nil
+        let sequence = autosaveSequence, sessionID = projectSessionID
+        do {
+            try await autosaveStore.writeCopy(projectSnapshot(), to: url)
+            onRecentProjectChanged?(url, nil)
+            if projectSessionID == sessionID, autosaveSequence == sequence {
+                hasUnsavedChanges = false
+                saveStatus = nil
+            }
+        } catch {
+            if projectSessionID == sessionID, autosaveSequence == sequence {
+                saveStatus = "Not saved: \(error.localizedDescription)"
+            }
             throw error
         }
     }
@@ -389,6 +416,7 @@ final class AppState: ObservableObject {
         preserveUnreadableSession = false
         projectURL = nil
         saveStatus = nil
+        hasUnsavedChanges = false
         pendingProjectRename = false
         projectName = nil
         recentPartColors = []
@@ -744,6 +772,10 @@ final class AppState: ObservableObject {
 
     private func scheduleDraftSave() {
         guard projectReady, !preserveUnreadableSession else { return }
+        // Invalidate older in-flight writes immediately, before the draft's
+        // debounced autosave starts.
+        autosaveSequence += 1
+        hasUnsavedChanges = true
         draftSaveTask?.cancel()
         let session = projectSessionID
         draftSaveTask = Task { [weak self] in
@@ -1054,6 +1086,8 @@ final class AppState: ObservableObject {
     }
 
     private func scheduleAuditSave() {
+        autosaveSequence += 1
+        hasUnsavedChanges = true
         guard auditSaveTask == nil else { return }
         let session = projectSessionID
         auditSaveTask = Task { [weak self] in
@@ -1659,6 +1693,7 @@ final class AppState: ObservableObject {
 
     private func restore(_ project: LADProject) {
         projectReady = false
+        hasUnsavedChanges = false
         activityImages.reset()
         resetQueueWork()
         projectSessionID = UUID()
@@ -1697,6 +1732,7 @@ final class AppState: ObservableObject {
     }
     private func autosave() {
         guard projectReady, !preserveUnreadableSession else { return }
+        hasUnsavedChanges = true
         autosaveSequence += 1
         let snapshot = projectSnapshot(), sequence = autosaveSequence, sessionID = projectSessionID
         let documentID = projectID, name = autosaveTitle, preferredURL = autosavedProjectURL
@@ -1712,6 +1748,7 @@ final class AppState: ObservableObject {
                 autosavedProjectURL = url
                 rememberAutosavedProject(url)
                 pendingProjectRename = false
+                hasUnsavedChanges = false
                 saveStatus = nil
             } catch {
                 guard projectSessionID == sessionID, autosaveSequence == sequence else { return }

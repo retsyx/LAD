@@ -83,7 +83,9 @@ final class ProjectWindowCoordinator: ObservableObject {
     private var initialRestoreClaimed = false
     private var closeTasks: [UUID: ClosingSession] = [:]
     private var closingURLs: [URL: UUID] = [:]
+    private var reopeningStates: [UUID: AppState] = [:]
     private let closeSession: @MainActor (AppState) async -> Void
+    private let saveUnsavedProject: @MainActor (AppState) async -> Void
     private let readProject: @Sendable (URL) async throws -> LADProject
     private let loadProject: @MainActor (LADProject, URL) -> AppState
     private let loadExistingProject: @MainActor (AppState, LADProject, URL) -> Void
@@ -92,6 +94,7 @@ final class ProjectWindowCoordinator: ObservableObject {
     private var isQuitting = false
 
     init(closeSession: @escaping @MainActor (AppState) async -> Void = { await $0.prepareToQuit() },
+         saveUnsavedProject: @escaping @MainActor (AppState) async -> Void = { await ProjectQuitSave.save($0) },
          readProject: @escaping @Sendable (URL) async throws -> LADProject = { url in
              try await Task.detached { try ProjectAutosaveStore.readProject(from: url) }.value
          },
@@ -105,6 +108,7 @@ final class ProjectWindowCoordinator: ObservableObject {
          },
          flushProject: @escaping @MainActor (AppState) async throws -> Void = { try await $0.flushForReplacement() }) {
         self.closeSession = closeSession
+        self.saveUnsavedProject = saveUnsavedProject
         self.readProject = readProject
         self.loadProject = loadProject
         self.loadExistingProject = loadExistingProject
@@ -118,10 +122,16 @@ final class ProjectWindowCoordinator: ObservableObject {
     }
 
     func register(_ session: ProjectWindowSession, id: UUID, sourceURL: URL?) {
+        var aliases = Set<URL>()
+        if let retained = reopeningStates.removeValue(forKey: id) {
+            session.state = retained
+            aliases = adoptClosedState(retained)
+        }
         let source = sourceURL.map(Self.canonicalURL)
         session.sourceURL = source
         entries[id] = Entry(session: session, sourceURL: source,
-                            keepsSourceAlias: source.map { !Self.isManagedURL($0) } ?? false)
+                            keepsSourceAlias: source.map { !Self.isManagedURL($0) } ?? false,
+                            inheritedAliases: aliases)
         pendingURLs = pendingURLs.filter { $0.value.windowID != id }
         if !focusOrder.contains(id) { focusOrder.append(id) }
         if windows[id]?.window?.isKeyWindow == true || activeID == nil || activeID == id {
@@ -173,6 +183,7 @@ final class ProjectWindowCoordinator: ObservableObject {
                     return
                 }
                 reserve(destination, for: request.id, token: request.id)
+                if closing.state.hasUnsavedChanges { reopeningStates[request.id] = closing.state }
                 createWindow(ProjectWindowRequest(id: request.id, fileURL: destination))
             }
             return
@@ -255,6 +266,7 @@ final class ProjectWindowCoordinator: ObservableObject {
                     aliases.formUnion(other.inheritedAliases)
                     if other.keepsSourceAlias, let alias = other.sourceURL { aliases.insert(alias) }
                 }
+                aliases.formUnion(adoptClosedState(incoming))
                 let sourceIsImported = !Self.isManagedURL(source)
                 if sourceIsImported { aliases.insert(source) }
                 entries[id] = Entry(session: session, sourceURL: source,
@@ -282,6 +294,7 @@ final class ProjectWindowCoordinator: ObservableObject {
     }
 
     func windowClosed(_ id: UUID) {
+        reopeningStates.removeValue(forKey: id)
         cancelReplacement(in: id)
         windows.removeValue(forKey: id)
         pendingURLs = pendingURLs.filter { $0.value.windowID != id }
@@ -304,8 +317,12 @@ final class ProjectWindowCoordinator: ObservableObject {
         let task = Task { [self, state = entry.state] in
             for replacement in replacing { await replacement.value }
             await closeSession(state)
-            closeTasks.removeValue(forKey: token)
-            closingURLs = closingURLs.filter { $0.value != token }
+            // A closed window must not discard a failed autosave. Keep its
+            // state and aliases until quit, or until another window reuses it.
+            if !state.hasUnsavedChanges {
+                closeTasks.removeValue(forKey: token)
+                closingURLs = closingURLs.filter { $0.value != token }
+            }
         }
         closeTasks[token] = ClosingSession(state: entry.state, task: task)
     }
@@ -315,13 +332,17 @@ final class ProjectWindowCoordinator: ObservableObject {
         isQuitting = true
         let replacing = replacementTasks.values.map(\.task)
         for id in Array(replacements.keys) { cancelReplacement(in: id) }
-        let closing = closeTasks.values.map(\.task)
+        let closing = Array(closeTasks.values)
         let sessions = uniqueStates()
         for state in sessions { state.cancel() }
-        let task = Task { [closeSession] in
+        let task = Task { [closeSession, saveUnsavedProject] in
             for replacement in replacing { await replacement.value }
-            for closingTask in closing { await closingTask.value }
+            for closingSession in closing { await closingSession.task.value }
             for state in sessions { await closeSession(state) }
+            var seen = Set<ObjectIdentifier>()
+            for state in sessions + closing.map(\.state) where seen.insert(ObjectIdentifier(state)).inserted {
+                if state.hasUnsavedChanges { await saveUnsavedProject(state) }
+            }
         }
         quitTask = task
         await task.value
@@ -383,6 +404,17 @@ final class ProjectWindowCoordinator: ObservableObject {
     }
 
     private func hasLoadedProject(_ state: AppState) -> Bool { state.projectURL != nil || state.canRenameProject }
+
+    private func adoptClosedState(_ state: AppState) -> Set<URL> {
+        var aliases = Set<URL>()
+        let tokens = closeTasks.filter { $0.value.state === state }.map(\.key)
+        for token in tokens {
+            aliases.formUnion(closingURLs.filter { $0.value == token }.map(\.key).filter { !Self.isManagedURL($0) })
+            closeTasks.removeValue(forKey: token)
+            closingURLs = closingURLs.filter { $0.value != token }
+        }
+        return aliases
+    }
 
     private func hasWindow(for state: AppState) -> Bool { entries.values.contains { $0.state === state } }
 
@@ -481,6 +513,7 @@ final class ProjectWindowAnchor: NSView {
         guard let window, let projectID, let state, let windowCoordinator else { return }
         window.title = state.projectDisplayName
         window.representedURL = state.projectURL
+        window.isDocumentEdited = state.hasUnsavedChanges
         window.tabbingMode = .disallowed
         guard observedWindow !== window else { return }
         disconnect()

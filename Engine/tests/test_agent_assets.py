@@ -25,6 +25,14 @@ def cube_obj(low=0, high=1, offset=0):
     return ''.join('v %s %s %s\n' % point for point in points) + ''.join('f ' + ' '.join(str(i + offset) for i in face) + '\n' for face in faces)
 
 
+def prism_obj(outline, low, high, offset=0):
+    count = len(outline)
+    points = [(x, y, z) for z in (low, high) for x, y in outline]
+    faces = [list(range(count, 0, -1)), list(range(count + 1, count * 2 + 1))]
+    faces += [[i + 1, (i + 1) % count + 1, (i + 1) % count + count + 1, i + count + 1] for i in range(count)]
+    return ''.join('v %s %s %s\n' % point for point in points) + ''.join('f ' + ' '.join(str(i + offset) for i in face) + '\n' for face in faces)
+
+
 def spec(asset, script=None):
     return {'title': 'External geometry', 'summary': 'Imported input test', 'units': 'mm',
             'script': script or "result = imported_assets['external']", 'inputAssets': [asset]}
@@ -58,6 +66,39 @@ class AgentAssetTests(unittest.TestCase):
             hollow = import_input_asset(path, 'obj', cq)
             self.assertEqual(len(hollow.Solids()), 1)
             self.assertAlmostEqual(hollow.Volume(), 56, places=7)
+
+    def test_mesh_shell_intersections_are_rejected_instead_of_becoming_cavities(self):
+        import cadquery as cq
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'intersecting.obj'
+            for first, second in [((0, 2), (1, 3)), ((1, 3), (0, 2)), ((0, 1), (1, 2))]:
+                with self.subTest(first=first):
+                    path.write_text(cube_obj(*first) + cube_obj(*second, offset=8))
+                    with self.assertRaisesRegex(ModelError, 'intersecting|touching'):
+                        import_input_asset(path, 'obj', cq)
+
+            # Every corner of this bar lies inside one arm of the U, but its
+            # faces cross the empty gap. Checking all vertices is insufficient.
+            outline = [(0, 0), (5, 0), (5, 5), (4, 5), (4, 1), (1, 1), (1, 5), (0, 5)]
+            bar = [(0.25, 2), (4.75, 2), (4.75, 3), (0.25, 3)]
+            path.write_text(prism_obj(outline, 0, 5) + prism_obj(bar, 2, 3, offset=16))
+            with self.assertRaisesRegex(ModelError, 'intersecting|touching'):
+                import_input_asset(path, 'obj', cq)
+
+    def test_mesh_shell_classification_preserves_disconnected_bodies_and_nested_islands(self):
+        import cadquery as cq
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bodies.obj'
+            path.write_text(cube_obj(0, 1) + cube_obj(3, 5, offset=8))
+            disconnected = import_input_asset(path, 'obj', cq)
+            self.assertEqual(len(disconnected.Solids()), 2)
+            self.assertAlmostEqual(disconnected.Volume(), 9, places=7)
+            self.assertAlmostEqual(disconnected.BoundingBox().xmax, 5, places=7)
+
+            path.write_text(cube_obj(2, 4) + cube_obj(1, 5, offset=8) + cube_obj(0, 6, offset=16))
+            nested = import_input_asset(path, 'obj', cq)
+            self.assertEqual(len(nested.Solids()), 2)
+            self.assertAlmostEqual(nested.Volume(), 160, places=7)
 
     def test_binary_ascii_stl_and_open_mesh_rejection(self):
         import cadquery as cq

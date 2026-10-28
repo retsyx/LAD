@@ -307,7 +307,7 @@ actor ProjectAutosaveStore {
                            inode: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0)
     }
 
-    private nonisolated static func filenameStem(_ title: String) -> String {
+    nonisolated static func filenameStem(_ title: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(.whitespaces).union(CharacterSet(charactersIn: "-_()"))
         let clean = title.precomposedStringWithCanonicalMapping.unicodeScalars.map { allowed.contains($0) ? String($0) : " " }.joined()
         let words = clean.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
