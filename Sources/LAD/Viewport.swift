@@ -933,7 +933,9 @@ final class CADSceneView: SCNView {
 
     private func perform(_ action: ViewportCommand.Action) {
         switch action {
-        case .fit: rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+        case .fit:
+            zoomAnchor = nil
+            rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
         case .isometric: rig.yaw = -.pi / 4; rig.elevation = 0.6154797087
         case .front: rig.yaw = -.pi / 2; rig.elevation = 0
         case .back: rig.yaw = .pi / 2; rig.elevation = 0
@@ -948,6 +950,8 @@ final class CADSceneView: SCNView {
     func selectOrientationCubeFace(_ face: ViewportCubeFace) {
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
+        zoomAnchor = nil
+        rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
         switch face {
         case .front: perform(.front)
         case .back: perform(.back)
@@ -964,6 +968,8 @@ final class CADSceneView: SCNView {
         let direction = corner.direction
         rig.yaw = atan2(direction.y, direction.x)
         rig.elevation = asin(direction.z)
+        zoomAnchor = nil
+        rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
         applyCamera()
     }
 

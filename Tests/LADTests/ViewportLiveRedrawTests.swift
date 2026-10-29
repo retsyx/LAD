@@ -1,10 +1,92 @@
 import AppKit
 import Metal
 import SceneKit
+import simd
 import XCTest
 @testable import LAD
 
 final class ViewportLiveRedrawTests: XCTestCase {
+    @MainActor
+    func testWheelZoomRecoversAfterSurfaceAnchorBecomesTooSmallToHit() async throws {
+        guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for live viewport drawing.") }
+        _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let application = NSApplication.shared
+        let previousPolicy = application.activationPolicy()
+        XCTAssertTrue(application.setActivationPolicy(.regular))
+        defer { _ = application.setActivationPolicy(previousPolicy) }
+        application.finishLaunching()
+
+        for projection in ViewportProjectionMode.allCases {
+            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360), options: [
+                SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
+            ])
+            let frames = ViewportRenderCounter()
+            view.delegate = frames
+            let window = NSWindow(contentRect: NSRect(x: 50, y: 50, width: 480, height: 360),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+            window.title = "LAD viewport wheel zoom test"
+            window.isReleasedWhenClosed = false
+            window.contentView = view
+            defer {
+                view.delegate = nil
+                window.orderOut(nil)
+                window.contentView = nil
+                window.close()
+            }
+            view.update(mesh: box(), mode: .edges, grid: false, command: ViewportCommand(.front),
+                        selectedSolids: [], hiddenSolids: [], projection: projection)
+            application.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            view.layout()
+            let deadline = ContinuousClock.now + .seconds(10)
+            while view.isPreparingResources, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertFalse(view.isPreparingResources)
+            guard try await waitForFrame(frames, after: 0, reason: "The wheel regression needs a rendered front surface.") else { return }
+            guard try await waitForIdle(frames) else { return }
+            let center = NSPoint(x: view.bounds.midX, y: view.bounds.midY)
+            let hitOptions: [SCNHitTestOption: Any] = [.categoryBitMask: 1, .searchMode: SCNHitTestSearchMode.closest.rawValue]
+            XCTAssertFalse(view.hitTest(center, options: hitOptions).isEmpty)
+            func projectedWidth() -> Double {
+                abs(Double(view.projectPoint(SCNVector3(3, 0, 0)).x - view.projectPoint(SCNVector3(-3, 0, 0)).x))
+            }
+            let fittedWidth = projectedWidth()
+            XCTAssertGreaterThan(fittedWidth, 50)
+
+            for _ in 0..<6 {
+                let before = frames.count
+                view.scrollWheel(with: try wheel(-250, at: center, in: view))
+                guard try await waitForFrame(frames, after: before, reason: "Wheel zoom-out must draw its new camera.") else { return }
+            }
+            guard try await waitForIdle(frames) else { return }
+            let target = try XCTUnwrap(view.agentCaptureMetadata["cameraTarget"] as? [Double])
+            XCTAssertGreaterThan(abs(target[1]), 10, "Surface zoom must have displaced the target behind this front-facing design.")
+            XCTAssertLessThan(projectedWidth(), 0.1, "The regression must reach a subpixel design.")
+            // The original ray still intersects its surface anchor. A one-point
+            // pointer movement forces the empty-space fallback at this scale.
+            let missedPoint = NSPoint(x: center.x + 1, y: center.y)
+            XCTAssertTrue(view.hitTest(missedPoint, options: hitOptions).isEmpty)
+            for step in 0..<8 {
+                let projected = view.projectPoint(SCNVector3Zero)
+                let point = step == 0 ? missedPoint : NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+                let before = frames.count
+                view.scrollWheel(with: try wheel(250, at: point, in: view))
+                guard try await waitForFrame(frames, after: before, reason: "Wheel zoom-in after idle must draw its recovered camera.") else { return }
+                let transform = try XCTUnwrap(view.pointOfView).simdWorldTransform
+                let position = SIMD3(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z)
+                let backward = SIMD3(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z)
+                XCTAssertGreaterThan(simd_dot(position, backward), 0, "Empty-space zoom must keep the design in front of the camera in \(projection.rawValue).")
+                if projectedWidth() >= fittedWidth * 0.6 { break }
+            }
+            guard try await waitForIdle(frames) else { return }
+            XCTAssertGreaterThanOrEqual(projectedWidth(), fittedWidth * 0.6, "Wheel zoom must recover visible design scale without Fit.")
+            let recovered = view.projectPoint(SCNVector3Zero)
+            XCTAssertTrue(view.bounds.insetBy(dx: 10, dy: 10).contains(NSPoint(x: CGFloat(recovered.x), y: CGFloat(recovered.y))))
+            XCTAssertFalse(view.rendersContinuously, "Recovered wheel navigation must return to idle.")
+        }
+    }
+
     @MainActor
     func testIdleNativeViewportRendersDisplayAndCameraChangesIntoItsWindow() async throws {
         guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for live viewport drawing.") }
@@ -150,6 +232,26 @@ final class ViewportLiveRedrawTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(250))
         XCTAssertFalse(view.rendersContinuously)
         XCTAssertEqual(frames.count, afterDetach, "Lifecycle notifications must not wake a detached viewport.")
+    }
+
+    @MainActor
+    private func wheel(_ delta: Int32, at point: NSPoint, in view: CADSceneView) throws -> NSEvent {
+        let scroll = try XCTUnwrap(CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                                          wheel1: delta, wheel2: 0, wheel3: 0))
+        // CG-backed synthetic events have no window. Match their AppKit
+        // location to the receiving view's window coordinates explicitly.
+        scroll.location = .zero
+        let origin = try XCTUnwrap(NSEvent(cgEvent: scroll)).locationInWindow
+        scroll.location = CGPoint(x: 1, y: 1)
+        let unit = try XCTUnwrap(NSEvent(cgEvent: scroll)).locationInWindow
+        let desired = view.convert(point, to: nil)
+        scroll.location = CGPoint(x: (desired.x - origin.x) / (unit.x - origin.x),
+                                  y: (desired.y - origin.y) / (unit.y - origin.y))
+        let event = try XCTUnwrap(NSEvent(cgEvent: scroll))
+        let received = view.convert(event.locationInWindow, from: nil)
+        XCTAssertEqual(received.x, point.x, accuracy: 0.01)
+        XCTAssertEqual(received.y, point.y, accuracy: 0.01)
+        return event
     }
 
     @MainActor

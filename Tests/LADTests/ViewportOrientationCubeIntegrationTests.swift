@@ -7,21 +7,31 @@ import XCTest
 
 final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     @MainActor
-    func testAllFacesAndEightCornersSnapWithoutChangingPanZoomProjectionOrDrawingResources() async throws {
+    func testAllFacesAndEightCornersRefitAfterPanAndZoomPreservingProjectionAndDrawingResources() async throws {
         for projection in ViewportProjectionMode.allCases {
-            let (view, preview) = try await readyView(projection: projection)
-            view.otherMouseDown(with: try mouse(.otherMouseDown, at: NSPoint(x: 200, y: 150), in: view))
-            view.otherMouseDragged(with: try mouse(.otherMouseDragged, at: NSPoint(x: 225, y: 163), in: view))
-            view.otherMouseUp(with: try mouse(.otherMouseUp, at: NSPoint(x: 225, y: 163), in: view))
+            let (view, preview) = try await readyView(projection: projection, offset: SIMD3(146, -91, 1))
             let before = view.agentCaptureMetadata
             let target = try XCTUnwrap(before["cameraTarget"] as? [Double])
             let distance = try XCTUnwrap(before["cameraDistance"] as? Double)
             let scale = try XCTUnwrap(before["orthographicScale"] as? Double)
+            XCTAssertEqual(target, [146, -91, 1])
             let solid = try geometry("solid:0", in: view)
             let edges = try geometry("edges:0", in: view)
             var selectionChanges = 0
             view.onSelectionChanged = { _ in selectionChanges += 1 }
             view.onFeatureSelectionChanged = { _ in selectionChanges += 1 }
+
+            func navigateAwayFromFit() throws {
+                view.otherMouseDown(with: try mouse(.otherMouseDown, at: NSPoint(x: 200, y: 150), in: view))
+                view.otherMouseDragged(with: try mouse(.otherMouseDragged, at: NSPoint(x: 225, y: 163), in: view))
+                view.otherMouseUp(with: try mouse(.otherMouseUp, at: NSPoint(x: 225, y: 163), in: view))
+                let scroll = try XCTUnwrap(CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                                                  wheel1: -60, wheel2: 0, wheel3: 0))
+                scroll.location = CGPoint(x: 200, y: 150)
+                view.scrollWheel(with: try XCTUnwrap(NSEvent(cgEvent: scroll)))
+                XCTAssertNotEqual(view.agentCaptureMetadata["cameraTarget"] as? [Double], target)
+                XCTAssertGreaterThan(try XCTUnwrap(view.agentCaptureMetadata["cameraDistance"] as? Double), distance)
+            }
 
             func checkSnap(_ expected: SIMD3<Double>) throws {
                 let orientation = view.cameraOrientation
@@ -35,14 +45,30 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
                 XCTAssertTrue(try geometry("solid:0", in: view) === solid)
                 XCTAssertTrue(try geometry("edges:0", in: view) === edges)
                 XCTAssertFalse(view.isPreparingResources)
+                let cameraNode = try XCTUnwrap(view.pointOfView)
+                let camera = try XCTUnwrap(cameraNode.camera)
+                // Read the current camera directly; SCNView.projectPoint can
+                // retain its last rendered state while the viewport is idle.
+                let projectionMatrix = simd_float4x4(camera.projectionTransform(withViewportSize: view.bounds.size))
+                let transform = projectionMatrix * simd_inverse(cameraNode.simdWorldTransform)
+                for vertex in preview.vertices {
+                    let clip = transform * SIMD4(Float(vertex[0]), Float(vertex[1]), Float(vertex[2]), 1)
+                    XCTAssertGreaterThan(clip.w, 0)
+                    XCTAssertGreaterThan(clip.x / clip.w, -1, "A cube click must fit the complete design in the viewport.")
+                    XCTAssertLessThan(clip.x / clip.w, 1)
+                    XCTAssertGreaterThan(clip.y / clip.w, -1)
+                    XCTAssertLessThan(clip.y / clip.w, 1)
+                }
             }
             for face in ViewportCubeFace.allCases {
+                try navigateAwayFromFit()
                 view.selectOrientationCubeFace(face)
                 try checkSnap(expectedBackward(face))
             }
             XCTAssertEqual(ViewportCubeCorner.allCases.count, 8)
             var octants = Set<String>()
             for corner in ViewportCubeCorner.allCases {
+                try navigateAwayFromFit()
                 view.selectOrientationCubeCorner(corner)
                 try checkSnap(corner.direction)
                 let direction = view.cameraOrientation.backward
@@ -235,12 +261,20 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    private func readyView(projection: ViewportProjectionMode = .perspective) async throws -> (CADSceneView, PreviewMesh) {
+    private func readyView(projection: ViewportProjectionMode = .perspective,
+                           offset: SIMD3<Double> = .zero) async throws -> (CADSceneView, PreviewMesh) {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360), options: [
             SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
         ])
-        let preview = box()
+        var preview = box()
+        preview.vertices = preview.vertices.map { vertex in
+            (0..<3).map { vertex[$0] + offset[$0] }
+        }
+        preview.edges = preview.edges.map { edge in
+            edge.indices.map { edge[$0] + offset[$0 % 3] }
+        }
+        preview.bounds = preview.bounds.indices.map { preview.bounds[$0] + offset[$0 % 3] }
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [], projection: projection)
         view.layout()

@@ -102,6 +102,77 @@ final class CameraRigTests: XCTestCase {
         XCTAssertEqual(rig.distance, distance, accuracy: 1e-9)
     }
 
+    func testEmptySpaceAnchorStaysAtDesignDepthAfterSurfaceZoom() {
+        for orthographic in [false, true] {
+            var rig = CameraRig()
+            rig.usesOrthographicProjection = orthographic
+            rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
+            rig.pan(dx: 35, dy: -20, height: 800)
+            rig.orbitAroundCenter(dx: 40, dy: 15)
+            let surface = rig.orbitCenter + rig.backward * (rig.radius * 0.6)
+            rig.zoom(factor: 1e10, anchor: surface)
+            XCTAssertGreaterThan(abs(simd_dot(rig.target - rig.orbitCenter, rig.backward)), rig.radius * 1000,
+                                 "The surface zoom must exercise a target displaced from design depth.")
+            let anchor = rig.planeAnchor(x: 530, y: 470, width: 1200, height: 800)
+            XCTAssertEqual(simd_dot(anchor - rig.orbitCenter, rig.backward), 0, accuracy: 1e-7)
+            let projected = rig.project(anchor, width: 1200, height: 800)
+            XCTAssertEqual(projected.x, 530, accuracy: 1e-7)
+            XCTAssertEqual(projected.y, 470, accuracy: 1e-7)
+        }
+    }
+
+    func testZoomRecoversFromMaximumDistanceAfterSurfaceHitsBecomeEmptySpace() {
+        for orthographic in [false, true] {
+            var rig = CameraRig()
+            rig.usesOrthographicProjection = orthographic
+            rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
+            rig.pan(dx: 35, dy: -20, height: 800)
+            rig.orbitAroundCenter(dx: 40, dy: 15)
+            let initialDistance = rig.distance
+            let surface = rig.orbitCenter + rig.backward * (rig.radius * 0.6)
+            let cursor = rig.project(surface, width: 1200, height: 800)
+            rig.zoom(factor: 1e10, anchor: surface)
+            XCTAssertEqual(rig.distance, rig.radius * 100_000)
+
+            // At this scale the surface is subpixel, so subsequent input has
+            // to fall back to an empty-space anchor instead of a surface hit.
+            for _ in 0..<40 where rig.distance > initialDistance {
+                let anchor = rig.planeAnchor(x: cursor.x, y: cursor.y, width: 1200, height: 800)
+                rig.zoom(factor: 0.65, anchor: anchor)
+                XCTAssertGreaterThan(simd_dot(rig.position - rig.orbitCenter, rig.backward), 0,
+                                     "Zooming back must keep the design in front of the camera.")
+            }
+            XCTAssertLessThanOrEqual(rig.distance, initialDistance)
+            let center = rig.project(rig.orbitCenter, width: 1200, height: 800)
+            XCTAssertGreaterThan(center.x, 0)
+            XCTAssertLessThan(center.x, 1200)
+            XCTAssertGreaterThan(center.y, 0)
+            XCTAssertLessThan(center.y, 800)
+        }
+    }
+
+    func testEmptySpaceZoomCanBackOutAfterMovingPastDesignCenter() {
+        for orthographic in [false, true] {
+            var rig = CameraRig()
+            rig.usesOrthographicProjection = orthographic
+            rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
+            let surface = rig.orbitCenter - rig.backward * (rig.radius * 0.6)
+            rig.zoom(factor: 0.01, anchor: surface)
+            XCTAssertLessThan(simd_dot(rig.position - rig.orbitCenter, rig.backward), 0,
+                              "The close-up must put the camera beyond the design center.")
+            for _ in 0..<10 {
+                let anchor = rig.planeAnchor(x: 600, y: 400, width: 1200, height: 800)
+                XCTAssertGreaterThan(simd_dot(rig.position - anchor, rig.backward), 0,
+                                     "An empty-space anchor must stay in front of the camera.")
+                let before = rig.position
+                rig.zoom(factor: 2, anchor: anchor)
+                XCTAssertGreaterThan(simd_dot(rig.position - before, rig.backward), 0,
+                                     "Zooming out must back away even when viewing inside the design.")
+            }
+            XCTAssertGreaterThan(simd_dot(rig.position - rig.orbitCenter, rig.backward), 0)
+        }
+    }
+
     func testFitAccountsForNarrowViewport() {
         var wide = CameraRig()
         wide.fit(bounds: [-50, -20, 0, 50, 20, 35], width: 1200, height: 800)

@@ -35,10 +35,18 @@ struct CameraRig {
         distance = radius / sin(angle) * 1.12
     }
 
-    /// Intersection of a screen ray and the plane through the orbit target.
+    /// Intersect a screen ray at design-center depth while it is ahead of the
+    /// camera. Surface zoom can move `target` far behind the design;
+    /// using that target's depth after a missed hit can zoom past the design.
     func planeAnchor(x: Double, y: Double, width: Double, height: Double) -> SIMD3<Double> {
-        let units = 2 * orthographicScale / max(height, 1)
-        return target + right * ((x - width / 2) * units) + up * ((y - height / 2) * units)
+        let centerOffset = simd_dot(orbitCenter - target, backward)
+        // A close surface zoom can intentionally pass the design center.
+        // Keep the fallback in front of the camera in that case.
+        let depthOffset = distance > centerOffset ? centerOffset : 0
+        let extent = usesOrthographicProjection ? orthographicScale : (distance - depthOffset) * tangent
+        let units = 2 * extent / max(height, 1)
+        return target + backward * depthOffset
+            + right * ((x - width / 2) * units) + up * ((y - height / 2) * units)
     }
 
     /// Uniformly scales camera and orbit target around the world-space anchor.
