@@ -76,6 +76,12 @@ final class AppState: ObservableObject {
     }
     var onOpenProject: ((URL) -> Void)?
     var onRecentProjectChanged: ((URL, URL?) -> Void)?
+    var awaitingResponse: Bool {
+        !isWorking && messages.last(where: { $0.role == "assistant" && $0.phase != "commentary" })?.phase == "response"
+    }
+    var submissionWillQueue: Bool {
+        isWorking || isSendingQueuedRequestID != nil || (!queuedRequests.isEmpty && !awaitingResponse)
+    }
     private let codex = CodexService()
     private let engine = EngineService()
     private var operation: Task<Void, Never>?
@@ -447,7 +453,7 @@ final class AppState: ObservableObject {
         guard enteredText.utf8.count <= 1_000_000 else {
             error = "The request exceeds the design file's 1 MB message limit."; return
         }
-        let enqueue = isWorking || !queuedRequests.isEmpty || isSendingQueuedRequestID != nil
+        let enqueue = submissionWillQueue
         guard !enqueue || queuedRequests.count < 10_000 else {
             error = "The design already contains the maximum number of queued requests."; return
         }
@@ -896,7 +902,7 @@ final class AppState: ObservableObject {
                 }
                 autosave()
                 guard isCodexInstalled else { throw LADError.message("Codex CLI was not found. Install the ChatGPT desktop app or Codex CLI and sign in, then try again.") }
-                var spec = try await codex.generate(prompt: text, current: previous, history: history, attachments: sources, partLayout: previousLayout,
+                let result = try await codex.generate(prompt: text, current: previous, history: history, attachments: sources, partLayout: previousLayout,
                                                     executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
                                                     onMessage: { commentary("project", $0) }, onActivity: { toolActivity("project", $0) },
                                                     python: runtime, threads: cores, engine: engine, currentPreview: mesh,
@@ -910,6 +916,13 @@ final class AppState: ObservableObject {
                 guard operationID == token else { return }
                 drainGenerationFeedback(feedback, token: token)
                 try Task.checkCancellation()
+                var spec: ModelSpec
+                switch result {
+                case .ready(let project): spec = project
+                case .response(let message):
+                    finishConversationResponse(message)
+                    return
+                }
                 activity = "Building solid geometry…"
                 var preview: PreviewMesh
                 do {
@@ -953,7 +966,7 @@ final class AppState: ObservableObject {
 
                     Preserve the intended shape and dimensions. Fix or simplify the failing operations and return the complete replacement design.
                     """
-                    spec = try await codex.generate(prompt: repairRequest, current: spec, history: messages, attachments: sources, partLayout: previousLayout,
+                    let repairResult = try await codex.generate(prompt: repairRequest, current: spec, history: messages, attachments: sources, partLayout: previousLayout,
                                                      executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
                                                      onMessage: { commentary("repair", $0) }, onActivity: { toolActivity("repair", $0) },
                                                      python: runtime, threads: cores, engine: engine, viewport: viewportView,
@@ -967,6 +980,12 @@ final class AppState: ObservableObject {
                     guard operationID == token else { return }
                     drainGenerationFeedback(feedback, token: token)
                     try Task.checkCancellation()
+                    switch repairResult {
+                    case .ready(let project): spec = project
+                    case .response(let message):
+                        finishConversationResponse(message)
+                        return
+                    }
                     activity = "Validating the repaired geometry…"
                     if let validated = codex.validatedPreview(for: spec) { preview = validated }
                     else { preview = try await engine.buildPreview(spec, python: runtime, threads: cores) }
@@ -1013,6 +1032,19 @@ final class AppState: ObservableObject {
                 self.autosave()
             }
         }
+    }
+
+    private func finishConversationResponse(_ response: String) {
+        // A question or explanation completes the turn without replacing the
+        // design. Keep pending work paused so the next composer submission can
+        // answer this response before unrelated queued refinements continue.
+        queuePaused = true; queueCanAdvance = false; queuePauseReason = nil
+        setSteeringAvailable(false)
+        finishGenerationFeedback()
+        finishTaskAudit(status: "completed")
+        messages.append(ChatMessage(role: "assistant", content: response, phase: "response"))
+        error = nil; activity = "Ready"; isWorking = false; operation = nil
+        autosave()
     }
 
     private func commit(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout? = nil, previouslyHidden: Set<String> = [], userMessageID: UUID, previousColors: [String: PartColor] = [:]) throws {

@@ -42,21 +42,22 @@ enum SaveNewProject {
            let user = messages.firstIndex(where: { $0.id == userID }),
            let response = messages.firstIndex(where: { $0.id == responseID }),
            user < response, messages[user].role == "user", messages[response].role == "assistant",
-           messages[response].phase != "commentary" {
+           messages[response].phase != "commentary", messages[response].phase != "response" {
             return [messages[user], messages[response]]
         }
 
         // Older designs did not associate turns with revisions. A validated
         // closeout follows its revision's commit; its user request precedes it.
         // The date bounds prevent a later failed request from being attached to
-        // the last successful model. Commentary is never a validated closeout.
+        // the last successful model. Updates and conversational replies are
+        // never validated closeouts.
         let summary = revision.model.summary.trimmingCharacters(in: .whitespacesAndNewlines)
         var precedingUser: Int?
         var candidates: [(user: Int, response: Int)] = []
         for index in messages.indices {
             let message = messages[index]
             if message.role == "user" { precedingUser = index; continue }
-            guard message.role == "assistant", message.phase != "commentary",
+            guard message.role == "assistant", message.phase != "commentary", message.phase != "response",
                   let user = precedingUser,
                   messages[user].date <= revision.date, revision.date <= message.date else { continue }
             let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)

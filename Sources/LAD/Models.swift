@@ -127,7 +127,7 @@ struct ChatMessage: Codable, Sendable, Identifiable, Equatable {
     var content: String
     var date = Date()
     var attachments: [SourceAttachment]? = nil
-    /// User-facing assistant updates and the validated task closeout.
+    /// Assistant updates, conversational replies, and validated CAD closeouts.
     var phase: String? = nil
     /// Immutable user selection captured when this request was submitted.
     var selection: ProjectSelectionContext? = nil

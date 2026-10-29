@@ -15,7 +15,7 @@ final class CodexAgentIntegrationTests: XCTestCase {
         let model = ProcessInfo.processInfo.environment["LAD_TEST_CODEX_MODEL"] ?? ""
         let capture = AgentIntegrationCapture()
         let service = CodexService()
-        let spec = try await service.generate(prompt: """
+        let result = try await service.generate(prompt: """
         This is a small LAD tool integration verification in an empty design.
         Create one solid: a circular loft from radius 5 mm at Z=0 to radius 3 mm at Z=12,
         with a concentric radius 1 mm through-hole. Use the installed CadQuery runtime.
@@ -28,6 +28,7 @@ final class CodexAgentIntegrationTests: XCTestCase {
         """, current: nil, history: [], executable: executable, model: model,
             onProgress: { _ in }, onMessage: { _ in }, onActivity: { capture.append($0) },
             python: EngineService.defaultPython, threads: 4)
+        guard case .ready(let spec) = result else { return XCTFail("Expected a completed CAD design.") }
         let preview = try XCTUnwrap(service.validatedPreview(for: spec), "The final recipe must reuse geometry validated during the agent turn.")
         XCTAssertEqual(preview.solids, 1)
         XCTAssertEqual(preview.volume, 184 * .pi, accuracy: 1e-5)

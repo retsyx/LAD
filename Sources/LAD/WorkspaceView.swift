@@ -8,7 +8,7 @@ private final class WorkspaceViewportReference: ObservableObject {
 
 struct WorkspaceView: View {
     @ObservedObject var state: AppState
-    @FocusState private var promptFocused: Bool
+    @State private var promptFocused = false
     @FocusState private var projectNameFocused: Bool
     @State private var isRenamingProject = false
     @State private var projectNameDraft = ""
@@ -44,6 +44,9 @@ struct WorkspaceView: View {
             if !allowed { cancelProjectRename() }
         }
         .onChange(of: state.editingQueuedRequestID) { _, _ in promptFocused = true }
+        .onChange(of: state.awaitingResponse, initial: true) { _, awaiting in
+            if awaiting { promptFocused = true }
+        }
         .sheet(item: $previewImageAttachment) { attachment in PromptImagePreview(attachment: attachment) }
     }
 
@@ -342,10 +345,6 @@ struct WorkspaceView: View {
                 errorText(error).fixedSize(horizontal: false, vertical: true)
                 ScrollView { errorText(error) }
             }.frame(maxHeight: 96)
-            HStack {
-                SettingsLink { Text("Settings") }.buttonStyle(.bordered)
-                Button("Rebuild design") { state.rebuild() }.buttonStyle(.bordered).disabled(state.isWorking)
-            }.controlSize(.small)
         }.padding(13).background(Palette.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 16).padding(.bottom, 10)
     }
 
@@ -360,6 +359,8 @@ struct WorkspaceView: View {
 
     private var composer: some View {
         let editingRequestID = state.editingQueuedRequestID
+        let submissionLabel = editingRequestID != nil ? "Save queued request" :
+            state.submissionWillQueue ? "Queue request" : state.awaitingResponse ? "Send reply" : "Generate design"
         return VStack(spacing: 10) {
             VStack(spacing: 5) {
                 if state.editingQueuedRequestID != nil {
@@ -403,7 +404,8 @@ struct WorkspaceView: View {
                 }
                 ZStack(alignment: .topLeading) {
                     if state.prompt.isEmpty {
-                        Text("Describe your next design…").font(.system(size: 12)).foregroundStyle(Palette.muted).padding(.horizontal, 5).allowsHitTesting(false)
+                        Text(state.awaitingResponse && editingRequestID == nil ? "Reply…" : "Describe your next design…")
+                            .font(.system(size: 12)).foregroundStyle(Palette.muted).padding(.horizontal, 5).allowsHitTesting(false)
                     }
                     PromptTextEditor(text: $state.prompt, isFocused: promptFocused,
                         onFocus: { promptFocused = true }, onBlur: { promptFocused = false },
@@ -442,10 +444,9 @@ struct WorkspaceView: View {
                         .buttonStyle(.borderedProminent).keyboardShortcut(.return, modifiers: .command)
                         .disabled(state.isReadingPromptAttachments || (state.editingQueuedRequestID != nil ? !state.canCommitQueuedRequest :
                                   state.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && state.pendingAttachments.isEmpty))
-                        .help(state.editingQueuedRequestID != nil ? "Save queued request (⌘Return)" :
-                              state.isWorking || !state.queuedRequests.isEmpty ? "Queue request (⌘Return)" : "Generate design (⌘Return)")
-                        .accessibilityLabel(state.editingQueuedRequestID != nil ? "Save queued request" :
-                                            state.isWorking || !state.queuedRequests.isEmpty ? "Queue request" : "Generate design")
+                        .help("\(submissionLabel) (⌘Return)")
+                        .accessibilityLabel(submissionLabel)
+                        .accessibilityIdentifier("projectSubmitRequest")
                 }
             }.padding(12).background(Palette.background.opacity(0.75), in: RoundedRectangle(cornerRadius: 10))
                 .background(PromptFilePathDropRegion(text: $state.prompt, onFocus: { promptFocused = true },

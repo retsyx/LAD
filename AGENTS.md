@@ -100,6 +100,7 @@
 - Send a queued item immediately only through acknowledged same-turn Codex `turn/steer`, without interrupting or spawning a parallel design task. Keep it queued until acknowledgement; retain it on rejection and do not silently retry ambiguous delivery. Disable this action outside an active Codex turn, preserve accepted supplemental chat/audit links, and handle completion/edit/send races without duplicates or dropped requests.
 - Request a short opening plan from Codex and concise progress updates for substantial work. Display actual user-facing commentary as it arrives, retaining it in the saved conversation.
 - Keep final CAD JSON, tool output, source file contents, and private reasoning out of progress messages. Announce completion only after the CAD worker validates the model; summarize failures and cancellation accurately.
+- Show Codex questions, explanations, and unsupported-request explanations as assistant conversation, preserving the current design. Reply through the existing bottom composer; an idle reply must run before paused queued refinements. Do not turn conversational replies into errors, completed-design claims, or duplicate revisions. Reserve error presentation for actual failures and omit unrelated Settings/Rebuild actions.
 - Do not impose an elapsed-time limit on Codex design requests. Keep Stop/cancellation responsive, including forcefully stopping a process that ignores termination.
 
 ## Codex model selection

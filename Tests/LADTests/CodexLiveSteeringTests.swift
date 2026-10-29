@@ -45,7 +45,8 @@ final class CodexLiveSteeringTests: XCTestCase {
         let activeTurn = try XCTUnwrap(service.currentTurnID)
         let acceptedTurn = try await service.steer(prompt: "Set X to 7 mm instead of 5 mm. Keep Y exactly 2 mm and Z exactly 3 mm. No holes or extras. Rebuild, validate and render this updated box before the final response.")
         XCTAssertEqual(acceptedTurn, activeTurn, "Supplemental information must be acknowledged by the same active turn")
-        let specification = try await generation.value
+        let result = try await generation.value
+        guard case .ready(let specification) = result else { return XCTFail("Expected a completed CAD design.") }
         let preview = try XCTUnwrap(service.validatedPreview(for: specification),
             "Final geometry must reuse the agent's matching native MCP build. \(capture.failureSummary)")
         XCTAssertEqual(preview.solids, 1)

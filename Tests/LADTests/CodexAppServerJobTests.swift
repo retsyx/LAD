@@ -210,7 +210,7 @@ final class CodexAppServerJobTests: XCTestCase {
         let accepted = try await service.steer(prompt: "Use this reference", attachments: [source])
         XCTAssertEqual(accepted, "turn-1")
         let model = try await task.value
-        XCTAssertEqual(model, .bracket)
+        XCTAssertEqual(model, .ready(.bracket))
         let input = try String(contentsOf: fixture.directory.appendingPathComponent("steer-input.txt"), encoding: .utf8)
         XCTAssertTrue(input.contains("Use this reference"))
         XCTAssertTrue(input.contains(source.path))

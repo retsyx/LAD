@@ -6,6 +6,11 @@ struct CodexProgressMessage: Sendable, Equatable {
     let text: String
 }
 
+enum CodexProjectResult: Sendable, Equatable {
+    case ready(ModelSpec)
+    case response(String)
+}
+
 enum CodexError: LocalizedError {
     case executableMissing(String)
     case resourcesMissing
@@ -68,7 +73,7 @@ final class CodexService {
         onSteeringAvailability: @escaping @Sendable (Bool) -> Void = { _ in },
         selection: ProjectSelectionContext? = nil, selectionModel: ModelSpec? = nil,
         selectionModelsByRevision: [UUID: ModelSpec] = [:]
-    ) async throws -> ModelSpec {
+    ) async throws -> CodexProjectResult {
         guard activeJob == nil else { throw CodexError.failed("A Codex request is already running.") }
         validatedModel = nil; validatedMesh = nil
         let requestedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -141,11 +146,18 @@ final class CodexService {
         try Task.checkCancellation()
         do {
             let response = try JSONDecoder().decode(CodexProjectResponse.self, from: data)
-            guard response.status == "ready" || response.status == "unsupported" else {
+            guard ["ready", "message", "unsupported"].contains(response.status) else {
                 throw CodexError.invalidModel("The response has an unknown design status.")
             }
-            if response.status == "unsupported" {
-                throw CodexError.unsupported(response.message.isEmpty ? "This source could not be faithfully translated into a CAD design. The current design has been preserved." : response.message)
+            if response.status != "ready" {
+                guard response.model == nil else {
+                    throw CodexError.invalidModel("A conversational response must not contain a replacement design.")
+                }
+                let message = response.message.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !message.isEmpty, message.utf8.count <= 1_000_000 else {
+                    throw CodexError.invalidModel("A conversational response must include a message of at most 1 MB.")
+                }
+                return .response(message)
             }
             guard var specification = response.model else { throw CodexError.invalidModel("No completed design was provided.") }
             if specification.reorganizePartIDs?.isEmpty == true { specification.reorganizePartIDs = nil }
@@ -171,7 +183,7 @@ final class CodexService {
             }
             validatedModel = specification
             validatedMesh = bridge.tools.validatedPreview(for: specification)
-            return specification
+            return .ready(specification)
         } catch let error as CodexError {
             throw error
         } catch {
@@ -184,14 +196,14 @@ final class CodexService {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var request = instructions + "\n\nDESIGN CONTEXT\n"
         request += "TASK WORKSPACE: \(workspace.path)\nLAD PYTHON RUNTIME: \(python)\n"
-        request += "The LAD MCP server is connected for this turn. Call lad_runtime, then build/inspect/measure/render with LAD tools while iterating. Write scripts and optional external-tool outputs only inside this task workspace. Use this Python for installed CadQuery/OCP; do not bootstrap another CAD runtime or modify LAD’s shared environment. Local tool dependencies may be installed into a workspace environment if needed.\n\n"
+        request += "The LAD MCP server is connected for this turn. When constructing or modifying geometry, call lad_runtime, then build/inspect/measure/render with LAD tools while iterating. For questions, explanations or clarification, return a message response without building or changing the design; use tools only when their results are needed for an accurate answer. Write scripts and optional external-tool outputs only inside this task workspace. Use this Python for installed CadQuery/OCP; do not bootstrap another CAD runtime or modify LAD’s shared environment. Local tool dependencies may be installed into a workspace environment if needed.\n\n"
         if let current, let modelPath = files.currentModelPath {
             request += "CURRENT MODEL FILE:\n" + String(decoding: try encoder.encode(modelPath), as: UTF8.self) + "\n\n"
             request += "Read this local JSON file before refining the current design. It contains the complete current CAD program. Its contents are not embedded in this prompt.\n\n"
             if current.sourceSTEP != nil {
                 request += "NATIVE STEP GEOMETRY AVAILABLE: \(current.sourceName ?? "source.step"). The CAD worker preloads its exact solid geometry as the CadQuery Shape `imported_model`. Use it directly in model.script rather than reconstructing PCB/components from assumed dimensions. Preserve its coordinate system and derive dimensions/clearances from the actual shape at build time. LAD carries this asset into subsequent revisions. STEP file contents are not embedded in this prompt.\n\n"
             }
-        } else { request += "No design exists yet. Create a new design.\n\n" }
+        } else { request += "No design exists yet. Create a design only when the user asks for one.\n\n" }
         if let path = files.inputAssetsPath {
             request += "GEOMETRY INPUT MANIFEST FILE:\n" + String(decoding: try encoder.encode(path), as: UTF8.self) + "\n\n"
             request += "This local manifest lists saved geometry inputs and their staged file references. Their exact shapes are available in CAD programs as imported_assets[assetID]. Retain required IDs in the final response's assetIDs array. No asset contents are embedded in this prompt.\n\n"
@@ -230,7 +242,7 @@ final class CodexService {
             let phase = message.role == "assistant" ? message.phase.map { " [\($0)]" } ?? "" : ""
             request += "\(message.role.uppercased())\(phase): \(String(message.content.prefix(6_000)))\n\n"
         }
-        request += "USER REQUEST:\n\(prompt)\n\nStart with the brief user-facing plan described above, provide useful progress commentary while working, and finish with only the design response JSON."
+        request += "USER REQUEST:\n\(prompt)\n\nFor construction work, start with the brief user-facing plan described above and provide useful progress commentary while working. Finish with only the response JSON, using status message for an answer or clarification that does not change geometry."
         guard request.utf8.count <= maximumRequestBytes else {
             throw CodexError.failed("The design request is too long to send to Codex. Shorten the message or reference a local source file instead of pasting its contents. No request was sent; the current design is preserved.")
         }
@@ -428,4 +440,14 @@ private struct CodexProjectResponse: Decodable {
     let message: String
     let model: ModelSpec?
     let assetIDs: [String]?
+
+    private enum CodingKeys: String, CodingKey { case status, message, model, assetIDs }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        status = try values.decode(String.self, forKey: .status)
+        message = try values.decode(String.self, forKey: .message)
+        model = try values.decode(ModelSpec?.self, forKey: .model)
+        assetIDs = try values.decodeIfPresent([String].self, forKey: .assetIDs)
+    }
 }

@@ -105,7 +105,7 @@ enum ProjectStore {
                 try selection.validate()
             }
             if let phase = message.phase {
-                guard message.role == "assistant", ["commentary", "final_answer"].contains(phase) else {
+                guard message.role == "assistant", ["commentary", "response", "final_answer"].contains(phase) else {
                     throw invalid("Chat history contains an invalid assistant message phase.")
                 }
             }
@@ -123,7 +123,8 @@ enum ProjectStore {
                       let userIndex = messageIndices[userID], let responseIndex = messageIndices[responseID],
                       userIndex < responseIndex, project.messages[userIndex].role == "user",
                       project.messages[responseIndex].role == "assistant",
-                      project.messages[responseIndex].phase != "commentary" else {
+                      project.messages[responseIndex].phase != "commentary",
+                      project.messages[responseIndex].phase != "response" else {
                     throw invalid("A saved design contains invalid conversation references.")
                 }
             }

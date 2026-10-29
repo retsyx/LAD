@@ -52,13 +52,9 @@ final class CodexToolContextTests: XCTestCase {
         let cli = try FakeCodex(responseJSON: "{\"status\":\"unsupported\",\"message\":\"Context inspection complete\",\"model\":null,\"assetIDs\":[]}", delay: 0.01)
         defer { cli.remove() }
         let model = program(inputs: [asset("external-input")])
-        do {
-            _ = try await CodexService().generate(prompt: "Refine the saved imported shape", current: model, history: [],
-                                                  executable: cli.executable.path, model: "", onProgress: { _ in })
-            XCTFail("The fixture intentionally returns unsupported after capturing the request.")
-        } catch {
-            XCTAssertTrue(error.localizedDescription.contains("Context inspection complete"))
-        }
+        let result = try await CodexService().generate(prompt: "Refine the saved imported shape", current: model, history: [],
+            executable: cli.executable.path, model: "", onProgress: { _ in })
+        XCTAssertEqual(result, .response("Context inspection complete"))
         let request = try String(contentsOf: cli.inputURL, encoding: .utf8)
         XCTAssertTrue(request.contains("GEOMETRY INPUT MANIFEST FILE:"))
         XCTAssertTrue(request.contains("geometry-inputs.json"))

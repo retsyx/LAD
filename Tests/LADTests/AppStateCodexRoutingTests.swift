@@ -16,7 +16,8 @@ final class AppStateCodexRoutingTests: XCTestCase {
         let request = try await fixture.submit(prompt, to: state)
 
         XCTAssertTrue(request.contains(prompt), "PCB/STEP wording must be forwarded to Codex without an automatic conversion route.")
-        XCTAssertTrue(state.error?.contains("AGENT_ROUTING_RESPONSE") == true)
+        XCTAssertNil(state.error)
+        XCTAssertTrue(state.messages.contains { $0.role == "assistant" && $0.content == "AGENT_ROUTING_RESPONSE" })
         XCTAssertEqual(state.taskAudits.first?.model, "routing-model")
         XCTAssertEqual(state.taskAudits.first?.reasoningEffort, "high")
         XCTAssertTrue(state.revisions.isEmpty, "Only a validated agent result may create a revision.")
@@ -43,8 +44,9 @@ final class AppStateCodexRoutingTests: XCTestCase {
         let request = try await fixture.submit(prompt, to: state)
 
         XCTAssertTrue(request.contains(prompt))
-        XCTAssertTrue(state.error?.contains("AGENT_ROUTING_RESPONSE") == true,
-                      "Directory ambiguity belongs to agent-directed inspection, not a pre-Codex importer.")
+        XCTAssertNil(state.error)
+        XCTAssertTrue(state.messages.contains { $0.role == "assistant" && $0.content == "AGENT_ROUTING_RESPONSE" },
+                      "Directory ambiguity belongs to agent-directed inspection and conversation, not a pre-Codex importer.")
         XCTAssertNil(state.messages.first(where: { $0.role == "user" })?.attachments)
         XCTAssertFalse(request.contains("DIRECTORY_SOURCE_SENTINEL"))
         XCTAssertFalse(request.contains("ATTACHED SOURCE FILE REFERENCES"))
@@ -65,7 +67,8 @@ final class AppStateCodexRoutingTests: XCTestCase {
         state.pendingAttachments = attachments
         let request = try await fixture.submit("Export the attached PCB as STEP using KiCad if needed.", to: state)
 
-        XCTAssertTrue(state.error?.contains("AGENT_ROUTING_RESPONSE") == true)
+        XCTAssertNil(state.error)
+        XCTAssertTrue(state.messages.contains { $0.role == "assistant" && $0.content == "AGENT_ROUTING_RESPONSE" })
         XCTAssertEqual(state.messages.first(where: { $0.role == "user" })?.attachments, attachments)
         XCTAssertTrue(request.contains("ATTACHED SOURCE FILE REFERENCES"))
         XCTAssertFalse(request.contains("PORTABLE_BOARD_SOURCE_SENTINEL"))

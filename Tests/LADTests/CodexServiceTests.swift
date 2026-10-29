@@ -48,7 +48,7 @@ final class CodexServiceTests: XCTestCase {
         await fulfillment(of: [received], timeout: 2)
         XCTAssertEqual(capture.messages.first, CodexProgressMessage(id: "plan", text: initial))
         let result = try await task.value
-        XCTAssertEqual(result, .bracket)
+        XCTAssertEqual(result, .ready(.bracket))
         XCTAssertEqual(capture.messages, [CodexProgressMessage(id: "plan", text: initial),
                                           CodexProgressMessage(id: "clearance", text: milestone),
                                           CodexProgressMessage(id: "clearance", text: expanded)])
@@ -118,7 +118,7 @@ final class CodexServiceTests: XCTestCase {
         XCTAssertTrue(request.contains("ASSISTANT [final_answer]: Created the bracket with a 12 mm bore."))
         XCTAssertFalse(request.contains("COMMENTARY_ONLY_MARKER"))
         XCTAssertFalse(try currentModelPath(request).isEmpty)
-        XCTAssertTrue(request.contains("Start with the brief user-facing plan"))
+        XCTAssertTrue(request.contains("For construction work, start with the brief user-facing plan"))
     }
 
     @MainActor
@@ -171,8 +171,9 @@ final class CodexServiceTests: XCTestCase {
         let stagedModel = try JSONDecoder().decode(ModelSpec.self, from: fixture.capturedData(at: currentModelPath(request)))
         XCTAssertNil(stagedModel.sourceSTEP)
         XCTAssertEqual(stagedModel.script, current.script)
-        XCTAssertEqual(response.sourceSTEP, step)
-        XCTAssertEqual(response.sourceName, "pcb.step")
+        guard case .ready(let specification) = response else { return XCTFail("Expected a completed CAD design.") }
+        XCTAssertEqual(specification.sourceSTEP, step)
+        XCTAssertEqual(specification.sourceName, "pcb.step")
     }
 
     @MainActor
@@ -241,7 +242,7 @@ final class CodexServiceTests: XCTestCase {
         """)
         defer { fixture.remove() }
         let model = try await CodexService().generate(prompt: "Create a bracket", current: nil, history: [], executable: fixture.executable.path, model: "", onProgress: { _ in })
-        XCTAssertEqual(model, .bracket)
+        XCTAssertEqual(model, .ready(.bracket))
         XCTAssertNotNil(try fixture.turnRequest()["outputSchema"] as? [String: Any])
     }
 
@@ -261,7 +262,7 @@ final class CodexServiceTests: XCTestCase {
             defer { fixture.remove() }
             let result = try await CodexService().generate(prompt: "Create a bracket", current: nil, history: [],
                 executable: fixture.executable.path, model: "", onProgress: { _ in })
-            XCTAssertEqual(result, .bracket)
+            XCTAssertEqual(result, .ready(.bracket))
             XCTAssertEqual(try Data(contentsOf: source), externalBytes)
         }
     }
@@ -284,20 +285,50 @@ final class CodexServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testUnsupportedProjectReturnsItsReasonWithoutAnUnchangedModel() async throws {
-        let reason = "This FeatureScript needs unavailable private Onshape libraries. Export STEP from Onshape to import its exact geometry."
-        let encoded = try jsonText(["status": "unsupported", "message": reason, "model": NSNull()])
-        let fixture = try FakeCodex(body: """
-        cat > "$output" <<'LAD_MODEL'
-        \(encoded)
-        LAD_MODEL
-        """)
-        defer { fixture.remove() }
-        do {
-            _ = try await CodexService().generate(prompt: "Import this FeatureScript", current: .bracket, history: [], executable: fixture.executable.path, model: "", onProgress: { _ in })
-            XCTFail("Unsupported imports must not return the previous model as a success")
-        } catch {
-            XCTAssertTrue(error.localizedDescription.contains(reason))
+    func testAssistantQuestionsAndLimitationsReturnConversationWithoutAReplacementDesign() async throws {
+        let reply = "Yes—I can use existing fonts or create custom raised lettering for HALO. What style would you like?"
+        for status in ["message", "unsupported"] {
+            let encoded = try jsonText(["status": status, "message": "  \(reply)\n", "model": NSNull(), "assetIDs": []])
+            let fixture = try FakeCodex(responseJSON: encoded, delay: 0.01)
+            defer { fixture.remove() }
+            let service = CodexService()
+            let result = try await service.generate(prompt: "Can we use a different font?", current: .bracket,
+                history: [], executable: fixture.executable.path, model: "", onProgress: { _ in })
+            XCTAssertEqual(result, .response(reply))
+            XCTAssertNil(service.validatedPreview(for: .bracket), "A conversation reply must not supply replacement geometry.")
+            let request = try String(contentsOf: fixture.inputURL, encoding: .utf8)
+            XCTAssertTrue(request.contains("For questions, explanations or clarification, return a message response"))
+            XCTAssertTrue(request.contains("Do not create or change geometry merely to answer a question."))
+            let schema = try XCTUnwrap(try fixture.turnRequest()["outputSchema"] as? [String: Any])
+            let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+            let statusSchema = try XCTUnwrap(properties["status"] as? [String: Any])
+            XCTAssertTrue((statusSchema["enum"] as? [String])?.contains("message") == true)
+            try fixture.assertJobWasCleanedUp()
+        }
+    }
+
+    @MainActor
+    func testConversationResponseRejectsUnknownEmptyOversizedAndContradictoryResults() async throws {
+        let completed = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ModelSpec.bracket))
+        let invalid: [[String: Any]] = [
+            ["status": "unknown", "message": "Hello", "model": NSNull()],
+            ["status": "message", "message": "Missing the required null design field."],
+            ["status": "message", "message": " \n\t", "model": NSNull()],
+            ["status": "unsupported", "message": "", "model": NSNull()],
+            ["status": "message", "message": String(repeating: "界", count: 333_334), "model": NSNull()],
+            ["status": "message", "message": "Which style?", "model": completed],
+            ["status": "unsupported", "message": "A source dependency is missing.", "model": completed]
+        ]
+        for response in invalid {
+            let fixture = try FakeCodex(responseJSON: try jsonText(response), delay: 0.01)
+            defer { fixture.remove() }
+            do {
+                _ = try await CodexService().generate(prompt: "Discuss the design", current: .bracket, history: [],
+                    executable: fixture.executable.path, model: "", onProgress: { _ in })
+                XCTFail("Malformed or contradictory responses must remain actual errors.")
+            } catch let error as CodexError {
+                guard case .invalidModel = error else { return XCTFail("Expected an invalid response, got \(error).") }
+            }
         }
     }
 
@@ -316,7 +347,8 @@ final class CodexServiceTests: XCTestCase {
         """)
         defer { fixture.remove() }
         let model = try await CodexService().generate(prompt: "Translate the FeatureScript", current: nil, history: [], executable: fixture.executable.path, model: "", onProgress: { _ in })
-        XCTAssertEqual(model.script, script)
+        guard case .ready(let specification) = model else { return XCTFail("Expected a completed CAD design.") }
+        XCTAssertEqual(specification.script, script)
     }
 
     @MainActor
