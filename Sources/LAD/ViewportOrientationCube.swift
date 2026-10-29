@@ -190,11 +190,8 @@ struct ViewportCubeProjection {
 
     init(bounds: NSRect, right: SIMD3<Double>, up: SIMD3<Double>, backward: SIMD3<Double>) {
         let safeSpan = max(0, min(bounds.width, bounds.height) - 8)
-        let targetArea = safeSpan * safeSpan / 2
-        let projectedNormal = simd_cross(right, up)
-        let projectedArea = 4 * (abs(projectedNormal.x) + abs(projectedNormal.y) + abs(projectedNormal.z))
-        // Normalize coverage instead of bounding dimensions so angled and face-on views retain the same apparent size.
-        let scale = projectedArea > 1e-8 ? sqrt(targetArea / projectedArea) : 0
+        // Keep a fixed world-to-point scale while rotating; the cube's bounding sphere fits every pose.
+        let scale = safeSpan / (2 * sqrt(3))
         let center = NSPoint(x: bounds.midX, y: bounds.midY)
         func project(_ point: SIMD3<Double>) -> NSPoint {
             NSPoint(x: center.x + simd_dot(point, right) * scale,

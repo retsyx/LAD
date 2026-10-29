@@ -12,7 +12,7 @@ final class ViewportOrientationCubeTests: XCTestCase {
             XCTAssertEqual(projection.hitTarget(at: NSPoint(x: 46, y: 46)), .face(direction))
             XCTAssertNil(projection.hitTarget(at: .zero))
             let face = projection.faces[0]
-            XCTAssertEqual(face.frame.width, sqrt(3528), accuracy: 1e-8)
+            XCTAssertEqual(face.frame.width, 84 / sqrt(3), accuracy: 1e-8)
             XCTAssertEqual(face.horizontal.dx, 1, accuracy: 1e-8)
             XCTAssertEqual(face.horizontal.dy, 0, accuracy: 1e-8)
             XCTAssertEqual(face.vertical.dx, 0, accuracy: 1e-8)
@@ -27,17 +27,24 @@ final class ViewportOrientationCubeTests: XCTestCase {
         }
     }
 
-    func testProjectedCoverageStaysConstantAcrossFacesCornersOrbitAndRoll() {
+    func testWorldToPointScaleStaysFixedAcrossFacesCornersOrbitAndRoll() {
         let bounds = NSRect(x: 0, y: 0, width: 92, height: 92)
-        for pose in coveragePoses(yawSteps: 16, elevationSteps: 12, rollSteps: 8) {
+        let scale = 84 / (2 * sqrt(3.0))
+        let localSigns: [SIMD2<Double>] = [[-1, -1], [1, -1], [1, 1], [-1, 1]]
+        for pose in orientationPoses(yawSteps: 16, elevationSteps: 12, rollSteps: 8) {
             let projection = ViewportCubeProjection(bounds: bounds, right: pose.right, up: pose.up, backward: pose.backward)
-            let area = projection.faces.reduce(0.0) { $0 + polygonArea($1.points) }
-            XCTAssertEqual(area, 3528, accuracy: 1e-6, pose.name)
-            for point in projection.faces.flatMap(\.points) {
-                XCTAssertGreaterThanOrEqual(point.x, 2, pose.name)
-                XCTAssertLessThanOrEqual(point.x, 90, pose.name)
-                XCTAssertGreaterThanOrEqual(point.y, 2, pose.name)
-                XCTAssertLessThanOrEqual(point.y, 90, pose.name)
+            for face in projection.faces {
+                XCTAssertEqual(face.scale, scale, accuracy: 1e-10, pose.name)
+                let basis = directionBasis(face.direction)
+                for (point, signs) in zip(face.points, localSigns) {
+                    let world = face.direction.normal + signs.x * basis.right + signs.y * basis.up
+                    XCTAssertEqual(point.x, 46 + simd_dot(world, pose.right) * scale, accuracy: 1e-8, pose.name)
+                    XCTAssertEqual(point.y, 46 + simd_dot(world, pose.up) * scale, accuracy: 1e-8, pose.name)
+                    XCTAssertGreaterThanOrEqual(point.x, 4 - 1e-8, pose.name)
+                    XCTAssertLessThanOrEqual(point.x, 88 + 1e-8, pose.name)
+                    XCTAssertGreaterThanOrEqual(point.y, 4 - 1e-8, pose.name)
+                    XCTAssertLessThanOrEqual(point.y, 88 + 1e-8, pose.name)
+                }
             }
             for (target, point) in projection.projectedTargetCenters {
                 XCTAssertEqual(projection.hitTarget(at: point), target, pose.name)
@@ -45,27 +52,40 @@ final class ViewportOrientationCubeTests: XCTestCase {
         }
     }
 
+    func testUprightWorldEdgeKeepsItsHeightBetweenFrontAndDiagonalViews() throws {
+        let front = try XCTUnwrap(projection(for: .front).faces.first)
+        let diagonal = ViewportCubeProjection(bounds: NSRect(x: 0, y: 0, width: 92, height: 92),
+            right: [sqrt(0.5), sqrt(0.5), 0], up: [0, 0, 1], backward: [sqrt(0.5), -sqrt(0.5), 0])
+        let diagonalFront = try XCTUnwrap(diagonal.faces.first { $0.direction == .front })
+        func height(_ face: ViewportCubeProjection.Face) -> Double {
+            let bottom = face.point(at: NSPoint(x: 1, y: -1))
+            let top = face.point(at: NSPoint(x: 1, y: 1))
+            return top.y - bottom.y
+        }
+        // A vertical world edge stays parallel to the screen in both views.
+        // Both the old bounding-box fit and equal-area sizing changed its height.
+        XCTAssertEqual(height(front), height(diagonalFront), accuracy: 1e-8)
+        XCTAssertEqual(height(front), 84 / sqrt(3), accuracy: 1e-8)
+        XCTAssertGreaterThan(diagonalFront.frame.width, 0)
+        XCTAssertLessThan(diagonalFront.frame.width, front.frame.width,
+                          "Foreshortening is natural; it must not trigger compensating scale changes.")
+    }
+
     @MainActor
-    func testNativeAlphaCoverageStaysConsistentWithoutClippingAtBothPixelScales() throws {
+    func testNativeBitmapsRemainUnclippedAndClickableAtBothPixelScales() throws {
         _ = NSApplication.shared
         let cube = ViewportOrientationCube(frame: NSRect(x: 0, y: 0, width: 92, height: 92))
-        let poses = coveragePoses(yawSteps: 8, elevationSteps: 6, rollSteps: 4)
         for pixelScale in [1, 2] {
-            var areas = [Double]()
-            for pose in poses {
+            for pose in orientationPoses(yawSteps: 8, elevationSteps: 6, rollSteps: 4) {
                 cube.setOrientation(right: pose.right, up: pose.up, backward: pose.backward)
                 let bitmap = try capture(cube, pixelScale: pixelScale)
-                let metrics = try alphaCoverage(bitmap, pixelScale: pixelScale)
-                areas.append(metrics.area)
+                let metrics = try alphaMetrics(bitmap, pixelScale: pixelScale)
+                XCTAssertGreaterThan(metrics.occupiedPixels, 1000 * pixelScale * pixelScale, pose.name)
                 XCTAssertLessThan(metrics.borderAlpha, 0.01, "\(pose.name), \(pixelScale)×: the cube must retain a transparent border.")
                 for (target, point) in cube.projectedTargetCenters {
                     XCTAssertEqual(cube.hitTarget(at: point), target, pose.name)
                 }
             }
-            let minimum = try XCTUnwrap(areas.min()), maximum = try XCTUnwrap(areas.max())
-            XCTAssertGreaterThan(minimum, 3200, "A transparent or incomplete bitmap must not satisfy size consistency.")
-            XCTAssertLessThanOrEqual(maximum / minimum, 1.03,
-                                     "\(pixelScale)× alpha-weighted coverage varies from \(minimum) to \(maximum) pt².")
         }
     }
 
@@ -215,11 +235,17 @@ final class ViewportOrientationCubeTests: XCTestCase {
         let directory = URL(fileURLWithPath: "/private/tmp/lad-orientation-cube-preview", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: directory.appendingPathComponent("top.png"))
+        cube.setOrientation(right: [1, 0, 0], up: [0, 0, 1], backward: [0, -1, 0])
+        let front = try capture(cube)
+        try XCTUnwrap(front.representation(using: .png, properties: [:])).write(to: directory.appendingPathComponent("front.png"))
+        cube.setOrientation(right: [sqrt(0.5), sqrt(0.5), 0], up: [0, 0, 1], backward: [sqrt(0.5), -sqrt(0.5), 0])
+        let diagonal = try capture(cube)
+        try XCTUnwrap(diagonal.representation(using: .png, properties: [:])).write(to: directory.appendingPathComponent("upright-diagonal.png"))
         cube.setOrientation(right: [sqrt(0.5), sqrt(0.5), 0], up: [-1 / sqrt(6), 1 / sqrt(6), sqrt(2.0 / 3)],
                             backward: [1 / sqrt(3), -1 / sqrt(3), 1 / sqrt(3)])
         let isometric = try capture(cube)
         try XCTUnwrap(isometric.representation(using: .png, properties: [:])).write(to: directory.appendingPathComponent("isometric.png"))
-        let comparison = try pairedComparison(bitmap, isometric)
+        let comparison = try comparisonStrip([front, diagonal, isometric])
         try XCTUnwrap(comparison.representation(using: .png, properties: [:])).write(to: directory.appendingPathComponent("comparison.png"))
     }
 
@@ -246,22 +272,22 @@ final class ViewportOrientationCubeTests: XCTestCase {
             windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 0))
     }
 
-    private struct CoveragePose {
+    private struct OrientationPose {
         let name: String
         let right: SIMD3<Double>
         let up: SIMD3<Double>
         let backward: SIMD3<Double>
     }
 
-    private func coveragePoses(yawSteps: Int, elevationSteps: Int, rollSteps: Int) -> [CoveragePose] {
+    private func orientationPoses(yawSteps: Int, elevationSteps: Int, rollSteps: Int) -> [OrientationPose] {
         var poses = ViewportCubeFace.allCases.map { face in
             let basis = directionBasis(face)
-            return CoveragePose(name: face.rawValue, right: basis.right, up: basis.up, backward: face.normal)
+            return OrientationPose(name: face.rawValue, right: basis.right, up: basis.up, backward: face.normal)
         }
         for corner in ViewportCubeCorner.allCases {
             let backward = corner.direction
             let right = simd_normalize(SIMD3<Double>(-backward.y, backward.x, 0))
-            poses.append(CoveragePose(name: corner.rawValue, right: right, up: simd_cross(backward, right), backward: backward))
+            poses.append(OrientationPose(name: corner.rawValue, right: right, up: simd_cross(backward, right), backward: backward))
         }
         for yawIndex in 0..<yawSteps {
             let yaw = Double(yawIndex) * 2 * .pi / Double(yawSteps)
@@ -272,7 +298,7 @@ final class ViewportOrientationCubeTests: XCTestCase {
                 let baseUp = simd_cross(backward, baseRight)
                 for rollIndex in 0..<rollSteps {
                     let roll = Double(rollIndex) * .pi / (2 * Double(rollSteps))
-                    poses.append(CoveragePose(name: "orbit-\(yawIndex)-\(elevationIndex)-roll-\(rollIndex)",
+                    poses.append(OrientationPose(name: "orbit-\(yawIndex)-\(elevationIndex)-roll-\(rollIndex)",
                         right: cos(roll) * baseRight + sin(roll) * baseUp,
                         up: -sin(roll) * baseRight + cos(roll) * baseUp, backward: backward))
                 }
@@ -282,34 +308,27 @@ final class ViewportOrientationCubeTests: XCTestCase {
         // 45 degrees, so a width-only or upright-only sweep would miss it.
         let backward = SIMD3<Double>(1, 0, 1) / sqrt(2)
         let right = SIMD3<Double>(1, 1, -1) / sqrt(3)
-        poses.append(CoveragePose(name: "adversarial-rolled-edge", right: right,
+        poses.append(OrientationPose(name: "adversarial-rolled-edge", right: right,
                                   up: simd_cross(backward, right), backward: backward))
         return poses
     }
 
-    private func polygonArea(_ points: [NSPoint]) -> Double {
-        abs(points.indices.reduce(0.0) { sum, index in
-            let a = points[index], b = points[(index + 1) % points.count]
-            return sum + a.x * b.y - b.x * a.y
-        }) / 2
-    }
-
-    private func alphaCoverage(_ bitmap: NSBitmapImageRep, pixelScale: Int) throws -> (area: Double, borderAlpha: Double) {
+    private func alphaMetrics(_ bitmap: NSBitmapImageRep, pixelScale: Int) throws -> (occupiedPixels: Int, borderAlpha: Double) {
         XCTAssertEqual(bitmap.bitsPerPixel, 32)
         XCTAssertFalse(bitmap.bitmapFormat.contains(.alphaFirst))
         let bytes = try XCTUnwrap(bitmap.bitmapData)
-        var alphaSum = 0.0, borderAlpha = 0.0
+        var occupiedPixels = 0, borderAlpha = 0.0
         let border = pixelScale * 2
         for y in 0..<bitmap.pixelsHigh {
             for x in 0..<bitmap.pixelsWide {
                 let alpha = Double(bytes[y * bitmap.bytesPerRow + x * 4 + 3]) / 255
-                alphaSum += alpha
+                if alpha > 0 { occupiedPixels += 1 }
                 if x < border || y < border || x >= bitmap.pixelsWide - border || y >= bitmap.pixelsHigh - border {
                     borderAlpha = max(borderAlpha, alpha)
                 }
             }
         }
-        return (alphaSum / Double(pixelScale * pixelScale), borderAlpha)
+        return (occupiedPixels, borderAlpha)
     }
 
     private func pixelColor(at point: NSPoint, in bitmap: NSBitmapImageRep, pixelScale: Int) throws -> NSColor {
@@ -318,20 +337,22 @@ final class ViewportOrientationCubeTests: XCTestCase {
     }
 
     @MainActor
-    private func pairedComparison(_ cardinal: NSBitmapImageRep, _ isometric: NSBitmapImageRep) throws -> NSBitmapImageRep {
-        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 400, pixelsHigh: 184,
+    private func comparisonStrip(_ images: [NSBitmapImageRep]) throws -> NSBitmapImageRep {
+        let width = images.count * 184 + (images.count - 1) * 32
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: 184,
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
             bytesPerRow: 0, bitsPerPixel: 0))
         let context = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: bitmap))
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = context
         NSColor(srgbRed: 0.071, green: 0.086, blue: 0.106, alpha: 1).setFill()
-        NSRect(x: 0, y: 0, width: 400, height: 184).fill()
+        NSRect(x: 0, y: 0, width: CGFloat(width), height: 184).fill()
         context.cgContext.interpolationQuality = .none
-        context.cgContext.draw(try XCTUnwrap(cardinal.cgImage), in: CGRect(x: 0, y: 0, width: 184, height: 184))
-        context.cgContext.draw(try XCTUnwrap(isometric.cgImage), in: CGRect(x: 216, y: 0, width: 184, height: 184))
+        for (index, image) in images.enumerated() {
+            context.cgContext.draw(try XCTUnwrap(image.cgImage), in: CGRect(x: CGFloat(index * 216), y: 0, width: 184, height: 184))
+        }
         NSGraphicsContext.restoreGraphicsState()
-        bitmap.size = NSSize(width: 200, height: 92)
+        bitmap.size = NSSize(width: CGFloat(width) / 2, height: 92)
         return bitmap
     }
 
