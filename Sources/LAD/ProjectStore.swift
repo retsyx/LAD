@@ -240,6 +240,9 @@ enum ProjectStore {
             count += 1
             guard count <= 8_192, depth <= 32, validPartID(node.id), validPartName(node.name), node.isGroup || !node.solidIndices.isEmpty,
                   identifiers.insert(node.id).inserted else { throw invalid("The parts hierarchy contains invalid or duplicate items.") }
+            if let color = node.color, !color.isValid {
+                throw invalid("The saved parts hierarchy contains an invalid color.")
+            }
             for solid in node.solidIndices {
                 guard solid >= 0, solid < solidCount, owners.insert(solid).inserted else {
                     throw invalid("Each solid must belong to exactly one item in the parts hierarchy.")

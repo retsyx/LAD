@@ -9,6 +9,46 @@ final class ViewportColorTests: XCTestCase {
     private let teal = PartColor(red: 0.25, green: 0.61, blue: 0.56)
 
     @MainActor
+    func testWireframeNeutralFinishMatchesExplicitCurrentNeutralColor() async throws {
+        let view = try makeView(), preview = mesh()
+        view.update(mesh: preview, mode: .wireframe, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [])
+        try await waitForPreparation(view)
+        let material = try XCTUnwrap(node("edges:0", in: view).geometry?.firstMaterial)
+        try assertColor(material, equals: PartColorState.defaultFinish)
+        view.update(mesh: preview, mode: .wireframe, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [], solidColors: [0: PartColorState.defaultFinish])
+        try assertColor(material, equals: PartColorState.defaultFinish)
+    }
+
+    @MainActor
+    func testPartFinishesAndCurrentColorsReuseGeometry() async throws {
+        let view = try makeView()
+        var preview = mesh()
+        preview.parts = [PartNode(id: "first", name: "First", solidIndices: [0], color: coral),
+                         PartNode(id: "second", name: "Second", solidIndices: [1], color: teal)]
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
+        try await waitForPreparation(view)
+        let geometry = try XCTUnwrap(node("solid:0", in: view).geometry)
+        let material = try XCTUnwrap(geometry.firstMaterial)
+        try assertColor(material, equals: coral)
+        try assertColor(try XCTUnwrap(node("solid:1", in: view).geometry?.firstMaterial), equals: teal)
+
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [], solidColors: [0: teal])
+        try assertColor(material, equals: teal)
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [], solidColors: [0: PartColorState.defaultFinish])
+        try assertColor(material, equals: PartColorState.defaultFinish)
+        XCTAssertTrue(try node("solid:0", in: view).geometry === geometry)
+        XCTAssertFalse(view.isPreparingResources)
+        view.needsDisplay = false
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [], solidColors: [0: PartColorState.defaultFinish])
+        XCTAssertFalse(view.needsDisplay)
+    }
+
+    @MainActor
     func testPartColorsRemainIndependentAcrossSelectionDisplayModesAndReset() async throws {
         let view = try makeView()
         let preview = mesh()

@@ -59,6 +59,8 @@ struct PartNode: Codable, Sendable, Identifiable, Equatable {
     var name: String
     var solidIndices: [Int]
     var children: [PartNode]? = nil
+    /// Opaque sRGB color for this node's own solids.
+    var color: PartColor? = nil
 
     var isGroup: Bool { children != nil }
     var allSolidIndices: Set<Int> {

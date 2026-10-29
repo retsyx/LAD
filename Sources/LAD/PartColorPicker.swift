@@ -14,7 +14,7 @@ struct PartColorPicker: View {
         self.recentColors = recentColors
         self.onApply = onApply
         self.onCancel = onCancel
-        _customColor = State(initialValue: initialColor?.swatchColor ?? Color(red: 0.68, green: 0.74, blue: 0.82))
+        _customColor = State(initialValue: (initialColor ?? PartColorState.defaultFinish).swatchColor)
     }
 
     var body: some View {

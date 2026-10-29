@@ -158,14 +158,8 @@ final class AppState: ObservableObject {
         return []
     }
     var solidColors: [Int: PartColor] {
-        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }),
-              let colors = revision.partColors else { return [:] }
-        var result: [Int: PartColor] = [:]
-        for node in partTree.flatMap(\.flattened) {
-            guard let color = colors[node.id] else { continue }
-            for solid in node.solidIndices { result[solid] = color }
-        }
-        return result
+        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return [:] }
+        return PartColorState.solidColors(in: partTree, overrides: revision.partColors ?? [:])
     }
     private var currentSolidCount: Int {
         guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return 0 }
@@ -839,6 +833,11 @@ final class AppState: ObservableObject {
         let previousLayout = selectedPartLayout
         let previouslyHidden = hiddenPartIDs
         let sourceRevisionID = selectedRevisionID
+        let previousColors = Self.completePartColors(in: previousLayout.nodes,
+            stored: revisions.first(where: { $0.id == sourceRevisionID })?.partColors ?? [:])
+        let previousPreview = mesh
+        let previousSolidColors = PartColorState.solidColors(in: previousLayout.nodes, overrides: previousColors)
+        let previousHiddenSolids = hiddenSolids
         let versions = ProjectVersionContext(revisions: revisions, selectedRevisionID: selectedRevisionID)
         let selectionModels = Dictionary(uniqueKeysWithValues: revisions.map { ($0.id, $0.model) })
         let selectionModel = request.selection.flatMap { selectionModels[$0.revisionID] }
@@ -903,11 +902,11 @@ final class AppState: ObservableObject {
                 }
                 autosave()
                 guard isCodexInstalled else { throw LADError.message("Codex CLI was not found. Install the ChatGPT desktop app or Codex CLI and sign in, then try again.") }
-                let result = try await codex.generate(prompt: text, current: previous, history: history, attachments: sources, partLayout: previousLayout,
+                let result = try await codex.generate(prompt: text, current: previous, history: history, attachments: sources, partLayout: previousLayout, partColors: previousColors,
                                                     executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
                                                     onMessage: { commentary("project", $0) }, onActivity: { toolActivity("project", $0) },
-                                                    python: runtime, threads: cores, engine: engine, currentPreview: mesh,
-                                                    viewport: viewportView, hiddenSolids: hiddenSolids, solidColors: solidColors,
+                                                    python: runtime, threads: cores, engine: engine, currentPreview: previousPreview,
+                                                    viewport: viewportView, hiddenSolids: previousHiddenSolids, solidColors: previousSolidColors,
                                                     onSteeringAvailability: { [weak self] available in
                     Task { @MainActor in
                         guard let self, self.operationID == token else { return }
@@ -921,6 +920,8 @@ final class AppState: ObservableObject {
                 switch result {
                 case .ready(let project): spec = project
                 case .response(let message):
+                    try applyAgentPartColorChanges(codex.partColorChanges, to: sourceRevisionID,
+                                                  matching: previous, startedWith: previousColors)
                     finishConversationResponse(message)
                     return
                 }
@@ -967,11 +968,11 @@ final class AppState: ObservableObject {
 
                     Preserve the intended shape and dimensions. Fix or simplify the failing operations and return the complete replacement design.
                     """
-                    let repairResult = try await codex.generate(prompt: repairRequest, current: spec, history: messages, attachments: sources, partLayout: previousLayout,
+                    let repairResult = try await codex.generate(prompt: repairRequest, current: spec, history: messages, attachments: sources, partLayout: previousLayout, partColors: previousColors,
                                                      executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
                                                      onMessage: { commentary("repair", $0) }, onActivity: { toolActivity("repair", $0) },
                                                      python: runtime, threads: cores, engine: engine, viewport: viewportView,
-                                                     hiddenSolids: hiddenSolids, solidColors: solidColors,
+                                                     hiddenSolids: previousHiddenSolids, solidColors: previousSolidColors,
                                                      onSteeringAvailability: { [weak self] available in
                         Task { @MainActor in
                             guard let self, self.operationID == token else { return }
@@ -984,6 +985,8 @@ final class AppState: ObservableObject {
                     switch repairResult {
                     case .ready(let project): spec = project
                     case .response(let message):
+                        try applyAgentPartColorChanges(codex.partColorChanges, to: sourceRevisionID,
+                                                      matching: previous, startedWith: previousColors)
                         finishConversationResponse(message)
                         return
                     }
@@ -1001,13 +1004,18 @@ final class AppState: ObservableObject {
                 guard operationID == token else { return }
                 try Task.checkCancellation()
                 let sourceRevision = revisions.first(where: { $0.id == sourceRevisionID })
+                if let previous, sourceRevision?.model != previous {
+                    throw LADError.message("The original design version changed before the update could be applied.")
+                }
                 let liveLayout = sourceRevision?.partLayout ?? previousLayout
                 let liveHidden = Set(sourceRevision?.hiddenSolids ?? [])
                 let hiddenIDs = sourceRevision?.hiddenSolids == nil ? previouslyHidden : Set(liveLayout.nodes.flatMap(\.flattened).filter {
                     !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: liveHidden)
                 }.map(\.id))
                 try commit(spec, preview: preview, previousLayout: liveLayout, previouslyHidden: hiddenIDs, userMessageID: userMessage.id,
-                           previousColors: sourceRevision?.partColors ?? [:])
+                           previousColors: Self.completePartColors(in: liveLayout.nodes, stored: sourceRevision?.partColors ?? [:]),
+                           colorChanges: codex.partColorChanges,
+                           startedColors: previousColors)
             } catch is CancellationError {
                 if operationID == token {
                     queuePaused = true; queueCanAdvance = false
@@ -1048,15 +1056,17 @@ final class AppState: ObservableObject {
         autosave()
     }
 
-    private func commit(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout? = nil, previouslyHidden: Set<String> = [], userMessageID: UUID, previousColors: [String: PartColor] = [:]) throws {
+    private func commit(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout? = nil, previouslyHidden: Set<String> = [], userMessageID: UUID, previousColors: [String: PartColor] = [:], colorChanges: [CADPartColorChange] = [], startedColors: [String: PartColor] = [:]) throws {
         let defaults = Self.defaultParts(for: preview)
         let layout = previousLayout?.reconciled(with: defaults, allowingPlacementChanges: Set(spec.reorganizePartIDs ?? [])) ?? PartLayout(nodes: defaults)
         try ProjectStore.validatePartHierarchy(layout.nodes, solidCount: preview.solids)
+        let colors = try Self.partColors(applying: colorChanges, in: layout.nodes,
+                                        current: previousColors, startedWith: startedColors)
         let hidden = Set(layout.nodes.flatMap(\.flattened).filter { previouslyHidden.contains($0.id) }.flatMap(\.solidIndices))
         let response = ChatMessage(role: "assistant", content: spec.summary + "\n\nDesign ready.", phase: "final_answer")
         let revision = ProjectRevision(model: spec, date: response.date, preview: preview, partLayout: layout, hiddenSolids: hidden.sorted(), parts: defaults, runtime: preview.runtime,
                                       userMessageID: userMessageID, responseMessageID: response.id,
-                                      partColors: Self.retainedPartColors(previousColors, in: layout.nodes))
+                                      partColors: colors.isEmpty ? nil : colors)
         revisions.append(revision)
         selectedRevisionID = revision.id; builtRevisionID = revision.id
         mesh = preview; selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = hidden
@@ -1309,8 +1319,9 @@ final class AppState: ObservableObject {
     func partColor(for nodeID: String) -> PartColor? {
         guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return nil }
         let targets = colorTargets(for: nodeID)
-        guard let first = targets.first, let color = revision.partColors?[first.id],
-              targets.allSatisfy({ revision.partColors?[$0.id] == color }) else { return nil }
+        let colors = Self.completePartColors(in: partTree, stored: revision.partColors ?? [:])
+        guard let first = targets.first, let color = colors[first.id],
+              targets.allSatisfy({ colors[$0.id] == color }) else { return nil }
         return color
     }
 
@@ -1320,7 +1331,9 @@ final class AppState: ObservableObject {
         let targets = colorTargets(for: nodeID)
         guard !targets.isEmpty else { return }
         var colors = revisions[index].partColors ?? [:]
-        for node in targets { colors[node.id] = color }
+        for node in targets {
+            colors[node.id] = color ?? (node.color == nil ? nil : PartColorState.defaultFinish)
+        }
         let changed = colors != (revisions[index].partColors ?? [:])
         var recent = recentPartColors
         if let color {
@@ -1332,6 +1345,49 @@ final class AppState: ObservableObject {
         revisions[index].partColors = colors.isEmpty ? nil : colors
         recentPartColors = recent
         autosave()
+    }
+
+    /// Apply only a successful turn's staged display edits to its captured
+    /// source revision. Navigating history must not redirect those edits.
+    func applyAgentPartColorChanges(_ changes: [CADPartColorChange], to sourceRevisionID: UUID?,
+                                   matching source: ModelSpec?, startedWith snapshot: [String: PartColor]) throws {
+        guard !changes.isEmpty else { return }
+        guard let sourceRevisionID, let source,
+              let index = revisions.firstIndex(where: { $0.id == sourceRevisionID }),
+              revisions[index].model == source else {
+            throw LADError.message("The original design version changed before its colors could be applied.")
+        }
+        let revision = revisions[index]
+        let nodes = revision.partLayout?.nodes ?? revision.parts ?? revision.preview.map(Self.defaultParts(for:)) ?? []
+        let colors = try Self.partColors(applying: changes, in: nodes,
+                                        current: Self.completePartColors(in: nodes, stored: revision.partColors ?? [:]),
+                                        startedWith: snapshot)
+        revisions[index].partColors = colors.isEmpty ? nil : colors
+    }
+
+    /// A task can replace existing colors; a newer edit made during that
+    /// task remains current on the physical parts it changed.
+    static func partColors(applying changes: [CADPartColorChange], in nodes: [PartNode],
+                           current: [String: PartColor], startedWith snapshot: [String: PartColor]) throws -> [String: PartColor] {
+        let retained = retainedPartColors(current, in: nodes) ?? [:]
+        let colors = completePartColors(in: nodes, stored: retained)
+        var result = try PartColorState.applyingPhysical(changes: changes, to: colors, in: nodes)
+        let physicalIDs = Set(nodes.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map(\.id))
+        for id in snapshot.keys where physicalIDs.contains(id) && current[id] != snapshot[id] {
+            result[id] = current[id] ?? PartColorState.defaultFinish
+        }
+        return result
+    }
+
+    /// Capture every physical part's current RGB, including the neutral finish.
+    /// Stable IDs retain these values when a later build supplies new parts.
+    static func completePartColors(in nodes: [PartNode], stored: [String: PartColor]) -> [String: PartColor] {
+        let colors = PartColorState.resolved(in: nodes, overrides: stored)
+        var result: [String: PartColor] = [:]
+        for node in nodes.flatMap(\.flattened) where !node.solidIndices.isEmpty {
+            result[node.id] = colors[node.id] ?? PartColorState.defaultFinish
+        }
+        return result
     }
 
     /// Stable part identities preserve colors across refinements. Only an

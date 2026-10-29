@@ -32,6 +32,9 @@ INSTRUCTIONS = (
     "conversion does not build, import or commit a design. lad_import is only for pre-existing external/reference geometry, including that PCB conversion. "
     "NEVER export/import, reimport or use lad_import for geometry generated as part of the current design, whether authored with LAD or external tools such as SDF software. "
     "Keep all authored geometry in the replayable CAD program; external tools may support analysis and prototyping. Mesh reference inputs remain faceted. "
+    "Use lad_get_part_colors for effective sRGB colors and stable part IDs, and lad_set_part_colors to stage color assignments or null resets without rebuilding geometry. "
+    "Colors on candidate artifacts remain speculative; only the current patch or the final program's matching artifact patch is committed on success. "
+    "Part colors have one current RGB value; the last successful color assignment applies. CadQuery Assembly color=cq.Color(r,g,b) seeds colors for new parts. "
     "Inputs and outputs are file references, never inline complete source files. Screenshots/render tools return actual PNG image content. "
     "For geometry changes, inspect and repair as many times as needed, then return the final complete program and its required assetIDs in the response schema."
 )
@@ -59,6 +62,13 @@ TOOLS = [
     ("lad_inspect", "Inspect exact geometry metadata, named parts and native topology IDs. Paginate vertices, edges or faces to find entities for measurements.",
      schema({**ARTIFACT, "kind": prop("string", enum=["summary", "parts", "vertices", "edges", "faces"]), "solidIndices": INDICES,
              "offset": prop("integer", minimum=0), "limit": prop("integer", minimum=1, maximum=500)}), True),
+    ("lad_get_part_colors", "Read current opaque sRGB colors, stable part and folder IDs, and parent relationships. Paginated; current works from the saved parts layout even when its geometry preview is unavailable. Never rebuilds geometry or changes the design.",
+     schema({**ARTIFACT, "offset": prop("integer", minimum=0, default=0), "limit": prop("integer", minimum=1, maximum=500, default=100)}), True),
+    ("lad_set_part_colors", "Stage an atomic batch of part or folder color assignments for one artifact without rebuilding geometry or changing the live design. Folder assignments expand to physical parts; conflicting overlaps are rejected. Use color:null to set the neutral default finish. Only a successful final response commits the current patch or the final replacement program's matching artifact patch.",
+     schema({**ARTIFACT, "changes": prop("array", minItems=1, maxItems=256, items=schema({
+         "partID": prop("string", minLength=1, maxLength=1024),
+         "color": {"anyOf": [schema({channel: prop("number", minimum=0, maximum=1) for channel in ("red", "green", "blue")}, ["red", "green", "blue"]), {"type": "null"}]}
+     }, ["partID", "color"]))}, ["changes"]), False),
     ("lad_measure", "Measure native vertices, edges, curves, faces or whole parts. Returns exact properties and OpenCascade minimum distances/closest points and supported analytic angles.",
      schema({**ARTIFACT, "features": prop("array", items=schema({"kind": prop("string", enum=["vertex", "edge", "face"]),
                                                                "solidIndex": prop("integer", minimum=0), "localIndex": prop("integer", minimum=0)},

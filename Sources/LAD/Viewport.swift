@@ -374,7 +374,10 @@ final class CADSceneView: SCNView {
             projectedFeatures = nil
             hoveredFeature = nil
         }
-        self.solidColors = solidColors.filter { (0..<4_096).contains($0.key) && $0.value.isValid }
+        var finishes = PartColorState.solidColors(in: mesh?.parts ?? [], overrides: [:])
+        finishes.merge(solidColors.filter { (0..<4_096).contains($0.key) && $0.value.isValid },
+                       uniquingKeysWith: { _, override in override })
+        self.solidColors = finishes
         var installedModel = false
         if meshChanged {
             loadedPath = mesh?.stepPath
@@ -836,7 +839,7 @@ final class CADSceneView: SCNView {
             // Older projects have one combined edge buffer. Never keep that
             // buffer visible after hiding a part, since its lines include it.
             node.isHidden = hidden
-            node.geometry?.firstMaterial?.diffuse.contents = mode == .wireframe ? solid.flatMap { assignedColor(for: $0) } ?? NSColor(srgbRed: 0.73, green: 0.80, blue: 0.88, alpha: 1)
+            node.geometry?.firstMaterial?.diffuse.contents = mode == .wireframe ? solid.flatMap { assignedColor(for: $0) } ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
                 : Self.edgeInk
             node.geometry?.firstMaterial?.readsFromDepthBuffer = mode != .wireframe
             node.geometry?.firstMaterial?.transparency = translucent ? 0.8 : 1

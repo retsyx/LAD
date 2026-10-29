@@ -92,13 +92,15 @@ enum CADAgentVersionFiles {
         if let runtime = version.runtime {
             info["runtime"] = try JSONSerialization.jsonObject(with: encoded(runtime))
         }
-        if let layout = version.partLayout {
+        if var layout = version.partLayout {
+            layout.nodes = PartColorState.nodesWithCurrentColors(layout.nodes, stored: version.partColors ?? [:])
             info["partsLayoutPath"] = try path("\(base)/parts-layout.json")
             files.append(File(path: "\(base)/parts-layout.json", data: try encoded(layout)))
         }
         if let parts = version.parts {
             info["partsPath"] = try path("\(base)/parts.json")
-            files.append(File(path: "\(base)/parts.json", data: try encoded(parts)))
+            let currentParts = PartColorState.nodesWithCurrentColors(parts, stored: version.partColors ?? [:])
+            files.append(File(path: "\(base)/parts.json", data: try encoded(currentParts)))
         }
         if version.hiddenSolids != nil || version.partColors != nil {
             var display: [String: Any] = [:]

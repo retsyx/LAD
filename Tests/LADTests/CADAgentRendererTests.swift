@@ -6,6 +6,26 @@ import XCTest
 
 final class CADAgentRendererTests: XCTestCase {
     @MainActor
+    func testIndependentRendersUsePartColorsAndCurrentAssignments() async throws {
+        var preview = twoParts()
+        preview.parts = [PartNode(id: "red", name: "Red", solidIndices: [0],
+                                 color: PartColor(red: 0.85, green: 0.08, blue: 0.08)),
+                         PartNode(id: "green", name: "Green", solidIndices: [1],
+                                  color: PartColor(red: 0.08, green: 0.85, blue: 0.08))]
+        let authored = try await CADAgentRenderer.renderPNG(preview: preview, view: "top", display: .shaded,
+                                                          width: 320, height: 240)
+        let counts = dominantColors(try XCTUnwrap(NSBitmapImageRep(data: authored)))
+        XCTAssertGreaterThan(counts.red, 10)
+        XCTAssertGreaterThan(counts.green, 10)
+        let overridden = try await CADAgentRenderer.renderPNG(preview: preview, view: "top", display: .shaded,
+            solidColors: [0: PartColor(red: 0.08, green: 0.85, blue: 0.08)], width: 320, height: 240)
+        let overrideCounts = dominantColors(try XCTUnwrap(NSBitmapImageRep(data: overridden)))
+        XCTAssertEqual(overrideCounts.red, 0)
+        XCTAssertGreaterThan(overrideCounts.green, counts.green)
+        try authored.write(to: URL(fileURLWithPath: "/private/tmp/lad-agent-part-colors.png"))
+    }
+
+    @MainActor
     func testNamedViewsProduceRealPNGImagesInRequestedDimensions() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         var images = [String: Data]()

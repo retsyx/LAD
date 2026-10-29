@@ -48,6 +48,7 @@ final class CodexService {
     private var activeBridge: CADAgentBridge?
     private var validatedModel: ModelSpec?
     private var validatedMesh: PreviewMesh?
+    private(set) var partColorChanges: [CADPartColorChange] = []
 
     func validatedPreview(for model: ModelSpec) -> PreviewMesh? {
         guard let built = validatedModel, built.script == model.script, built.units == model.units,
@@ -61,6 +62,7 @@ final class CodexService {
         history: [ChatMessage],
         attachments: [SourceAttachment] = [],
         partLayout: PartLayout? = nil,
+        partColors: [String: PartColor] = [:],
         executable: String,
         model: String,
         reasoningEffort: CodexReasoningEffort = .defaultConfiguration,
@@ -75,7 +77,7 @@ final class CodexService {
         selectionModelsByRevision: [UUID: ModelSpec] = [:], versions: ProjectVersionContext = .empty
     ) async throws -> CodexProjectResult {
         guard activeJob == nil else { throw CodexError.failed("A Codex request is already running.") }
-        validatedModel = nil; validatedMesh = nil
+        validatedModel = nil; validatedMesh = nil; partColorChanges = []
         let requestedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let executableURL = Self.resolveExecutable(requestedExecutable) else {
             throw CodexError.executableMissing(requestedExecutable)
@@ -99,7 +101,8 @@ final class CodexService {
             threads: threads > 0 ? threads : ProcessInfo.processInfo.activeProcessorCount,
             current: current, currentPreview: currentPreview, engine: engine ?? EngineService(),
             viewport: viewport, hiddenSolids: hiddenSolids, solidColors: solidColors, onActivity: onActivity,
-            referenceAssets: selectionModel?.inputAssets ?? [], versions: versions)
+            referenceAssets: selectionModel?.inputAssets ?? [], versions: versions,
+            partLayout: partLayout, partColors: partColors)
         activeBridge = bridge
         defer { bridge.stop(); if activeBridge === bridge { activeBridge = nil } }
         var arguments = ["app-server", "--listen", "stdio://"]
@@ -108,8 +111,13 @@ final class CodexService {
 
         let request = try await Task.detached(priority: .userInitiated) {
             try SourceImport.validateAttachments(attachments.filter(\.isImage))
+            let contextLayout = partLayout.map { layout in
+                var copy = layout
+                copy.nodes = PartColorState.nodesWithCurrentColors(layout.nodes, stored: partColors)
+                return copy
+            }
             let files = try CodexFileContext.prepare(current: current, history: history, attachments: attachments, directory: directory,
-                partLayout: partLayout, selection: selection, selectionModel: selectionModel,
+                partLayout: contextLayout, selection: selection, selectionModel: selectionModel,
                 selectionModelsByRevision: selectionModelsByRevision)
             return (text: try Self.makeRequest(instructions: instructions, prompt: prompt, current: current, history: history, files: files,
                                                workspace: directory, python: taskRuntime, versions: versions), images: files.currentImagePaths)
@@ -157,6 +165,7 @@ final class CodexService {
                 guard !message.isEmpty, message.utf8.count <= 1_000_000 else {
                     throw CodexError.invalidModel("A conversational response must include a message of at most 1 MB.")
                 }
+                if response.status == "message" { partColorChanges = bridge.tools.partColorChanges(for: nil) }
                 return .response(message)
             }
             guard var specification = response.model else { throw CodexError.invalidModel("No completed design was provided.") }
@@ -183,6 +192,7 @@ final class CodexService {
             }
             validatedModel = specification
             validatedMesh = bridge.tools.validatedPreview(for: specification)
+            partColorChanges = bridge.tools.partColorChanges(for: specification)
             return .ready(specification)
         } catch let error as CodexError {
             throw error
@@ -341,6 +351,7 @@ final class CodexService {
     }
 
     func cancel() {
+        partColorChanges = []
         activeBridge?.stop()
         activeBridge = nil
         activeJob?.cancel()

@@ -132,7 +132,9 @@ final class CodexServiceTests: XCTestCase {
         let request = try String(contentsOf: fixture.inputURL, encoding: .utf8)
         let path = try JSONDecoder().decode(String.self, from: contextSection("CURRENT PARTS LAYOUT FILE:", in: request))
         let saved = try JSONDecoder().decode(PartLayout.self, from: fixture.capturedData(at: path))
-        XCTAssertEqual(saved, layout)
+        var expected = layout
+        expected.nodes[0].color = PartColorState.defaultFinish
+        XCTAssertEqual(saved, expected)
         XCTAssertFalse(request.contains(marker))
         XCTAssertFalse(request.contains("stable-body"))
         XCTAssertTrue(request.contains("reorganizePartIDs"))

@@ -15,6 +15,9 @@ final class CADAgentTools {
         var programURL: URL
         var metadataURL: URL
         var versionID: UUID? = nil
+        var parts: [PartNode] = []
+        var partColors: [String: PartColor] = [:]
+        var colorChanges: [CADPartColorChange] = []
     }
     private let workspace: CADAgentWorkspace
     private let python: String
@@ -25,7 +28,8 @@ final class CADAgentTools {
     private let versions: ProjectVersionContext
     private weak var viewport: CADSceneView?
     private let hiddenSolids: Set<Int>
-    private let solidColors: [Int: PartColor]
+    private let partLayout: PartLayout?
+    private let initialPartColors: [String: PartColor]
     /// A per-call handoff of the exact PNG already returned by an image tool.
     /// It is consumed by the trusted bridge, never added to the tool JSON.
     private var renderedImageData: Data?
@@ -40,7 +44,8 @@ final class CADAgentTools {
     init(directory: URL, python: String, threads: Int, current: ModelSpec?, currentPreview: PreviewMesh?,
          engine: EngineService, viewport: CADSceneView? = nil, hiddenSolids: Set<Int> = [],
          solidColors: [Int: PartColor] = [:], kicad: KiCadService? = nil,
-         referenceAssets: [CADInputAsset] = [], versions: ProjectVersionContext = .empty) throws {
+         referenceAssets: [CADInputAsset] = [], versions: ProjectVersionContext = .empty,
+         partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:]) throws {
         workspace = try CADAgentWorkspace(directory: directory)
         self.python = python
         self.threads = threads
@@ -50,7 +55,25 @@ final class CADAgentTools {
         self.kicad = kicad ?? KiCadService()
         self.viewport = viewport
         self.hiddenSolids = hiddenSolids
-        self.solidColors = solidColors
+        self.partLayout = partLayout
+        let currentParts = partLayout?.nodes ?? Self.parts(in: currentPreview)
+        if !currentParts.isEmpty {
+            let count = currentPreview?.solids ?? (currentParts.flatMap(\.flattened).flatMap(\.solidIndices).max().map { $0 + 1 } ?? 0)
+            try ProjectStore.validatePartHierarchy(currentParts, solidCount: count)
+        }
+        let physicalIDs = Self.physicalIDs(in: currentParts)
+        guard partColors.count <= 4096, partColors.allSatisfy({ physicalIDs.contains($0.key) && $0.value.isValid }),
+              solidColors.allSatisfy({ $0.key >= 0 && $0.key < (currentPreview?.solids ?? Int.max) && $0.value.isValid }) else {
+            throw LADError.message("The current design has invalid part colors.")
+        }
+        var currentColors = Self.completePartColors(in: currentParts, colors: partColors)
+        for node in currentParts.flatMap(\.flattened) where partColors[node.id] == nil && !node.solidIndices.isEmpty {
+            let legacy = node.solidIndices.compactMap { solidColors[$0] }
+            if legacy.count == node.solidIndices.count, let color = legacy.first, legacy.allSatisfy({ $0 == color }) {
+                currentColors[node.id] = color
+            }
+        }
+        self.initialPartColors = currentColors
         runtime = currentPreview?.runtime
         for asset in current?.inputAssets ?? [] {
             guard inputs[asset.id] == nil else { throw LADError.message("Imported geometry has duplicate asset identities.") }
@@ -60,10 +83,11 @@ final class CADAgentTools {
         // external inputs. Keep these available for exact origin replay without
         // changing the current design or substituting its imported_model.
         try registerReferenceAssets(referenceAssets)
-        if let current, let currentPreview {
+        if let current {
             artifacts["current"] = Artifact(id: "current", model: current, preview: currentPreview,
-                                             programURL: workspace.root.appendingPathComponent("context/current-model.json"),
-                                             metadataURL: workspace.root.appendingPathComponent("artifacts/current/metadata.json"))
+                programURL: workspace.root.appendingPathComponent("context/current-model.json"),
+                metadataURL: workspace.root.appendingPathComponent("artifacts/current/metadata.json"),
+                parts: currentParts, partColors: currentColors)
         }
     }
 
@@ -118,6 +142,26 @@ final class CADAgentTools {
             return preview
         }
         return nil
+    }
+
+    /// Only the chosen construction's speculative color patch crosses the
+    /// successful task boundary. Other candidates and history remain isolated.
+    func partColorChanges(for model: ModelSpec?) -> [CADPartColorChange] {
+        guard !cancelled else { return [] }
+        guard let model else { return artifacts["current"]?.colorChanges ?? [] }
+        for id in Array(artifactOrder.reversed()) + ["current"] {
+            guard let artifact = artifacts[id], constructionMatches(artifact.model, model) else { continue }
+            guard artifact.versionID != nil else { return artifact.colorChanges }
+            // Choosing a historical construction must also restore the exact
+            // current colors that were reviewed.
+            var changes: [String: CADPartColorChange] = [:]
+            for id in Self.physicalIDs(in: artifact.parts) where artifact.partColors[id] != initialPartColors[id] {
+                changes[id] = CADPartColorChange(partID: id, color: artifact.partColors[id])
+            }
+            for change in artifact.colorChanges { changes[change.partID] = change }
+            return changes.values.sorted { $0.partID < $1.partID }
+        }
+        return []
     }
 
     func cancel() {
@@ -266,6 +310,28 @@ final class CADAgentTools {
                 ? "No producer files were specified. Optional producerPaths can retain source-conversion code and dependency descriptions for a pre-existing reference input in the task audit."
                 : "Producer file references supplied for the saved task audit."
             return try result(info)
+        case "lad_get_part_colors":
+            try allowed(arguments, ["artifactID", "offset", "limit"])
+            let artifact = try colorArtifact(arguments)
+            let offset = try integer("offset", arguments, fallback: 0, range: 0...1_000_000)
+            let limit = try integer("limit", arguments, fallback: 100, range: 1...500)
+            return try result(colorPage(artifact, offset: offset, limit: limit))
+        case "lad_set_part_colors":
+            try allowed(arguments, ["artifactID", "changes"])
+            var artifact = try colorArtifact(arguments)
+            let changes = try colorChanges(arguments)
+            let normalized = try PartColorState.normalized(changes: changes, in: artifact.parts)
+            let updated = try PartColorState.applyingPhysical(changes: normalized, to: artifact.partColors, in: artifact.parts)
+            var staged = Dictionary(uniqueKeysWithValues: artifact.colorChanges.map { ($0.partID, $0) })
+            for change in normalized { staged[change.partID] = change }
+            artifact.partColors = Self.completePartColors(in: artifact.parts, colors: updated)
+            artifact.colorChanges = staged.values.sorted { $0.partID < $1.partID }
+            artifacts[artifact.id] = artifact
+            var info = try colorPage(artifact, offset: 0, limit: 100)
+            info["staged"] = true
+            info["changedPartCount"] = normalized.count
+            info["nextStep"] = "Colors are staged for this artifact only. Use lad_render to review them when needed. A successful final response applies only the current design's patch or the final replacement program's matching artifact patch."
+            return try result(info)
         case "lad_inspect":
             try allowed(arguments, ["artifactID", "kind", "solidIndices", "offset", "limit"])
             let artifact = try await artifact(arguments)
@@ -279,11 +345,12 @@ final class CADAgentTools {
             let items: [[String: Any]]
             switch kind {
             case "parts":
-                let nodes = (preview.parts ?? []).flatMap(\.flattened)
+                let nodes = artifact.parts.flatMap(\.flattened)
                 items = try topology.parts.filter { solids?.contains($0.solidIndex) ?? true }.map { part in
                     var item = try json(part)
                     if let owner = nodes.first(where: { $0.solidIndices.contains(part.solidIndex) }) {
                         item["partID"] = owner.id; item["name"] = owner.name
+                        item.merge(try colorInfo(owner, in: artifact)) { _, color in color }
                     }
                     return item
                 }
@@ -331,7 +398,7 @@ final class CADAgentTools {
             let selected = try indices(arguments, preview: preview, optional: true)
             let hidden = selected.map { Set(0..<preview.solids).subtracting($0) } ?? []
             let captured = try await CADAgentRenderer.renderWithMetadata(preview: preview, view: view, projection: projection,
-                display: display, hiddenSolids: hidden, solidColors: solidColors, width: width, height: height, camera: camera)
+                display: display, hiddenSolids: hidden, solidColors: renderColors(for: artifact), width: width, height: height, camera: camera)
             try checkCancellation()
             let url = try workspace.write(captured.png, path: "renders/\(UUID().uuidString).png")
             var metadata = captured.metadata
@@ -355,7 +422,7 @@ final class CADAgentTools {
                 return try imageResult(url, metadata: metadata)
             }
             let artifact = try await artifact([:])
-            let png = try await CADAgentRenderer.renderPNG(preview: artifact.preview!, hiddenSolids: hiddenSolids, solidColors: solidColors)
+            let png = try await CADAgentRenderer.renderPNG(preview: artifact.preview!, hiddenSolids: hiddenSolids, solidColors: renderColors(for: artifact))
             try checkCancellation()
             let url = try workspace.write(png, path: "renders/\(UUID().uuidString).png")
             return try imageResult(url, metadata: ["source": "LAD offscreen fallback; no live viewport is attached", "artifactID": artifact.id])
@@ -416,13 +483,103 @@ final class CADAgentTools {
         runtime = preview.runtime
         let programURL = try workspace.write(Data(model.script.utf8), path: "artifacts/\(id)/program.py")
         let metadataURL = workspace.root.appendingPathComponent("artifacts/\(id)/metadata.json")
-        let artifact = Artifact(id: id, model: model, preview: preview, programURL: programURL, metadataURL: metadataURL, versionID: versionID)
+        let defaults = Self.parts(in: preview)
+        let previous = artifacts[id]
+        let version = versionID.flatMap { identity in versions.versions.first { $0.id == identity } }
+        let layout = version?.partLayout ?? (versionID == nil ? partLayout : nil)
+        let nodes = previous.flatMap { $0.parts.isEmpty ? nil : $0.parts } ?? layout.map {
+            $0.remappingGenericParts(to: defaults).reconciled(with: defaults,
+                allowingPlacementChanges: Set(model.reorganizePartIDs ?? [])).nodes
+        } ?? defaults
+        let inherited = previous?.partColors ?? (versionID != nil ? version?.partColors ?? [:]
+            : artifacts["current"]?.partColors ?? initialPartColors)
+        let physicalIDs = Self.physicalIDs(in: nodes)
+        let patch = previous?.colorChanges ?? (versionID == nil ? artifacts["current"]?.colorChanges ?? [] : [])
+        let artifact = Artifact(id: id, model: model, preview: preview, programURL: programURL, metadataURL: metadataURL,
+            versionID: versionID, parts: nodes,
+            partColors: Self.completePartColors(in: nodes, colors: inherited),
+            colorChanges: patch.filter { physicalIDs.contains($0.partID) })
         _ = try workspace.write(JSONSerialization.data(withJSONObject: summary(artifact), options: [.sortedKeys, .prettyPrinted]), path: "artifacts/\(id)/metadata.json")
         artifacts[id] = artifact
         if !artifactOrder.contains(id) { artifactOrder.append(id) }
         // Retain recipes for replay while bounding heavyweight display caches.
         for old in artifactOrder.dropLast(16) where old != "current" { artifacts[old]?.preview = nil }
         return artifact
+    }
+
+    private static func parts(in preview: PreviewMesh?) -> [PartNode] {
+        guard let preview else { return [] }
+        return preview.parts ?? (0..<preview.solids).map {
+            PartNode(id: "solid/\($0)", name: "Part \($0 + 1)", solidIndices: [$0])
+        }
+    }
+
+    private static func physicalIDs(in nodes: [PartNode]) -> Set<String> {
+        Set(nodes.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map(\.id))
+    }
+
+    private func colorArtifact(_ arguments: [String: Any]) throws -> Artifact {
+        let id = try string("artifactID", arguments) ?? "current"
+        guard let artifact = artifacts[id] else {
+            throw LADError.message(id == "current" ? "There is no current design with parts to color."
+                : "The requested CAD artifact is unavailable in this task.")
+        }
+        return artifact
+    }
+
+    private func colorChanges(_ arguments: [String: Any]) throws -> [CADPartColorChange] {
+        guard let values = arguments["changes"] as? [[String: Any]], !values.isEmpty, values.count <= 256 else {
+            throw LADError.message("Provide between 1 and 256 part color assignments.")
+        }
+        return try values.map { value in
+            try allowed(value, ["partID", "color"])
+            let id = try string("partID", value, required: true)!
+            guard let raw = value["color"] else { throw LADError.message("Each part color assignment requires color, or null to use the neutral default finish.") }
+            if raw is NSNull { return CADPartColorChange(partID: id, color: nil) }
+            guard let components = raw as? [String: Any], Set(components.keys) == ["red", "green", "blue"] else {
+                throw LADError.message("Part colors require red, green and blue sRGB components between 0 and 1.")
+            }
+            func component(_ name: String) throws -> Double {
+                guard let number = components[name] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      number.doubleValue.isFinite, (0...1).contains(number.doubleValue) else {
+                    throw LADError.message("Part color components must be finite sRGB numbers between 0 and 1.")
+                }
+                return number.doubleValue
+            }
+            return CADPartColorChange(partID: id, color: PartColor(red: try component("red"),
+                green: try component("green"), blue: try component("blue")))
+        }
+    }
+
+    private static func completePartColors(in nodes: [PartNode], colors: [String: PartColor]) -> [String: PartColor] {
+        Dictionary(uniqueKeysWithValues: nodes.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map { node in
+            (node.id, colors[node.id] ?? node.color ?? PartColorState.defaultFinish)
+        })
+    }
+
+    private func colorInfo(_ node: PartNode, in artifact: Artifact) throws -> [String: Any] {
+        ["color": try json(artifact.partColors[node.id] ?? PartColorState.defaultFinish)]
+    }
+
+    private func colorPage(_ artifact: Artifact, offset: Int, limit: Int) throws -> [String: Any] {
+        var nodes: [(PartNode, String?)] = []
+        func append(_ children: [PartNode], parent: String?) {
+            for node in children { nodes.append((node, parent)); append(node.children ?? [], parent: node.id) }
+        }
+        append(artifact.parts, parent: nil)
+        let page = try nodes.dropFirst(offset).prefix(limit).map { node, parent -> [String: Any] in
+            var item: [String: Any] = ["partID": node.id, "name": node.name, "isGroup": node.isGroup,
+                                      "solidIndices": node.solidIndices]
+            if let parent { item["parentID"] = parent }
+            if !node.solidIndices.isEmpty { item.merge(try colorInfo(node, in: artifact)) { _, color in color } }
+            return item
+        }
+        return ["artifactID": artifact.id, "offset": offset, "total": nodes.count, "items": page,
+                "hasMore": offset + page.count < nodes.count, "staged": !artifact.colorChanges.isEmpty]
+    }
+
+    private func renderColors(for artifact: Artifact) -> [Int: PartColor] {
+        PartColorState.solidColors(in: artifact.parts, overrides: artifact.partColors)
     }
 
     private func artifact(_ arguments: [String: Any]) async throws -> Artifact {

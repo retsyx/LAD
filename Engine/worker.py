@@ -134,6 +134,28 @@ def validate_shape(shape, preview_stats=None):
     return shape
 
 
+def validate_part_color(color):
+    """Validate the opaque sRGB metadata shared by previews and saved parts."""
+    if (not isinstance(color, dict) or set(color) != {"red", "green", "blue"}
+            or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   or not 0 <= value <= 1 or not math.isfinite(value) for value in color.values())):
+        raise ModelError("Part colors must contain finite sRGB red, green and blue values between 0 and 1.")
+    return color
+
+
+def assembly_part_color(color):
+    if color is None:
+        return None
+    import cadquery as cq
+    if not isinstance(color, cq.Color):
+        raise ModelError("Assembly colors must be CadQuery Color values.")
+    # CadQuery returns Quantity_TOC_sRGB from toTuple, not OCCT's linear RGB.
+    red, green, blue, alpha = color.toTuple()
+    if not math.isfinite(alpha) or alpha != 1:
+        raise ModelError("LAD supports only opaque assembly colors; set alpha to 1.")
+    return validate_part_color({"red": red, "green": green, "blue": blue})
+
+
 def assembly_parts(assembly, shape):
     """Keep named assembly structure mapped to the exported solid ordering.
 
@@ -178,8 +200,9 @@ def assembly_parts(assembly, shape):
         generated_ids.add(candidate)
         return candidate
 
-    def visit(node, parent_location, path):
+    def visit(node, parent_location, path, parent_color=None):
         location = parent_location * node.loc
+        color = assembly_part_color(node.color) if node.color is not None else parent_color
         name = supplied_name(node)
         if node.metadata.get("lad_id") is not None:
             identity = node.metadata["lad_id"]
@@ -207,21 +230,27 @@ def assembly_parts(assembly, shape):
             # Imported compounds often represent a PCB or another assembly
             # without body names. Keep that logical folder while exposing
             # every contained solid for independent selection and visibility.
-            children.extend({"id": generated_id("body:" + json.dumps([identity, number], ensure_ascii=False, separators=(",", ":"))),
-                             "name": (name or "Body") if len(indices) == 1 else f"Part {number + 1}",
-                             "solidIndices": [index], "children": None}
-                            for number, index in enumerate(indices))
+            for number, index in enumerate(indices):
+                body = {"id": generated_id("body:" + json.dumps([identity, number], ensure_ascii=False, separators=(",", ":"))),
+                        "name": (name or "Body") if len(indices) == 1 else f"Part {number + 1}",
+                        "solidIndices": [index], "children": None}
+                if color is not None:
+                    body["color"] = color
+                children.append(body)
             indices = []
         for index, child in enumerate(node.children):
-            part = visit(child, location, path + [supplied_name(child) or f"@{index}"])
+            part = visit(child, location, path + [supplied_name(child) or f"@{index}"], color)
             if part is not None:
                 children.append(part)
         if not indices and not children:
             return None
         if not name:
             name = "Parts" if children else f"Part {indices[0] + 1}"
-        return {"id": identity, "name": name, "solidIndices": indices,
+        part = {"id": identity, "name": name, "solidIndices": indices,
                 "children": children if children or is_folder else None}
+        if indices and color is not None:
+            part["color"] = color
+        return part
 
     root = visit(assembly, cq.Location(), [])
     if claimed != set(range(len(solids))):
@@ -772,7 +801,7 @@ def validate_parts(parts, solid_count):
         part, depth = pending.pop()
         count += 1
         if (not isinstance(part, dict) or not {"id", "name", "solidIndices"} <= set(part)
-                or set(part) - {"id", "name", "solidIndices", "children"} or count > 8192 or depth > 32):
+                or set(part) - {"id", "name", "solidIndices", "children", "color"} or count > 8192 or depth > 32):
             raise ModelError("The saved parts hierarchy contains invalid items.")
         identity, name = part["id"], part["name"]
         if (not isinstance(identity, str) or not identity or len(identity.encode("utf-8")) > 1024
@@ -781,6 +810,8 @@ def validate_parts(parts, solid_count):
                 or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in name)):
             raise ModelError("The saved parts hierarchy contains invalid or duplicate identities.")
         identifiers.add(identity)
+        if part.get("color") is not None:
+            validate_part_color(part["color"])
         indices, children = part["solidIndices"], part.get("children")
         if (not isinstance(indices, list) or (children is not None and not isinstance(children, list))
                 or (children is None and not indices)):
