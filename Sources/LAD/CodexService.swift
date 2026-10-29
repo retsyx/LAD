@@ -190,6 +190,9 @@ final class CodexService {
                specification.script == current.script {
                 throw CodexError.unsupported("Source file references were provided, but Codex returned the existing design without importing its geometry. The current design has been preserved. Try describing the features you want translated, or request an approximation explicitly.")
             }
+            // Construction reuse skips the worker. Validate the complete final
+            // metadata here so every accepted revision can be saved.
+            try ProjectStore.validateModel(specification)
             validatedModel = specification
             validatedMesh = bridge.tools.validatedPreview(for: specification)
             partColorChanges = bridge.tools.partColorChanges(for: specification)

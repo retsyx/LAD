@@ -59,6 +59,7 @@ final class AppState: ObservableObject {
     @Published var viewportCommand: ViewportCommand?
     @Published var projectURL: URL?
     @Published var saveStatus: String?
+    @Published private(set) var saveConflict: ProjectSaveConflict?
     @Published private(set) var hasUnsavedChanges = false
     @Published var notice: String?
     @Published var selectedSolids: Set<Int> = [] {
@@ -114,6 +115,9 @@ final class AppState: ObservableObject {
     private var projectSessionID = UUID()
     private var projectID = UUID()
     private var autosavedProjectURL: URL?
+    private var projectFileOrigin: ProjectFileOrigin?
+    private var saveConflictPromptTask: Task<Void, Never>?
+    private var presentedSaveConflict: ProjectSaveConflict?
     private var autosaveSequence = 0
     private var preserveUnreadableSession = false
     private let autosaveStore: ProjectAutosaveStore
@@ -150,6 +154,7 @@ final class AppState: ObservableObject {
     }
     var canRenameProject: Bool { projectReady && !preserveUnreadableSession }
     var projectEditingID: UUID { projectSessionID }
+    var hasStartedProjectSession: Bool { loaded }
     var projectDocumentID: UUID { projectID }
     var partTree: [PartNode] {
         guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return [] }
@@ -360,6 +365,7 @@ final class AppState: ObservableObject {
 
     private func flushProject() async throws {
         guard projectReady, !preserveUnreadableSession else { return }
+        if let saveConflict { throw saveConflict }
         autosaveSequence += 1
         let sequence = autosaveSequence, sessionID = projectSessionID
         hasUnsavedChanges = true
@@ -379,7 +385,7 @@ final class AppState: ObservableObject {
             }
         } catch {
             if projectSessionID == sessionID, autosaveSequence == sequence {
-                saveStatus = "Not saved: \(error.localizedDescription)"
+                recordSaveFailure(error)
             }
             throw error
         }
@@ -415,6 +421,10 @@ final class AppState: ObservableObject {
         cancel()
         activityImages.reset()
         projectReady = false
+        saveConflict = nil
+        presentedSaveConflict = nil
+        saveConflictPromptTask?.cancel(); saveConflictPromptTask = nil
+        projectFileOrigin = nil
         projectSessionID = UUID()
         projectID = UUID()
         autosavedProjectURL = nil
@@ -1595,6 +1605,11 @@ final class AppState: ObservableObject {
         // The regular Save command flushes the managed iCloud project. Save As
         // still offers an explicit portable copy at a user-selected location.
         if !newLocation {
+            if saveConflict != nil {
+                presentedSaveConflict = nil
+                presentSaveConflict(in: viewportView?.window)
+                return
+            }
             autosave()
             return
         }
@@ -1794,6 +1809,10 @@ final class AppState: ObservableObject {
 
     private func restore(_ project: LADProject) {
         projectReady = false
+        saveConflict = nil
+        presentedSaveConflict = nil
+        saveConflictPromptTask?.cancel(); saveConflictPromptTask = nil
+        projectFileOrigin = project.fileOrigin
         hasUnsavedChanges = false
         activityImages.reset()
         resetQueueWork()
@@ -1836,6 +1855,7 @@ final class AppState: ObservableObject {
         guard projectReady, !preserveUnreadableSession else { return }
         hasUnsavedChanges = true
         autosaveSequence += 1
+        guard saveConflict == nil else { return }
         let snapshot = projectSnapshot(), sequence = autosaveSequence, sessionID = projectSessionID
         let documentID = projectID, name = autosaveTitle, preferredURL = autosavedProjectURL
         let preferExactName = pendingProjectRename
@@ -1854,8 +1874,81 @@ final class AppState: ObservableObject {
                 saveStatus = nil
             } catch {
                 guard projectSessionID == sessionID, autosaveSequence == sequence else { return }
-                saveStatus = "Not saved: \(error.localizedDescription)"
+                recordSaveFailure(error)
             }
+        }
+    }
+
+    private func recordSaveFailure(_ failure: Error) {
+        saveStatus = "Not saved: \(failure.localizedDescription)"
+        if let conflict = failure as? ProjectSaveConflict { saveConflict = conflict }
+    }
+
+    /// Shared document views coalesce onto one native conflict sheet.
+    func presentSaveConflict(in window: NSWindow?,
+        choose: @escaping @MainActor (ProjectSaveConflict, NSWindow) async -> ProjectSaveConflictPrompt.Choice = ProjectSaveConflictPrompt.choose) {
+        guard let window, let conflict = saveConflict, saveConflictPromptTask == nil,
+              presentedSaveConflict != conflict else { return }
+        presentedSaveConflict = conflict
+        let session = projectSessionID
+        saveConflictPromptTask = Task { [weak self] in
+            let choice = await choose(conflict, window)
+            guard let self, self.projectSessionID == session else { return }
+            self.saveConflictPromptTask = nil
+            do { try await self.resolveSaveConflict(choice) }
+            catch { self.recordSaveFailure(error) }
+        }
+    }
+
+    func retrySaveConflict(in window: NSWindow?) {
+        presentedSaveConflict = nil
+        presentSaveConflict(in: window)
+    }
+
+    func resolveSaveConflict(_ choice: ProjectSaveConflictPrompt.Choice) async throws {
+        guard let conflict = saveConflict, projectReady, !preserveUnreadableSession else { return }
+        if case .cancel = choice { return }
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
+        autosaveSequence += 1
+        let sequence = autosaveSequence, session = projectSessionID
+        var snapshot = projectSnapshot()
+        saveStatus = "Saving…"; hasUnsavedChanges = true
+        do {
+            switch choice {
+            case .cancel: return
+            case .overwrite:
+                let url = try await autosaveStore.write(project: snapshot, projectID: projectID, title: autosaveTitle,
+                    sequence: sequence, preferredURL: conflict.file.url, preferExactName: pendingProjectRename,
+                    resolving: conflict)
+                guard projectSessionID == session else { return }
+                autosavedProjectURL = url; projectURL = url
+                rememberAutosavedProject(url)
+                pendingProjectRename = false
+            case .saveAs(let target):
+                guard !conflict.file.matches(target) else {
+                    throw LADError.message("Choose a different filename to preserve the other design file.")
+                }
+                let name = try ProjectNaming.userName(target.deletingPathExtension().lastPathComponent)
+                let identity = UUID()
+                snapshot.projectID = identity
+                snapshot.projectName = name
+                snapshot.fileOrigin = nil
+                let origin = try await autosaveStore.writeCopy(snapshot, to: target,
+                    preserving: conflict.file.url, projectID: projectID)
+                guard projectSessionID == session else { return }
+                projectID = identity; projectName = name; projectFileOrigin = origin
+                autosavedProjectURL = isManagedProjectURL(target) ? target : nil
+                projectURL = target
+                pendingProjectRename = false
+                noteRecentProject(at: target)
+            }
+            saveConflict = nil
+            if autosaveSequence == sequence {
+                hasUnsavedChanges = false; saveStatus = nil
+            } else { autosave() }
+        } catch {
+            if projectSessionID == session { recordSaveFailure(error) }
+            throw error
         }
     }
 
@@ -1977,7 +2070,7 @@ final class AppState: ObservableObject {
                    draftPrompt: draftPrompt.isEmpty ? nil : draftPrompt,
                    draftAttachments: draftAttachments.isEmpty ? nil : draftAttachments,
                    queuePaused: queuedRequests.isEmpty ? nil : queuePaused,
-                   partsPaneFraction: partsPaneFraction)
+                   partsPaneFraction: partsPaneFraction, fileOrigin: projectFileOrigin)
     }
 }
 

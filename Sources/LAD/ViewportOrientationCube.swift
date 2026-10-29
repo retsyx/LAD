@@ -278,7 +278,7 @@ final class ViewportOrientationCube: NSView {
         if let applicationObserver { NotificationCenter.default.removeObserver(applicationObserver) }
     }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 92, height: 92) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 108, height: 108) }
     override var isOpaque: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 

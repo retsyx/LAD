@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Installs a drag destination above both the workspace and native title bar.
 /// The SwiftUI anchor itself always passes ordinary input through.
@@ -110,6 +111,21 @@ final class ProjectFileDropAnchor: NSView {
 }
 
 enum ProjectFileDrop {
+    static let textTypes: [NSPasteboard.PasteboardType] = [
+        NSPasteboard.PasteboardType(UTType.text.identifier), .string, .rtf, .rtfd, .html, .tabularText
+    ]
+
+    /// Finder URLs and image representations keep their existing routes even
+    /// when the pasteboard also contains a textual label or path.
+    static func isTextOnly(_ pasteboard: NSPasteboard) -> Bool {
+        guard !PromptAttachmentPasteboard.canRead(pasteboard) else { return false }
+        return pasteboard.pasteboardItems?.contains { item in
+            item.types.contains { type in
+                textTypes.contains(type) || UTType(type.rawValue)?.conforms(to: .text) == true
+            }
+        } ?? false
+    }
+
     /// Read URL references and filesystem metadata only, never file contents.
     /// Reject the whole drag rather than silently selecting one of many items.
     static func fileURL(from pasteboard: NSPasteboard) -> URL? {
@@ -136,7 +152,7 @@ final class ProjectFileDropView: NSView {
     init(onDrop: @escaping @MainActor (URL) -> Void) {
         self.onDrop = onDrop
         super.init(frame: .zero)
-        registerForDraggedTypes(PromptAttachmentPasteboard.draggedTypes)
+        registerForDraggedTypes(PromptAttachmentPasteboard.draggedTypes + ProjectFileDrop.textTypes)
         setAccessibilityElement(false)
     }
 
@@ -165,7 +181,7 @@ final class ProjectFileDropView: NSView {
         guard dragSequence == sender.draggingSequenceNumber, !performedDrop else { return false }
         if let promptDestination { return promptDestination.prepareForDragOperation(sender) }
         if handlesProject { return acceptedURL(sender) != nil }
-        return forwardedDestination?.prepareForDragOperation(sender) ?? false
+        return validForwardedDestination(sender)?.prepareForDragOperation(sender) ?? false
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
@@ -180,7 +196,7 @@ final class ProjectFileDropView: NSView {
             onDrop(url)
             return true
         }
-        performedDrop = forwardedDestination?.performDragOperation(sender) ?? false
+        performedDrop = validForwardedDestination(sender)?.performDragOperation(sender) ?? false
         return performedDrop
     }
 
@@ -241,12 +257,28 @@ final class ProjectFileDropView: NSView {
         guard let targetWindow = sender.draggingDestinationWindow ?? window,
               let root = targetWindow.contentView?.superview else { return nil }
         var candidate = root.hitTest(root.convert(sender.draggingLocation, from: nil))
+        let textOnly = ProjectFileDrop.isTextOnly(sender.draggingPasteboard)
         while let view = candidate {
+            if textOnly {
+                // Native text inputs retain their own insertion, selection,
+                // and undo behavior. Text over other controls is not a command.
+                if let editor = view as? NSTextView, editor.isEditable { return editor }
+                if let field = view as? NSTextField, field.isEditable, field.isEnabled { return field }
+                candidate = view.superview
+                continue
+            }
             if view !== self, !view.registeredDraggedTypes.isEmpty,
                sender.draggingPasteboard.availableType(from: view.registeredDraggedTypes) != nil { return view }
             candidate = view.superview
         }
         return nil
+    }
+
+    private func validForwardedDestination(_ sender: any NSDraggingInfo) -> NSView? {
+        guard let forwardedDestination else { return nil }
+        if ProjectFileDrop.isTextOnly(sender.draggingPasteboard),
+           underlyingDestination(sender) !== forwardedDestination { return nil }
+        return forwardedDestination
     }
 
     private func resetDrag() {

@@ -121,13 +121,26 @@ final class ProjectWindowCoordinator: ObservableObject {
         return true
     }
 
-    func register(_ session: ProjectWindowSession, id: UUID, sourceURL: URL?) {
+    /// Claim a document before starting its initial read. Restored windows can
+    /// register the same file before either read has completed.
+    /// Returns whether this window owns the document's initial start.
+    @discardableResult
+    func register(_ session: ProjectWindowSession, id: UUID, sourceURL: URL?) -> Bool {
         var aliases = Set<URL>()
+        var shouldStart = !hasWindow(for: session.state)
+        let source = sourceURL.map(Self.canonicalURL)
         if let retained = reopeningStates.removeValue(forKey: id) {
             session.state = retained
             aliases = adoptClosedState(retained)
+            shouldStart = false
+        } else if let source,
+                  let existingID = entryID(matching: source, excluding: id, includingUnstarted: true),
+                  let existing = entries[existingID] {
+            session.state = existing.state
+            aliases = existing.inheritedAliases
+            if existing.keepsSourceAlias, let alias = existing.sourceURL { aliases.insert(alias) }
+            shouldStart = false
         }
-        let source = sourceURL.map(Self.canonicalURL)
         session.sourceURL = source
         entries[id] = Entry(session: session, sourceURL: source,
                             keepsSourceAlias: source.map { !Self.isManagedURL($0) } ?? false,
@@ -139,9 +152,11 @@ final class ProjectWindowCoordinator: ObservableObject {
         } else {
             updateActiveStates()
         }
+        return shouldStart
     }
 
-    func register(_ state: AppState, id: UUID, sourceURL: URL?) {
+    @discardableResult
+    func register(_ state: AppState, id: UUID, sourceURL: URL?) -> Bool {
         register(ProjectWindowSession(state: state), id: id, sourceURL: sourceURL)
     }
 
@@ -439,8 +454,16 @@ final class ProjectWindowCoordinator: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func entryID(matching url: URL) -> UUID? {
-        focusOrder.reversed().first { id in entries[id].map { matches(url, entry: $0) } ?? false }
+    private func entryID(matching url: URL, excluding excludedID: UUID? = nil, includingUnstarted: Bool = false) -> UUID? {
+        focusOrder.reversed().first { id in
+            guard id != excludedID, let entry = entries[id] else { return false }
+            if matches(url, entry: entry) { return true }
+            // Registration precedes start(), so an initial file reservation
+            // must also cover the interval before isWorking becomes true.
+            // A failed read has started already and remains retryable.
+            return includingUnstarted && entry.sourceURL == url && entry.state.projectURL == nil &&
+                !entry.state.hasStartedProjectSession
+        }
     }
 
     private func matches(_ url: URL, entry: Entry) -> Bool {

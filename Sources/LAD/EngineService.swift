@@ -15,8 +15,7 @@ enum EngineExportError: LocalizedError {
 final class EngineService {
     private var job: EngineProcessJob?
     private var generation = UUID()
-    private var nativeArtifacts: Set<String> = []
-    private var stepArtifacts: Set<String> = []
+    private let temporaryDirectory: URL
     private struct STEPExportColor: Codable, Hashable, Sendable {
         var solidIndex: Int
         var color: PartColor
@@ -29,6 +28,12 @@ final class EngineService {
     private var exportedSTEP: [STEPExportKey: Data] = [:]
     private var exportedSTEPOrder: [STEPExportKey] = []
     private var exportedSTEPBytes = 0
+
+    init(temporaryDirectory: URL = FileManager.default.temporaryDirectory) {
+        self.temporaryDirectory = temporaryDirectory
+    }
+
+    deinit { job?.cancel() }
 
     static var defaultPython: String {
         let configured = ResourcePaths.root.appendingPathComponent("python-runtime.txt")
@@ -87,7 +92,6 @@ final class EngineService {
             try JSONSerialization.data(withJSONObject: ["operation": "runtime"])
                 .write(to: folder.appendingPathComponent("request.json"), options: .atomic)
         }
-        defer { try? FileManager.default.removeItem(at: output.folder) }
         let data = try await Task.detached(priority: .userInitiated) {
             try EngineArtifact.read(output.folder.appendingPathComponent("result.json"), in: output.folder, maximumBytes: 65_536)
         }.value
@@ -114,6 +118,7 @@ final class EngineService {
     /// Repeated exports reuse bytes only for the same geometry, subset and RGB.
     func exportSTEP(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, solidColors: [Int: PartColor] = [:],
                     python: String, threads: Int) async throws -> Data {
+        defer { withExtendedLifetime(preview.buildArtifacts) {} }
         try Task.checkCancellation()
         if let solidIndices {
             guard !solidIndices.isEmpty, solidIndices.allSatisfy({ $0 >= 0 && $0 < preview.solids }) else {
@@ -128,7 +133,8 @@ final class EngineService {
         let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
         // Raw bytes are valid only when the caller requests no display colors.
         // Any supplied current RGB must be written from native geometry.
-        if selection == nil, colors.isEmpty, stepArtifacts.contains(preview.stepPath) {
+        if selection == nil, colors.isEmpty, let artifacts = preview.buildArtifacts, artifacts.containsSTEP,
+           preview.stepPath == artifacts.folder.appendingPathComponent("model.step").path {
             let source = URL(fileURLWithPath: preview.stepPath)
             return try await Task.detached(priority: .userInitiated) {
                 let data = try EngineArtifact.read(source, in: source.deletingLastPathComponent(), maximumBytes: ProjectStore.maximumSTEPBytes)
@@ -136,7 +142,8 @@ final class EngineService {
                 return data
             }.value
         }
-        if let path = preview.brepPath, nativeArtifacts.contains(path) {
+        if let path = preview.brepPath, let artifacts = preview.buildArtifacts,
+           path == artifacts.folder.appendingPathComponent("model.brep").path {
             let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors)
             if let cached = exportedSTEP[cacheKey] {
                 exportedSTEPOrder.removeAll { $0 == cacheKey }
@@ -151,7 +158,6 @@ final class EngineService {
                 if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
                 try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
             }
-            defer { try? FileManager.default.removeItem(at: output.folder) }
             let data = try await Task.detached(priority: .userInitiated) {
                 let data = try EngineArtifact.read(output.folder.appendingPathComponent("model.step"), in: output.folder,
                                                    maximumBytes: ProjectStore.maximumSTEPBytes)
@@ -195,7 +201,6 @@ final class EngineService {
                                           "solidIndices": selectedIndices]
             try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
         }
-        defer { try? FileManager.default.removeItem(at: output.folder) }
         let exact = try await Task.detached(priority: .userInitiated) {
             let data = try EngineArtifact.read(output.folder.appendingPathComponent("result.json"), in: output.folder, maximumBytes: 1_000_000)
             let report = try JSONDecoder().decode(CADMeasurementReport.self, from: data)
@@ -213,7 +218,9 @@ final class EngineService {
     }
 
     private func nativeBytes(_ preview: PreviewMesh) async throws -> Data {
-        guard let path = preview.brepPath, nativeArtifacts.contains(path) else { throw EngineExportError.nativeArtifactUnavailable }
+        defer { withExtendedLifetime(preview.buildArtifacts) {} }
+        guard let path = preview.brepPath, let artifacts = preview.buildArtifacts,
+              path == artifacts.folder.appendingPathComponent("model.brep").path else { throw EngineExportError.nativeArtifactUnavailable }
         let source = URL(fileURLWithPath: path)
         do {
             return try await Task.detached(priority: .userInitiated) {
@@ -232,7 +239,11 @@ final class EngineService {
         }
     }
 
-    private struct RunResult: Sendable { var folder: URL; var token: UUID }
+    private struct RunResult: Sendable {
+        var artifacts: EngineBuildArtifacts
+        var token: UUID
+        var folder: URL { artifacts.folder }
+    }
 
     private func run(python: String, threads: Int, scriptMode: Bool, deferSTEP: Bool = false,
                      action: String = "build this design",
@@ -240,11 +251,9 @@ final class EngineService {
         cancel()
         let token = UUID()
         generation = token
-        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-build-\(token.uuidString)")
-        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        // realpath must run after creation: nonexistent /var/folders children
-        // otherwise keep the /var alias, which Seatbelt compares as /private/var.
-        let folder = try EngineArtifact.canonicalDirectory(scratch)
+        let artifacts = try EngineBuildArtifacts.create(in: temporaryDirectory, token: token, containsSTEP: !deferSTEP)
+        let folder = artifacts.folder
+        defer { withExtendedLifetime(artifacts) {} }
         let request = folder.appendingPathComponent("request.json")
         try await Task.detached(priority: .userInitiated) { try prepare(folder) }.value
         guard token == generation, !Task.isCancelled else { throw CancellationError() }
@@ -296,8 +305,9 @@ final class EngineService {
             "TMPDIR": temporary.path, "LAD_MODEL_OUTPUT": folder.path
         ]
         if interpreter != actualRuntime { environment["__PYVENV_LAUNCHER__"] = runtime.path }
-        let task = EngineProcessJob(executable: executable, arguments: launchArguments, directory: folder, environment: environment)
+        let task = try EngineProcessJob(executable: executable, arguments: launchArguments, artifacts: artifacts, environment: environment)
         job = task
+        defer { if job === task { job = nil } }
         let status = try await withTaskCancellationHandler {
             try await task.run()
         } onCancel: {
@@ -316,13 +326,13 @@ final class EngineService {
             }
             throw LADError.message("The CAD engine could not \(action).\n\n\(log.suffix(3_000))")
         }
-        return RunResult(folder: folder, token: token)
+        return RunResult(artifacts: artifacts, token: token)
     }
 
     private func readPreview(_ output: RunResult, deferSTEP: Bool) async throws -> PreviewMesh {
         let folder = output.folder
         let resultURL = folder.appendingPathComponent("result.json")
-        let mesh = try await Task.detached(priority: .userInitiated) {
+        var mesh = try await Task.detached(priority: .userInitiated) {
             let data = try EngineArtifact.read(resultURL, in: folder, maximumBytes: ProjectStore.maximumFileBytes)
             let result = try JSONDecoder().decode(PreviewMesh.self, from: data)
             guard result.normals != nil else {
@@ -358,8 +368,7 @@ final class EngineService {
             return result
         }.value
         guard output.token == generation, !Task.isCancelled else { throw CancellationError() }
-        if let path = mesh.brepPath { nativeArtifacts.insert(path) }
-        if !deferSTEP { stepArtifacts.insert(mesh.stepPath) }
+        mesh.buildArtifacts = output.artifacts
         return mesh
     }
 
@@ -427,20 +436,25 @@ private final class EngineProcessJob: @unchecked Sendable {
     private var launched = false
     private var timedOut = false
     private let directory: URL
+    private let artifacts: EngineBuildArtifacts
+    private let workerInput: FileHandle
 
-    init(executable: URL, arguments: [String], directory: URL, environment: [String: String]) {
-        self.directory = directory
+    init(executable: URL, arguments: [String], artifacts: EngineBuildArtifacts, environment: [String: String]) throws {
+        self.artifacts = artifacts
+        directory = artifacts.folder
+        workerInput = try artifacts.workerInput()
         process.executableURL = executable
         process.arguments = arguments
-        process.currentDirectoryURL = directory
+        process.currentDirectoryURL = artifacts.folder
         process.environment = environment
-        process.standardInput = FileHandle.nullDevice
+        process.standardInput = workerInput
         process.standardOutput = FileHandle.nullDevice
     }
 
     func run() async throws -> Int32 {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async { [self] in
+                defer { try? workerInput.close() }
                 let log = directory.appendingPathComponent("stderr.log")
                 FileManager.default.createFile(atPath: log.path, contents: nil)
                 do {

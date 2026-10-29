@@ -358,10 +358,6 @@ final class CADSceneView: SCNView {
         let visibilityChanged = self.hiddenSolids != hiddenSolids
         let modeChanged = self.mode != mode
         rig.usesOrthographicProjection = orthographic
-        if projectionChanged && orthographic {
-            rig.yaw = -.pi / 4
-            rig.elevation = atan(1 / sqrt(2))
-        }
         // Selection and visibility belong to the project state, including when
         // a sidebar selection arrives before a newly installed mesh.
         self.mode = mode

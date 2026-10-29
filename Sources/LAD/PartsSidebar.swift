@@ -1,10 +1,8 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct PartsSidebar: View {
     @ObservedObject var state: AppState
-    @State private var rootDropTargeted = false
     @State private var folderParentID: String?
     @State private var editedName = ""
     @State private var showingNameEditor = false
@@ -30,11 +28,7 @@ struct PartsSidebar: View {
                 .help("New folder").accessibilityLabel("New folder")
             }
             .padding(.horizontal, 15).padding(.vertical, 19)
-            .background(rootDropTargeted ? Palette.accent.opacity(0.13) : .clear)
             .contentShape(Rectangle())
-            .onDrop(of: [UTType.text], isTargeted: $rootDropTargeted) { providers in
-                receivePartDrop(providers, state: state, parentID: nil)
-            }
             .contextMenu {
                 PartActionsMenu(state: state, onNewFolder: newFolder, onRename: rename)
             }
@@ -109,7 +103,6 @@ private struct PartTreeItem: View {
     let onFinishRename: (Bool) -> Void
     let onNewFolder: (String?) -> Void
     let onRename: (PartNode) -> Void
-    @State private var dropTargeted = false
     @State private var showingColorPicker = false
     @State private var colorRevisionID: UUID?
     @State private var colorProjectID: UUID?
@@ -168,30 +161,6 @@ private struct PartTreeItem: View {
     }
 
     private var row: some View {
-        Group {
-            if isRenaming {
-                rowContent
-            } else {
-                rowContent.onDrag {
-                    onFinishRename(false)
-                    let ids: Set<String>
-                    if state.selectedPartNodeIDs.contains(node.id) {
-                        ids = state.selectedPartNodeIDs
-                    } else {
-                        state.selectPartNodes([node.id])
-                        ids = [node.id]
-                    }
-                    return NSItemProvider(object: ids.sorted().joined(separator: "\n") as NSString)
-                }
-            }
-        }
-        .onDrop(of: [UTType.text], isTargeted: $dropTargeted) { providers in
-            guard isGroup else { return false }
-            return receivePartDrop(providers, state: state, parentID: node.id)
-        }
-    }
-
-    private var rowContent: some View {
         HStack(spacing: 2) {
             if isRenaming {
                 HStack(spacing: 7) {
@@ -261,7 +230,6 @@ private struct PartTreeItem: View {
         }
         .background(selection.isSelected ? Palette.accent.opacity(selection.isFull ? 0.13 : 0.07) : .clear,
                     in: RoundedRectangle(cornerRadius: 5))
-        .overlay(RoundedRectangle(cornerRadius: 5).stroke(dropTargeted && isGroup ? Palette.accent : .clear))
         .popover(isPresented: $showingColorPicker, arrowEdge: .trailing) { colorPicker }
     }
 
@@ -391,18 +359,4 @@ private struct PartActionsMenu: View {
 private struct PartFolderDestination: Identifiable {
     let id: String
     let name: String
-}
-
-private func receivePartDrop(_ providers: [NSItemProvider], state: AppState, parentID: String?) -> Bool {
-    // Finder file URLs can also advertise a text representation. They belong
-    // to file-drop handling, never to the internal part-ID reorder operation.
-    guard !providers.contains(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else { return false }
-    guard let provider = providers.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else { return false }
-    provider.loadObject(ofClass: NSString.self) { object, _ in
-        guard let value = object as? String else { return }
-        let ids = Set(value.split(separator: "\n").map(String.init))
-        guard !ids.isEmpty else { return }
-        DispatchQueue.main.async { state.movePartNodes(ids, toParent: parentID) }
-    }
-    return true
 }

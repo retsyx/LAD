@@ -78,7 +78,10 @@ struct WorkspaceView: View {
             statusBar
         }
         .background(Palette.background)
-        .background(ProjectActivityWindowAnchor { viewportReference.window = $0 })
+        .background(ProjectActivityWindowAnchor {
+            viewportReference.window = $0
+            state.presentSaveConflict(in: $0)
+        })
         .toolbarBackground(Palette.panel, for: .windowToolbar)
         .onChange(of: state.projectEditingID) { _, _ in
             cancelProjectRename()
@@ -93,6 +96,9 @@ struct WorkspaceView: View {
         .onChange(of: state.editingQueuedRequestID) { _, _ in promptFocused = true }
         .onChange(of: state.awaitingResponse, initial: true) { _, awaiting in
             if awaiting { promptFocused = true }
+        }
+        .onChange(of: state.saveConflict) { _, conflict in
+            if conflict != nil { state.presentSaveConflict(in: viewportReference.window) }
         }
         .sheet(item: $previewImageAttachment) { attachment in PromptImagePreview(attachment: attachment) }
     }
@@ -110,7 +116,14 @@ struct WorkspaceView: View {
                 // changing save state must not resize the header or viewport.
                 .overlay(alignment: .bottomLeading) {
                     if let message = projectRenameError ?? state.saveStatus {
-                        Text(message).font(.system(size: 10)).foregroundStyle(Palette.accent)
+                        Group {
+                            if projectRenameError == nil, state.saveConflict != nil {
+                                Button { state.retrySaveConflict(in: viewportReference.window) } label: { Text(message).underline() }
+                                    .buttonStyle(.plain)
+                                    .accessibilityHint("Choose how to save the conflicting design")
+                            } else { Text(message) }
+                        }
+                            .font(.system(size: 10)).foregroundStyle(Palette.accent)
                             .lineLimit(1).truncationMode(.tail)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .offset(y: 14)
@@ -223,16 +236,15 @@ struct WorkspaceView: View {
                         })
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
-                    Spacer()
-                    VStack(alignment: .trailing, spacing: 8) {
-                        HStack(spacing: 2) {
-                            viewportButton("arrow.up.left.and.arrow.down.right", "Fit design", .fit)
-                            Rectangle().fill(Palette.line).frame(width: 1, height: 18).padding(.horizontal, 5)
-                            Button { state.showGrid.toggle() } label: { Image(systemName: "grid").frame(width: 28, height: 28).foregroundStyle(state.showGrid ? Palette.accent : Palette.muted) }.help("Toggle grid")
-                                .accessibilityValue(state.showGrid ? "On" : "Off")
-                        }.buttonStyle(.plain).padding(5).background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
-                        ViewportOrientationCubeControl(reference: viewportReference).frame(width: 92, height: 92)
+                    Button { state.showGrid.toggle() } label: {
+                        Image(systemName: "grid").frame(width: 28, height: 28)
+                            .foregroundStyle(state.showGrid ? Palette.accent : Palette.muted)
                     }
+                    .buttonStyle(.plain).padding(5)
+                    .background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
+                    .help("Toggle grid").accessibilityValue(state.showGrid ? "On" : "Off")
+                    Spacer()
+                    ViewportOrientationCubeControl(reference: viewportReference).frame(width: 108, height: 108)
                 }.padding(22)
                 Spacer()
                 HStack(spacing: 12) {
@@ -262,10 +274,6 @@ struct WorkspaceView: View {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
             }
         }.background(Palette.background)
-    }
-
-    private func viewportButton(_ icon: String, _ help: String, _ action: ViewportCommand.Action) -> some View {
-        Button { state.viewportCommand = ViewportCommand(action) } label: { Image(systemName: icon).frame(width: 28, height: 28) }.help(help)
     }
 
     private var chat: some View {

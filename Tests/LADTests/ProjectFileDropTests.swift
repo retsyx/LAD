@@ -4,6 +4,109 @@ import XCTest
 
 final class ProjectFileDropTests: XCTestCase {
     @MainActor
+    func testTextDropsAreRejectedOverNonTextSurfacesAndNeverForwardedAsCommands() throws {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let content = try XCTUnwrap(window.contentView)
+        let nonText = FileDropDestinationProbe(frame: NSRect(x: 20, y: 30, width: 200, height: 120))
+        nonText.registerForDraggedTypes([.string, .rtf])
+        content.addSubview(nonText)
+        var opened: [URL] = []
+        let anchor = ProjectFileDropAnchor(onDrop: { opened.append($0) })
+        content.addSubview(anchor)
+        defer { anchor.disconnect() }
+        let surface = try XCTUnwrap(anchor.contentDropSurface)
+        XCTAssertTrue(surface.registeredDraggedTypes.contains(.string))
+        XCTAssertTrue(surface.registeredDraggedTypes.contains(.rtf))
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let sender = FileDropDraggingInfo(pasteboard: board)
+        sender.draggingDestinationWindow = window
+        for type in [NSPasteboard.PasteboardType.string, .rtf] {
+            board.clearContents()
+            XCTAssertTrue(board.setData(Data("body".utf8), forType: type))
+            for mask: NSDragOperation in [.copy, .move, []] {
+                sender.draggingSourceOperationMask = mask
+                for point in [NSPoint(x: 100, y: 80), NSPoint(x: 350, y: 220)] {
+                    sender.draggingSequenceNumber += 1
+                    sender.draggingLocation = point
+                    XCTAssertEqual(surface.draggingEntered(sender), [])
+                    XCTAssertEqual(surface.draggingUpdated(sender), [])
+                    XCTAssertFalse(surface.prepareForDragOperation(sender))
+                    XCTAssertFalse(surface.performDragOperation(sender))
+                    surface.draggingEnded(sender)
+                }
+            }
+        }
+        XCTAssertTrue(nonText.events.isEmpty, "Text must never reach a non-text control's drop handler.")
+        XCTAssertTrue(opened.isEmpty)
+    }
+
+    @MainActor
+    func testNativeEditableTextViewsAndRenameFieldEditorsKeepTextDropInsertion() throws {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let content = try XCTUnwrap(window.contentView)
+        let rename = NSTextField(string: "Design name")
+        rename.frame = NSRect(x: 20, y: 330, width: 250, height: 24)
+        content.addSubview(rename)
+        let notes = NSTextView(frame: NSRect(x: 20, y: 120, width: 250, height: 150))
+        notes.isRichText = false
+        notes.string = "Notes"
+        content.addSubview(notes)
+        let chat = NSTextView(frame: NSRect(x: 310, y: 120, width: 250, height: 150))
+        chat.isRichText = false
+        chat.string = "Prompt"
+        content.addSubview(chat)
+        let region = PromptFilePathDropView(frame: NSRect(x: 300, y: 100, width: 280, height: 190))
+        region.readText = { chat.string }
+        region.writeText = { chat.string = $0 }
+        content.addSubview(region)
+        defer { region.disconnect() }
+        var opened: [URL] = []
+        let anchor = ProjectFileDropAnchor(onDrop: { opened.append($0) })
+        content.addSubview(anchor)
+        defer { anchor.disconnect() }
+        let surface = try XCTUnwrap(anchor.contentDropSurface)
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        XCTAssertTrue(board.writeObjects([" dropped text " as NSString]))
+        let sender = FileDropDraggingInfo(pasteboard: board)
+        sender.draggingDestinationWindow = window
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(window.makeFirstResponder(rename))
+        let renameEditor = try XCTUnwrap(rename.currentEditor() as? NSTextView)
+
+        for editor in [renameEditor, notes, chat] {
+            sender.draggingSequenceNumber += 1
+            sender.draggingLocation = editor.convert(NSPoint(x: 10, y: 10), to: nil)
+            XCTAssertFalse(surface.draggingEntered(sender).isEmpty)
+            XCTAssertFalse(surface.draggingUpdated(sender).isEmpty)
+            XCTAssertTrue(surface.prepareForDragOperation(sender))
+            XCTAssertTrue(surface.performDragOperation(sender))
+            surface.draggingEnded(sender)
+            XCTAssertTrue(editor.string.contains("dropped text"), "Native text insertion must remain available in rename, notes, and chat inputs.")
+        }
+        XCTAssertTrue(opened.isEmpty)
+
+        sender.draggingSequenceNumber += 1
+        sender.draggingLocation = notes.convert(NSPoint(x: 10, y: 10), to: nil)
+        XCTAssertFalse(surface.draggingEntered(sender).isEmpty)
+        // Prepare/perform can arrive without a final location-update callback.
+        // Leaving an editor must not retain its earlier accepted destination.
+        sender.draggingLocation = NSPoint(x: 450, y: 30)
+        XCTAssertFalse(surface.prepareForDragOperation(sender))
+        XCTAssertFalse(surface.performDragOperation(sender))
+        surface.draggingEnded(sender)
+    }
+
+    @MainActor
     func testWindowDropSurfaceForwardsRawImageToComposerOnceWithoutOpeningADesign() throws {
         _ = NSApplication.shared
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
@@ -152,7 +255,7 @@ final class ProjectFileDropTests: XCTestCase {
         XCTAssertEqual(view.draggingUpdated(sender), [])
         XCTAssertFalse(view.prepareForDragOperation(sender))
         XCTAssertFalse(view.performDragOperation(sender))
-        XCTAssertNil(view.hitTest(.zero), "Internal hierarchy drags must reach the parts sidebar")
+        XCTAssertNil(view.hitTest(.zero), "Rejected text drags must not intercept ordinary mouse input")
     }
 
     @MainActor
@@ -464,7 +567,15 @@ private final class FileDropDraggingInfo: NSObject, NSDraggingInfo {
     func resetSpringLoading() {}
     func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions, for view: NSView?, classes classArray: [AnyClass],
                                 searchOptions: [NSPasteboard.ReadingOptionKey: Any],
-                                using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+                                using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {
+        let objects = draggingPasteboard.readObjects(forClasses: classArray, options: searchOptions) ?? []
+        for (index, object) in objects.enumerated() {
+            guard let writer = object as? any NSPasteboardWriting else { continue }
+            var stop: ObjCBool = false
+            block(NSDraggingItem(pasteboardWriter: writer), index, &stop)
+            if stop.boolValue { break }
+        }
+    }
 }
 
 @MainActor

@@ -28,8 +28,8 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         XCTAssertEqual(exported.count, 2)
         try assertPart(at: [1, 1.5, 2], volume: 24, bounds: [0, 0, 0, 2, 3, 4], color: red, in: exported)
         try assertPart(at: [22.5, 8, 10.5], volume: 30, bounds: [20, 7, 9, 25, 9, 12], color: green, in: exported)
-        XCTAssertNotEqual(fixture.state.mesh?.brepPath, fixture.preview.brepPath,
-                          "The AppState engine must replay an unregistered session preview before exporting.")
+        XCTAssertEqual(fixture.state.mesh?.brepPath, fixture.preview.brepPath,
+                       "A retained host-owned preview can be exported by another engine without replaying its program.")
 
         fixture.state.setPartColor(blue, for: "first")
         let recolored = fixture.directory.appendingPathComponent("recolored.step")

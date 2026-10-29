@@ -48,9 +48,11 @@ private struct ProjectWindowRoot: View {
                 started = true
                 let source = storedFilePath.isEmpty ? request?.fileURL : URL(fileURLWithPath: storedFilePath)
                 let restoreRecent = source == nil && request == nil && coordinator.claimInitialRestore()
-                coordinator.register(session, id: windowID, sourceURL: source ?? (restoreRecent ? AppState.recentProjectURL : nil))
+                let shouldStart = coordinator.register(session, id: windowID, sourceURL: source ?? (restoreRecent ? AppState.recentProjectURL : nil))
                 configureOpenHandler()
-                state.start(restoringRecent: restoreRecent, opening: source, restoringProjectID: UUID(uuidString: storedDocumentID))
+                if shouldStart {
+                    state.start(restoringRecent: restoreRecent, opening: source, restoringProjectID: UUID(uuidString: storedDocumentID))
+                }
             }
             .onChange(of: state.projectURL) { _, _ in
                 persistWindowProject()

@@ -23,6 +23,13 @@ enum ProjectStore {
     }
 
     static func read(from url: URL) throws -> LADProject {
+        let data = try readArchive(from: url)
+        var project = try decode(data)
+        project.fileOrigin = ProjectFileOrigin(url: url, data: data)
+        return project
+    }
+
+    static func readArchive(from url: URL) throws -> Data {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         if let size = attributes[.size] as? NSNumber, size.uint64Value > UInt64(maximumFileBytes) {
             throw invalid("File exceeds the 256 MB design limit.")
@@ -36,7 +43,7 @@ enum ProjectStore {
             data.append(chunk)
             guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 256 MB design limit.") }
         }
-        return try decode(data)
+        return data
     }
 
     static func write(_ project: LADProject, to url: URL) throws {
@@ -278,7 +285,7 @@ enum ProjectStore {
         }
     }
 
-    private static func validateModel(_ model: ModelSpec) throws {
+    static func validateModel(_ model: ModelSpec) throws {
         if let ids = model.reorganizePartIDs {
             guard ids.count <= 8_192, ids.allSatisfy(validPartID) else { throw invalid("The design contains invalid parts layout changes.") }
         }

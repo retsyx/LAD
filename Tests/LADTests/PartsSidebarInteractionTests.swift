@@ -64,6 +64,74 @@ final class PartsSidebarInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testNativeTextDropsMatchingPartIDsCannotReorganizeTheSidebar() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        fixture.state.selectPartNodes(["lid"])
+        var opened: [URL] = []
+        let window = makeWindow(state: fixture.state, onProjectDrop: { opened.append($0) })
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+        let rows = try await rowFrames(in: host)
+        let folderFrame = try XCTUnwrap(rows["case"])
+        let anchor = try XCTUnwrap(descendants(host).compactMap { $0 as? ProjectFileDropAnchor }.first)
+        let surface = try XCTUnwrap(anchor.contentDropSurface)
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let sender = PartsTextDraggingInfo(pasteboard: board)
+        sender.draggingDestinationWindow = window
+
+        let originalTree = fixture.state.partTree
+        let originalModel = fixture.state.current
+        let originalRevisionIDs = fixture.state.revisions.map(\.id)
+        let originalRevisionID = fixture.state.selectedRevisionID
+        let originalSolids = fixture.state.selectedSolids
+        let originalNodeIDs = fixture.state.selectedPartNodeIDs
+        let originalFeatures = fixture.state.selectedFeatures
+        let originalError = fixture.state.error
+        let headerPoint = NSPoint(x: host.bounds.midX,
+                                  y: host.isFlipped ? 24 : host.bounds.height - 24)
+        let folderPoint = NSPoint(x: folderFrame.midX, y: folderFrame.midY)
+
+        // A generic text handler must not interpret these real stable IDs
+        // as a request to move local parts, regardless of the drag's origin.
+        for (text, point) in [("base", headerPoint), ("board", folderPoint)] {
+            board.clearContents()
+            XCTAssertTrue(board.writeObjects([text as NSString]))
+            XCTAssertTrue(board.setString(text, forType: NSPasteboard.PasteboardType("public.text")))
+            XCTAssertTrue(board.setData(Data(text.utf8), forType: NSPasteboard.PasteboardType("public.data")))
+            // SwiftUI can install native drop destinations outside the normal
+            // mouse hit ancestry. Reject text there as well as at the overlay.
+            let textDestinations = descendants(host).filter { view in
+                !(view is ProjectFileDropView) && !view.isHiddenOrHasHiddenAncestor &&
+                    host.convert(view.bounds, from: view).contains(point) &&
+                    board.availableType(from: view.registeredDraggedTypes) != nil
+            }
+            XCTAssertTrue(textDestinations.isEmpty, "Parts must not register a text drop destination: \(text)")
+            sender.draggingSequenceNumber += 1
+            sender.draggingLocation = host.convert(point, to: nil)
+            XCTAssertEqual(surface.draggingEntered(sender), [], text)
+            XCTAssertEqual(surface.draggingUpdated(sender), [], text)
+            XCTAssertFalse(surface.prepareForDragOperation(sender), text)
+            XCTAssertFalse(surface.performDragOperation(sender), text)
+            surface.draggingEnded(sender)
+            // A text provider can deliver asynchronously after native drop
+            // callbacks return. Give it time to expose an accidental edit.
+            try await Task.sleep(for: .milliseconds(100))
+            host.layoutSubtreeIfNeeded()
+            XCTAssertEqual(fixture.state.partTree, originalTree, text)
+            XCTAssertEqual(fixture.state.current, originalModel, text)
+            XCTAssertEqual(fixture.state.revisions.map(\.id), originalRevisionIDs, text)
+            XCTAssertEqual(fixture.state.selectedRevisionID, originalRevisionID, text)
+            XCTAssertEqual(fixture.state.selectedSolids, originalSolids, text)
+            XCTAssertEqual(fixture.state.selectedPartNodeIDs, originalNodeIDs, text)
+            XCTAssertEqual(fixture.state.selectedFeatures, originalFeatures, text)
+            XCTAssertEqual(fixture.state.error, originalError, text)
+            XCTAssertTrue(opened.isEmpty, "Text drops must not open a design.")
+        }
+    }
+
+    @MainActor
     private func rowFrames(in host: NSView) async throws -> [String: NSRect] {
         let deadline = ContinuousClock.now + .seconds(5)
         while ContinuousClock.now < deadline {
@@ -84,8 +152,8 @@ final class PartsSidebarInteractionTests: XCTestCase {
                         rows[row].append(frame)
                     } else { rows.append([frame]) }
                 }
-                // A row's drop destination also spans its visibility button;
-                // the narrower rendered control is the name/select button.
+                // The narrower rendered control is the name/select button;
+                // a surrounding row can span its visibility button as well.
                 let buttons = rows.compactMap { $0.min { $0.width < $1.width } }.sorted {
                     host.isFlipped ? $0.midY < $1.midY : $0.midY > $1.midY
                 }
@@ -149,13 +217,15 @@ final class PartsSidebarInteractionTests: XCTestCase {
     private func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
 
     @MainActor
-    private func makeWindow(state: AppState) -> NSWindow {
+    private func makeWindow(state: AppState, onProjectDrop: (@MainActor (URL) -> Void)? = nil) -> NSWindow {
         let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 340, height: 320),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "LAD Parts interaction test"
         window.isReleasedWhenClosed = false
         window.appearance = NSAppearance(named: .darkAqua)
-        let host = NSHostingView(rootView: PartsSidebar(state: state))
+        let host = NSHostingView(rootView: PartsSidebar(state: state).overlay {
+            if let onProjectDrop { ProjectFileDropTarget(onDrop: onProjectDrop) }
+        })
         host.sizingOptions = []
         window.contentView = host
         NSApplication.shared.activate(ignoringOtherApps: true)
@@ -209,6 +279,38 @@ final class PartsSidebarInteractionTests: XCTestCase {
             state.cancel()
             NSApplication.shared.setActivationPolicy(previousPolicy)
             try? FileManager.default.removeItem(at: directory)
+        }
+    }
+}
+
+@MainActor
+private final class PartsTextDraggingInfo: NSObject, NSDraggingInfo {
+    var draggingDestinationWindow: NSWindow?
+    var draggingSourceOperationMask: NSDragOperation = [.copy, .move]
+    var draggingLocation: NSPoint = .zero
+    var draggedImageLocation: NSPoint = .zero
+    let draggedImage: NSImage? = nil
+    let draggingPasteboard: NSPasteboard
+    let draggingSource: Any? = nil
+    var draggingSequenceNumber = 1
+    var draggingFormation: NSDraggingFormation = .default
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 1
+    let springLoadingHighlight: NSSpringLoadingHighlight = .none
+
+    init(pasteboard: NSPasteboard) { draggingPasteboard = pasteboard }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    nonisolated override func namesOfPromisedFilesDropped(atDestination dropDestination: URL) -> [String]? { nil }
+    func resetSpringLoading() {}
+    func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions, for view: NSView?, classes classArray: [AnyClass],
+                                searchOptions: [NSPasteboard.ReadingOptionKey: Any],
+                                using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {
+        let objects = draggingPasteboard.readObjects(forClasses: classArray, options: searchOptions) ?? []
+        for (index, object) in objects.enumerated() {
+            guard let writer = object as? any NSPasteboardWriting else { continue }
+            var stop: ObjCBool = false
+            block(NSDraggingItem(pasteboardWriter: writer), index, &stop)
+            if stop.boolValue { break }
         }
     }
 }

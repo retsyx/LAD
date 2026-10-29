@@ -108,6 +108,15 @@ struct PreviewMesh: Codable, Sendable {
     /// previews may omit these when no native CAD surface is available.
     var normals: [[Double]]? = nil
 
+    /// Keeps private native files alive across copies and history navigation.
+    /// Decoding derived worker JSON never grants ownership of arbitrary paths.
+    var buildArtifacts: EngineBuildArtifacts? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case vertices, triangles, edges, bounds, volume, area, solids, faces, buildSeconds, threads, stepPath
+        case triangleSolids, edgeSolids, parts, brepPath, runtime, topology, triangleFaces, edgeFeatures, normals
+    }
+
     var hasValidNormals: Bool {
         guard let normals, normals.count == vertices.count else { return false }
         return normals.allSatisfy { normal in
@@ -221,6 +230,14 @@ struct LADProject: Codable, Sendable {
     var queuePaused: Bool? = nil
     /// Preferred share of the sidebar height reserved for Parts, local to this project.
     var partsPaneFraction: Double = 0.75
+    /// Session-only file baseline for conflict detection, including first save.
+    var fileOrigin: ProjectFileOrigin? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case formatVersion, messages, revisions, selectedRevisionID, projectID, codexSettings, projectName
+        case showGrid, projectionMode, displayMode, recentPartColors, taskAudits, queuedRequests
+        case draftPrompt, draftAttachments, queuePaused, partsPaneFraction
+    }
 }
 
 enum LADError: LocalizedError {

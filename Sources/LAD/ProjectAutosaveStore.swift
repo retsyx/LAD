@@ -23,6 +23,8 @@ actor ProjectAutosaveStore {
         var url: URL
         var sequence: Int
         var fingerprint: Fingerprint
+        var origin: ProjectFileOrigin
+        var sourceOrigin: ProjectFileOrigin?
     }
 
     /// Bind the ownership fingerprint to the bytes written while the
@@ -30,6 +32,7 @@ actor ProjectAutosaveStore {
     private struct WriteReceipt {
         var url: URL
         var fingerprint: Fingerprint
+        var origin: ProjectFileOrigin
     }
 
     init(rootDirectory: URL? = nil) {
@@ -37,7 +40,8 @@ actor ProjectAutosaveStore {
         requiresCloudDrive = rootDirectory == nil
     }
 
-    func write(project: LADProject, projectID: UUID, title: String, sequence: Int, preferredURL: URL? = nil, preferExactName: Bool = false) throws -> URL {
+    func write(project: LADProject, projectID: UUID, title: String, sequence: Int, preferredURL: URL? = nil,
+               preferExactName: Bool = false, resolving conflict: ProjectSaveConflict? = nil) throws -> URL {
         try prepareDirectory()
         defer { if requiresCloudDrive { ProjectFolderIcon.apply(to: managedDirectory) } }
         if let previous = saved[projectID], sequence <= previous.sequence {
@@ -54,18 +58,20 @@ actor ProjectAutosaveStore {
         } else { base = Self.filenameStem(title) }
         let previous = saved[projectID]
         let preferred = preferredURL.flatMap { isManaged($0) ? $0.standardizedFileURL : nil }
-        var source = [previous?.url, preferred].compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
+        let reopened = portable.fileOrigin != previous?.sourceOrigin && portable.fileOrigin?.matches(preferred ?? managedDirectory) == true
+        let candidates = reopened ? [preferred, previous?.url] : [previous?.url, preferred]
+        var source = candidates.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
         if let proposed = source,
            previous?.url.standardizedFileURL != proposed.standardizedFileURL || (try? Self.fingerprint(proposed)) != previous?.fingerprint {
-            source = try ownedSource(proposed, project: portable, projectID: projectID, previous: previous)
+            source = try ownedSource(proposed, project: portable, projectID: projectID, previous: previous, resolving: conflict)
         }
 
         // A deliberate inline rename can reclaim its exact name after a
         // collision disappears. Ordinary autosaves retain a stable suffix.
         if preferExactName, let source {
             let destination = managedDirectory.appendingPathComponent(base).appendingPathExtension("lad")
-            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous) {
-                remember(result, projectID: projectID, sequence: sequence)
+            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
+                remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
             }
         }
@@ -74,16 +80,16 @@ actor ProjectAutosaveStore {
         // every time another similarly titled project disappears.
         if let source, let matchingName = Self.matchingStem(source, stem: base) {
             let destination = managedDirectory.appendingPathComponent(matchingName).appendingPathExtension("lad")
-            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous) {
-                remember(result, projectID: projectID, sequence: sequence)
+            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
+                remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
             }
         }
         for index in 1...10_000 {
             let name = index == 1 ? base : "\(base) (\(index))"
             let destination = managedDirectory.appendingPathComponent(name).appendingPathExtension("lad")
-            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous) {
-                remember(result, projectID: projectID, sequence: sequence)
+            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
+                remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
             }
         }
@@ -98,7 +104,7 @@ actor ProjectAutosaveStore {
         if let preferredURL, isManaged(preferredURL), FileManager.default.fileExists(atPath: preferredURL.path) {
             let snapshot = try Self.readSnapshot(from: preferredURL)
             if projectID == nil || snapshot.project.projectID == projectID {
-                if let id = snapshot.project.projectID { saved[id] = SavedFile(url: preferredURL, sequence: -1, fingerprint: snapshot.fingerprint) }
+                if let id = snapshot.project.projectID { saved[id] = SavedFile(url: preferredURL, sequence: -1, fingerprint: snapshot.fingerprint, origin: snapshot.project.fileOrigin!, sourceOrigin: snapshot.project.fileOrigin) }
                 return (snapshot.project, preferredURL)
             }
         }
@@ -116,7 +122,7 @@ actor ProjectAutosaveStore {
             do {
                 let snapshot = try Self.readSnapshot(from: url)
                 guard projectID == nil || snapshot.project.projectID == projectID else { continue }
-                if let id = snapshot.project.projectID { saved[id] = SavedFile(url: url, sequence: -1, fingerprint: snapshot.fingerprint) }
+                if let id = snapshot.project.projectID { saved[id] = SavedFile(url: url, sequence: -1, fingerprint: snapshot.fingerprint, origin: snapshot.project.fileOrigin!, sourceOrigin: snapshot.project.fileOrigin) }
                 return (snapshot.project, url)
             } catch {
                 // A known identity must never be replaced by an unrelated
@@ -136,7 +142,8 @@ actor ProjectAutosaveStore {
 
     /// Explicit Save As uses the same writer so it cannot race an autosave to
     /// an open cloud project. Replacement here is authorized by the save panel.
-    func writeCopy(_ project: LADProject, to url: URL, preserving sourceURL: URL? = nil, projectID sourceID: UUID? = nil) throws {
+    @discardableResult
+    func writeCopy(_ project: LADProject, to url: URL, preserving sourceURL: URL? = nil, projectID sourceID: UUID? = nil) throws -> ProjectFileOrigin {
         func protectSource(at destination: URL) throws {
             let matchesPath = sourceURL.map {
                 $0.standardizedFileURL.resolvingSymlinksInPath() == destination.standardizedFileURL.resolvingSymlinksInPath()
@@ -157,15 +164,18 @@ actor ProjectAutosaveStore {
             outcome = Result {
                 try protectSource(at: writable)
                 try data.write(to: writable, options: .atomic)
-                return WriteReceipt(url: writable, fingerprint: try Self.fingerprint(writable))
+                return WriteReceipt(url: writable, fingerprint: try Self.fingerprint(writable), origin: ProjectFileOrigin(url: writable, data: data))
             }
         }
         guard let outcome else { throw coordinationError ?? NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError) }
         let written = try outcome.get()
         for id in Array(saved.keys) where saved[id]?.url.standardizedFileURL == written.url.standardizedFileURL {
-            if id == project.projectID, let sequence = saved[id]?.sequence { remember(written, projectID: id, sequence: sequence) }
+            if id == project.projectID, let sequence = saved[id]?.sequence {
+                remember(written, projectID: id, sequence: sequence, sourceOrigin: project.fileOrigin)
+            }
             else { saved.removeValue(forKey: id) }
         }
+        return written.origin
     }
 
     private func prepareDirectory() throws {
@@ -188,7 +198,7 @@ actor ProjectAutosaveStore {
         }
     }
 
-    private func writeCandidate(_ data: Data, project: LADProject, projectID: UUID, source: URL?, destination: URL, previous: SavedFile?) throws -> WriteReceipt? {
+    private func writeCandidate(_ data: Data, project: LADProject, projectID: UUID, source: URL?, destination: URL, previous: SavedFile?, resolving conflict: ProjectSaveConflict?) throws -> WriteReceipt? {
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordinationError: NSError?
         var outcome: Result<WriteReceipt?, Error>?
@@ -208,11 +218,11 @@ actor ProjectAutosaveStore {
                         // always a collision, even if it has the same ID/data.
                         guard let old, try Self.isCaseAlias(old, target) else { return nil }
                     } else {
-                        guard try self.canUpdate(target, project: project, projectID: projectID, previous: previous) else { return nil }
+                        guard try self.canUpdate(target, project: project, projectID: projectID, previous: previous, resolving: conflict) else { return nil }
                     }
                 }
                 if let old, manager.fileExists(atPath: old.path) {
-                    guard try self.canUpdate(old, project: project, projectID: projectID, previous: previous) else { return nil }
+                    guard try self.canUpdate(old, project: project, projectID: projectID, previous: previous, resolving: conflict) else { return nil }
                     try data.write(to: old, options: .atomic)
                     if moving {
                         coordinator.item(at: old, willMoveTo: target)
@@ -222,12 +232,12 @@ actor ProjectAutosaveStore {
                             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: target.path])
                         }
                         coordinator.item(at: old, didMoveTo: target)
-                        return WriteReceipt(url: target, fingerprint: try Self.fingerprint(target))
+                        return WriteReceipt(url: target, fingerprint: try Self.fingerprint(target), origin: ProjectFileOrigin(url: target, data: data))
                     }
-                    return WriteReceipt(url: old, fingerprint: try Self.fingerprint(old))
+                    return WriteReceipt(url: old, fingerprint: try Self.fingerprint(old), origin: ProjectFileOrigin(url: old, data: data))
                 }
                 try data.write(to: target, options: .atomic)
-                return WriteReceipt(url: target, fingerprint: try Self.fingerprint(target))
+                return WriteReceipt(url: target, fingerprint: try Self.fingerprint(target), origin: ProjectFileOrigin(url: target, data: data))
             }
         }
         if moving, let source {
@@ -243,29 +253,38 @@ actor ProjectAutosaveStore {
         throw coordinationError ?? NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError)
     }
 
-    private func canUpdate(_ url: URL, project: LADProject, projectID: UUID, previous: SavedFile?) throws -> Bool {
+    private func canUpdate(_ url: URL, project: LADProject, projectID: UUID, previous: SavedFile?,
+                           resolving conflict: ProjectSaveConflict?) throws -> Bool {
         guard let current = try? Self.fingerprint(url) else { return false }
-        if let previous, previous.url.standardizedFileURL == url.standardizedFileURL, previous.fingerprint == current { return true }
-        let existing: LADProject
-        do { existing = try ProjectStore.read(from: url) }
-        catch { return false }
-        guard existing.projectID == projectID else { return false }
-        let incomingMessages = Dictionary(uniqueKeysWithValues: project.messages.map { ($0.id, $0) })
-        let incomingRevisions = Dictionary(uniqueKeysWithValues: project.revisions.map { ($0.id, $0) })
-        guard existing.messages.allSatisfy({ old in
-            guard let new = incomingMessages[old.id], old.role == new.role, old.content == new.content else { return false }
-            return (old.attachments ?? []).allSatisfy { attached in (new.attachments ?? []).contains { $0.path == attached.path && $0.sha256 == attached.sha256 } }
-        }), existing.revisions.allSatisfy({ incomingRevisions[$0.id]?.model == $0.model }) else { throw changedExternally() }
+        let supplied = project.fileOrigin.flatMap { $0.matches(url) ? $0 : nil }
+        let prior = previous.flatMap { $0.origin.matches(url) ? $0 : nil }
+        // The read token distinguishes a deliberate reopen from subsequent
+        // snapshots of one open session, whose own earlier writes are allowed.
+        let baseline = supplied != prior?.sourceOrigin ? supplied ?? prior?.origin : prior?.origin ?? supplied
+        let authorization = conflict?.file.matches(url) == true ? conflict?.file : nil
+        if authorization == nil, supplied == prior?.sourceOrigin, prior?.fingerprint == current { return true }
+        let bytes = try ProjectStore.readArchive(from: url)
+        let observed = ProjectFileOrigin(url: url, data: bytes)
+        if let expected = authorization ?? baseline {
+            guard observed.sha256 == expected.sha256 else { throw ProjectSaveConflict(file: observed) }
+            return true
+        }
+        // A caller without an opening baseline may adopt an identical complete
+        // document, but may never infer ownership from matching geometry alone.
+        guard let existing = try? ProjectStore.decode(bytes), existing.projectID == projectID else { return false }
+        guard try ProjectArchive.encode(existing) == ProjectArchive.encode(project) else {
+            throw ProjectSaveConflict(file: observed)
+        }
         return true
     }
 
-    private func ownedSource(_ url: URL, project: LADProject, projectID: UUID, previous: SavedFile?) throws -> URL? {
+    private func ownedSource(_ url: URL, project: LADProject, projectID: UUID, previous: SavedFile?, resolving conflict: ProjectSaveConflict?) throws -> URL? {
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordinationError: NSError?
         var outcome: Result<URL?, Error>?
         coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
             outcome = Result {
-                guard self.isManaged(readable), try self.canUpdate(readable, project: project, projectID: projectID, previous: previous) else { return nil }
+                guard self.isManaged(readable), try self.canUpdate(readable, project: project, projectID: projectID, previous: previous, resolving: conflict) else { return nil }
                 return readable
             }
         }
@@ -273,8 +292,8 @@ actor ProjectAutosaveStore {
         throw coordinationError ?? NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError)
     }
 
-    private func remember(_ receipt: WriteReceipt, projectID: UUID, sequence: Int) {
-        saved[projectID] = SavedFile(url: receipt.url, sequence: sequence, fingerprint: receipt.fingerprint)
+    private func remember(_ receipt: WriteReceipt, projectID: UUID, sequence: Int, sourceOrigin: ProjectFileOrigin?) {
+        saved[projectID] = SavedFile(url: receipt.url, sequence: sequence, fingerprint: receipt.fingerprint, origin: receipt.origin, sourceOrigin: sourceOrigin)
     }
 
     private func isManaged(_ url: URL) -> Bool {
@@ -291,7 +310,12 @@ actor ProjectAutosaveStore {
         var coordinationError: NSError?
         var outcome: Result<(project: LADProject, fingerprint: Fingerprint), Error>?
         coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
-            outcome = Result { (try ProjectStore.read(from: readable), try fingerprint(readable)) }
+            outcome = Result {
+                let data = try ProjectStore.readArchive(from: readable)
+                var project = try ProjectStore.decode(data)
+                project.fileOrigin = ProjectFileOrigin(url: readable, data: data)
+                return (project, try fingerprint(readable))
+            }
         }
         if let outcome { return try outcome.get() }
         throw coordinationError ?? NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError)
