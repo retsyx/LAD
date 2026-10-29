@@ -169,7 +169,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
         XCTAssertTrue(application.setActivationPolicy(.regular))
         defer { _ = application.setActivationPolicy(previousPolicy) }
         application.finishLaunching()
-        let (view, _) = try await readyView()
+        let (view, preview) = try await readyView()
         let frames = CubeViewportRenderCounter()
         view.delegate = frames
         let container = NSView(frame: view.frame)
@@ -177,6 +177,13 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
         let cube = ViewportOrientationCube(frame: NSRect(x: 380, y: 258, width: 92, height: 92))
         container.addSubview(cube)
         bind(cube, to: view)
+        var orientationUpdates = [SIMD3<Double>]()
+        view.onCameraOrientationChanged = { [weak cube, weak view] right, up, backward in
+            cube?.setOrientation(right: right, up: up, backward: backward)
+            orientationUpdates.append(backward)
+            guard let view else { return }
+            self.assertVectorEqual(backward, view.cameraOrientation.backward, accuracy: 1e-6)
+        }
         let window = NSWindow(contentRect: NSRect(x: 50, y: 50, width: 480, height: 360),
                               styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "LAD orientation cube test"
@@ -208,23 +215,114 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
         XCTAssertEqual(frames.count, beforeDrag, "Dragging the cube must not wake viewport rendering.")
         XCTAssertFalse(view.rendersContinuously)
 
+        let fittedDistance = try XCTUnwrap(view.agentCaptureMetadata["cameraDistance"] as? Double)
+        let fittedScale = try XCTUnwrap(view.agentCaptureMetadata["orthographicScale"] as? Double)
         let targetKinds: [(ViewportCubeTarget) -> Bool] = [
             { if case .face = $0 { return true }; return false },
             { if case .oppositeFace = $0 { return true }; return false },
             { if case .corner = $0 { return true }; return false }
         ]
-        for matches in targetKinds {
-            let (target, point) = try XCTUnwrap(cube.projectedTargetCenters.first { matches($0.key) })
-            XCTAssertEqual(cube.hitTarget(at: point), target)
-            let beforeSnap = frames.count
-            let beforeCamera = try XCTUnwrap(view.pointOfView).simdTransform
-            cube.mouseDown(with: try mouse(.leftMouseDown, at: point, in: cube))
-            cube.mouseUp(with: try mouse(.leftMouseUp, at: point, in: cube))
-            guard try await waitForFrame(frames, after: beforeSnap), try await waitForIdle(view, frames: frames) else { return }
-            assertVectorEqual(view.cameraOrientation.backward, expectedBackward(target), accuracy: 0.00002)
-            XCTAssertGreaterThan(matrixDifference(beforeCamera, try XCTUnwrap(view.pointOfView).simdTransform), 0.1)
-            XCTAssertFalse(view.rendersContinuously, "Every cube target must retain bounded viewport redraw bursts.")
+        for projection in ViewportProjectionMode.allCases {
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                        selectedSolids: [], hiddenSolids: [], projection: projection)
+            guard try await waitForIdle(view, frames: frames) else { return }
+            for matches in targetKinds {
+                let (target, point) = try XCTUnwrap(cube.projectedTargetCenters.first { matches($0.key) })
+                XCTAssertEqual(cube.hitTarget(at: point), target)
+                view.otherMouseDown(with: try mouse(.otherMouseDown, at: NSPoint(x: 200, y: 150), in: view))
+                view.otherMouseDragged(with: try mouse(.otherMouseDragged, at: NSPoint(x: 225, y: 163), in: view))
+                view.otherMouseUp(with: try mouse(.otherMouseUp, at: NSPoint(x: 225, y: 163), in: view))
+                let scroll = try XCTUnwrap(CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                                                  wheel1: -60, wheel2: 0, wheel3: 0))
+                scroll.location = CGPoint(x: 200, y: 150)
+                view.scrollWheel(with: try XCTUnwrap(NSEvent(cgEvent: scroll)))
+                let beforeSnap = frames.count
+                let beforeCamera = try XCTUnwrap(view.pointOfView).simdTransform
+                let beforeUpdates = orientationUpdates.count
+                cube.mouseDown(with: try mouse(.leftMouseDown, at: point, in: cube))
+                cube.mouseUp(with: try mouse(.leftMouseUp, at: point, in: cube))
+                guard try await waitForFrame(frames, after: beforeSnap), try await waitForIdle(view, frames: frames) else { return }
+                assertVectorEqual(view.cameraOrientation.backward, expectedBackward(target), accuracy: 0.00002)
+                XCTAssertEqual(view.agentCaptureMetadata["cameraTarget"] as? [Double], [0, 0, 0])
+                XCTAssertEqual(try XCTUnwrap(view.agentCaptureMetadata["cameraDistance"] as? Double), fittedDistance, accuracy: 1e-8)
+                XCTAssertEqual(try XCTUnwrap(view.agentCaptureMetadata["orthographicScale"] as? Double), fittedScale, accuracy: 1e-8)
+                XCTAssertGreaterThan(matrixDifference(beforeCamera, try XCTUnwrap(view.pointOfView).simdTransform), 0.1)
+                XCTAssertFalse(view.rendersContinuously, "Every cube target must retain bounded viewport redraw bursts.")
+                if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    let finalCamera = try XCTUnwrap(view.pointOfView).simdTransform
+                    XCTAssertTrue(frames.poses(after: beforeSnap).contains {
+                        matrixDifference($0, beforeCamera) > 0.01 && matrixDifference($0, finalCamera) > 0.01
+                    }, "A cube click must render an intermediate camera pose, not just delay a snap.")
+                    XCTAssertGreaterThan(orientationUpdates.count - beforeUpdates, 2,
+                                         "The cube must follow the animated camera throughout its transition.")
+                }
+            }
         }
+
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        // Retarget from the current animated pose. The old transition must
+        // never snap back or overwrite the new destination after finishing.
+        let beforeRetarget = try XCTUnwrap(view.pointOfView).simdTransform
+        view.selectOrientationCubeFace(.back)
+        guard try await waitForAnimationProgress(view, from: beforeRetarget) else { return }
+        let intermediate = try XCTUnwrap(view.pointOfView).simdTransform
+        view.selectOrientationCubeCorner(.leftFrontBottom)
+        assertMatrixEqual(try XCTUnwrap(view.pointOfView).simdTransform, intermediate)
+        XCTAssertTrue(view.isAnimatingCamera)
+        guard try await waitForIdle(view, frames: frames) else { return }
+        assertVectorEqual(view.cameraOrientation.backward, ViewportCubeCorner.leftFrontBottom.direction)
+
+        // Direct navigation remains immediate and owns the camera from the
+        // first pointer input, with no later transition tick overriding it.
+        let beforeNavigation = try XCTUnwrap(view.pointOfView).simdTransform
+        view.selectOrientationCubeFace(.top)
+        guard try await waitForAnimationProgress(view, from: beforeNavigation) else { return }
+        view.rightMouseDown(with: try mouse(.rightMouseDown, at: NSPoint(x: 200, y: 150), in: view))
+        view.rightMouseDragged(with: try mouse(.rightMouseDragged, at: NSPoint(x: 230, y: 160), in: view))
+        view.rightMouseUp(with: try mouse(.rightMouseUp, at: NSPoint(x: 230, y: 160), in: view))
+        XCTAssertFalse(view.isAnimatingCamera)
+        let navigated = try XCTUnwrap(view.pointOfView).simdTransform
+        try await Task.sleep(for: .milliseconds(400))
+        assertMatrixEqual(try XCTUnwrap(view.pointOfView).simdTransform, navigated)
+
+        for _ in ViewportProjectionMode.allCases {
+            let beforeProjection = try XCTUnwrap(view.pointOfView).simdTransform
+            view.selectOrientationCubeFace(.bottom)
+            guard try await waitForAnimationProgress(view, from: beforeProjection) else { return }
+            let nextProjection: ViewportProjectionMode = view.pointOfView?.camera?.usesOrthographicProjection == true ? .perspective : .isometric
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                        selectedSolids: [], hiddenSolids: [], projection: nextProjection)
+            XCTAssertFalse(view.isAnimatingCamera, "Changing projection must cancel the pending camera transition.")
+            let projected = try XCTUnwrap(view.pointOfView).simdTransform
+            try await Task.sleep(for: .milliseconds(400))
+            assertMatrixEqual(try XCTUnwrap(view.pointOfView).simdTransform, projected)
+            XCTAssertEqual(view.pointOfView?.camera?.usesOrthographicProjection, nextProjection == .isometric)
+        }
+
+        let beforeDetach = try XCTUnwrap(view.pointOfView).simdTransform
+        view.selectOrientationCubeFace(.right)
+        guard try await waitForAnimationProgress(view, from: beforeDetach) else { return }
+        window.contentView = nil
+        XCTAssertFalse(view.isAnimatingCamera)
+        let detached = try XCTUnwrap(view.pointOfView).simdTransform
+        try await Task.sleep(for: .milliseconds(400))
+        assertMatrixEqual(try XCTUnwrap(view.pointOfView).simdTransform, detached)
+        XCTAssertFalse(view.rendersContinuously, "Detaching a viewport must cancel animation and playback.")
+    }
+
+    @MainActor
+    private func waitForAnimationProgress(_ view: CADSceneView, from previous: simd_float4x4) async throws -> Bool {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while view.isAnimatingCamera, matrixDifference(try XCTUnwrap(view.pointOfView).simdTransform, previous) < 0.01,
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        guard view.isAnimatingCamera else {
+            XCTFail("A visible cube transition must remain active long enough to produce intermediate frames.")
+            return false
+        }
+        XCTAssertGreaterThan(matrixDifference(try XCTUnwrap(view.pointOfView).simdTransform, previous), 0.01)
+        return true
     }
 
     @MainActor
@@ -371,6 +469,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
 private final class CubeViewportRenderCounter: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
+    private var renderedPoses = [(Int, simd_float4x4)]()
 
     var count: Int {
         lock.lock()
@@ -378,9 +477,17 @@ private final class CubeViewportRenderCounter: NSObject, SCNSceneRendererDelegat
         return value
     }
 
+    func poses(after frame: Int) -> [simd_float4x4] {
+        lock.lock(); defer { lock.unlock() }
+        return renderedPoses.filter { $0.0 > frame }.map { $0.1 }
+    }
+
     func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
+        let pose = renderer.pointOfView?.presentation.simdWorldTransform
         lock.lock()
         value += 1
+        if let pose { renderedPoses.append((value, pose)) }
+        if renderedPoses.count > 512 { renderedPoses.removeFirst(renderedPoses.count - 512) }
         lock.unlock()
     }
 }

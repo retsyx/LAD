@@ -143,6 +143,9 @@ final class CADSceneView: SCNView {
     private var partSilhouettes = [Int: SCNNode]()
     private var silhouetteSlots = [SCNNode]()
     private var rig = CameraRig()
+    private var cameraTransitionTask: Task<Void, Never>?
+    private var cameraTransitionID: UUID?
+    var isAnimatingCamera: Bool { cameraTransitionID != nil }
     private var loadedPath: String?
     private var loadedNativePath: String?
     private var meshBounds: [Double] = [-40, -40, 0, 40, 40, 60]
@@ -357,6 +360,7 @@ final class CADSceneView: SCNView {
         let meshChanged = mesh?.stepPath != loadedPath || mesh?.brepPath != loadedNativePath
         let visibilityChanged = self.hiddenSolids != hiddenSolids
         let modeChanged = self.mode != mode
+        if meshChanged || projectionChanged { cancelCameraTransition() }
         rig.usesOrthographicProjection = orthographic
         // Selection and visibility belong to the project state, including when
         // a sidebar selection arrives before a newly installed mesh.
@@ -932,6 +936,7 @@ final class CADSceneView: SCNView {
     }
 
     private func perform(_ action: ViewportCommand.Action) {
+        cancelCameraTransition()
         switch action {
         case .fit:
             zoomAnchor = nil
@@ -948,34 +953,82 @@ final class CADSceneView: SCNView {
     }
 
     func selectOrientationCubeFace(_ face: ViewportCubeFace) {
-        window?.makeKeyAndOrderFront(nil)
-        window?.makeFirstResponder(self)
-        zoomAnchor = nil
-        rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+        var destination = rig
         switch face {
-        case .front: perform(.front)
-        case .back: perform(.back)
-        case .left: perform(.left)
-        case .right: perform(.right)
-        case .top: perform(.top)
-        case .bottom: perform(.bottom)
+        case .front: destination.yaw = -.pi / 2; destination.elevation = 0
+        case .back: destination.yaw = .pi / 2; destination.elevation = 0
+        case .left: destination.yaw = .pi; destination.elevation = 0
+        case .right: destination.yaw = 0; destination.elevation = 0
+        case .top: destination.yaw = -.pi / 2; destination.elevation = .pi / 2 - 0.00001
+        case .bottom: destination.yaw = -.pi / 2; destination.elevation = -.pi / 2 + 0.00001
         }
+        fitOrientationCubeView(destination)
     }
 
     func selectOrientationCubeCorner(_ corner: ViewportCubeCorner) {
+        var destination = rig
+        let direction = corner.direction
+        destination.yaw = atan2(direction.y, direction.x)
+        destination.elevation = asin(direction.z)
+        fitOrientationCubeView(destination)
+    }
+
+    private func fitOrientationCubeView(_ destination: CameraRig) {
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
-        let direction = corner.direction
-        rig.yaw = atan2(direction.y, direction.x)
-        rig.elevation = asin(direction.z)
+        cancelCameraTransition()
         zoomAnchor = nil
-        rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+        var destination = destination
+        destination.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+        // Activation and occlusion notifications can lag the click that
+        // brings a design window forward. Do not let those bits skip motion.
+        guard let window, window.isVisible, !window.isMiniaturized, !isHiddenOrHasHiddenAncestor,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            rig = destination
+            applyCamera()
+            return
+        }
+        let transition = CameraTransition(from: rig, to: destination)
+        let token = UUID()
+        cameraTransitionID = token
+        cameraTransitionTask = Task { @MainActor [weak self] in
+            let started = ProcessInfo.processInfo.systemUptime
+            while !Task.isCancelled {
+                let progress = min((ProcessInfo.processInfo.systemUptime - started) / 0.32, 1)
+                // The rig, picker and cube all follow the same pose, rather
+                // than diverging from a SceneKit-only presentation animation.
+                guard self?.advanceCameraTransition(transition, token: token, progress: progress) == true else { return }
+                do { try await Task.sleep(for: .milliseconds(16)) }
+                catch { return }
+            }
+        }
+        requestRedraw()
+    }
+
+    private func advanceCameraTransition(_ transition: CameraTransition, token: UUID, progress: Double) -> Bool {
+        guard cameraTransitionID == token else { return false }
+        rig = transition.rig(at: progress)
         applyCamera()
+        // An orientation observer may have started another transition.
+        guard cameraTransitionID == token else { return false }
+        if progress >= 1 {
+            cameraTransitionID = nil
+            cameraTransitionTask = nil
+            return false
+        }
+        return true
+    }
+
+    private func cancelCameraTransition() {
+        cameraTransitionID = nil
+        cameraTransitionTask?.cancel()
+        cameraTransitionTask = nil
     }
 
     /// Used only by an independent offscreen tool view. The live viewport's
     /// camera and project display preferences are never changed by rendering.
     func configureAgentView(named name: String, camera: CADAgentCamera = CADAgentCamera()) throws {
+        cancelCameraTransition()
         let pose = try camera.resolved(view: name, bounds: meshBounds, width: Double(bounds.width),
                                        height: Double(bounds.height), orthographic: rig.usesOrthographicProjection)
         rig = pose.rig
@@ -1024,12 +1077,14 @@ final class CADSceneView: SCNView {
         super.layout()
         let sizeChanged = projectionSize != bounds.size
         if sizeChanged {
+            cancelCameraTransition()
             projectionSize = bounds.size
             projectedFeatures = nil
             setHoveredFeature(nil)
             updateStrokeViewportHeight()
         }
         if needsInitialFit, bounds.width >= 10, bounds.height >= 10 {
+            cancelCameraTransition()
             needsInitialFit = false
             rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
             applyCamera()
@@ -1124,6 +1179,7 @@ final class CADSceneView: SCNView {
         NSWorkspace.shared.notificationCenter.removeObserver(self, name: NSWorkspace.screensDidWakeNotification, object: nil)
         setHoveredFeature(nil)
         resetNavigationGesture()
+        cancelCameraTransition()
         if newWindow == nil { stopRedraw() }
         super.viewWillMove(toWindow: newWindow)
     }
@@ -1154,6 +1210,7 @@ final class CADSceneView: SCNView {
     }
 
     @objc private func windowResignedKey() {
+        cancelCameraTransition()
         setHoveredFeature(nil)
         resetNavigationGesture()
     }
@@ -1166,7 +1223,10 @@ final class CADSceneView: SCNView {
         // AppKit temporarily retains the key-window flag. Input and wake
         // requests can still recover from a stale occlusion bit afterward.
         if window?.occlusionState.contains(.visible) == true { requestRedraw() }
-        else { stopRedraw() }
+        else {
+            cancelCameraTransition()
+            stopRedraw()
+        }
     }
 
     @objc private func viewportEnvironmentWoke() {
@@ -1183,7 +1243,7 @@ final class CADSceneView: SCNView {
 
     private func updateHover(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard rightDownPoint == nil, NSEvent.pressedMouseButtons == 0, bounds.contains(point) else {
+        guard !isAnimatingCamera, rightDownPoint == nil, NSEvent.pressedMouseButtons == 0, bounds.contains(point) else {
             setHoveredFeature(nil)
             return
         }
@@ -1197,6 +1257,7 @@ final class CADSceneView: SCNView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        cancelCameraTransition()
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
         let feature = feature(at: point)
@@ -1210,6 +1271,7 @@ final class CADSceneView: SCNView {
     override func mouseUp(with event: NSEvent) { NSCursor.arrow.set() }
     override func mouseDragged(with event: NSEvent) { setHoveredFeature(nil) }
     override func rightMouseDown(with event: NSEvent) {
+        cancelCameraTransition()
         window?.makeFirstResponder(self)
         setHoveredFeature(nil)
         rightDownPoint = convert(event.locationInWindow, from: nil)
@@ -1249,6 +1311,7 @@ final class CADSceneView: SCNView {
         applyCamera()
     }
     override func otherMouseDown(with event: NSEvent) {
+        cancelCameraTransition()
         window?.makeFirstResponder(self)
         setHoveredFeature(nil)
         otherDragPoint = convert(event.locationInWindow, from: nil)
@@ -1436,6 +1499,7 @@ final class CADSceneView: SCNView {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        cancelCameraTransition()
         let point = convert(event.locationInWindow, from: nil)
         if event.modifierFlags.contains(.shift) {
             rig.pan(dx: event.scrollingDeltaX, dy: event.scrollingDeltaY, height: bounds.height)
@@ -1447,6 +1511,7 @@ final class CADSceneView: SCNView {
     }
 
     override func magnify(with event: NSEvent) {
+        cancelCameraTransition()
         let point = convert(event.locationInWindow, from: nil)
         if event.phase == .began || zoomAnchor == nil { zoomAnchor = anchor(at: point) }
         rig.zoom(factor: exp(-event.magnification), anchor: zoomAnchor!)
@@ -1455,6 +1520,7 @@ final class CADSceneView: SCNView {
     }
 
     override func keyDown(with event: NSEvent) {
+        cancelCameraTransition()
         if event.keyCode == 53 { deselectAll(); return }
         switch event.charactersIgnoringModifiers?.lowercased() {
         case "f": perform(.fit)
