@@ -6,6 +6,7 @@ struct LADSettingsView: View {
     @AppStorage(ProjectSaveLocation.preferenceKey) private var projectSaveDirectory = ""
     @AppStorage("workerThreads") private var threads = 0
     @ObservedObject private var cadRuntime = CADRuntimeManager.shared
+    @ObservedObject private var agentPermissions = AgentPermissionController.shared
     @State private var folderChoice: ProjectSaveFolderChoice = .cloud
 
     private enum ProjectSaveFolderChoice: Hashable { case cloud, documents, custom, choose }
@@ -59,6 +60,16 @@ struct LADSettingsView: View {
                     chooseProjectDirectory()
                     folderChoice = savedFolderChoice
                 }
+            }
+            Section("Agent permissions") {
+                Picker("Requests", selection: $agentPermissions.policy) {
+                    Text("Ask each time").tag(AgentPermissionPolicy.ask)
+                    Text("Always allow").tag(AgentPermissionPolicy.alwaysAllow)
+                    Text("Always deny").tag(AgentPermissionPolicy.alwaysDeny)
+                }
+                .pickerStyle(.menu)
+                Text("Applies to all designs on this Mac.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("CAD engine") {
                 if cadRuntime.phase == .preparing {

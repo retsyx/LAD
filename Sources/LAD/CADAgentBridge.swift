@@ -21,7 +21,8 @@ final class CADAgentBridge {
          engine: EngineService, viewport: CADSceneView?, hiddenSolids: Set<Int>, solidColors: [Int: PartColor],
          onActivity: @escaping @Sendable (ProjectActivityEvent) -> Void,
          referenceAssets: [CADInputAsset] = [], versions: ProjectVersionContext = .empty,
-         partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:]) throws {
+         partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:],
+         permissionController: AgentPermissionController? = nil) throws {
         self.workspace = try EngineArtifact.canonicalDirectory(workspace)
         control = self.workspace.appendingPathComponent(".lad-tools", isDirectory: true)
         requests = control.appendingPathComponent("requests", isDirectory: true)
@@ -44,7 +45,8 @@ final class CADAgentBridge {
             tools = try CADAgentTools(directory: self.workspace, python: python, threads: threads, current: current,
                                       currentPreview: currentPreview, engine: engine, viewport: viewport,
                                       hiddenSolids: hiddenSolids, solidColors: solidColors,
-                                      referenceAssets: referenceAssets, versions: versions, partLayout: partLayout, partColors: partColors)
+                                      referenceAssets: referenceAssets, versions: versions, partLayout: partLayout, partColors: partColors,
+                                      permissionController: permissionController)
         } catch {
             Darwin.close(controlFD); Darwin.close(responseFD)
             throw error

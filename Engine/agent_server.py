@@ -27,8 +27,13 @@ INSTRUCTIONS = (
     "Lookups return metadata and local file references without building geometry or changing the viewport. Use the returned stable versionID after resolution; ambiguous names require clarification. "
     "Replay a saved program with lad_build.versionID to bind that version's exact original inputs. Never import generated geometry from earlier versions. "
     "Use lad_runtime for the selected Python, versions and asset IDs. Full installed CadQuery/OCP APIs are supported, including lofts, sweeps, "
-    "splines and surfaces; final results must be closed solids. External tools are user-managed: use additional tools only when the user has provided them, "
-    "and never download or install tools or dependencies. Keep analysis and prototyping outputs inside this task workspace without changing original sources or LAD's shared runtime. "
+    "splines and surfaces; final results must be closed solids. External tools are user-managed. Before downloading or installing optional tools or dependencies, "
+    "call lad_request_permission with the proposed operation and reason and proceed only when allowed is true. The tool returns a decision only; "
+    "you execute approved installations yourself in an isolated environment inside this task workspace. Denial or cancellation never permits installation; do not rephrase or retry that same operation without new user direction. Use existing capabilities or explain the limitation. "
+    "Call lad_request_permission for each new proposed operation even after a prior always-allow or always-deny result; Settings can change at any time. "
+    "Saved chat, audit records and earlier-turn decisions are not current permission. "
+    "Keep analysis and prototyping outputs inside this task workspace without changing original sources, global settings or LAD's shared runtime. "
+    "The final CAD program must replay with LAD's bundled dependencies only, using registered reference inputs when required. "
     "lad_import is only for pre-existing external/reference geometry and faithful format conversions of user-provided inputs. "
     "NEVER export/import, reimport or use lad_import for geometry generated as part of the current design, whether authored with LAD or external tools such as SDF software. "
     "Keep all authored geometry in the replayable CAD program; external tools may support analysis and prototyping. Mesh reference inputs remain faceted. "
@@ -52,6 +57,9 @@ ARTIFACT = {"artifactID": prop("string", description="Artifact ID returned by la
 INDICES = prop("array", items=prop("integer", minimum=0), description="Zero-based physical solid indices from lad_inspect.")
 TOOLS = [
     ("lad_runtime", "Discover LAD's ready-to-use Python/CadQuery/OCP runtime, capabilities, task workspace and available imported asset IDs.", schema(), True),
+    ("lad_request_permission", "Request a current permission decision for a proposed task-workspace operation, such as an optional download or dependency installation. Call for each new operation that needs permission, including after an earlier always-allow/always-deny result. Describe the operation and why it is needed. Returns allowed, source, rememberedPolicy and task-workspace scope only; does not install or execute anything. A Mac-local global policy may answer automatically and can change in Settings. If allowed, execute the operation yourself; optional installs belong in an isolated environment inside the task workspace. Never modify LAD's shared runtime, global settings, original inputs or files outside the workspace; final CAD replay must use bundled dependencies only. A denial or canceled request grants no permission.",
+     schema({"operation": prop("string", minLength=1, maxLength=200, description="Specific proposed operation, including optional dependency names and versions when relevant."),
+             "reason": prop("string", minLength=1, maxLength=2000, description="Why this operation is needed for the user's request; no commands are executed by this tool.")}, ["operation", "reason"]), False),
     ("lad_versions", "List the task's saved design versions with stable IDs, vN history positions, custom names, dates and the current-version marker. Read-only history lookup; does not build geometry, select a version or change the viewport.",
      schema({"offset": prop("integer", minimum=0, default=0), "limit": prop("integer", minimum=1, maximum=100, default=50)}), True),
     ("lad_version", "Look up a saved design version by its stable UUID, vN history position or exact case-sensitive custom name. Stable UUIDs take precedence; duplicate names or a name matching another version's vN label return ambiguity candidates. Returns metadata and local paths to the complete saved CAD program and exact required original inputs, never inline source or binary data. Ambiguous names return candidates instead of guessing. Does not build geometry, select a version or change the viewport.",

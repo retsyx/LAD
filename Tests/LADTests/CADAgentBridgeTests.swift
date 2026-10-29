@@ -46,6 +46,7 @@ final class CADAgentBridgeTests: XCTestCase {
         XCTAssertTrue((initialized["instructions"] as? String)?.contains("lad_build") == true)
         XCTAssertTrue((initialized["instructions"] as? String)?.contains("lad_versions") == true)
         XCTAssertTrue((initialized["instructions"] as? String)?.contains("lad_version") == true)
+        XCTAssertTrue((initialized["instructions"] as? String)?.contains("lad_request_permission") == true)
         XCTAssertFalse((initialized["instructions"] as? String)?.contains("lad_convert_kicad") == true)
         try await client.notify(method: "notifications/initialized")
         let listed = try await rpc(client, method: "tools/list")

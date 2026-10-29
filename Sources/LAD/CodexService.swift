@@ -74,7 +74,8 @@ final class CodexService {
         hiddenSolids: Set<Int> = [], solidColors: [Int: PartColor] = [:],
         onSteeringAvailability: @escaping @Sendable (Bool) -> Void = { _ in },
         selection: ProjectSelectionContext? = nil, selectionModel: ModelSpec? = nil,
-        selectionModelsByRevision: [UUID: ModelSpec] = [:], versions: ProjectVersionContext = .empty
+        selectionModelsByRevision: [UUID: ModelSpec] = [:], versions: ProjectVersionContext = .empty,
+        permissionController: AgentPermissionController? = nil
     ) async throws -> CodexProjectResult {
         guard activeJob == nil else { throw CodexError.failed("A Codex request is already running.") }
         validatedModel = nil; validatedMesh = nil; partColorChanges = []
@@ -100,7 +101,7 @@ final class CodexService {
             current: current, currentPreview: currentPreview, engine: engine ?? EngineService(),
             viewport: viewport, hiddenSolids: hiddenSolids, solidColors: solidColors, onActivity: onActivity,
             referenceAssets: selectionModel?.inputAssets ?? [], versions: versions,
-            partLayout: partLayout, partColors: partColors)
+            partLayout: partLayout, partColors: partColors, permissionController: permissionController)
         activeBridge = bridge
         defer { bridge.stop(); if activeBridge === bridge { activeBridge = nil } }
         var arguments = ["app-server", "--listen", "stdio://"]
@@ -207,7 +208,7 @@ final class CodexService {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var request = instructions + "\n\nDESIGN CONTEXT\n"
         request += "TASK WORKSPACE: \(workspace.path)\nLAD PYTHON RUNTIME: \(python)\n"
-        request += "The LAD MCP server is connected for this turn. When constructing or modifying geometry, call lad_runtime, then build/inspect/measure/render with LAD tools while iterating. For questions, explanations or clarification, return a message response without building or changing the design; use tools only when their results are needed for an accurate answer. Write scripts and optional external-tool outputs only inside this task workspace. Use this Python for installed CadQuery/OCP; do not bootstrap another CAD runtime or modify LAD’s shared environment. External tools are user-managed. Use additional tools only when the user has provided them; never download or install tools or dependencies.\n\n"
+        request += "The LAD MCP server is connected for this turn. When constructing or modifying geometry, call lad_runtime, then build/inspect/measure/render with LAD tools while iterating. For questions, explanations or clarification, return a message response without building or changing the design; use tools only when their results are needed for an accurate answer. Write scripts and optional external-tool outputs only inside this task workspace. Use this Python for bundled CadQuery/OCP and as the base of any approved isolated helper environment; do not replace the CAD runtime or modify LAD’s shared environment. External tools are user-managed. Before downloading or installing optional tools or dependencies, call lad_request_permission with the proposed operation and reason and proceed only when allowed is true. The tool returns a decision only; you execute approved operations yourself in an isolated environment inside TASK WORKSPACE. Denial or cancellation grants no permission; do not rephrase or retry the same operation without new user direction. Use existing capabilities or explain the limitation. Call lad_request_permission for each new proposed operation even after a prior always-allow or always-deny result, because Settings can change at any time. Never treat saved chat, audit records or earlier-turn decisions as current permission. Never change original files, global settings or LAD’s shared runtime. The final CAD program must replay with bundled CAD dependencies only.\n\n"
         request += "VERSION HISTORY: \(versions.versions.count) saved versions are available through lad_versions and lad_version."
         if let id = versions.selectedRevisionID { request += " The selected design version ID is \(id.uuidString)." }
         request += " These tools read a snapshot of this design's history for this task. Use them when the user refers to an older version, vN history position, or custom version name. Lookup leaves the current design and viewport unchanged and returns local program/input file references, never embedded source.\n\n"

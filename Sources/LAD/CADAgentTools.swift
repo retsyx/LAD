@@ -24,9 +24,13 @@ final class CADAgentTools {
     private let python: String
     private let threads: Int
     private let engine: EngineService
+    private let permissionController: AgentPermissionController
     private let current: ModelSpec?
     private let versions: ProjectVersionContext
     private weak var viewport: CADSceneView?
+    private weak var permissionWindow: NSWindow?
+    private var permissionWindowWasBound: Bool
+    private let hasPermissionViewport: Bool
     private let hiddenSolids: Set<Int>
     private let partLayout: PartLayout?
     private let initialPartColors: [String: PartColor]
@@ -39,20 +43,26 @@ final class CADAgentTools {
     private var versionInputSizes: [String: Int] = [:]
     private var versionTasks: [UUID: Task<CADAgentVersionFiles.Prepared, Error>] = [:]
     private var runtime: CADRuntime?
+    private var permissionRequest: (id: UUID, task: Task<AgentPermissionDecision, Error>)?
     private var cancelled = false
 
     init(directory: URL, python: String, threads: Int, current: ModelSpec?, currentPreview: PreviewMesh?,
          engine: EngineService, viewport: CADSceneView? = nil, hiddenSolids: Set<Int> = [],
          solidColors: [Int: PartColor] = [:],
          referenceAssets: [CADInputAsset] = [], versions: ProjectVersionContext = .empty,
-         partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:]) throws {
+         partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:],
+         permissionController: AgentPermissionController? = nil) throws {
         workspace = try CADAgentWorkspace(directory: directory)
         self.python = python
         self.threads = threads
         self.current = current
         self.versions = versions
         self.engine = engine
+        self.permissionController = permissionController ?? .shared
         self.viewport = viewport
+        permissionWindow = viewport?.window
+        permissionWindowWasBound = viewport?.window != nil
+        hasPermissionViewport = viewport != nil
         self.hiddenSolids = hiddenSolids
         self.partLayout = partLayout
         let currentParts = partLayout?.nodes ?? Self.parts(in: currentPreview)
@@ -167,6 +177,7 @@ final class CADAgentTools {
         cancelled = true
         renderedImageData = nil
         versionTasks.values.forEach { $0.cancel() }
+        permissionRequest?.task.cancel()
         engine.cancel()
     }
 
@@ -186,9 +197,41 @@ final class CADAgentTools {
                                "workspace": workspace.root.path,
                                "programInterface": "Full installed CadQuery and OCP Python APIs; assign result. cq, math, np and imported_assets are preloaded. imported_model is available when the current design has an original STEP input.",
                                "capabilities": ["sketches", "lofts", "sweeps", "splines", "surfaces", "shells", "offsets", "booleans", "assemblies", "direct OCP", "exact measurements", "PNG rendering", "STEP export"],
-                               "externalTools": "External tools are user-managed. Use an additional tool only when the user has provided it; do not download or install tools or dependencies. Keep analysis and prototyping outputs inside this task workspace without changing original sources or LAD's shared runtime. Final authored geometry must remain in the replayable CAD program. lad_import is only for pre-existing external/reference inputs and faithful format conversions of user-provided inputs; never export/import or reimport geometry generated as part of this design by LAD or external tools.",
+                               "externalTools": "External tools are user-managed. Before each new optional download or dependency installation, call lad_request_permission with the proposed operation and reason, even after a previous always-allow/always-deny result; Settings can change at any time. Proceed only when the current result has allowed true. That tool returns a decision only; you execute any approved operation in an isolated environment inside this task workspace, using LAD's Python as the base for a helper environment if needed. Never change LAD's shared runtime, global settings, original sources or files outside the task workspace. Final authored geometry must replay using only LAD's bundled CAD dependencies and registered reference inputs. lad_import is only for pre-existing external/reference inputs and faithful format conversions of user-provided inputs; never export/import or reimport geometry generated as part of this design by LAD or external tools.",
                                "apiHelp": "The selected runtime is ready to use. Inspect Python help(cq.Workplane.loft), help(cq.Solid), or installed OCP classes with workspace commands; no CAD environment bootstrap is needed.",
                                "inputAssets": inputs.values.sorted { $0.id < $1.id }.map { ["assetID": $0.id, "name": $0.name, "format": $0.format] }])
+        case "lad_request_permission":
+            try allowed(arguments, ["operation", "reason"])
+            let operation = try permissionText("operation", arguments, maximum: 200)
+            let reason = try permissionText("reason", arguments, maximum: 2_000)
+            guard permissionRequest == nil else { throw LADError.message("A permission request is already pending for this task.") }
+            let controller = permissionController
+            let owner: NSWindow?
+            if hasPermissionViewport {
+                if !permissionWindowWasBound, let window = viewport?.window {
+                    permissionWindow = window
+                    permissionWindowWasBound = true
+                }
+                guard let window = permissionWindow, viewport?.window === window else { throw CancellationError() }
+                owner = window
+            } else { owner = nil }
+            let id = UUID()
+            let request = Task { try await controller.request(operation: operation, reason: reason, window: owner) }
+            permissionRequest = (id, request)
+            defer { if permissionRequest?.id == id { permissionRequest = nil } }
+            let decision = try await withTaskCancellationHandler {
+                try await request.value
+            } onCancel: {
+                request.cancel()
+            }
+            try checkCancellation()
+            return try result(["allowed": decision.allowed, "source": decision.source.rawValue,
+                               "rememberedPolicy": decision.rememberedPolicy.map { $0.rawValue as Any } ?? NSNull(),
+                               "scope": "task_workspace", "workspace": workspace.root.path,
+                               "executionPerformed": false,
+                               "nextStep": decision.allowed
+                                   ? "Permission granted for this proposed operation inside this task workspace. Execute it yourself; LAD has not run anything. Use an isolated local environment for optional installs, keep final CAD replay dependent only on LAD's bundled dependencies, and query permission again for each new operation."
+                                   : "Permission denied. Do not perform the proposed operation or rephrase/retry it without new user direction. Continue with existing or bundled capabilities, or explain the limitation."])
         case "lad_versions":
             try allowed(arguments, ["offset", "limit"])
             let offset = try integer("offset", arguments, fallback: 0, range: 0...1_000_000)
@@ -647,6 +690,13 @@ final class CADAgentTools {
         guard let value = (values[key] ?? fallback) as? String,
               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               value.count <= maximum, !value.contains("\0") else {
+            throw LADError.message("‘\(key)’ must be nonempty text of at most \(maximum) characters.")
+        }
+        return value
+    }
+    private func permissionText(_ key: String, _ values: [String: Any], maximum: Int) throws -> String {
+        let value = try string(key, values, required: true)!.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.unicodeScalars.count <= maximum else {
             throw LADError.message("‘\(key)’ must be nonempty text of at most \(maximum) characters.")
         }
         return value
