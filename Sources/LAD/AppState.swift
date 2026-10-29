@@ -1533,7 +1533,7 @@ final class AppState: ObservableObject {
                     let hiddenIDs = Set(migrated.nodes.flatMap(\.flattened).filter {
                         !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: oldHidden)
                     }.map(\.id))
-                    revisions[index].preview = preview; revisions[index].stepData = Self.nativeSTEP(for: spec)
+                    revisions[index].preview = preview; revisions[index].stepData = nil
                     if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
                     revisions[index].parts = defaults
                     revisions[index].partLayout = layout
@@ -1689,12 +1689,15 @@ final class AppState: ObservableObject {
         exportSTEP(to: url, solidIndices: solids)
     }
 
-    /// Export the captured revision, with STEP bytes cached only for this
-    /// session. Native solid serialization and the final write stay off the UI.
-    func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil) {
+    /// Export the captured geometry and current colors. The engine caches
+    /// session bytes by geometry, selected solids and RGB assignments.
+    func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil, revealInFinder: Bool = true) {
         guard canExport, let preview = mesh, let revisionID = selectedRevisionID,
               let revision = revisions.first(where: { $0.id == revisionID }) else { return }
         if let solidIndices, solidIndices.isEmpty || !solidIndices.isSubset(of: Set(0..<preview.solids)) { return }
+        let nodes = revision.partLayout?.nodes ?? revision.parts ?? Self.defaultParts(for: preview)
+        let colors = Self.completePartColors(in: nodes, stored: revision.partColors ?? [:])
+        let exportColors = PartColorState.solidColors(in: nodes, overrides: colors)
         let token = UUID(), sessionID = projectSessionID
         operationID = token
         let runtime = python, cores = threads
@@ -1702,23 +1705,24 @@ final class AppState: ObservableObject {
         operation = Task {
             do {
                 let data: Data
-                if solidIndices == nil, let cached = revision.stepData ?? Self.nativeSTEP(for: revision.model) { data = cached }
-                else {
-                    do { data = try await engine.exportSTEP(preview, solidIndices: solidIndices, python: runtime, threads: cores) }
-                    catch EngineExportError.nativeArtifactUnavailable {
-                        // A session artifact can be evicted or removed by the
-                        // OS. Recreate that revision, then retry native export.
-                        let rebuilt = try await engine.buildPreview(revision.model, python: runtime, threads: cores)
-                        guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
-                              !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
-                        try cacheReplayedPreview(rebuilt, at: index)
-                        let remapped = try solidIndices.map { try Self.restoredPartState(for: revision, preview: rebuilt, selected: $0).selected }
-                        data = try await engine.exportSTEP(rebuilt, solidIndices: remapped, python: runtime, threads: cores)
-                    }
+                do {
+                    data = try await engine.exportSTEP(preview, solidIndices: solidIndices, solidColors: exportColors,
+                                                       python: runtime, threads: cores)
+                } catch EngineExportError.nativeArtifactUnavailable {
+                    // Replay can enumerate solids differently. Bind the
+                    // captured colors and subset to fresh stable ownership.
+                    let rebuilt = try await engine.buildPreview(revision.model, python: runtime, threads: cores)
+                    guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
+                          !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
+                    let restored = try Self.restoredPartState(for: revision, preview: rebuilt, selected: solidIndices ?? [])
+                    let rebuiltColors = PartColorState.solidColors(in: restored.layout?.nodes ?? restored.parts, overrides: colors)
+                    try cacheReplayedPreview(rebuilt, at: index)
+                    data = try await engine.exportSTEP(rebuilt, solidIndices: solidIndices == nil ? nil : restored.selected,
+                                                       solidColors: rebuiltColors, python: runtime, threads: cores)
                 }
                 guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
                       !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
-                if solidIndices == nil { revisions[index].stepData = data }
+                revisions[index].stepData = nil
                 let writing = Task.detached(priority: .userInitiated) {
                     try Task.checkCancellation()
                     try data.write(to: url, options: .atomic)
@@ -1730,7 +1734,7 @@ final class AppState: ObservableObject {
                       !Task.isCancelled else { return }
                 notice = "STEP exported · \(url.lastPathComponent)"
                 activity = "Ready"; isWorking = false; operation = nil
-                NSWorkspace.shared.activateFileViewerSelecting([url])
+                if revealInFinder { NSWorkspace.shared.activateFileViewerSelecting([url]) }
             } catch is CancellationError {
                 if operationID == token { isWorking = false; activity = "Ready"; operation = nil }
             } catch {
@@ -1895,7 +1899,7 @@ final class AppState: ObservableObject {
         revisions[index].hiddenSolids = restored.hidden.sorted()
         revisions[index].preview = preview
         if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
-        revisions[index].stepData = Self.nativeSTEP(for: revisions[index].model)
+        revisions[index].stepData = nil
         mesh = preview; builtRevisionID = revisions[index].id
         hiddenSolids = restored.hidden; selectedSolids = restored.selected
         selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: selectedPartNodeIDs, in: partTree)
@@ -1941,15 +1945,6 @@ final class AppState: ObservableObject {
         if let layout { try ProjectStore.validatePartHierarchy(layout.nodes, solidCount: preview.solids) }
         return (remapped(previous), layout, Set((revision.hiddenSolids ?? []).compactMap { mapping[$0] }),
                 Set(selected.compactMap { mapping[$0] }))
-    }
-
-    /// A native import has no generated operations, so its original input is
-    /// already the exact export. Avoid reserializing it through OpenCascade.
-    private static func nativeSTEP(for model: ModelSpec) -> Data? {
-        let statements = model.script.split(separator: "\n").map {
-            $0.trimmingCharacters(in: .whitespaces)
-        }.filter { !$0.isEmpty && !$0.hasPrefix("#") }
-        return statements.count == 1 && statements[0].replacingOccurrences(of: " ", with: "") == "result=imported_model" ? model.sourceSTEP : nil
     }
 
     private static func defaultParts(for preview: PreviewMesh) -> [PartNode] {

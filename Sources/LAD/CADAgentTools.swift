@@ -16,6 +16,7 @@ final class CADAgentTools {
         var metadataURL: URL
         var versionID: UUID? = nil
         var parts: [PartNode] = []
+        var partLayout: PartLayout? = nil
         var partColors: [String: PartColor] = [:]
         var colorChanges: [CADPartColorChange] = []
     }
@@ -87,7 +88,7 @@ final class CADAgentTools {
             artifacts["current"] = Artifact(id: "current", model: current, preview: currentPreview,
                 programURL: workspace.root.appendingPathComponent("context/current-model.json"),
                 metadataURL: workspace.root.appendingPathComponent("artifacts/current/metadata.json"),
-                parts: currentParts, partColors: currentColors)
+                parts: currentParts, partLayout: partLayout, partColors: currentColors)
         }
     }
 
@@ -428,10 +429,16 @@ final class CADAgentTools {
             return try imageResult(url, metadata: ["source": "LAD offscreen fallback; no live viewport is attached", "artifactID": artifact.id])
         case "lad_export_step":
             try allowed(arguments, ["artifactID", "path", "solidIndices"])
+            let requestedID = try string("artifactID", arguments) ?? "current"
+            let previous = artifacts[requestedID]
             let artifact = try await artifact(arguments)
             let preview = artifact.preview!
-            let indices = try indices(arguments, preview: preview, optional: true)
-            let data = try await engine.exportSTEP(preview, solidIndices: indices, python: python, threads: threads)
+            var indices = try indices(arguments, preview: preview, optional: true)
+            if let requested = indices, let previous, previous.preview == nil, !previous.parts.isEmpty {
+                indices = try Self.remappedExportIndices(requested, from: previous.parts, to: artifact.parts)
+            }
+            let data = try await engine.exportSTEP(preview, solidIndices: indices, solidColors: renderColors(for: artifact),
+                                                   python: python, threads: threads)
             try checkCancellation()
             let relative = try string("path", arguments) ?? "exports/\(artifact.id).step"
             let url = try workspace.write(data, path: relative)
@@ -486,17 +493,19 @@ final class CADAgentTools {
         let defaults = Self.parts(in: preview)
         let previous = artifacts[id]
         let version = versionID.flatMap { identity in versions.versions.first { $0.id == identity } }
-        let layout = version?.partLayout ?? (versionID == nil ? partLayout : nil)
-        let nodes = previous.flatMap { $0.parts.isEmpty ? nil : $0.parts } ?? layout.map {
+        let layout = previous?.partLayout ?? version?.partLayout ?? (versionID == nil ? partLayout : nil)
+            ?? previous.flatMap { $0.parts.isEmpty ? nil : PartLayout(nodes: $0.parts) }
+        let resolvedLayout = layout.map {
             $0.remappingGenericParts(to: defaults).reconciled(with: defaults,
-                allowingPlacementChanges: Set(model.reorganizePartIDs ?? [])).nodes
-        } ?? defaults
+                allowingPlacementChanges: Set(model.reorganizePartIDs ?? []))
+        } ?? PartLayout(nodes: defaults)
+        let nodes = resolvedLayout.nodes
         let inherited = previous?.partColors ?? (versionID != nil ? version?.partColors ?? [:]
             : artifacts["current"]?.partColors ?? initialPartColors)
         let physicalIDs = Self.physicalIDs(in: nodes)
         let patch = previous?.colorChanges ?? (versionID == nil ? artifacts["current"]?.colorChanges ?? [] : [])
         let artifact = Artifact(id: id, model: model, preview: preview, programURL: programURL, metadataURL: metadataURL,
-            versionID: versionID, parts: nodes,
+            versionID: versionID, parts: nodes, partLayout: resolvedLayout,
             partColors: Self.completePartColors(in: nodes, colors: inherited),
             colorChanges: patch.filter { physicalIDs.contains($0.partID) })
         _ = try workspace.write(JSONSerialization.data(withJSONObject: summary(artifact), options: [.sortedKeys, .prettyPrinted]), path: "artifacts/\(id)/metadata.json")
@@ -516,6 +525,26 @@ final class CADAgentTools {
 
     private static func physicalIDs(in nodes: [PartNode]) -> Set<String> {
         Set(nodes.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map(\.id))
+    }
+
+    /// Color lookup can expose saved ownership before a cold replay. Keep an
+    /// export subset attached to those physical identities if native order changes.
+    private static func remappedExportIndices(_ requested: Set<Int>, from previous: [PartNode],
+                                             to current: [PartNode]) throws -> Set<Int> {
+        let owners = Dictionary(uniqueKeysWithValues: current.flatMap(\.flattened).filter {
+            !$0.solidIndices.isEmpty
+        }.map { ($0.id, $0.solidIndices) })
+        var result = Set<Int>()
+        for part in previous.flatMap(\.flattened) where !Set(part.solidIndices).isDisjoint(with: requested) {
+            guard let indices = owners[part.id], indices.count == part.solidIndices.count else {
+                throw LADError.message("Part ownership changed while rebuilding this artifact. Inspect its current parts before exporting a subset.")
+            }
+            for (old, new) in zip(part.solidIndices, indices) where requested.contains(old) { result.insert(new) }
+        }
+        guard result.count == requested.count else {
+            throw LADError.message("The selected export parts are no longer available. Inspect the artifact's current parts.")
+        }
+        return result
     }
 
     private func colorArtifact(_ arguments: [String: Any]) throws -> Artifact {

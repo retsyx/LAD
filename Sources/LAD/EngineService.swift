@@ -17,7 +17,18 @@ final class EngineService {
     private var generation = UUID()
     private var nativeArtifacts: Set<String> = []
     private var stepArtifacts: Set<String> = []
-    private var exportedSTEP: [String: Data] = [:]
+    private struct STEPExportColor: Codable, Hashable, Sendable {
+        var solidIndex: Int
+        var color: PartColor
+    }
+    private struct STEPExportKey: Hashable {
+        var nativePath: String
+        var selection: [Int]?
+        var colors: [STEPExportColor]
+    }
+    private var exportedSTEP: [STEPExportKey: Data] = [:]
+    private var exportedSTEPOrder: [STEPExportKey] = []
+    private var exportedSTEPBytes = 0
 
     static var defaultPython: String {
         let configured = ResourcePaths.root.appendingPathComponent("python-runtime.txt")
@@ -100,16 +111,24 @@ final class EngineService {
     }
 
     /// Export an already built native solid, with no program replay or meshing.
-    /// Repeated exports of the same session geometry reuse its exact bytes.
-    func exportSTEP(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, python: String, threads: Int) async throws -> Data {
+    /// Repeated exports reuse bytes only for the same geometry, subset and RGB.
+    func exportSTEP(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, solidColors: [Int: PartColor] = [:],
+                    python: String, threads: Int) async throws -> Data {
+        try Task.checkCancellation()
         if let solidIndices {
             guard !solidIndices.isEmpty, solidIndices.allSatisfy({ $0 >= 0 && $0 < preview.solids }) else {
                 throw LADError.message("Select at least one available part to export.")
             }
         }
+        guard solidColors.count <= preview.solids,
+              solidColors.allSatisfy({ (0..<preview.solids).contains($0.key) && $0.value.isValid }) else {
+            throw LADError.message("The export colors must refer to available parts and use finite sRGB components between 0 and 1.")
+        }
         let selection: [Int]? = solidIndices.flatMap { $0.count == preview.solids ? nil : $0.sorted() }
-        // Whole imported/direct exports retain their original exact STEP bytes.
-        if selection == nil, stepArtifacts.contains(preview.stepPath) {
+        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
+        // Raw bytes are valid only when the caller requests no display colors.
+        // Any supplied current RGB must be written from native geometry.
+        if selection == nil, colors.isEmpty, stepArtifacts.contains(preview.stepPath) {
             let source = URL(fileURLWithPath: preview.stepPath)
             return try await Task.detached(priority: .userInitiated) {
                 let data = try EngineArtifact.read(source, in: source.deletingLastPathComponent(), maximumBytes: ProjectStore.maximumSTEPBytes)
@@ -118,13 +137,18 @@ final class EngineService {
             }.value
         }
         if let path = preview.brepPath, nativeArtifacts.contains(path) {
-            let cacheKey = path + (selection.map { ":solids:" + $0.map(String.init).joined(separator: ",") } ?? "")
-            if let cached = exportedSTEP[cacheKey] { return cached }
+            let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors)
+            if let cached = exportedSTEP[cacheKey] {
+                exportedSTEPOrder.removeAll { $0 == cacheKey }
+                exportedSTEPOrder.append(cacheKey)
+                return cached
+            }
             let bytes = try await nativeBytes(preview)
             let output = try await run(python: python, threads: threads, scriptMode: false, action: "export this design") { folder in
                 try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
                 var payload: [String: Any] = ["operation": "export", "brepAsset": "source.brep"]
                 if let selection { payload["solidIndices"] = selection }
+                if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
                 try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
             }
             defer { try? FileManager.default.removeItem(at: output.folder) }
@@ -135,10 +159,23 @@ final class EngineService {
                 return data
             }.value
             guard generation == output.token, !Task.isCancelled else { throw CancellationError() }
-            exportedSTEP[cacheKey] = data
+            cacheSTEP(data, for: cacheKey)
             return data
         }
         throw EngineExportError.nativeArtifactUnavailable
+    }
+
+    private func cacheSTEP(_ data: Data, for key: STEPExportKey) {
+        // Recoloring can produce many large STEP variants of one assembly.
+        // Keep a small, byte-bounded LRU rather than retaining every finish.
+        while !exportedSTEPOrder.isEmpty &&
+                (exportedSTEP.count >= 8 || exportedSTEPBytes + data.count > ProjectStore.maximumFileBytes) {
+            let oldest = exportedSTEPOrder.removeFirst()
+            if let removed = exportedSTEP.removeValue(forKey: oldest) { exportedSTEPBytes -= removed.count }
+        }
+        exportedSTEP[key] = data
+        exportedSTEPBytes += data.count
+        exportedSTEPOrder.append(key)
     }
 
     /// Exact single-item properties are already available in session metadata.

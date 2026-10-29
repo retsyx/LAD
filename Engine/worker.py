@@ -1065,20 +1065,48 @@ def selected_solids(spec, solids, required=False):
     return indices
 
 
+def export_solid_colors(records, solid_count):
+    """Validate the complete color request before creating any export output."""
+    if not isinstance(records, list) or len(records) > solid_count:
+        raise ModelError("STEP colors must be a list of uniquely indexed solid colors.")
+    colors = {}
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"solidIndex", "color"}:
+            raise ModelError("Each STEP color must contain a solidIndex and an RGB color.")
+        index = record["solidIndex"]
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < solid_count or index in colors:
+            raise ModelError("STEP colors contain invalid or duplicate solid indices.")
+        colors[index] = validate_part_color(record["color"])
+    return colors
+
+
 def export_brep(spec, asset_directory, output, cq, threads):
     """Create whole or selected STEP without replaying or tessellating."""
-    if set(spec) - {"operation", "brepAsset", "solidIndices"} or spec.get("brepAsset") != "source.brep":
+    if set(spec) - {"operation", "brepAsset", "solidIndices", "solidColors"} or spec.get("brepAsset") != "source.brep":
         raise ModelError("STEP export requires the private source.brep asset.")
     shape = read_brep(spec, asset_directory, cq, threads)
     solids = shape.Solids()
     indices = selected_solids(spec, solids)
+    colors = export_solid_colors(spec.get("solidColors", []), len(solids))
     if not indices:
         raise ModelError("Select at least one part to export.")
     if set(indices) != set(range(len(solids))):
         chosen = [solids[index] for index in indices]
         shape = chosen[0] if len(chosen) == 1 else cq.Compound.makeCompound(chosen)
+    else:
+        indices = list(range(len(solids)))
     step = output / "model.step"
-    cq.exporters.export(shape, str(step), exportType="STEP")
+    if colors:
+        from cadquery.occ_impl.exporters.assembly import exportAssembly
+        assembly = cq.Assembly(name="Parts")
+        for index in indices:
+            rgb = colors.get(index)
+            color = cq.Color(rgb["red"], rgb["green"], rgb["blue"], 1) if rgb is not None else None
+            assembly.add(solids[index], name=f"Part {index + 1}", color=color)
+        if not exportAssembly(assembly, str(step), mode="default"):
+            raise ModelError("STEP export could not write the colored parts.")
+    else:
+        cq.exporters.export(shape, str(step), exportType="STEP")
     return {"solids": len(shape.Solids()), "faces": len(shape.Faces())}
 
 

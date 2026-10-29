@@ -90,7 +90,7 @@ TOOLS = [
              "projection": prop("string", enum=["perspective", "isometric"]), "display": prop("string", enum=["shaded", "edges", "translucent", "wireframe"]),
              "width": prop("integer", minimum=256, maximum=2048), "height": prop("integer", minimum=256, maximum=2048), "solidIndices": INDICES}), True),
     ("lad_screenshot", "Capture the current LAD viewport as a PNG image attachment. Uses an explicitly disclosed offscreen fallback if no live viewport is attached.", schema(), True),
-    ("lad_export_step", "Export exact whole or selected artifact geometry as STEP into the task workspace. Returns a file reference without sending the file bytes as text.",
+    ("lad_export_step", "Export exact whole or selected artifact geometry with its current part RGB colors as STEP into the task workspace. Includes staged colors and neutral finishes; preserves separate solids and original coordinates. Returns a file reference without sending the file bytes as text.",
      schema({**ARTIFACT, "path": prop("string"), "solidIndices": INDICES}), False),
     ("lad_convert_kicad", "Faithfully convert an exact supplied .kicad_pcb reference to a task-workspace STEP using LAD's existing KiCad converter. Reads original board/project/component paths without modifying them. Returns coverage, missing-component diagnostics and provenance only; does not build, import, register an asset or commit the design. Decide whether conversion is needed and explicitly call lad_import afterward if appropriate.",
      schema({"boardPath": prop("string", description="Exact .kicad_pcb path: workspace-relative or an absolute original source reference so KiCad resolves project component models correctly."),
