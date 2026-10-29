@@ -22,7 +22,7 @@ enum ViewportDisplayMode: String, Codable, Sendable, CaseIterable, Identifiable 
 }
 
 struct ViewportCommand: Equatable {
-    enum Action { case fit, isometric, front, top, right }
+    enum Action { case fit, isometric, front, back, left, right, top, bottom }
     let id = UUID()
     let action: Action
     init(_ action: Action) { self.action = action }
@@ -236,6 +236,22 @@ final class CADSceneView: SCNView {
     var onHideSelected: (() -> Void)?
     var onShowAll: (() -> Void)?
     var onActivated: ((CADSceneView) -> Void)?
+    var onCameraOrientationChanged: ((SIMD3<Double>, SIMD3<Double>, SIMD3<Double>) -> Void)? {
+        didSet { notifyCameraOrientation() }
+    }
+
+    var cameraOrientation: (right: SIMD3<Double>, up: SIMD3<Double>, backward: SIMD3<Double>) {
+        let transform = cameraNode.simdTransform
+        return (SIMD3<Double>(SIMD3(transform.columns.0.x, transform.columns.0.y, transform.columns.0.z)),
+                SIMD3<Double>(SIMD3(transform.columns.1.x, transform.columns.1.y, transform.columns.1.z)),
+                SIMD3<Double>(SIMD3(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z)))
+    }
+
+    private func notifyCameraOrientation() {
+        guard let onCameraOrientationChanged else { return }
+        let orientation = cameraOrientation
+        onCameraOrientationChanged(orientation.right, orientation.up, orientation.backward)
+    }
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { false }
@@ -921,10 +937,33 @@ final class CADSceneView: SCNView {
         case .fit: rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
         case .isometric: rig.yaw = -.pi / 4; rig.elevation = 0.6154797087
         case .front: rig.yaw = -.pi / 2; rig.elevation = 0
+        case .back: rig.yaw = .pi / 2; rig.elevation = 0
+        case .left: rig.yaw = .pi; rig.elevation = 0
         case .right: rig.yaw = 0; rig.elevation = 0
         case .top: rig.yaw = -.pi / 2; rig.elevation = .pi / 2 - 0.00001
+        case .bottom: rig.yaw = -.pi / 2; rig.elevation = -.pi / 2 + 0.00001
         }
         applyCamera()
+    }
+
+    func orbitFromOrientationCube(dx: Double, dy: Double) {
+        guard dx.isFinite, dy.isFinite, dx != 0 || dy != 0 else { return }
+        if let window, window.firstResponder !== self { window.makeFirstResponder(self) }
+        rig.orbitAroundCenter(dx: dx, dy: -dy)
+        applyCamera()
+    }
+
+    func selectOrientationCubeFace(_ face: ViewportCubeFace) {
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(self)
+        switch face {
+        case .front: perform(.front)
+        case .back: perform(.back)
+        case .left: perform(.left)
+        case .right: perform(.right)
+        case .top: perform(.top)
+        case .bottom: perform(.bottom)
+        }
     }
 
     /// Used only by an independent offscreen tool view. The live viewport's
@@ -945,6 +984,7 @@ final class CADSceneView: SCNView {
         cameraNode.camera?.usesOrthographicProjection = rig.usesOrthographicProjection
         cameraNode.camera?.orthographicScale = pose.orthographicScale
         SCNTransaction.commit()
+        notifyCameraOrientation()
         requestRedraw()
     }
 
@@ -969,6 +1009,7 @@ final class CADSceneView: SCNView {
             cameraNode.camera?.orthographicScale = rig.orthographicScale
         }
         SCNTransaction.commit()
+        notifyCameraOrientation()
         requestRedraw()
     }
 
@@ -1268,7 +1309,7 @@ final class CADSceneView: SCNView {
         reset.target = self
         menu.addItem(.separator())
         let views = NSMenu(title: "Standard Views")
-        for (title, tag) in [("Front", 1), ("Top", 2), ("Right", 3)] {
+        for (title, tag) in [("Front", 1), ("Back", 4), ("Left", 5), ("Right", 3), ("Top", 2), ("Bottom", 6)] {
             let item = views.addItem(withTitle: title, action: #selector(menuView(_:)), keyEquivalent: "")
             item.target = self
             item.tag = tag
@@ -1298,7 +1339,15 @@ final class CADSceneView: SCNView {
     @objc private func menuHideSelected() { onHideSelected?() }
     @objc private func menuShowAll() { onShowAll?() }
     @objc private func menuView(_ sender: NSMenuItem) {
-        perform(sender.tag == 1 ? .front : sender.tag == 2 ? .top : .right)
+        switch sender.tag {
+        case 1: perform(.front)
+        case 2: perform(.top)
+        case 3: perform(.right)
+        case 4: perform(.back)
+        case 5: perform(.left)
+        case 6: perform(.bottom)
+        default: break
+        }
     }
 
     private func anchor(at point: NSPoint) -> SIMD3<Double> {

@@ -4,6 +4,53 @@ import SwiftUI
 private final class WorkspaceViewportReference: ObservableObject {
     weak var view: CADSceneView?
     weak var window: NSWindow?
+    private weak var cube: ViewportOrientationCube?
+
+    func bindViewport(_ view: CADSceneView) {
+        guard self.view !== view else { return }
+        self.view?.onCameraOrientationChanged = nil
+        self.view = view
+        view.onCameraOrientationChanged = { [weak self] right, up, backward in
+            self?.cube?.setOrientation(right: right, up: up, backward: backward)
+        }
+    }
+
+    func bindCube(_ cube: ViewportOrientationCube) {
+        guard self.cube !== cube else { return }
+        self.cube?.onOrbit = nil
+        self.cube?.onSelectFace = nil
+        self.cube = cube
+        cube.onOrbit = { [weak self] dx, dy in self?.view?.orbitFromOrientationCube(dx: dx, dy: dy) }
+        cube.onSelectFace = { [weak self] face in self?.view?.selectOrientationCubeFace(face) }
+        if let orientation = view?.cameraOrientation {
+            cube.setOrientation(right: orientation.right, up: orientation.up, backward: orientation.backward)
+        }
+    }
+
+    func unbindCube(_ cube: ViewportOrientationCube) {
+        guard self.cube === cube else { return }
+        cube.onOrbit = nil
+        cube.onSelectFace = nil
+        self.cube = nil
+    }
+}
+
+private struct ViewportOrientationCubeControl: NSViewRepresentable {
+    let reference: WorkspaceViewportReference
+
+    func makeNSView(context: Context) -> ViewportOrientationCube {
+        let cube = ViewportOrientationCube(frame: .zero)
+        reference.bindCube(cube)
+        return cube
+    }
+
+    func updateNSView(_ cube: ViewportOrientationCube, context: Context) { reference.bindCube(cube) }
+
+    func makeCoordinator() -> WorkspaceViewportReference { reference }
+
+    static func dismantleNSView(_ cube: ViewportOrientationCube, coordinator: WorkspaceViewportReference) {
+        coordinator.unbindCube(cube)
+    }
 }
 
 struct WorkspaceView: View {
@@ -187,24 +234,21 @@ struct WorkspaceView: View {
                         onFeatureSelectionChanged: { state.selectFeatures($0) }, onDeselectAll: { state.clearSelections() },
                         onHideSelected: { state.hideSelectedParts() }, onShowAll: { state.showAllParts() },
                         onViewReady: { view in
-                            viewportReference.view = view
+                            viewportReference.bindViewport(view)
                             if view.window?.isKeyWindow == true || state.viewportView == nil { state.viewportView = view }
                         })
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
                     Spacer()
-                    HStack(spacing: 2) {
-                        viewportButton("arrow.up.left.and.arrow.down.right", "Fit design", .fit)
-                        Menu {
-                            Button("Front") { state.viewportCommand = ViewportCommand(.front) }
-                            Button("Top") { state.viewportCommand = ViewportCommand(.top) }
-                            Button("Right") { state.viewportCommand = ViewportCommand(.right) }
-                        } label: { Image(systemName: "square.stack.3d.up").frame(width: 28, height: 28) }
-                        .menuStyle(.borderlessButton).tint(.primary).frame(width: 32)
-                        Rectangle().fill(Palette.line).frame(width: 1, height: 18).padding(.horizontal, 5)
-                        Button { state.showGrid.toggle() } label: { Image(systemName: "grid").frame(width: 28, height: 28).foregroundStyle(state.showGrid ? Palette.accent : Palette.muted) }.help("Toggle grid")
-                            .accessibilityValue(state.showGrid ? "On" : "Off")
-                    }.buttonStyle(.plain).padding(5).background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
+                    VStack(alignment: .trailing, spacing: 8) {
+                        HStack(spacing: 2) {
+                            viewportButton("arrow.up.left.and.arrow.down.right", "Fit design", .fit)
+                            Rectangle().fill(Palette.line).frame(width: 1, height: 18).padding(.horizontal, 5)
+                            Button { state.showGrid.toggle() } label: { Image(systemName: "grid").frame(width: 28, height: 28).foregroundStyle(state.showGrid ? Palette.accent : Palette.muted) }.help("Toggle grid")
+                                .accessibilityValue(state.showGrid ? "On" : "Off")
+                        }.buttonStyle(.plain).padding(5).background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
+                        ViewportOrientationCubeControl(reference: viewportReference).frame(width: 92, height: 92)
+                    }
                 }.padding(22)
                 Spacer()
                 HStack(spacing: 12) {

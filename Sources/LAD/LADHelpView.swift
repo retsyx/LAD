@@ -8,6 +8,8 @@ struct LADHelpView: View {
                 control("Parts tree", "Select whole parts or folders")
                 control("Right-click", "Context menu")
                 control("Right-drag", "Rotate about the design’s geometric center")
+                control("Left-drag orientation cube", "Rotate about the design’s geometric center")
+                control("Click cube face", "View from that direction")
                 control("Scroll / pinch", "Zoom toward the cursor")
                 control("Middle-drag / Shift-right-drag", "Pan")
                 control("Double-click empty space / Escape", "Deselect all")
