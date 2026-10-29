@@ -1423,8 +1423,10 @@ final class CADSceneView: SCNView {
         // remain visible. Query those surfaces too, then explicitly discard
         // user-hidden parts before either selecting or anchoring a zoom.
         let search = hiddenSolids.isEmpty ? SCNHitTestSearchMode.closest : .all
+        // The deprecated sortResults option overrides nearest-hit ordering,
+        // even with searchMode.closest, and can return a farther solid first.
         return hitTest(point, options: [.categoryBitMask: 1, .ignoreHiddenNodes: false,
-                                 .searchMode: search.rawValue, .sortResults: !hiddenSolids.isEmpty])
+                                 .searchMode: search.rawValue])
             .first { hit in
                 guard let solid = solidIndex(of: hit.node) else { return false }
                 return !hiddenSolids.contains(solid)
