@@ -17,11 +17,11 @@ private final class WorkspaceViewportReference: ObservableObject {
 
     func bindCube(_ cube: ViewportOrientationCube) {
         guard self.cube !== cube else { return }
-        self.cube?.onOrbit = nil
+        self.cube?.onSelectCorner = nil
         self.cube?.onSelectFace = nil
         self.cube = cube
-        cube.onOrbit = { [weak self] dx, dy in self?.view?.orbitFromOrientationCube(dx: dx, dy: dy) }
         cube.onSelectFace = { [weak self] face in self?.view?.selectOrientationCubeFace(face) }
+        cube.onSelectCorner = { [weak self] corner in self?.view?.selectOrientationCubeCorner(corner) }
         if let orientation = view?.cameraOrientation {
             cube.setOrientation(right: orientation.right, up: orientation.up, backward: orientation.backward)
         }
@@ -29,7 +29,7 @@ private final class WorkspaceViewportReference: ObservableObject {
 
     func unbindCube(_ cube: ViewportOrientationCube) {
         guard self.cube === cube else { return }
-        cube.onOrbit = nil
+        cube.onSelectCorner = nil
         cube.onSelectFace = nil
         self.cube = nil
     }

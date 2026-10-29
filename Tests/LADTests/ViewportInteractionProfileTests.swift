@@ -8,7 +8,6 @@ import XCTest
 /// Opt in with LAD_VIEWPORT_PROFILE_PREVIEW pointing to a real worker
 /// result.json. This records a baseline without imposing machine-specific
 /// performance thresholds on the ordinary test suite.
-/// Set LAD_VIEWPORT_PROFILE_CUBE=1 to profile native orientation cube input.
 final class ViewportInteractionProfileTests: XCTestCase {
     @MainActor
     func testProfileRealPreviewNavigationAndFeaturePicking() async throws {
@@ -25,24 +24,9 @@ final class ViewportInteractionProfileTests: XCTestCase {
         let preview = try JSONDecoder().decode(PreviewMesh.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
         let display = ProcessInfo.processInfo.environment["LAD_VIEWPORT_PROFILE_DISPLAY"]
             .flatMap(ViewportDisplayMode.init(rawValue:)) ?? .edges
-        let profileCube = ProcessInfo.processInfo.environment["LAD_VIEWPORT_PROFILE_CUBE"] == "1"
-        let inputControl = profileCube ? "orientationCube" : "viewport"
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 618, height: 770), options: [
             SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
         ])
-        let cube: ViewportOrientationCube?
-        if profileCube {
-            let control = ViewportOrientationCube(frame: NSRect(x: view.bounds.maxX - 106, y: view.bounds.maxY - 106,
-                                                               width: 92, height: 92))
-            control.autoresizingMask = [.minXMargin, .minYMargin]
-            control.onOrbit = { [weak view] in view?.orbitFromOrientationCube(dx: $0, dy: $1) }
-            control.onSelectFace = { [weak view] in view?.selectOrientationCubeFace($0) }
-            view.onCameraOrientationChanged = { [weak control] in
-                control?.setOrientation(right: $0, up: $1, backward: $2)
-            }
-            view.addSubview(control)
-            cube = control
-        } else { cube = nil }
         let frames = ViewportProfileFrameCounter()
         view.delegate = frames
         let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
@@ -51,7 +35,6 @@ final class ViewportInteractionProfileTests: XCTestCase {
         window.contentView = view
         defer {
             view.delegate = nil
-            view.onCameraOrientationChanged = nil
             window.orderOut(nil)
             window.contentView = nil
             window.close()
@@ -71,12 +54,8 @@ final class ViewportInteractionProfileTests: XCTestCase {
 
         let initialCamera = view.agentCaptureMetadata["cameraTransform"] as? [Double]
         var dragCosts = [Double]()
-        let startPoint = profileCube ? NSPoint(x: 46, y: 46) : NSPoint(x: 240, y: 380)
-        if let cube {
-            cube.mouseDown(with: try mouse(.leftMouseDown, at: startPoint, in: cube))
-        } else {
-            view.rightMouseDown(with: try mouse(.rightMouseDown, at: startPoint, in: view))
-        }
+        let startPoint = NSPoint(x: 240, y: 380)
+        view.rightMouseDown(with: try mouse(.rightMouseDown, at: startPoint, in: view))
         frames.beginRecording()
         let firstDragFrame = frames.count
         let dragStart = ProcessInfo.processInfo.systemUptime
@@ -84,12 +63,9 @@ final class ViewportInteractionProfileTests: XCTestCase {
         for index in 0..<60 {
             lastPoint = NSPoint(x: startPoint.x + CGFloat(index + 1) * 2,
                                 y: startPoint.y + CGFloat(sin(Double(index + 1) * 0.12) * 30))
-            let event: NSEvent
-            if let cube { event = try mouse(.leftMouseDragged, at: lastPoint, in: cube) }
-            else { event = try mouse(.rightMouseDragged, at: lastPoint, in: view) }
+            let event = try mouse(.rightMouseDragged, at: lastPoint, in: view)
             let started = ProcessInfo.processInfo.systemUptime
-            if let cube { cube.mouseDragged(with: event) }
-            else { view.rightMouseDragged(with: event) }
+            view.rightMouseDragged(with: event)
             dragCosts.append((ProcessInfo.processInfo.systemUptime - started) * 1_000)
             if let transform = view.pointOfView?.simdWorldTransform {
                 frames.recordInput(pose: viewportProfilePose(transform), at: started)
@@ -98,8 +74,7 @@ final class ViewportInteractionProfileTests: XCTestCase {
         }
         let dragElapsed = ProcessInfo.processInfo.systemUptime - dragStart
         let dragFrameCount = frames.count - firstDragFrame
-        if let cube { cube.mouseUp(with: try mouse(.leftMouseUp, at: lastPoint, in: cube)) }
-        else { view.rightMouseUp(with: try mouse(.rightMouseUp, at: lastPoint, in: view)) }
+        view.rightMouseUp(with: try mouse(.rightMouseUp, at: lastPoint, in: view))
         let frameMetrics = frames.finishRecording()
         XCTAssertNotEqual(view.agentCaptureMetadata["cameraTransform"] as? [Double], initialCamera)
 
@@ -144,7 +119,6 @@ final class ViewportInteractionProfileTests: XCTestCase {
         let topology = preview.topology
         let report: [String: Any] = [
             "previewPath": path,
-            "inputControl": inputControl,
             "displayMode": display.rawValue,
             "viewportPoints": [618, 770],
             "backingScale": window.backingScaleFactor,
@@ -170,7 +144,7 @@ final class ViewportInteractionProfileTests: XCTestCase {
         try data.write(to: URL(fileURLWithPath: "/tmp/lad-viewport-interaction-profile.json"), options: [.atomic])
         let dragP95 = summary(dragCosts)["p95MS"] ?? 0
         let warmP95 = summary(warmCosts)["p95MS"] ?? 0
-        print("LAD viewport profile (\(inputControl)): drag p95=\(dragP95) ms, FPS=\(Double(dragFrameCount) / max(0.001, dragElapsed)), cold pick=\(coldCost) ms, warm pick p95=\(warmP95) ms")
+        print("LAD viewport profile: drag p95=\(dragP95) ms, FPS=\(Double(dragFrameCount) / max(0.001, dragElapsed)), cold pick=\(coldCost) ms, warm pick p95=\(warmP95) ms")
     }
 
     private func summary(_ values: [Double]) -> [String: Double] {
@@ -183,7 +157,7 @@ final class ViewportInteractionProfileTests: XCTestCase {
     }
 
     @MainActor
-    private func mouse(_ type: NSEvent.EventType, at point: NSPoint, in view: NSView) throws -> NSEvent {
+    private func mouse(_ type: NSEvent.EventType, at point: NSPoint, in view: CADSceneView) throws -> NSEvent {
         let window = try XCTUnwrap(view.window)
         return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: [],
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,

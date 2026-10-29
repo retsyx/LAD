@@ -946,13 +946,6 @@ final class CADSceneView: SCNView {
         applyCamera()
     }
 
-    func orbitFromOrientationCube(dx: Double, dy: Double) {
-        guard dx.isFinite, dy.isFinite, dx != 0 || dy != 0 else { return }
-        if let window, window.firstResponder !== self { window.makeFirstResponder(self) }
-        rig.orbitAroundCenter(dx: dx, dy: -dy)
-        applyCamera()
-    }
-
     func selectOrientationCubeFace(_ face: ViewportCubeFace) {
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
@@ -964,6 +957,15 @@ final class CADSceneView: SCNView {
         case .top: perform(.top)
         case .bottom: perform(.bottom)
         }
+    }
+
+    func selectOrientationCubeCorner(_ corner: ViewportCubeCorner) {
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(self)
+        let direction = corner.direction
+        rig.yaw = atan2(direction.y, direction.x)
+        rig.elevation = asin(direction.z)
+        applyCamera()
     }
 
     /// Used only by an independent offscreen tool view. The live viewport's

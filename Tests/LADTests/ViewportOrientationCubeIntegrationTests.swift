@@ -7,7 +7,7 @@ import XCTest
 
 final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     @MainActor
-    func testAllSixFacesSnapWithoutChangingPanZoomProjectionOrDrawingResources() async throws {
+    func testAllFacesAndEightCornersSnapWithoutChangingPanZoomProjectionOrDrawingResources() async throws {
         for projection in ViewportProjectionMode.allCases {
             let (view, preview) = try await readyView(projection: projection)
             view.otherMouseDown(with: try mouse(.otherMouseDown, at: NSPoint(x: 200, y: 150), in: view))
@@ -23,10 +23,9 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
             view.onSelectionChanged = { _ in selectionChanges += 1 }
             view.onFeatureSelectionChanged = { _ in selectionChanges += 1 }
 
-            for face in ViewportCubeFace.allCases {
-                view.selectOrientationCubeFace(face)
+            func checkSnap(_ expected: SIMD3<Double>) throws {
                 let orientation = view.cameraOrientation
-                assertVectorEqual(orientation.backward, expectedBackward(face), accuracy: 0.00002)
+                assertVectorEqual(orientation.backward, expected, accuracy: 0.00002)
                 assertOrthonormal(orientation.right, orientation.up, orientation.backward)
                 let after = view.agentCaptureMetadata
                 XCTAssertEqual(after["cameraTarget"] as? [Double], target)
@@ -37,6 +36,23 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
                 XCTAssertTrue(try geometry("edges:0", in: view) === edges)
                 XCTAssertFalse(view.isPreparingResources)
             }
+            for face in ViewportCubeFace.allCases {
+                view.selectOrientationCubeFace(face)
+                try checkSnap(expectedBackward(face))
+            }
+            XCTAssertEqual(ViewportCubeCorner.allCases.count, 8)
+            var octants = Set<String>()
+            for corner in ViewportCubeCorner.allCases {
+                view.selectOrientationCubeCorner(corner)
+                try checkSnap(corner.direction)
+                let direction = view.cameraOrientation.backward
+                for coordinate in [direction.x, direction.y, direction.z] {
+                    XCTAssertEqual(abs(coordinate), 1 / sqrt(3), accuracy: 1e-6,
+                                   "A corner must select an isometric direction, including lower views.")
+                }
+                octants.insert([direction.x, direction.y, direction.z].map { $0 > 0 ? "+" : "-" }.joined())
+            }
+            XCTAssertEqual(octants.count, 8, "Every physical cube corner must select its own isometric octant.")
             XCTAssertEqual(selectionChanges, 0)
             // A later ordinary update must retain the cube's camera instead
             // of replaying an unrelated old toolbar command or fitting again.
@@ -48,34 +64,36 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testCubeOrbitMatchesViewportPointerNavigationWithoutSelectingOrRebuilding() async throws {
+    func testCubeDraggingLeavesCameraSelectionAndDrawingResourcesUnchanged() async throws {
         for projection in ViewportProjectionMode.allCases {
-            let (cubeView, _) = try await readyView(projection: projection)
-            let (viewportView, _) = try await readyView(projection: projection)
-            let solid = try geometry("solid:0", in: cubeView)
-            let edges = try geometry("edges:0", in: cubeView)
+            let (view, _) = try await readyView(projection: projection)
+            let cube = ViewportOrientationCube(frame: NSRect(x: 0, y: 0, width: 92, height: 92))
+            bind(cube, to: view)
+            let solid = try geometry("solid:0", in: view)
+            let edges = try geometry("edges:0", in: view)
             let sources = edges.sources
-            let distance = try XCTUnwrap(cubeView.agentCaptureMetadata["cameraDistance"] as? Double)
             var selectionChanges = 0
-            cubeView.onSelectionChanged = { _ in selectionChanges += 1 }
-            cubeView.onFeatureSelectionChanged = { _ in selectionChanges += 1 }
-            let before = try XCTUnwrap(cubeView.pointOfView).simdTransform
-
-            cubeView.orbitFromOrientationCube(dx: 20, dy: 10)
-            cubeView.orbitFromOrientationCube(dx: 25, dy: 5)
-            viewportView.rightMouseDown(with: try mouse(.rightMouseDown, at: NSPoint(x: 200, y: 150), in: viewportView))
-            viewportView.rightMouseDragged(with: try mouse(.rightMouseDragged, at: NSPoint(x: 220, y: 160), in: viewportView))
-            viewportView.rightMouseDragged(with: try mouse(.rightMouseDragged, at: NSPoint(x: 245, y: 165), in: viewportView))
-            viewportView.rightMouseUp(with: try mouse(.rightMouseUp, at: NSPoint(x: 245, y: 165), in: viewportView))
-            let after = try XCTUnwrap(cubeView.pointOfView).simdTransform
-            assertMatrixEqual(after, try XCTUnwrap(viewportView.pointOfView).simdTransform)
-            XCTAssertGreaterThan(matrixDifference(before, after), 0.1)
-            XCTAssertEqual(try XCTUnwrap(cubeView.agentCaptureMetadata["cameraDistance"] as? Double), distance, accuracy: 1e-8)
-            XCTAssertTrue(try geometry("solid:0", in: cubeView) === solid)
-            XCTAssertTrue(try geometry("edges:0", in: cubeView) === edges)
+            view.onSelectionChanged = { _ in selectionChanges += 1 }
+            view.onFeatureSelectionChanged = { _ in selectionChanges += 1 }
+            let before = try XCTUnwrap(view.pointOfView).simdTransform
+            let start = try XCTUnwrap(cube.projectedTargetCenters.first { target, _ in
+                if case .face = target { return true }
+                return false
+            }).value
+            cube.mouseDown(with: try mouse(.leftMouseDown, at: start, in: cube))
+            let drag = try mouse(.leftMouseDragged, at: NSPoint(x: start.x + 20, y: start.y + 10), in: cube)
+            XCTAssertEqual(drag.deltaX, 0)
+            XCTAssertEqual(drag.deltaY, 0)
+            cube.mouseDragged(with: drag)
+            cube.mouseDragged(with: try mouse(.leftMouseDragged, at: start, in: cube))
+            cube.mouseUp(with: try mouse(.leftMouseUp, at: start, in: cube))
+            assertMatrixEqual(try XCTUnwrap(view.pointOfView).simdTransform, before)
+            XCTAssertTrue(try geometry("solid:0", in: view) === solid)
+            XCTAssertTrue(try geometry("edges:0", in: view) === edges)
             for (before, after) in zip(sources, edges.sources) { XCTAssertTrue(before === after) }
             XCTAssertEqual(selectionChanges, 0)
-            XCTAssertFalse(cubeView.isPreparingResources)
+            XCTAssertFalse(view.isPreparingResources)
+            XCTAssertFalse(view.rendersContinuously)
         }
     }
 
@@ -118,7 +136,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testLiveCubeDragAndFaceClickWakeAnIdleViewportAndThenPause() async throws {
+    func testLiveFaceFlipAndCornerClicksWakeAnIdleViewportWhileDraggingDoesNot() async throws {
         guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for live viewport drawing.") }
         let application = NSApplication.shared
         let previousPolicy = application.activationPolicy()
@@ -132,9 +150,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
         container.addSubview(view)
         let cube = ViewportOrientationCube(frame: NSRect(x: 380, y: 258, width: 92, height: 92))
         container.addSubview(cube)
-        cube.onOrbit = { [weak view] in view?.orbitFromOrientationCube(dx: $0, dy: $1) }
-        cube.onSelectFace = { [weak view] in view?.selectOrientationCubeFace($0) }
-        view.onCameraOrientationChanged = { [weak cube] in cube?.setOrientation(right: $0, up: $1, backward: $2) }
+        bind(cube, to: view)
         let window = NSWindow(contentRect: NSRect(x: 50, y: 50, width: 480, height: 360),
                               styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "LAD orientation cube test"
@@ -152,31 +168,44 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
         window.displayIfNeeded()
         guard try await waitForFrame(frames, after: 0), try await waitForIdle(view, frames: frames) else { return }
 
-        let probe = SCNVector3(3, 2, 1)
-        let beforeOrbit = view.projectPoint(probe)
         let beforeDrag = frames.count
-        let start = NSPoint(x: 46, y: 46)
+        let initialCamera = try XCTUnwrap(view.pointOfView).simdTransform
+        let start = try XCTUnwrap(cube.projectedTargetCenters.first { target, _ in
+            if case .face = target { return true }
+            return false
+        }).value
         cube.mouseDown(with: try mouse(.leftMouseDown, at: start, in: cube))
-        let drag = try mouse(.leftMouseDragged, at: NSPoint(x: 66, y: 61), in: cube)
-        XCTAssertEqual(drag.deltaX, 0)
-        XCTAssertEqual(drag.deltaY, 0)
-        cube.mouseDragged(with: drag)
-        cube.mouseUp(with: try mouse(.leftMouseUp, at: NSPoint(x: 66, y: 61), in: cube))
-        guard try await waitForFrame(frames, after: beforeDrag), try await waitForIdle(view, frames: frames) else { return }
-        let afterOrbit = view.projectPoint(probe)
-        XCTAssertGreaterThan(hypot(Double(afterOrbit.x - beforeOrbit.x), Double(afterOrbit.y - beforeOrbit.y)), 5,
-                             "Dragging the cube must change the live viewport's rendered camera.")
+        cube.mouseDragged(with: try mouse(.leftMouseDragged, at: NSPoint(x: start.x + 20, y: start.y + 15), in: cube))
+        cube.mouseUp(with: try mouse(.leftMouseUp, at: start, in: cube))
+        try await Task.sleep(for: .milliseconds(300))
+        assertMatrixEqual(try XCTUnwrap(view.pointOfView).simdTransform, initialCamera)
+        XCTAssertEqual(frames.count, beforeDrag, "Dragging the cube must not wake viewport rendering.")
+        XCTAssertFalse(view.rendersContinuously)
 
-        let face = try XCTUnwrap(cube.projectedFaces.last)
-        XCTAssertEqual(cube.face(at: face.center), face.direction)
-        let beforeSnap = frames.count
-        cube.mouseDown(with: try mouse(.leftMouseDown, at: face.center, in: cube))
-        cube.mouseUp(with: try mouse(.leftMouseUp, at: face.center, in: cube))
-        guard try await waitForFrame(frames, after: beforeSnap), try await waitForIdle(view, frames: frames) else { return }
-        assertVectorEqual(view.cameraOrientation.backward, expectedBackward(face.direction), accuracy: 0.00002)
-        XCTAssertEqual(cube.projectedFaces.last?.direction, face.direction,
-                       "The displayed cube must follow the snapped viewport camera.")
-        XCTAssertFalse(view.rendersContinuously, "The orientation cube must retain bounded viewport redraw bursts.")
+        let targetKinds: [(ViewportCubeTarget) -> Bool] = [
+            { if case .face = $0 { return true }; return false },
+            { if case .oppositeFace = $0 { return true }; return false },
+            { if case .corner = $0 { return true }; return false }
+        ]
+        for matches in targetKinds {
+            let (target, point) = try XCTUnwrap(cube.projectedTargetCenters.first { matches($0.key) })
+            XCTAssertEqual(cube.hitTarget(at: point), target)
+            let beforeSnap = frames.count
+            let beforeCamera = try XCTUnwrap(view.pointOfView).simdTransform
+            cube.mouseDown(with: try mouse(.leftMouseDown, at: point, in: cube))
+            cube.mouseUp(with: try mouse(.leftMouseUp, at: point, in: cube))
+            guard try await waitForFrame(frames, after: beforeSnap), try await waitForIdle(view, frames: frames) else { return }
+            assertVectorEqual(view.cameraOrientation.backward, expectedBackward(target), accuracy: 0.00002)
+            XCTAssertGreaterThan(matrixDifference(beforeCamera, try XCTUnwrap(view.pointOfView).simdTransform), 0.1)
+            XCTAssertFalse(view.rendersContinuously, "Every cube target must retain bounded viewport redraw bursts.")
+        }
+    }
+
+    @MainActor
+    private func bind(_ cube: ViewportOrientationCube, to view: CADSceneView) {
+        cube.onSelectFace = { [weak view] in view?.selectOrientationCubeFace($0) }
+        cube.onSelectCorner = { [weak view] in view?.selectOrientationCubeCorner($0) }
+        view.onCameraOrientationChanged = { [weak cube] in cube?.setOrientation(right: $0, up: $1, backward: $2) }
     }
 
     @MainActor
@@ -244,6 +273,14 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     private func mouse(_ type: NSEvent.EventType, at point: NSPoint, in view: NSView) throws -> NSEvent {
         try XCTUnwrap(NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: [],
             timestamp: 0, windowNumber: view.window?.windowNumber ?? 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 0))
+    }
+
+    private func expectedBackward(_ target: ViewportCubeTarget) -> SIMD3<Double> {
+        switch target {
+        case .face(let face): return expectedBackward(face)
+        case .oppositeFace(let face): return -expectedBackward(face)
+        case .corner(let corner): return corner.direction
+        }
     }
 
     private func expectedBackward(_ face: ViewportCubeFace) -> SIMD3<Double> {
