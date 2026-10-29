@@ -839,6 +839,7 @@ final class AppState: ObservableObject {
         let previousLayout = selectedPartLayout
         let previouslyHidden = hiddenPartIDs
         let sourceRevisionID = selectedRevisionID
+        let versions = ProjectVersionContext(revisions: revisions, selectedRevisionID: selectedRevisionID)
         let selectionModels = Dictionary(uniqueKeysWithValues: revisions.map { ($0.id, $0.model) })
         let selectionModel = request.selection.flatMap { selectionModels[$0.revisionID] }
         let history = messages
@@ -912,7 +913,7 @@ final class AppState: ObservableObject {
                         guard let self, self.operationID == token else { return }
                         self.setSteeringAvailable(available)
                     }
-                }, selection: request.selection, selectionModel: selectionModel, selectionModelsByRevision: selectionModels)
+                }, selection: request.selection, selectionModel: selectionModel, selectionModelsByRevision: selectionModels, versions: versions)
                 guard operationID == token else { return }
                 drainGenerationFeedback(feedback, token: token)
                 try Task.checkCancellation()
@@ -976,7 +977,7 @@ final class AppState: ObservableObject {
                             guard let self, self.operationID == token else { return }
                             self.setSteeringAvailable(available)
                         }
-                    }, selection: request.selection, selectionModel: selectionModel, selectionModelsByRevision: selectionModels)
+                    }, selection: request.selection, selectionModel: selectionModel, selectionModelsByRevision: selectionModels, versions: versions)
                     guard operationID == token else { return }
                     drainGenerationFeedback(feedback, token: token)
                     try Task.checkCancellation()

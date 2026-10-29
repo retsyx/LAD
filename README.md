@@ -156,6 +156,8 @@ Every Codex design task has these LAD tools available by default, with instructi
 | Tool | Purpose |
 | --- | --- |
 | `lad_runtime` | Discover the selected Python, installed CAD versions and full API capabilities |
+| `lad_versions` | List saved versions with stable IDs, history positions, custom names and the current marker |
+| `lad_version` | Resolve a version reference to metadata and local files for its complete program and original inputs |
 | `lad_build` | Build a complete local Python recipe into validated native geometry and a preview |
 | `lad_inspect` | Inspect parts, vertices, edges/curves and faces, with paginated exact properties |
 | `lad_measure` | Measure native features or parts using the same exact geometry as the viewer |
@@ -167,6 +169,8 @@ Every Codex design task has these LAD tools available by default, with instructi
 | `lad_import` | Register validated pre-existing STEP/BREP or closed STL/OBJ reference inputs, with optional provenance snapshots |
 
 Rendering uses LAD's camera, geometry, materials and lighting. Candidate renders do not move the user's camera or replace the open design; only the final validated result becomes a revision. Image data is delivered to Codex as an MCP image attachment, so it can review the result during the turn. Tool outputs use file references and concise geometry metadata, rather than complete source files or CAD programs.
+
+When a request references v3 or a custom version name, Codex can look it up from a task snapshot of the design's complete saved history. Version lookup does not rebuild geometry or change the selected version. It returns complete local recipe and original-input references; an explicit `lad_build` with the returned `versionID` can replay that version for inspection or rendering. Ambiguous names return candidates for clarification. Historical generated geometry is never imported as a frozen reference.
 
 The **Tool Activity** toggle beside the conversation settings opens a separate nonmodal pane. It is **hidden by default**, is never restored visible, and leaves the existing window layout intact. It shows live and saved task events with expandable complete inputs, outputs, source snapshots and standard copy buttons. Cancellation and interruption retain their outcomes. Private reasoning, final-response JSON and derived image payloads are excluded. LAD retains its own audit while using a private Codex app-server with an ephemeral thread per design request; transient task files are removed afterward. Live supplemental input uses the same active thread and turn. An oversized malformed CLI event produces an explicit incomplete-record diagnostic instead of silently claiming a complete log.
 

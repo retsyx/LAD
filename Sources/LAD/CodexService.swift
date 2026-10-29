@@ -72,7 +72,7 @@ final class CodexService {
         hiddenSolids: Set<Int> = [], solidColors: [Int: PartColor] = [:],
         onSteeringAvailability: @escaping @Sendable (Bool) -> Void = { _ in },
         selection: ProjectSelectionContext? = nil, selectionModel: ModelSpec? = nil,
-        selectionModelsByRevision: [UUID: ModelSpec] = [:]
+        selectionModelsByRevision: [UUID: ModelSpec] = [:], versions: ProjectVersionContext = .empty
     ) async throws -> CodexProjectResult {
         guard activeJob == nil else { throw CodexError.failed("A Codex request is already running.") }
         validatedModel = nil; validatedMesh = nil
@@ -99,7 +99,7 @@ final class CodexService {
             threads: threads > 0 ? threads : ProcessInfo.processInfo.activeProcessorCount,
             current: current, currentPreview: currentPreview, engine: engine ?? EngineService(),
             viewport: viewport, hiddenSolids: hiddenSolids, solidColors: solidColors, onActivity: onActivity,
-            referenceAssets: selectionModel?.inputAssets ?? [])
+            referenceAssets: selectionModel?.inputAssets ?? [], versions: versions)
         activeBridge = bridge
         defer { bridge.stop(); if activeBridge === bridge { activeBridge = nil } }
         var arguments = ["app-server", "--listen", "stdio://"]
@@ -112,7 +112,7 @@ final class CodexService {
                 partLayout: partLayout, selection: selection, selectionModel: selectionModel,
                 selectionModelsByRevision: selectionModelsByRevision)
             return (text: try Self.makeRequest(instructions: instructions, prompt: prompt, current: current, history: history, files: files,
-                                               workspace: directory, python: taskRuntime), images: files.currentImagePaths)
+                                               workspace: directory, python: taskRuntime, versions: versions), images: files.currentImagePaths)
         }.value
 
         let temporary = directory.appendingPathComponent("tmp", isDirectory: true)
@@ -192,11 +192,14 @@ final class CodexService {
     }
 
     nonisolated private static func makeRequest(instructions: String, prompt: String, current: ModelSpec?, history: [ChatMessage], files: CodexFileContext,
-                                                workspace: URL, python: String) throws -> String {
+                                                workspace: URL, python: String, versions: ProjectVersionContext) throws -> String {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var request = instructions + "\n\nDESIGN CONTEXT\n"
         request += "TASK WORKSPACE: \(workspace.path)\nLAD PYTHON RUNTIME: \(python)\n"
         request += "The LAD MCP server is connected for this turn. When constructing or modifying geometry, call lad_runtime, then build/inspect/measure/render with LAD tools while iterating. For questions, explanations or clarification, return a message response without building or changing the design; use tools only when their results are needed for an accurate answer. Write scripts and optional external-tool outputs only inside this task workspace. Use this Python for installed CadQuery/OCP; do not bootstrap another CAD runtime or modify LAD’s shared environment. Local tool dependencies may be installed into a workspace environment if needed.\n\n"
+        request += "VERSION HISTORY: \(versions.versions.count) saved versions are available through lad_versions and lad_version."
+        if let id = versions.selectedRevisionID { request += " The selected design version ID is \(id.uuidString)." }
+        request += " These tools read a snapshot of this design's history for this task. Use them when the user refers to an older version, vN history position, or custom version name. Lookup leaves the current design and viewport unchanged and returns local program/input file references, never embedded source.\n\n"
         if let current, let modelPath = files.currentModelPath {
             request += "CURRENT MODEL FILE:\n" + String(decoding: try encoder.encode(modelPath), as: UTF8.self) + "\n\n"
             request += "Read this local JSON file before refining the current design. It contains the complete current CAD program. Its contents are not embedded in this prompt.\n\n"

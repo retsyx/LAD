@@ -14,6 +14,7 @@ final class CADAgentTools {
         var preview: PreviewMesh?
         var programURL: URL
         var metadataURL: URL
+        var versionID: UUID? = nil
     }
     private let workspace: CADAgentWorkspace
     private let python: String
@@ -21,6 +22,7 @@ final class CADAgentTools {
     private let engine: EngineService
     private let kicad: KiCadService
     private let current: ModelSpec?
+    private let versions: ProjectVersionContext
     private weak var viewport: CADSceneView?
     private let hiddenSolids: Set<Int>
     private let solidColors: [Int: PartColor]
@@ -30,17 +32,20 @@ final class CADAgentTools {
     private var artifacts: [String: Artifact] = [:]
     private var artifactOrder: [String] = []
     private var inputs: [String: CADInputAsset] = [:]
+    private var versionInputSizes: [String: Int] = [:]
+    private var versionTasks: [UUID: Task<CADAgentVersionFiles.Prepared, Error>] = [:]
     private var runtime: CADRuntime?
     private var cancelled = false
 
     init(directory: URL, python: String, threads: Int, current: ModelSpec?, currentPreview: PreviewMesh?,
          engine: EngineService, viewport: CADSceneView? = nil, hiddenSolids: Set<Int> = [],
          solidColors: [Int: PartColor] = [:], kicad: KiCadService? = nil,
-         referenceAssets: [CADInputAsset] = []) throws {
+         referenceAssets: [CADInputAsset] = [], versions: ProjectVersionContext = .empty) throws {
         workspace = try CADAgentWorkspace(directory: directory)
         self.python = python
         self.threads = threads
         self.current = current
+        self.versions = versions
         self.engine = engine
         self.kicad = kicad ?? KiCadService()
         self.viewport = viewport
@@ -84,11 +89,15 @@ final class CADAgentTools {
     }
 
     func resolveAssets(ids: [String]) throws -> [CADInputAsset] {
+        try resolveAssets(ids: ids, available: inputs)
+    }
+
+    private func resolveAssets(ids: [String], available: [String: CADInputAsset]) throws -> [CADInputAsset] {
         guard ids.count <= 256, Set(ids).count == ids.count else {
             throw LADError.message("Choose at most 256 distinct imported geometry inputs.")
         }
         let assets = try ids.map { id in
-            guard let asset = inputs[id] else { throw LADError.message("Imported geometry input ‘\(id)’ is unavailable in this task.") }
+            guard let asset = available[id] else { throw LADError.message("Imported geometry input ‘\(id)’ is unavailable in this build's input context.") }
             return asset
         }
         var total = 0
@@ -111,7 +120,13 @@ final class CADAgentTools {
         return nil
     }
 
-    func cancel() { cancelled = true; renderedImageData = nil; engine.cancel(); kicad.cancel() }
+    func cancel() {
+        cancelled = true
+        renderedImageData = nil
+        versionTasks.values.forEach { $0.cancel() }
+        engine.cancel()
+        kicad.cancel()
+    }
 
     func consumeRenderedImage() -> Data? {
         defer { renderedImageData = nil }
@@ -133,20 +148,47 @@ final class CADAgentTools {
                                "externalTools": "Use the selected Python or create a workspace-local environment with --system-site-packages. Install additional dependencies only inside this workspace for analysis or prototyping. Final authored geometry must remain in the replayable CAD program. lad_import is only for pre-existing external/reference inputs, including faithful conversion of a supplied PCB; never export/import or reimport geometry generated as part of this design by LAD or external tools.",
                                "apiHelp": "The selected runtime is ready to use. Inspect Python help(cq.Workplane.loft), help(cq.Solid), or installed OCP classes with workspace commands; no CAD environment bootstrap is needed.",
                                "inputAssets": inputs.values.sorted { $0.id < $1.id }.map { ["assetID": $0.id, "name": $0.name, "format": $0.format] }])
+        case "lad_versions":
+            try allowed(arguments, ["offset", "limit"])
+            let offset = try integer("offset", arguments, fallback: 0, range: 0...1_000_000)
+            let limit = try integer("limit", arguments, fallback: 50, range: 1...100)
+            let page = Array(versions.versions.dropFirst(offset).prefix(limit))
+            return try result(["offset": offset, "total": versions.versions.count,
+                               "items": page.map(CADAgentVersionFiles.metadata),
+                               "hasMore": offset + page.count < versions.versions.count])
+        case "lad_version":
+            try allowed(arguments, ["reference"])
+            let reference = try string("reference", arguments, required: true)!.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !reference.isEmpty else { throw LADError.message("Choose a saved version by its versionID, vN label or exact custom name.") }
+            let matches = versions.matches(reference: reference)
+            guard !matches.isEmpty else { throw LADError.message("The saved version ‘\(reference)’ is unavailable. Use lad_versions to list this task's saved versions.") }
+            guard matches.count == 1 else {
+                return try result(["status": "ambiguous", "reference": reference,
+                                   "candidates": matches.map(CADAgentVersionFiles.metadata),
+                                   "nextStep": "Choose a candidate's stable versionID; no version was opened or rebuilt."])
+            }
+            return try await stageVersion(matches[0])
         case "lad_build":
-            try allowed(arguments, ["programPath", "title", "summary", "assetIDs"])
+            try allowed(arguments, ["programPath", "title", "summary", "assetIDs", "versionID"])
+            let version = try string("versionID", arguments).map { try versions.version(id: $0) }
+            let origin = version?.model ?? current
             let path = try string("programPath", arguments, required: true)!
             let bytes = try workspace.read(path, maximumBytes: 200_000)
             guard let script = String(data: bytes, encoding: .utf8), !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw LADError.message("The CAD program must be nonempty UTF-8 Python text.")
             }
-            let ids = try strings("assetIDs", arguments) ?? (current?.inputAssets ?? []).map(\.id)
-            let selected = try resolveAssets(ids: ids)
-            let model = ModelSpec(title: try boundedText("title", arguments, fallback: "Untitled design", maximum: 160),
-                                  summary: try boundedText("summary", arguments, fallback: "CAD program built and validated by LAD.", maximum: 6_000),
-                                  units: "mm", script: script, sourceSTEP: current?.sourceSTEP,
-                                  sourceName: current?.sourceName, inputAssets: selected.isEmpty ? nil : selected)
-            let artifact = try await build(model)
+            let ids = try strings("assetIDs", arguments) ?? (origin?.inputAssets ?? []).map(\.id)
+            let selected: [CADInputAsset]
+            if let version {
+                let assets = version.model.inputAssets ?? []
+                try ProjectStore.validateInputAssets(assets)
+                selected = try resolveAssets(ids: ids, available: Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0) }))
+            } else { selected = try resolveAssets(ids: ids) }
+            let model = ModelSpec(title: try boundedText("title", arguments, fallback: version?.model.title ?? "Untitled design", maximum: 160),
+                                  summary: try boundedText("summary", arguments, fallback: version?.model.summary ?? "CAD program built and validated by LAD.", maximum: 6_000),
+                                  units: "mm", script: script, sourceSTEP: origin?.sourceSTEP,
+                                  sourceName: origin?.sourceName, inputAssets: selected.isEmpty ? nil : selected)
+            let artifact = try await build(model, versionID: version?.id)
             return try result(summary(artifact))
         case "lad_convert_kicad":
             try allowed(arguments, ["boardPath", "path"])
@@ -332,7 +374,40 @@ final class CADAgentTools {
         }
     }
 
-    private func build(_ model: ModelSpec, id: String? = nil) async throws -> Artifact {
+    private func stageVersion(_ version: ProjectVersionContext.Version) async throws -> [String: Any] {
+        let workspace = self.workspace
+        let prepared = try await versionWork { try CADAgentVersionFiles.prepare(version, workspace: workspace) }
+        try checkCancellation()
+        var sizes = versionInputSizes
+        for (path, count) in prepared.inputSizes { sizes[path] = count }
+        var total = 0
+        for count in sizes.values {
+            guard count <= ProjectStore.maximumFileBytes - total else {
+                throw LADError.message("Saved version inputs exceed the design's 256 MB storage limit.")
+            }
+            total += count
+        }
+        versionInputSizes = sizes
+        _ = try await versionWork {
+            try CADAgentVersionFiles.write(prepared, workspace: workspace)
+            return prepared
+        }
+        try checkCancellation()
+        guard let object = try JSONSerialization.jsonObject(with: prepared.payload) as? [String: Any] else {
+            throw LADError.message("The saved version metadata is unavailable.")
+        }
+        return try result(object)
+    }
+
+    private func versionWork(_ operation: @escaping @Sendable () throws -> CADAgentVersionFiles.Prepared) async throws -> CADAgentVersionFiles.Prepared {
+        let id = UUID()
+        let task = Task.detached(priority: .userInitiated, operation: operation)
+        versionTasks[id] = task
+        defer { versionTasks.removeValue(forKey: id) }
+        return try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
+    }
+
+    private func build(_ model: ModelSpec, id: String? = nil, versionID: UUID? = nil) async throws -> Artifact {
         let id = id ?? UUID().uuidString
         let preview: PreviewMesh
         if let cached = validatedPreview(for: model) { preview = cached }
@@ -341,7 +416,7 @@ final class CADAgentTools {
         runtime = preview.runtime
         let programURL = try workspace.write(Data(model.script.utf8), path: "artifacts/\(id)/program.py")
         let metadataURL = workspace.root.appendingPathComponent("artifacts/\(id)/metadata.json")
-        let artifact = Artifact(id: id, model: model, preview: preview, programURL: programURL, metadataURL: metadataURL)
+        let artifact = Artifact(id: id, model: model, preview: preview, programURL: programURL, metadataURL: metadataURL, versionID: versionID)
         _ = try workspace.write(JSONSerialization.data(withJSONObject: summary(artifact), options: [.sortedKeys, .prettyPrinted]), path: "artifacts/\(id)/metadata.json")
         artifacts[id] = artifact
         if !artifactOrder.contains(id) { artifactOrder.append(id) }
@@ -353,7 +428,7 @@ final class CADAgentTools {
     private func artifact(_ arguments: [String: Any]) async throws -> Artifact {
         let id = try string("artifactID", arguments) ?? "current"
         if let artifact = artifacts[id] {
-            return artifact.preview == nil ? try await build(artifact.model, id: id) : artifact
+            return artifact.preview == nil ? try await build(artifact.model, id: id, versionID: artifact.versionID) : artifact
         }
         if id == "current", let current { return try await build(current, id: "current") }
         throw LADError.message(id == "current" ? "There is no current design. Build a CAD program first." : "The requested CAD artifact is unavailable in this task.")
@@ -369,6 +444,7 @@ final class CADAgentTools {
                                     "topologyCounts": ["vertices": preview.topology?.vertices.count ?? 0,
                                                        "edges": preview.topology?.edges.count ?? 0, "faces": preview.topology?.faces.count ?? 0]]
         if let runtime = preview.runtime, let info = try? json(runtime) { result["runtime"] = info }
+        if let versionID = artifact.versionID { result["versionID"] = versionID.uuidString }
         return result
     }
 
@@ -492,7 +568,7 @@ final class CADAgentTools {
 
 /// Descriptor-relative I/O keeps the native host inside this task's workspace,
 /// even if an agent replaces a parent directory while a tool is reading/writing.
-struct CADAgentWorkspace {
+struct CADAgentWorkspace: Sendable {
     let root: URL
     private let suppliedRoot: URL
     init(directory: URL) throws {

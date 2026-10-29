@@ -19,9 +19,13 @@ import uuid
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 INSTRUCTIONS = (
-    "You are connected to LAD's native CAD runtime. Write a complete CadQuery/OCP Python program in the task workspace, "
+    "You are connected to LAD's native CAD runtime. When creating or modifying geometry, write a complete CadQuery/OCP Python program in the task workspace, "
     "then use lad_build, lad_inspect/lad_measure, and lad_render to evaluate and visually review it before the final answer. "
+    "For questions, explanations and saved-version lookup, use only the tools needed to answer accurately; a message response does not require a CAD build or replacement program. "
     "LAD provides the installed CAD environment: no CAD bootstrap is needed. Tools are speculative and do not replace the user's design. "
+    "When a request refers to an earlier version or custom version name, use lad_versions and lad_version to resolve it from the task's saved history snapshot. "
+    "Lookups return metadata and local file references without building geometry or changing the viewport. Use the returned stable versionID after resolution; ambiguous names require clarification. "
+    "Replay a saved program with lad_build.versionID to bind that version's exact original inputs. Never import generated geometry from earlier versions. "
     "Use lad_runtime for the selected Python, versions and asset IDs. Full installed CadQuery/OCP APIs are supported, including lofts, sweeps, "
     "splines and surfaces; final results must be closed solids. Extra tools/dependencies may be used in this writable workspace, without "
     "changing original sources or LAD's shared runtime. Use lad_convert_kicad when a supplied PCB reference needs faithful KiCad-to-STEP conversion; "
@@ -29,7 +33,7 @@ INSTRUCTIONS = (
     "NEVER export/import, reimport or use lad_import for geometry generated as part of the current design, whether authored with LAD or external tools such as SDF software. "
     "Keep all authored geometry in the replayable CAD program; external tools may support analysis and prototyping. Mesh reference inputs remain faceted. "
     "Inputs and outputs are file references, never inline complete source files. Screenshots/render tools return actual PNG image content. "
-    "Inspect and repair as many times as needed, then return the final complete program and its required assetIDs in the response schema."
+    "For geometry changes, inspect and repair as many times as needed, then return the final complete program and its required assetIDs in the response schema."
 )
 
 
@@ -45,8 +49,13 @@ ARTIFACT = {"artifactID": prop("string", description="Artifact ID returned by la
 INDICES = prop("array", items=prop("integer", minimum=0), description="Zero-based physical solid indices from lad_inspect.")
 TOOLS = [
     ("lad_runtime", "Discover LAD's ready-to-use Python/CadQuery/OCP runtime, capabilities, task workspace and available imported asset IDs.", schema(), True),
+    ("lad_versions", "List the task's saved design versions with stable IDs, vN history positions, custom names, dates and the current-version marker. Read-only history lookup; does not build geometry, select a version or change the viewport.",
+     schema({"offset": prop("integer", minimum=0, default=0), "limit": prop("integer", minimum=1, maximum=100, default=50)}), True),
+    ("lad_version", "Look up a saved design version by its stable UUID, vN history position or exact case-sensitive custom name. Stable UUIDs take precedence; duplicate names or a name matching another version's vN label return ambiguity candidates. Returns metadata and local paths to the complete saved CAD program and exact required original inputs, never inline source or binary data. Ambiguous names return candidates instead of guessing. Does not build geometry, select a version or change the viewport.",
+     schema({"reference": prop("string", description="Stable version UUID, history position such as v3, or exact custom version name. Use a returned stable UUID to disambiguate names or vN collisions.")}, ["reference"]), True),
     ("lad_build", "Build and validate a workspace Python CAD program using LAD's multicore native CAD worker. Returns an artifact ID and exact geometry metadata; does not commit the design or export STEP.",
-     schema({"programPath": prop("string"), "title": prop("string"), "summary": prop("string"), "assetIDs": prop("array", items=prop("string"))}, ["programPath"]), False),
+     schema({"programPath": prop("string"), "title": prop("string"), "summary": prop("string"), "assetIDs": prop("array", items=prop("string")),
+             "versionID": prop("string", description="Optional stable UUID returned by lad_version. Binds that saved version's exact original STEP and imported_assets inputs for this build only; does not change the current design or register historical inputs for the final replacement program.")}, ["programPath"]), False),
     ("lad_inspect", "Inspect exact geometry metadata, named parts and native topology IDs. Paginate vertices, edges or faces to find entities for measurements.",
      schema({**ARTIFACT, "kind": prop("string", enum=["summary", "parts", "vertices", "edges", "faces"]), "solidIndices": INDICES,
              "offset": prop("integer", minimum=0), "limit": prop("integer", minimum=1, maximum=500)}), True),
