@@ -214,7 +214,8 @@ private struct PartTreeItem: View {
                 Button {
                     onFinishRename(false)
                     let modifiers = NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags
-                    state.selectPartNodes([node.id], extending: modifiers.contains(.command) || modifiers.contains(.shift))
+                    let extending = selection.isFull || modifiers.contains(.command) || modifiers.contains(.shift)
+                    state.selectPartNodes([node.id], extending: extending)
                 } label: {
                     HStack(spacing: 7) {
                         partIcon
