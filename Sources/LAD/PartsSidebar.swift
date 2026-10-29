@@ -40,7 +40,10 @@ struct PartsSidebar: View {
             }
             Rectangle().fill(Palette.line).frame(height: 1)
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 3) {
+                // Each root can contain a complete expanded assembly. Lazy
+                // height estimates for these subtrees change during selection
+                // updates and move the scroll position.
+                VStack(alignment: .leading, spacing: 3) {
                     ForEach(state.partTree) { node in
                         PartTreeItem(node: node, state: state, renamingNodeID: $renamingNodeID,
                                      renameText: $renameText, onFinishRename: finishRename,
@@ -49,6 +52,7 @@ struct PartsSidebar: View {
                 }
                 .padding(.horizontal, 8).padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .background(PartsScrollAnchor(state: state).allowsHitTesting(false))
             }
             .contextMenu {
                 PartActionsMenu(state: state, onNewFolder: newFolder, onRename: rename)
