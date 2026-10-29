@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MeasurementInfoView: View {
     @ObservedObject var state: AppState
+    var contentPadding: CGFloat = 15
 
     private var metrics: [CADMeasurementMetric] { state.measurementReport?.metrics ?? [] }
     private var summaryMetrics: [CADMeasurementMetric] {
@@ -51,7 +52,7 @@ struct MeasurementInfoView: View {
                 .foregroundStyle(Palette.accent)
             }
         }
-        .padding(15).frame(maxWidth: .infinity, alignment: .leading)
+        .padding(contentPadding).frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Measurements")
     }

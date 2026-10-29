@@ -21,6 +21,7 @@ enum ProjectArchive {
                                projectID: project.projectID, codexSettings: project.codexSettings,
                                projectName: project.projectName, showGrid: project.showGrid,
                                projectionMode: project.projectionMode, displayMode: project.displayMode,
+                               partsPaneFraction: project.partsPaneFraction,
                                recentPartColors: project.recentPartColors, taskAudits: taskAudits,
                                queuedRequests: queuedRequests, draftPrompt: project.draftPrompt,
                                draftAttachments: draftAttachments, queuePaused: project.queuePaused, assets: writer.assets)
@@ -74,7 +75,7 @@ enum ProjectArchive {
                           displayMode: archive.displayMode, recentPartColors: archive.recentPartColors,
                           taskAudits: taskAudits, queuedRequests: queuedRequests,
                           draftPrompt: archive.draftPrompt, draftAttachments: draftAttachments,
-                          queuePaused: archive.queuePaused)
+                          queuePaused: archive.queuePaused, partsPaneFraction: archive.partsPaneFraction ?? 0.75)
     }
 
     private struct Document: Codable {
@@ -88,6 +89,7 @@ enum ProjectArchive {
         var showGrid: Bool?
         var projectionMode: ViewportProjectionMode?
         var displayMode: ViewportDisplayMode?
+        var partsPaneFraction: Double?
         var recentPartColors: [PartColor]?
         var taskAudits: [ArchivedTaskAudit]?
         var queuedRequests: [ArchivedQueuedRequest]?

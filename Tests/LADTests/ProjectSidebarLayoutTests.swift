@@ -5,46 +5,60 @@ import XCTest
 
 final class ProjectSidebarLayoutTests: XCTestCase {
     @MainActor
-    func testSidebarPanesResizeIndependentlyWithMeasurements() async throws {
+    func testCombinedInformationScrollLeavesProgramSpaceAndKeepsNativeBounds() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
-        let window = makeWindow(width: 1280, height: 1000)
-        let host = NSHostingView(rootView: WorkspaceView(state: fixture.state))
-        window.contentView = host
+        fixture.state.selectedSolids = [0]
+        XCTAssertNotNil(fixture.state.measurementReport)
+        let window = makeWindow(width: 360, height: 700)
+        let pane = ProjectDetailsPane(state: fixture.state, project: fixture.model, isProgramExpanded: .constant(true))
+        let host = NSHostingView(rootView: pane)
+        host.sizingOptions = []
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 700))
+        container.autoresizingMask = [.width, .height]
+        window.contentView = container
+        host.frame = container.bounds
+        host.autoresizingMask = [.width, .height]
+        container.addSubview(host)
         defer { close(window) }
         window.orderFront(nil)
-        _ = try await sidebar(in: host, paneCount: 2)
-        fixture.state.selectedSolids = [0]
-        let split = try await sidebar(in: host, paneCount: 3)
-        let height = split.bounds.height
-        split.setPosition(height * 0.30, ofDividerAt: 0)
-        split.setPosition(height * 0.60, ofDividerAt: 1)
+        let program = try await programScroll(in: host)
         await settle(host)
-        let initial = split.arrangedSubviews.map { $0.frame.height }
-
-        split.setPosition(height * 0.30 + 60, ofDividerAt: 0)
-        await settle(host)
-        let firstDrag = split.arrangedSubviews.map { $0.frame.height }
-        XCTAssertEqual(firstDrag[0] - initial[0], 60, accuracy: 3)
-        XCTAssertEqual(initial[1] - firstDrag[1], 60, accuracy: 3)
-        XCTAssertEqual(firstDrag[2], initial[2], accuracy: 3,
-                       "The Parts divider should resize its neighboring Measurements pane.")
-
-        split.setPosition(height * 0.60 + 60, ofDividerAt: 1)
-        await settle(host)
-        let secondDrag = split.arrangedSubviews.map { $0.frame.height }
-        XCTAssertEqual(secondDrag[0], firstDrag[0], accuracy: 3)
-        XCTAssertEqual(secondDrag[1] - firstDrag[1], 60, accuracy: 3)
-        XCTAssertEqual(firstDrag[2] - secondDrag[2], 60, accuracy: 3,
-                       "The Design divider should resize independently of Parts.")
-        XCTAssertTrue(secondDrag.allSatisfy { $0 > 90 })
-        XCTAssertEqual(secondDrag.reduce(0, +) + split.dividerThickness * 2, height, accuracy: 3)
-        try snapshot(host, to: "/tmp/lad-resizable-sidebar.png")
-
+        let information = try XCTUnwrap(descendants(host).compactMap { $0 as? NSScrollView }.first {
+            $0 !== program && !$0.isHiddenOrHasHiddenAncestor && $0.frame.height > 10
+        })
+        XCTAssertGreaterThan(try XCTUnwrap(information.documentView).bounds.height, information.contentSize.height + 20,
+                             "Design information and measurements must scroll inside their bounded region.")
+        XCTAssertLessThanOrEqual(information.frame.height, host.bounds.height / 2 + 1)
+        XCTAssertGreaterThan(program.frame.height, 250,
+                             "Long measurements must leave the expanded program a flexible viewport.")
+        let infoFrame = host.convert(information.bounds, from: information)
+        let programFrame = host.convert(program.bounds, from: program)
+        if host.isFlipped { XCTAssertLessThan(infoFrame.maxY, programFrame.minY) }
+        else { XCTAssertGreaterThan(infoFrame.minY, programFrame.maxY) }
+        try snapshot(host, to: "/tmp/lad-combined-design-measurements.png")
+        let initialWindow = window.frame
+        let initialHost = host.frame
+        let initialProgramHeight = program.frame.height
         fixture.state.clearSelections()
-        let withoutMeasurements = try await sidebar(in: host, paneCount: 2)
-        XCTAssertTrue(withoutMeasurements.arrangedSubviews.allSatisfy { $0.frame.height >= 139 })
-        XCTAssertFalse(fixture.state.isWorking, "A layout fixture must never start CAD or Codex work.")
+        await settle(host)
+        let remainingProgram = try await programScroll(in: host)
+        XCTAssertTrue(remainingProgram === program)
+        let remainingInfo = try XCTUnwrap(descendants(host).compactMap { $0 as? NSScrollView }.first {
+            $0 !== program && !$0.isHiddenOrHasHiddenAncestor && $0.frame.height > 100
+        }, "Design information must remain visible after removing measurements.")
+        let remainingDocument = try XCTUnwrap(remainingInfo.documentView)
+        if remainingDocument.isFlipped {
+            XCTAssertEqual(remainingInfo.documentVisibleRect.minY, remainingDocument.bounds.minY, accuracy: 1)
+        } else {
+            XCTAssertEqual(remainingInfo.documentVisibleRect.maxY, remainingDocument.bounds.maxY, accuracy: 1)
+        }
+        XCTAssertGreaterThan(program.frame.height, initialProgramHeight + 50,
+                             "Removing measurements should release information space to the program.")
+        XCTAssertEqual(window.frame, initialWindow)
+        XCTAssertEqual(host.frame, initialHost)
+        XCTAssertFalse(fixture.state.isWorking)
+        try snapshot(host, to: "/tmp/lad-combined-information-pane.png")
     }
 
     @MainActor
@@ -67,9 +81,14 @@ final class ProjectSidebarLayoutTests: XCTestCase {
         defer { close(window) }
         window.orderFront(nil)
         let scroll = try await programScroll(in: host)
+        await settle(host)
         XCTAssertEqual(host.bounds.height, 700, accuracy: 1, "The fixture must retain the requested pane height.")
+        let information = try XCTUnwrap(descendants(host).compactMap { $0 as? NSScrollView }.first {
+            $0 !== scroll && !$0.isHiddenOrHasHiddenAncestor && $0.frame.height > 80
+        }, "Design information must remain visible above the expanded code.")
         XCTAssertGreaterThan(scroll.frame.height, 400,
                              "Expanded source must use the available pane height, rather than a 220-point cap.")
+        XCTAssertLessThan(scroll.frame.height, host.bounds.height - information.frame.height)
         let frame = host.convert(scroll.bounds, from: scroll)
         let bottomGap = host.isFlipped ? host.bounds.maxY - frame.maxY : frame.minY - host.bounds.minY
         XCTAssertGreaterThanOrEqual(bottomGap, 0)
@@ -98,26 +117,13 @@ final class ProjectSidebarLayoutTests: XCTestCase {
     }
 
     @MainActor
-    private func sidebar(in host: NSView, paneCount: Int) async throws -> NSSplitView {
-        let deadline = ContinuousClock.now + .seconds(5)
-        while ContinuousClock.now < deadline {
-            host.layoutSubtreeIfNeeded()
-            if let split = descendants(host).compactMap({ $0 as? NSSplitView }).first(where: {
-                !$0.isVertical && $0.arrangedSubviews.count == paneCount && $0.bounds.height > 300
-            }) { return split }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        XCTFail("The sidebar did not provide \(paneCount) native resizable panes.")
-        return try XCTUnwrap(descendants(host).compactMap { $0 as? NSSplitView }.first { !$0.isVertical })
-    }
-
-    @MainActor
     private func programScroll(in host: NSView) async throws -> NSScrollView {
         let deadline = ContinuousClock.now + .seconds(5)
         while ContinuousClock.now < deadline {
             host.layoutSubtreeIfNeeded()
             if let scroll = descendants(host).compactMap({ $0 as? NSScrollView }).first(where: {
-                !$0.isHiddenOrHasHiddenAncestor && $0.frame.height > 100
+                !$0.isHiddenOrHasHiddenAncestor && $0.frame.height > 100 &&
+                    ($0.documentView?.bounds.width ?? 0) > $0.contentSize.width * 1.5
             }) { return scroll }
             try await Task.sleep(for: .milliseconds(10))
         }

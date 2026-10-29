@@ -129,7 +129,7 @@ final class PartsSidebarScrollTests: XCTestCase {
     }
 
     @MainActor
-    func testWorkspaceMeasurementsAndPartsPaneGrowthPreserveItsScrolledContent() async throws {
+    func testWorkspaceMeasurementsAndDividerResizeKeepTwoPanesAndScrolledContent() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let window = makeWindow(WorkspaceView(state: fixture.state), size: NSSize(width: 1280, height: 1000))
@@ -143,7 +143,7 @@ final class PartsSidebarScrollTests: XCTestCase {
         let middle = initialScroll.documentVisibleRect.minY
         let documentHeight = try XCTUnwrap(initialScroll.documentView).bounds.height
         fixture.state.selectPartNodes(["part-40"])
-        let measuredSplit = try await sidebar(in: host, paneCount: 3)
+        let measuredSplit = try await sidebar(in: host, paneCount: 2)
         await settle(host)
         let measuredScroll = try await partsScroll(in: host)
         assertPreservedOffset(middle, scroll: measuredScroll)
@@ -163,15 +163,14 @@ final class PartsSidebarScrollTests: XCTestCase {
         assertPreservedOffset(middle, scroll: unselectedScroll)
         XCTAssertEqual(try XCTUnwrap(unselectedScroll.documentView).bounds.height, documentHeight, accuracy: 2)
 
-        // Inserting Measurements shrinks Parts, and removing it grows Parts
-        // again. Begin near the bottom so a reset or gratuitous re-anchor is
-        // visible while still allowing a genuine native bounds clamp.
+        // Measurements change the lower pane's content while both native
+        // panes stay mounted. Repeat near the bottom to catch re-anchoring.
         let document = try XCTUnwrap(unselectedScroll.documentView)
         try await scrollTo(max(0, document.bounds.maxY - unselectedScroll.contentSize.height - 8),
                            scroll: unselectedScroll, host: host, farFromBottom: false)
         let bottom = unselectedScroll.documentVisibleRect.minY
         fixture.state.selectPartNodes(["part-110"])
-        _ = try await sidebar(in: host, paneCount: 3)
+        _ = try await sidebar(in: host, paneCount: 2)
         let selectedScroll = try await partsScroll(in: host)
         await settle(host)
         assertPreservedOffset(bottom, scroll: selectedScroll)

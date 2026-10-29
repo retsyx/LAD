@@ -203,23 +203,7 @@ struct WorkspaceView: View {
     }
 
     private var partsPanel: some View {
-        VSplitView {
-            PartsSidebar(state: state)
-                .frame(minHeight: 140, idealHeight: 380, maxHeight: .infinity)
-                .id("projectPartsPane")
-            if state.hasMeasurementSelection {
-                ScrollView {
-                    MeasurementInfoView(state: state)
-                }
-                .frame(minHeight: 100, idealHeight: 220, maxHeight: .infinity)
-                .id("projectMeasurementsPane")
-            }
-            if let project = state.current {
-                ProjectDetailsPane(state: state, project: project, isProgramExpanded: $isProgramExpanded)
-                    .frame(minHeight: 160, idealHeight: 280, maxHeight: .infinity)
-                    .id("projectDetailsPane")
-            }
-        }
+        ProjectSidebarSplitView(state: state, isProgramExpanded: $isProgramExpanded)
         .background(Palette.panel)
         .accessibilityIdentifier("projectSidebarSplitView")
     }

@@ -80,7 +80,7 @@ Submitting while LAD is working queues the follow-up above the composer. Each qu
 
 The **Add to current request** button on a queued item delivers it as supplemental user input to the running Codex turn. It does not interrupt the task or start another design task. The button is available only while Codex can accept live input, and the item remains queued until Codex acknowledges it. An uncertain or rejected delivery keeps the item and pauses automatic replay so it cannot be sent twice silently. Accepted supplemental messages become part of the conversation and that task's audit.
 
-Selecting geometry opens a Measurements inspector below the parts tree. Measurements use native OpenCascade geometry rather than display triangles. Single-feature properties appear immediately; general pair distances run asynchronously without blocking navigation or CAD construction.
+The left panel contains Parts above Design, with a draggable divider. New designs use a 75% / 25% split; each design saves its chosen split, and selection or content changes never resize the panes. Design information appears first in the lower pane, followed by Measurements when geometry is selected. Measurements use native OpenCascade geometry rather than display triangles. Single-feature properties appear immediately; general pair distances run asynchronously without blocking navigation or CAD construction.
 
 CAD edges keep a consistent width on screen through zoom, orbit and projection changes. Ordinary edges use a dark 1.6-point stroke; hover uses a 3-point pale-gold core with a lighter halo, and selection uses a 4-point gold core with a dark outline. The strokes remain depth-tested and reuse cached GPU buffers. Grid guides keep their thin appearance.
 

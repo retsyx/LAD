@@ -219,6 +219,8 @@ struct LADProject: Codable, Sendable {
     var draftPrompt: String? = nil
     var draftAttachments: [SourceAttachment]? = nil
     var queuePaused: Bool? = nil
+    /// Preferred share of the sidebar height reserved for Parts, local to this project.
+    var partsPaneFraction: Double = 0.75
 }
 
 enum LADError: LocalizedError {

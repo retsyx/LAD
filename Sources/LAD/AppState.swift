@@ -19,7 +19,7 @@ final class AppState: ObservableObject {
         }
     }
     @Published var prompt = "" {
-        didSet { if prompt != oldValue { scheduleDraftSave() } }
+        didSet { if prompt != oldValue { scheduleDebouncedAutosave() } }
     }
     @Published private(set) var queuedRequests: [ProjectQueuedRequest] = []
     @Published private(set) var queuePaused = false
@@ -39,6 +39,7 @@ final class AppState: ObservableObject {
     @Published private(set) var codexSettings = CodexProjectSettings()
     @Published private(set) var projectName: String?
     @Published private(set) var recentPartColors: [PartColor] = []
+    @Published private(set) var partsPaneFraction = 0.75
     @Published var error: String?
     @Published var displayMode: ViewportDisplayMode = .edges {
         didSet {
@@ -72,7 +73,7 @@ final class AppState: ObservableObject {
     @Published var selectedPartNodeIDs: Set<String> = []
     @Published var hiddenSolids: Set<Int> = []
     @Published var pendingAttachments: [SourceAttachment] = [] {
-        didSet { if pendingAttachments != oldValue { scheduleDraftSave() } }
+        didSet { if pendingAttachments != oldValue { scheduleDebouncedAutosave() } }
     }
     var onOpenProject: ((URL) -> Void)?
     var onRecentProjectChanged: ((URL, URL?) -> Void)?
@@ -89,7 +90,7 @@ final class AppState: ObservableObject {
     private var generationFeedback: CodexConversationFeedback?
     private var activeTaskAuditID: UUID?
     private var auditSaveTask: Task<Void, Never>?
-    private var draftSaveTask: Task<Void, Never>?
+    private var autosaveDebounceTask: Task<Void, Never>?
     private var steeringTask: Task<Void, Never>?
     private var queueSourceTasks: [UUID: Task<Void, Never>] = [:]
     private var queueSourceTokens: [UUID: UUID] = [:]
@@ -168,6 +169,12 @@ final class AppState: ObservableObject {
     }
     var canExport: Bool { mesh != nil && builtRevisionID == selectedRevisionID && !isWorking }
     var featureSelectedSolids: Set<Int> { Set(selectedFeatures.map(\.solidIndex)) }
+
+    func setPartsPaneFraction(_ fraction: Double) {
+        guard fraction.isFinite, (0...1).contains(fraction), fraction != partsPaneFraction else { return }
+        partsPaneFraction = fraction
+        scheduleDebouncedAutosave()
+    }
     var selectedPartSolids: Set<Int> { selectedSolids.union(featureSelectedSolids) }
     var canExportSelectedParts: Bool { canExport && !selectedPartSolids.isEmpty }
     var hasMeasurementSelection: Bool { !selectedSolids.isEmpty || !selectedFeatures.isEmpty }
@@ -332,7 +339,7 @@ final class AppState: ObservableObject {
     func prepareToQuit() async {
         cancel()
         auditSaveTask?.cancel(); auditSaveTask = nil
-        draftSaveTask?.cancel(); draftSaveTask = nil
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         await waitForPromptAttachments()
         await waitForQueuedSources()
         do { try await flushProject() }
@@ -342,7 +349,7 @@ final class AppState: ObservableObject {
     func flushForReplacement() async throws {
         let wasGenerating = generationFeedback != nil
         cancel()
-        draftSaveTask?.cancel(); draftSaveTask = nil
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         await waitForPromptAttachments()
         await waitForQueuedSources()
         if wasGenerating {
@@ -381,7 +388,7 @@ final class AppState: ObservableObject {
     /// A quit-time recovery copy preserves the complete design. Unlike the
     /// ordinary Save As action, it is awaited and does not retry cloud autosave.
     func saveProjectForQuit(to url: URL) async throws {
-        draftSaveTask?.cancel(); draftSaveTask = nil
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         let sequence = autosaveSequence, sessionID = projectSessionID
         do {
             try await autosaveStore.writeCopy(projectSnapshot(), to: url)
@@ -420,6 +427,7 @@ final class AppState: ObservableObject {
         pendingProjectRename = false
         projectName = nil
         recentPartColors = []
+        partsPaneFraction = 0.75
         showGrid = true
         projectionMode = .perspective
         displayMode = .edges
@@ -770,18 +778,18 @@ final class AppState: ObservableObject {
         return urls.map { $0.standardizedFileURL.path }.filter { seen.insert($0).inserted }
     }
 
-    private func scheduleDraftSave() {
+    private func scheduleDebouncedAutosave() {
         guard projectReady, !preserveUnreadableSession else { return }
-        // Invalidate older in-flight writes immediately, before the draft's
-        // debounced autosave starts.
+        // Invalidate older in-flight writes immediately, and coalesce typing
+        // or divider dragging before serializing the complete project.
         autosaveSequence += 1
         hasUnsavedChanges = true
-        draftSaveTask?.cancel()
+        autosaveDebounceTask?.cancel()
         let session = projectSessionID
-        draftSaveTask = Task { [weak self] in
+        autosaveDebounceTask = Task { [weak self] in
             do { try await Task.sleep(for: .milliseconds(650)) } catch { return }
             guard let self, self.projectSessionID == session, !Task.isCancelled else { return }
-            self.draftSaveTask = nil
+            self.autosaveDebounceTask = nil
             self.autosave()
         }
     }
@@ -801,7 +809,7 @@ final class AppState: ObservableObject {
     }
 
     private func resetQueueWork() {
-        draftSaveTask?.cancel(); draftSaveTask = nil
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         steeringTask?.cancel(); steeringTask = nil
         for task in queueSourceTasks.values { task.cancel() }
         queueSourceTasks.removeAll(); queueSourceTokens.removeAll(); preparingQueuedRequestIDs = []
@@ -1798,6 +1806,7 @@ final class AppState: ObservableObject {
         pendingProjectRename = false
         projectName = project.projectName
         recentPartColors = project.recentPartColors ?? []
+        partsPaneFraction = project.partsPaneFraction
         auditSaveTask?.cancel(); auditSaveTask = nil
         taskAudits = project.taskAudits ?? []
         for index in taskAudits.indices where taskAudits[index].status == "running" {
@@ -1967,7 +1976,8 @@ final class AppState: ObservableObject {
                    queuedRequests: queuedRequests.isEmpty ? nil : queuedRequests,
                    draftPrompt: draftPrompt.isEmpty ? nil : draftPrompt,
                    draftAttachments: draftAttachments.isEmpty ? nil : draftAttachments,
-                   queuePaused: queuedRequests.isEmpty ? nil : queuePaused)
+                   queuePaused: queuedRequests.isEmpty ? nil : queuePaused,
+                   partsPaneFraction: partsPaneFraction)
     }
 }
 

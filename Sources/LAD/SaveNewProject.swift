@@ -34,7 +34,8 @@ enum SaveNewProject {
                           projectName: original.projectName, showGrid: original.showGrid,
                           projectionMode: original.projectionMode, displayMode: original.displayMode,
                           recentPartColors: original.recentPartColors,
-                          taskAudits: taskAudits?.isEmpty == true ? nil : taskAudits)
+                          taskAudits: taskAudits?.isEmpty == true ? nil : taskAudits,
+                          partsPaneFraction: original.partsPaneFraction)
     }
 
     private static func conversation(for revision: ProjectRevision, in messages: [ChatMessage]) -> [ChatMessage] {

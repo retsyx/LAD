@@ -46,6 +46,9 @@ enum ProjectStore {
     static func validate(_ project: LADProject) throws {
         var verifiedAttachmentPayloads: [String: Data] = [:]
         guard project.formatVersion == 1 else { throw invalid("Unsupported format version \(project.formatVersion).") }
+        guard project.partsPaneFraction.isFinite, (0...1).contains(project.partsPaneFraction) else {
+            throw invalid("The saved sidebar layout is invalid.")
+        }
         if let name = project.projectName {
             do { try ProjectNaming.validateSavedName(name) }
             catch { throw invalid("The saved design name is invalid. \(error.localizedDescription)") }
