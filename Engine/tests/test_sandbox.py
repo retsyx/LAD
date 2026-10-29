@@ -1,6 +1,6 @@
 """Opt-in macOS sandbox integration: run outside another sandbox.
 
-LAD_RUN_SANDBOX_TESTS=1 .venv/bin/python -m unittest discover -s Engine/tests -v
+LAD_RUN_SANDBOX_TESTS=1 .build/cad-runtime/arm64/expanded/python/bin/python3 -m unittest discover -s Engine/tests -v
 """
 import json
 import os

@@ -41,7 +41,6 @@ final class ProjectWindowCoordinator: ObservableObject {
     private struct Entry {
         var session: ProjectWindowSession
         var sourceURL: URL?
-        var keepsSourceAlias: Bool
         var inheritedAliases: Set<URL> = []
         @MainActor var state: AppState { session.state }
     }
@@ -85,16 +84,17 @@ final class ProjectWindowCoordinator: ObservableObject {
     private var closingURLs: [URL: UUID] = [:]
     private var reopeningStates: [UUID: AppState] = [:]
     private let closeSession: @MainActor (AppState) async -> Void
-    private let saveUnsavedProject: @MainActor (AppState) async -> Void
+    private let saveUnsavedProject: @MainActor (AppState) async -> Bool
     private let readProject: @Sendable (URL) async throws -> LADProject
     private let loadProject: @MainActor (LADProject, URL) -> AppState
     private let loadExistingProject: @MainActor (AppState, LADProject, URL) -> Void
     private let flushProject: @MainActor (AppState) async throws -> Void
-    private var quitTask: Task<Void, Never>?
+    private var quitTask: Task<Bool, Never>?
     private var isQuitting = false
+    var onReopenProjectWindow: (@MainActor (ProjectWindowRequest) -> Void)?
 
     init(closeSession: @escaping @MainActor (AppState) async -> Void = { await $0.prepareToQuit() },
-         saveUnsavedProject: @escaping @MainActor (AppState) async -> Void = { await ProjectQuitSave.save($0) },
+         saveUnsavedProject: @escaping @MainActor (AppState) async -> Bool = { await ProjectQuitSave.save($0) },
          readProject: @escaping @Sendable (URL) async throws -> LADProject = { url in
              try await Task.detached { try ProjectAutosaveStore.readProject(from: url) }.value
          },
@@ -138,13 +138,10 @@ final class ProjectWindowCoordinator: ObservableObject {
                   let existing = entries[existingID] {
             session.state = existing.state
             aliases = existing.inheritedAliases
-            if existing.keepsSourceAlias, let alias = existing.sourceURL { aliases.insert(alias) }
             shouldStart = false
         }
         session.sourceURL = source
-        entries[id] = Entry(session: session, sourceURL: source,
-                            keepsSourceAlias: source.map { !Self.isManagedURL($0) } ?? false,
-                            inheritedAliases: aliases)
+        entries[id] = Entry(session: session, sourceURL: source, inheritedAliases: aliases)
         pendingURLs = pendingURLs.filter { $0.value.windowID != id }
         if !focusOrder.contains(id) { focusOrder.append(id) }
         if windows[id]?.window?.isKeyWindow == true || activeID == nil || activeID == id {
@@ -279,13 +276,9 @@ final class ProjectWindowCoordinator: ObservableObject {
                 var aliases = Set<URL>()
                 for other in entries.values where other.state === incoming {
                     aliases.formUnion(other.inheritedAliases)
-                    if other.keepsSourceAlias, let alias = other.sourceURL { aliases.insert(alias) }
                 }
                 aliases.formUnion(adoptClosedState(incoming))
-                let sourceIsImported = !Self.isManagedURL(source)
-                if sourceIsImported { aliases.insert(source) }
-                entries[id] = Entry(session: session, sourceURL: source,
-                                    keepsSourceAlias: sourceIsImported, inheritedAliases: aliases)
+                entries[id] = Entry(session: session, sourceURL: source, inheritedAliases: aliases)
                 session.sourceURL = source
                 session.state = incoming
                 if !hasWindow(for: outgoing) { outgoing.setActiveProject(false) }
@@ -324,9 +317,12 @@ final class ProjectWindowCoordinator: ObservableObject {
         guard !isQuitting else { return }
         entry.state.cancel()
         let token = UUID()
-        var aliases = entry.inheritedAliases
+        var aliases = Set<URL>()
         if let url = entry.state.projectURL { aliases.insert(Self.canonicalURL(url)) }
-        if let source = entry.sourceURL, entry.keepsSourceAlias || entry.state.projectURL == nil { aliases.insert(source) }
+        else {
+            aliases = entry.inheritedAliases
+            if let source = entry.sourceURL { aliases.insert(source) }
+        }
         for alias in aliases { closingURLs[alias] = token }
         let replacing = replacementTasks.values.filter { $0.state === entry.state }.map(\.task)
         let task = Task { [self, state = entry.state] in
@@ -342,8 +338,9 @@ final class ProjectWindowCoordinator: ObservableObject {
         closeTasks[token] = ClosingSession(state: entry.state, task: task)
     }
 
-    func prepareToQuit() async {
-        if let quitTask { await quitTask.value; return }
+    @discardableResult
+    func prepareToQuit() async -> Bool {
+        if let quitTask { return await quitTask.value }
         isQuitting = true
         let replacing = replacementTasks.values.map(\.task)
         for id in Array(replacements.keys) { cancelReplacement(in: id) }
@@ -356,11 +353,29 @@ final class ProjectWindowCoordinator: ObservableObject {
             for state in sessions { await closeSession(state) }
             var seen = Set<ObjectIdentifier>()
             for state in sessions + closing.map(\.state) where seen.insert(ObjectIdentifier(state)).inserted {
-                if state.hasUnsavedChanges { await saveUnsavedProject(state) }
+                if state.hasUnsavedChanges, !(await saveUnsavedProject(state)) { return false }
             }
+            return true
         }
         quitTask = task
-        await task.value
+        let shouldQuit = await task.value
+        if !shouldQuit {
+            quitTask = nil
+            isQuitting = false
+            updateActiveStates()
+            reopenUnsavedClosedProjects()
+        }
+        return shouldQuit
+    }
+
+    private func reopenUnsavedClosedProjects() {
+        guard let onReopenProjectWindow else { return }
+        for closing in closeTasks.values where closing.state.hasUnsavedChanges && !hasWindow(for: closing.state) {
+            guard !reopeningStates.values.contains(where: { $0 === closing.state }) else { continue }
+            let request = ProjectWindowRequest(fileURL: closing.state.projectURL)
+            reopeningStates[request.id] = closing.state
+            onReopenProjectWindow(request)
+        }
     }
 
     fileprivate func bind(_ window: NSWindow, id: UUID) {
@@ -424,7 +439,7 @@ final class ProjectWindowCoordinator: ObservableObject {
         var aliases = Set<URL>()
         let tokens = closeTasks.filter { $0.value.state === state }.map(\.key)
         for token in tokens {
-            aliases.formUnion(closingURLs.filter { $0.value == token }.map(\.key).filter { !Self.isManagedURL($0) })
+            if state.projectURL == nil { aliases.formUnion(closingURLs.filter { $0.value == token }.map(\.key)) }
             closeTasks.removeValue(forKey: token)
             closingURLs = closingURLs.filter { $0.value != token }
         }
@@ -467,22 +482,15 @@ final class ProjectWindowCoordinator: ObservableObject {
     }
 
     private func matches(_ url: URL, entry: Entry) -> Bool {
-        if let current = entry.state.projectURL, Self.canonicalURL(current) == url { return true }
+        if let current = entry.state.projectURL { return Self.canonicalURL(current) == url }
         if entry.inheritedAliases.contains(url) { return true }
         guard entry.sourceURL == url else { return false }
-        if entry.keepsSourceAlias {
-            return entry.state.isWorking || entry.state.projectURL != nil || entry.state.canRenameProject
-        }
-        // A managed document's former path must be released after a rename.
+        // A former path must be released after a rename.
         return entry.state.projectURL == nil && entry.state.isWorking
     }
 
     private static func canonicalURL(_ url: URL) -> URL {
         url.standardizedFileURL.resolvingSymlinksInPath()
-    }
-
-    private static func isManagedURL(_ url: URL) -> Bool {
-        canonicalURL(url.deletingLastPathComponent()) == canonicalURL(ProjectAutosaveStore.defaultDirectory)
     }
 }
 

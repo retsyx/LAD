@@ -458,7 +458,7 @@ struct WorkspaceView: View {
                     }
                         .buttonStyle(.plain).foregroundStyle(Palette.muted)
                         .disabled(state.isReadingPromptAttachments)
-                        .help("Attach images, CAD source or a KiCad PCB (.kicad_pcb)")
+                        .help("Attach images or CAD source")
                         .accessibilityLabel("Attach files or images")
                     Spacer(minLength: 0)
                     reasoningSelector

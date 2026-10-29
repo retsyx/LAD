@@ -135,14 +135,10 @@ final class AppStateAgentColorTests: XCTestCase {
         let fixture = try AgentColorTurnFixture(status: "message", delay: 0.3)
         defer { fixture.remove() }
         let oldCodex = UserDefaults.standard.object(forKey: "codexPath")
-        let oldPython = UserDefaults.standard.object(forKey: "pythonPath")
         UserDefaults.standard.set(fixture.codex.executable.path, forKey: "codexPath")
-        UserDefaults.standard.set(EngineService.defaultPython, forKey: "pythonPath")
         defer {
             if let oldCodex { UserDefaults.standard.set(oldCodex, forKey: "codexPath") }
             else { UserDefaults.standard.removeObject(forKey: "codexPath") }
-            if let oldPython { UserDefaults.standard.set(oldPython, forKey: "pythonPath") }
-            else { UserDefaults.standard.removeObject(forKey: "pythonPath") }
         }
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: fixture.directory.appendingPathComponent("autosaves")))
         state.newProject()

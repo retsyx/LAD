@@ -121,6 +121,7 @@ final class AppState: ObservableObject {
     private var autosaveSequence = 0
     private var preserveUnreadableSession = false
     private let autosaveStore: ProjectAutosaveStore
+    private let runtimeOverride: String?
     private var isActiveProject = false
     private var lastNotedRecentURL: URL?
     private var measurementTask: Task<Void, Never>?
@@ -133,8 +134,9 @@ final class AppState: ObservableObject {
     }
     private var measurementCache: [MeasurementKey: CADMeasurementReport] = [:]
 
-    init(autosaveStore: ProjectAutosaveStore = ProjectAutosaveStore()) {
+    init(autosaveStore: ProjectAutosaveStore = ProjectAutosaveStore(), python: String? = nil) {
         self.autosaveStore = autosaveStore
+        runtimeOverride = python
     }
 
     private static let recentProjectPathKey = "lastAutosavedProjectPath"
@@ -184,7 +186,7 @@ final class AppState: ObservableObject {
     var canExportSelectedParts: Bool { canExport && !selectedPartSolids.isEmpty }
     var hasMeasurementSelection: Bool { !selectedSolids.isEmpty || !selectedFeatures.isEmpty }
     var canSaveNew: Bool { projectReady && !preserveUnreadableSession && !revisions.isEmpty && !isWorking }
-    var python: String { UserDefaults.standard.string(forKey: "pythonPath").flatMap { $0.isEmpty ? nil : $0 } ?? EngineService.defaultPython }
+    var python: String { runtimeOverride ?? EngineService.defaultPython }
     var executable: String { CodexService.configuredExecutable }
     var model: String { codexSettings.model }
     var reasoningEffort: CodexReasoningEffort {
@@ -200,7 +202,7 @@ final class AppState: ObservableObject {
         return CodexReasoningEffort(rawValue: fallback) ?? .defaultConfiguration
     }
     var threads: Int { let count = UserDefaults.standard.integer(forKey: "workerThreads"); return count > 0 ? count : ProcessInfo.processInfo.activeProcessorCount }
-    var isCodexInstalled: Bool { FileManager.default.isExecutableFile(atPath: executable) }
+    var isCodexInstalled: Bool { CodexService.resolveExecutable(executable) != nil }
     var activityStatus: String {
         guard let runningCodexSelection else { return activity }
         return "\(activity) · \(runningCodexSelection)"
@@ -313,7 +315,7 @@ final class AppState: ObservableObject {
                 let source: URL?
                 if recentURL != nil || recentID != nil {
                     guard let restored = try await autosaveStore.restoreRecent(preferredURL: recentURL, projectID: recentID) else {
-                        throw LADError.message("The last iCloud design could not be found. Open a design from iCloud Drive/LAD.")
+                        throw LADError.message("The last design could not be found. Open its .lad file to continue.")
                     }
                     saved = restored.project; source = restored.url
                 } else if let restored = try await autosaveStore.restoreRecent(preferredURL: nil, projectID: nil) {
@@ -397,9 +399,13 @@ final class AppState: ObservableObject {
         autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         let sequence = autosaveSequence, sessionID = projectSessionID
         do {
-            try await autosaveStore.writeCopy(projectSnapshot(), to: url)
+            let origin = try await autosaveStore.writeCopy(projectSnapshot(), to: url)
             onRecentProjectChanged?(url, nil)
             if projectSessionID == sessionID, autosaveSequence == sequence {
+                projectFileOrigin = origin
+                autosavedProjectURL = url
+                projectURL = url
+                pendingProjectRename = false
                 hasUnsavedChanges = false
                 saveStatus = nil
             }
@@ -919,7 +925,7 @@ final class AppState: ObservableObject {
                     messages[index].attachments = sources.isEmpty ? nil : sources
                 }
                 autosave()
-                guard isCodexInstalled else { throw LADError.message("Codex CLI was not found. Install the ChatGPT desktop app or Codex CLI and sign in, then try again.") }
+                guard isCodexInstalled else { throw LADError.message(CodexExecutable.setupMessage) }
                 let result = try await codex.generate(prompt: text, current: previous, history: history, attachments: sources, partLayout: previousLayout, partColors: previousColors,
                                                     executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
                                                     onMessage: { commentary("project", $0) }, onActivity: { toolActivity("project", $0) },
@@ -1602,7 +1608,7 @@ final class AppState: ObservableObject {
     }
 
     func saveProject(as newLocation: Bool = false) {
-        // The regular Save command flushes the managed iCloud project. Save As
+        // The regular Save command flushes the open project. Save As
         // still offers an explicit portable copy at a user-selected location.
         if !newLocation {
             if saveConflict != nil {
@@ -1654,7 +1660,7 @@ final class AppState: ObservableObject {
             do {
                 let project: LADProject
                 let source: URL
-                if isManagedProjectURL(url), let restoringProjectID,
+                if let restoringProjectID,
                    let restored = try await autosaveStore.restoreRecent(preferredURL: url, projectID: restoringProjectID) {
                     project = restored.project; source = restored.url
                 } else {
@@ -1677,9 +1683,8 @@ final class AppState: ObservableObject {
         loaded = true
         cancel()
         restore(project)
-        if !isManagedProjectURL(source) { projectID = UUID() }
-        autosavedProjectURL = isManagedProjectURL(source) ? source : nil
-        projectURL = autosavedProjectURL
+        autosavedProjectURL = source
+        projectURL = source
         isWorking = false
         projectReady = true
         noteRecentProject(at: source)
@@ -1773,11 +1778,6 @@ final class AppState: ObservableObject {
         return safe.isEmpty ? "Design" : String(safe.prefix(100))
     }
     private var autosaveTitle: String { title }
-
-    private func isManagedProjectURL(_ url: URL) -> Bool {
-        url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath() ==
-            autosaveStore.managedDirectory.standardizedFileURL.resolvingSymlinksInPath()
-    }
 
     private func rememberAutosavedProject(_ url: URL) {
         guard projectReady else { return }
@@ -1937,7 +1937,7 @@ final class AppState: ObservableObject {
                     preserving: conflict.file.url, projectID: projectID)
                 guard projectSessionID == session else { return }
                 projectID = identity; projectName = name; projectFileOrigin = origin
-                autosavedProjectURL = isManagedProjectURL(target) ? target : nil
+                autosavedProjectURL = target
                 projectURL = target
                 pendingProjectRename = false
                 noteRecentProject(at: target)

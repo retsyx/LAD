@@ -39,7 +39,7 @@ final class ProjectWindowRestorationTests: XCTestCase {
         try ProjectStore.write(project, to: source)
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory))
         let first = ProjectWindowSession(state: state), second = ProjectWindowSession()
-        let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { _ in XCTFail("The restored document must save to its existing local folder") })
+        let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { _ in XCTFail("The restored document must save to its existing local folder"); return false })
         let firstID = UUID(), secondID = UUID()
         let loaded = expectation(description: "Initial read completed")
         let observation = state.$messages.filter { $0 == [message] }.prefix(1).sink { _ in loaded.fulfill() }
@@ -61,7 +61,7 @@ final class ProjectWindowRestorationTests: XCTestCase {
     }
 
     @MainActor
-    func testRestoredRegistrationSharesAnAlreadyLoadedDocumentAndRetainsImportedAlias() async {
+    func testRestoredRegistrationSharesCurrentFileAndReleasesFormerExternalPath() async {
         let coordinator = ProjectWindowCoordinator(closeSession: { _ in })
         let original = URL(fileURLWithPath: "/tmp/Imported restored shared design.lad")
         let managed = ProjectAutosaveStore.defaultDirectory.appendingPathComponent("Restored imported copy.lad")
@@ -78,7 +78,7 @@ final class ProjectWindowRestorationTests: XCTestCase {
 
         var requests: [ProjectWindowRequest] = []
         coordinator.openProject(at: original) { requests.append($0) }
-        XCTAssertTrue(requests.isEmpty, "The remaining view must retain the original imported-file alias")
+        XCTAssertEqual(requests.count, 1, "A former external filename can now contain another design")
         await coordinator.prepareToQuit()
     }
 

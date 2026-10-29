@@ -5,6 +5,49 @@ import XCTest
 
 final class ProjectQuitSaveTests: XCTestCase {
     @MainActor
+    func testRecoveryFileRemainsAutosaveDestinationWhenQuittingIsCanceledLater() async throws {
+        let fixture = try Fixture(unavailable: true)
+        defer { fixture.cleanUp() }
+        let state = fixture.state()
+        state.newProject()
+        state.prompt = "Recovered draft"
+        await state.prepareToQuit()
+        let target = fixture.directory.appendingPathComponent("Recovered.lad")
+        let saved = await ProjectQuitSave.save(state, chooseAction: { _ in .save }, chooseURL: { _ in target })
+        XCTAssertTrue(saved)
+        XCTAssertEqual(state.projectURL, target)
+        state.prompt = "Edited after another design canceled quitting"
+        await state.prepareToQuit()
+        XCTAssertFalse(state.hasUnsavedChanges, state.saveStatus ?? "")
+        XCTAssertEqual(try ProjectStore.read(from: target).draftPrompt, state.prompt)
+    }
+
+    @MainActor
+    func testCancelAndDontSaveHaveDistinctTerminationResultsWithoutWriting() async throws {
+        let fixture = try Fixture(unavailable: true)
+        defer { fixture.cleanUp() }
+        let state = fixture.state()
+        state.newProject()
+        state.prompt = "Keep this draft"
+        await state.prepareToQuit()
+        let canceled = await ProjectQuitSave.save(state, chooseAction: { _ in .cancel }, chooseURL: { _ in
+            XCTFail("Cancel must not open a save panel")
+            return nil
+        })
+        XCTAssertFalse(canceled)
+        XCTAssertTrue(state.hasUnsavedChanges)
+        let discarded = await ProjectQuitSave.save(state, chooseAction: { _ in .dontSave }, chooseURL: { _ in
+            XCTFail("Don't Save must not open a save panel")
+            return nil
+        })
+        XCTAssertTrue(discarded)
+        XCTAssertTrue(state.hasUnsavedChanges, "Discarding must not claim a successful save")
+        let panelCanceled = await ProjectQuitSave.save(state, chooseAction: { _ in .save }, chooseURL: { _ in nil })
+        XCTAssertFalse(panelCanceled)
+        XCTAssertEqual(state.prompt, "Keep this draft")
+    }
+
+    @MainActor
     func testFailedAutosaveStaysUnsavedUntilALaterWriteSucceeds() async throws {
         let fixture = try Fixture(unavailable: true)
         defer { fixture.cleanUp() }
@@ -27,7 +70,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         XCTAssertEqual(saved.draftPrompt, state.prompt)
 
         var prompts = 0
-        await ProjectQuitSave.save(state, chooseURL: { _ in
+        await ProjectQuitSave.save(state, chooseAction: { _ in .save }, chooseURL: { _ in
             prompts += 1
             return nil
         }, onFailure: { error in
@@ -76,7 +119,7 @@ final class ProjectQuitSaveTests: XCTestCase {
 
         let destination = fixture.directory.appendingPathComponent("Recovered design.lad")
         var prompts = 0
-        await ProjectQuitSave.save(state, chooseURL: { selected in
+        await ProjectQuitSave.save(state, chooseAction: { _ in .save }, chooseURL: { selected in
             XCTAssertTrue(selected === state)
             prompts += 1
             return destination
@@ -124,7 +167,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         XCTAssertTrue(state.hasUnsavedChanges)
 
         var prompts = 0
-        await ProjectQuitSave.save(state, chooseURL: { _ in
+        await ProjectQuitSave.save(state, chooseAction: { _ in .save }, chooseURL: { _ in
             prompts += 1
             return nil
         }, onFailure: { error in
@@ -132,7 +175,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         })
 
         XCTAssertEqual(prompts, 1)
-        XCTAssertTrue(state.hasUnsavedChanges, "Cancel permits quitting without claiming the design was saved")
+        XCTAssertTrue(state.hasUnsavedChanges, "Cancel preserves the unsaved design and prevents quitting")
         XCTAssertEqual(state.prompt, "My local unsaved draft")
         XCTAssertEqual(try Data(contentsOf: originalURL), originalBytes)
     }
@@ -149,7 +192,7 @@ final class ProjectQuitSaveTests: XCTestCase {
 
         var prompts = 0
         var failures = 0
-        await ProjectQuitSave.save(state, chooseURL: { _ in
+        await ProjectQuitSave.save(state, chooseAction: { _ in .save }, chooseURL: { _ in
             prompts += 1
             return prompts == 1 ? invalidDestination : nil
         }, onFailure: { error in
@@ -174,7 +217,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         await state.prepareToQuit()
         let destination = fixture.directory.appendingPathComponent("Latest draft.lad")
 
-        await ProjectQuitSave.save(state, chooseURL: { selected in
+        await ProjectQuitSave.save(state, chooseAction: { _ in .save }, chooseURL: { selected in
             selected.prompt = "Latest draft"
             return destination
         }, onFailure: { error in

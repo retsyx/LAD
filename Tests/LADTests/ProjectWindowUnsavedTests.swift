@@ -5,6 +5,50 @@ import XCTest
 
 final class ProjectWindowUnsavedTests: XCTestCase {
     @MainActor
+    func testClosingRenamedExternalDesignDoesNotReserveItsFormerPath() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let state = fixture.state()
+        let original = fixture.directory.appendingPathComponent("Original.lad")
+        let renamed = fixture.directory.appendingPathComponent("Renamed.lad")
+        state.projectURL = original
+        let coordinator = ProjectWindowCoordinator(closeSession: { _ in }, saveUnsavedProject: { _ in true })
+        let id = UUID()
+        coordinator.register(state, id: id, sourceURL: original)
+        state.projectURL = renamed
+        coordinator.windowClosed(id)
+        var requests: [ProjectWindowRequest] = []
+        coordinator.openProject(at: original) { requests.append($0) }
+        XCTAssertEqual(requests.count, 1, "A renamed external document cannot retain the old path during a failed closing save")
+        await coordinator.prepareToQuit()
+    }
+
+    @MainActor
+    func testCancelingQuitReopensNeverSavedClosedDesignAndAllowsAnotherQuit() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let state = fixture.state()
+        var shouldQuit = false
+        var requests: [ProjectWindowRequest] = []
+        let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { _ in shouldQuit })
+        coordinator.onReopenProjectWindow = { requests.append($0) }
+        let id = UUID()
+        coordinator.register(state, id: id, sourceURL: nil)
+        coordinator.windowClosed(id)
+        let canceled = await coordinator.prepareToQuit()
+        XCTAssertFalse(canceled)
+        XCTAssertEqual(requests.count, 1)
+        let request = try XCTUnwrap(requests.first)
+        let reopened = ProjectWindowSession()
+        XCTAssertFalse(coordinator.register(reopened, id: request.id, sourceURL: request.fileURL))
+        XCTAssertTrue(reopened.state === state)
+        XCTAssertEqual(reopened.state.prompt, "Latest unsaved draft")
+        shouldQuit = true
+        let accepted = await coordinator.prepareToQuit()
+        XCTAssertTrue(accepted)
+    }
+
+    @MainActor
     func testClosedFailedSaveStaysAliveAndIsOfferedOnceAtQuit() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
@@ -12,7 +56,7 @@ final class ProjectWindowUnsavedTests: XCTestCase {
         weak var retained = state
         let identity = ObjectIdentifier(try XCTUnwrap(state))
         var offered: [ObjectIdentifier] = []
-        let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { offered.append(ObjectIdentifier($0)) })
+        let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { offered.append(ObjectIdentifier($0)); return true })
         let id = UUID()
         coordinator.register(try XCTUnwrap(state), id: id, sourceURL: nil)
         coordinator.windowClosed(id)
@@ -37,7 +81,7 @@ final class ProjectWindowUnsavedTests: XCTestCase {
             saves += 1
             await $0.prepareToQuit()
             closed.fulfill()
-        }, saveUnsavedProject: { _ in prompts += 1 })
+        }, saveUnsavedProject: { _ in prompts += 1; return true })
         let first = UUID(), second = UUID()
         coordinator.register(state, id: first, sourceURL: nil)
         coordinator.register(state, id: second, sourceURL: nil)
@@ -67,6 +111,7 @@ final class ProjectWindowUnsavedTests: XCTestCase {
             XCTAssertTrue($0 === state)
             XCTAssertTrue($0.hasUnsavedChanges)
             prompts += 1
+            return true
         })
         let id = UUID()
         coordinator.register(state, id: id, sourceURL: nil)
@@ -92,7 +137,7 @@ final class ProjectWindowUnsavedTests: XCTestCase {
             await $0.prepareToQuit()
             saves += 1
             if saves == 1 { closed.fulfill() }
-        }, saveUnsavedProject: { _ in prompts += 1 })
+        }, saveUnsavedProject: { _ in prompts += 1; return true })
         let id = UUID()
         coordinator.register(state, id: id, sourceURL: source)
         coordinator.windowClosed(id)
@@ -121,7 +166,7 @@ final class ProjectWindowUnsavedTests: XCTestCase {
                                                 withIntermediateDirectories: false)
         let state = fixture.state()
         var prompts = 0
-        let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { _ in prompts += 1 })
+        let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { _ in prompts += 1; return true })
         coordinator.register(state, id: UUID(), sourceURL: nil)
         await coordinator.prepareToQuit()
         XCTAssertFalse(state.hasUnsavedChanges)
@@ -144,7 +189,7 @@ final class ProjectWindowUnsavedTests: XCTestCase {
             await $0.prepareToQuit()
             saves += 1
             if saves == 1 { closed.fulfill() }
-        }, saveUnsavedProject: { _ in }, readProject: { _ in
+        }, saveUnsavedProject: { _ in true }, readProject: { _ in
             XCTFail("A retained design must be reused without rereading disk")
             throw LADError.message("Unexpected disk read")
         }, flushProject: { _ in })

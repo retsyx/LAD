@@ -252,6 +252,7 @@ enum ResourcePaths {
         if let path = ProcessInfo.processInfo.environment["LAD_ROOT"] { return URL(fileURLWithPath: path) }
         // Packaged app keeps its engine alongside the resource bundle.
         let packaged = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
+        if Bundle.main.bundleURL.pathExtension == "app" { return packaged }
         if FileManager.default.fileExists(atPath: packaged.appendingPathComponent("Engine/worker.py").path) { return packaged }
         var candidate = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         for _ in 0..<5 {

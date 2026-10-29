@@ -1,16 +1,15 @@
 import Foundation
 import Darwin
 
-/// Serializes complete projects into the visible iCloud Drive LAD folder.
+/// Serializes complete projects in place, or into the default folder for new files.
 /// All coordination and potentially large archive work stays off the main actor.
 actor ProjectAutosaveStore {
     nonisolated static var defaultDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/LAD", isDirectory: true)
+        ProjectSaveLocation.directory()
     }
 
-    nonisolated let managedDirectory: URL
-    private let requiresCloudDrive: Bool
+    nonisolated var managedDirectory: URL { rootDirectory ?? Self.defaultDirectory }
+    private nonisolated let rootDirectory: URL?
     private var saved: [UUID: SavedFile] = [:]
 
     private struct Fingerprint: Equatable {
@@ -36,14 +35,11 @@ actor ProjectAutosaveStore {
     }
 
     init(rootDirectory: URL? = nil) {
-        managedDirectory = (rootDirectory ?? Self.defaultDirectory).standardizedFileURL
-        requiresCloudDrive = rootDirectory == nil
+        self.rootDirectory = rootDirectory?.standardizedFileURL
     }
 
     func write(project: LADProject, projectID: UUID, title: String, sequence: Int, preferredURL: URL? = nil,
                preferExactName: Bool = false, resolving conflict: ProjectSaveConflict? = nil) throws -> URL {
-        try prepareDirectory()
-        defer { if requiresCloudDrive { ProjectFolderIcon.apply(to: managedDirectory) } }
         if let previous = saved[projectID], sequence <= previous.sequence {
             guard FileManager.default.fileExists(atPath: previous.url.path) else { throw changedExternally() }
             return previous.url
@@ -57,7 +53,10 @@ actor ProjectAutosaveStore {
             base = name
         } else { base = Self.filenameStem(title) }
         let previous = saved[projectID]
-        let preferred = preferredURL.flatMap { isManaged($0) ? $0.standardizedFileURL : nil }
+        let preferred = preferredURL.flatMap { url -> URL? in
+            guard Self.isProjectFile(url), isManaged(url) || portable.fileOrigin?.matches(url) == true || previous?.url == url.standardizedFileURL else { return nil }
+            return url.standardizedFileURL
+        }
         let reopened = portable.fileOrigin != previous?.sourceOrigin && portable.fileOrigin?.matches(preferred ?? managedDirectory) == true
         let candidates = reopened ? [preferred, previous?.url] : [previous?.url, preferred]
         var source = candidates.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
@@ -65,11 +64,31 @@ actor ProjectAutosaveStore {
            previous?.url.standardizedFileURL != proposed.standardizedFileURL || (try? Self.fingerprint(proposed)) != previous?.fingerprint {
             source = try ownedSource(proposed, project: portable, projectID: projectID, previous: previous, resolving: conflict)
         }
+        if source == nil, previous != nil || portable.fileOrigin?.matches(preferred ?? managedDirectory) == true {
+            throw changedExternally()
+        }
+        let directory = source?.deletingLastPathComponent() ?? managedDirectory
+        try prepareDirectory(directory, creating: source == nil)
+        defer {
+            if rootDirectory == nil, directory.standardizedFileURL == ProjectSaveLocation.cloudDirectory().standardizedFileURL {
+                ProjectFolderIcon.apply(to: directory)
+            }
+        }
+        // An opened file outside the default folder keeps its exact filename.
+        // Explicit header renaming still operates within that file's folder.
+        if let source, !isManaged(source), !preferExactName {
+            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source,
+                                               destination: source, previous: previous, resolving: conflict) {
+                remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
+                return result.url
+            }
+            throw changedExternally()
+        }
 
         // A deliberate inline rename can reclaim its exact name after a
         // collision disappears. Ordinary autosaves retain a stable suffix.
         if preferExactName, let source {
-            let destination = managedDirectory.appendingPathComponent(base).appendingPathExtension("lad")
+            let destination = directory.appendingPathComponent(base).appendingPathExtension("lad")
             if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
                 remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
@@ -79,7 +98,7 @@ actor ProjectAutosaveStore {
         // Retain an existing collision suffix rather than renaming a project
         // every time another similarly titled project disappears.
         if let source, let matchingName = Self.matchingStem(source, stem: base) {
-            let destination = managedDirectory.appendingPathComponent(matchingName).appendingPathExtension("lad")
+            let destination = directory.appendingPathComponent(matchingName).appendingPathExtension("lad")
             if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
                 remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
@@ -87,21 +106,19 @@ actor ProjectAutosaveStore {
         }
         for index in 1...10_000 {
             let name = index == 1 ? base : "\(base) (\(index))"
-            let destination = managedDirectory.appendingPathComponent(name).appendingPathExtension("lad")
+            let destination = directory.appendingPathComponent(name).appendingPathExtension("lad")
             if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
                 remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
             }
         }
-        throw LADError.message("Could not choose an available filename in iCloud Drive/LAD.")
+        throw LADError.message("Could not choose an available design filename in \(directory.path).")
     }
 
     /// Restore the exact last project, including a renamed file after a crash.
-    /// Without a prior identity, the newest cloud project is the initial choice.
+    /// Without a prior identity, the newest project in the default folder is the initial choice.
     func restoreRecent(preferredURL: URL?, projectID: UUID?) throws -> (project: LADProject, url: URL)? {
-        try prepareDirectory()
-        defer { if requiresCloudDrive { ProjectFolderIcon.apply(to: managedDirectory) } }
-        if let preferredURL, isManaged(preferredURL), FileManager.default.fileExists(atPath: preferredURL.path) {
+        if let preferredURL, Self.isProjectFile(preferredURL), FileManager.default.fileExists(atPath: preferredURL.path) {
             let snapshot = try Self.readSnapshot(from: preferredURL)
             if projectID == nil || snapshot.project.projectID == projectID {
                 if let id = snapshot.project.projectID { saved[id] = SavedFile(url: preferredURL, sequence: -1, fingerprint: snapshot.fingerprint, origin: snapshot.project.fileOrigin!, sourceOrigin: snapshot.project.fileOrigin) }
@@ -109,29 +126,38 @@ actor ProjectAutosaveStore {
             }
         }
         let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]
-        let candidates = try FileManager.default.contentsOfDirectory(at: managedDirectory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
-            .filter { $0.pathExtension.lowercased() == "lad" }
-            .sorted {
-                let first = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let second = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return first > second
-            }
-        for url in candidates {
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
-            do {
-                let snapshot = try Self.readSnapshot(from: url)
-                guard projectID == nil || snapshot.project.projectID == projectID else { continue }
-                if let id = snapshot.project.projectID { saved[id] = SavedFile(url: url, sequence: -1, fingerprint: snapshot.fingerprint, origin: snapshot.project.fileOrigin!, sourceOrigin: snapshot.project.fileOrigin) }
-                return (snapshot.project, url)
-            } catch {
-                // A known identity must never be replaced by an unrelated
-                // project merely because its own file cannot be read.
-                if projectID == nil { throw error }
+        var directories = [managedDirectory]
+        if projectID != nil, let preferredURL {
+            let parent = preferredURL.deletingLastPathComponent().standardizedFileURL
+            if parent != managedDirectory.standardizedFileURL,
+               FileManager.default.fileExists(atPath: parent.path) { directories.insert(parent, at: 0) }
+        }
+        for directory in directories {
+            if directory == managedDirectory { try prepareDirectory(directory, creating: true) }
+            let candidates = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
+                .filter { $0.pathExtension.lowercased() == "lad" }
+                .sorted {
+                    let first = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    let second = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    return first > second
+                }
+            for url in candidates {
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+                do {
+                    let snapshot = try Self.readSnapshot(from: url)
+                    guard projectID == nil || snapshot.project.projectID == projectID else { continue }
+                    if let id = snapshot.project.projectID { saved[id] = SavedFile(url: url, sequence: -1, fingerprint: snapshot.fingerprint, origin: snapshot.project.fileOrigin!, sourceOrigin: snapshot.project.fileOrigin) }
+                    return (snapshot.project, url)
+                } catch {
+                    // A known identity must never be replaced by an unrelated
+                    // project merely because its own file cannot be read.
+                    if projectID == nil { throw error }
+                }
             }
         }
         if projectID != nil || preferredURL != nil {
-            throw LADError.message("The last LAD design could not be found in iCloud Drive/LAD. Open its .lad file to continue.")
+            throw LADError.message("The last LAD design could not be found. Open its .lad file to continue.")
         }
         return nil
     }
@@ -141,7 +167,7 @@ actor ProjectAutosaveStore {
     }
 
     /// Explicit Save As uses the same writer so it cannot race an autosave to
-    /// an open cloud project. Replacement here is authorized by the save panel.
+    /// an open project. Replacement here is authorized by the save panel.
     @discardableResult
     func writeCopy(_ project: LADProject, to url: URL, preserving sourceURL: URL? = nil, projectID sourceID: UUID? = nil) throws -> ProjectFileOrigin {
         func protectSource(at destination: URL) throws {
@@ -178,23 +204,23 @@ actor ProjectAutosaveStore {
         return written.origin
     }
 
-    private func prepareDirectory() throws {
-        let parent = managedDirectory.deletingLastPathComponent()
+    private func prepareDirectory(_ directoryURL: URL, creating: Bool) throws {
+        let parent = directoryURL.deletingLastPathComponent()
         var directory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: parent.path, isDirectory: &directory), directory.boolValue else {
-            throw LADError.message(requiresCloudDrive
-                ? "iCloud Drive is unavailable. Enable iCloud Drive on this Mac so LAD can save your design."
-                : "The design save directory is unavailable.")
+        if !FileManager.default.fileExists(atPath: parent.path, isDirectory: &directory) || !directory.boolValue {
+            if rootDirectory != nil || !creating { throw LADError.message("The design save directory is unavailable.") }
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         }
-        if !FileManager.default.fileExists(atPath: managedDirectory.path) {
-            do { try FileManager.default.createDirectory(at: managedDirectory, withIntermediateDirectories: false) }
+        if !FileManager.default.fileExists(atPath: directoryURL.path) {
+            guard creating else { throw LADError.message("The design save directory is unavailable.") }
+            do { try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: false) }
             catch {
-                guard FileManager.default.fileExists(atPath: managedDirectory.path) else { throw error }
+                guard FileManager.default.fileExists(atPath: directoryURL.path) else { throw error }
             }
         }
-        let values = try managedDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        let values = try directoryURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard values.isDirectory == true, values.isSymbolicLink != true else {
-            throw LADError.message("The LAD save location must be a directory in iCloud Drive.")
+            throw LADError.message("The design save location must be a directory.")
         }
     }
 
@@ -205,8 +231,11 @@ actor ProjectAutosaveStore {
         let moving = source.map { $0.standardizedFileURL != destination.standardizedFileURL } ?? false
         let accessor: (URL?, URL) -> Void = { old, target in
             outcome = Result {
-                guard self.isManaged(target), old.map(self.isManaged) ?? true else {
-                    throw LADError.message("The iCloud design location changed while saving. Open the design again.")
+                let expected = destination.deletingLastPathComponent().resolvingSymlinksInPath()
+                guard Self.isProjectFile(target), old.map(Self.isProjectFile) ?? true,
+                      target.deletingLastPathComponent().resolvingSymlinksInPath() == expected,
+                      old.map({ $0.deletingLastPathComponent().resolvingSymlinksInPath() == expected }) ?? true else {
+                    throw LADError.message("The design location changed while saving. Open the design again.")
                 }
                 let manager = FileManager.default
                 if manager.fileExists(atPath: target.path), target.standardizedFileURL != old?.standardizedFileURL {
@@ -284,7 +313,7 @@ actor ProjectAutosaveStore {
         var outcome: Result<URL?, Error>?
         coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
             outcome = Result {
-                guard self.isManaged(readable), try self.canUpdate(readable, project: project, projectID: projectID, previous: previous, resolving: conflict) else { return nil }
+                guard Self.isProjectFile(readable), try self.canUpdate(readable, project: project, projectID: projectID, previous: previous, resolving: conflict) else { return nil }
                 return readable
             }
         }
@@ -297,12 +326,16 @@ actor ProjectAutosaveStore {
     }
 
     private func isManaged(_ url: URL) -> Bool {
-        url.isFileURL && url.pathExtension.lowercased() == "lad" &&
+        Self.isProjectFile(url) &&
             url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath() == managedDirectory.resolvingSymlinksInPath()
     }
 
+    private nonisolated static func isProjectFile(_ url: URL) -> Bool {
+        url.isFileURL && url.pathExtension.lowercased() == "lad"
+    }
+
     private func changedExternally() -> LADError {
-        .message("The iCloud design changed outside LAD. Open the latest .lad file before continuing, or save a separate copy.")
+        .message("The design changed outside LAD. Open the latest .lad file before continuing, or save a separate copy.")
     }
 
     private nonisolated static func readSnapshot(from url: URL) throws -> (project: LADProject, fingerprint: Fingerprint) {

@@ -6,7 +6,7 @@ serialization until export. Programs expose the installed CadQuery and
 OpenCascade APIs, including advanced curves, surfaces, sweeps, lofts,
 transformations, text, assemblies, and direct OCP geometry operations.
 
-Native STEP assets, including KiCad exports, are staged privately as
+Original external STEP assets are staged privately as
 `source.step`. A Python request may specify `sourceAsset: "source.step"`; the
 worker then preloads the exact geometry as the CadQuery Shape `imported_model`.
 Other asset paths and symlinked/nonregular assets are rejected. LAD stores the
@@ -14,11 +14,16 @@ original STEP bytes in the project, strips them from Codex prompts, and carries
 the asset into subsequent script revisions. A minimal imported model program is
 `result = imported_model`.
 
+For development, `Scripts/setup.sh` prepares the pinned standalone Python and
+CAD payload under `.build/cad-runtime/arm64`. The app
+provisions its own versioned runtime under `~/Library/Application Support/LAD/Runtimes`
+from that payload and does not depend on the checkout.
+
 ```sh
-.venv/bin/python Engine/worker.py \
+.build/cad-runtime/arm64/expanded/python/bin/python3 Engine/worker.py \
   --request Examples/mounting-bracket.json \
   --output /tmp/lad-bracket --threads 8 --defer-step
-.venv/bin/python -m unittest discover -s Engine/tests -v
+.build/cad-runtime/arm64/expanded/python/bin/python3 -m unittest discover -s Engine/tests -v
 ```
 
 With `--defer-step`, builds write `result.json` and a private session
@@ -114,14 +119,9 @@ are rejected. This does not allow generated replay programs to read user files.
 `agent_server.py --workspace <private-task-directory>` is LAD's stdlib-only
 stdio MCP adapter. The native app connects it for each Codex invocation and
 serves requests through private descriptor-confined filesystem IPC. Its tools
-are `lad_runtime`, `lad_build`, `lad_inspect`, `lad_measure`, `lad_validate`,
-`lad_render`, `lad_screenshot`, `lad_export_step`, `lad_convert_kicad` and `lad_import`.
-
-`lad_convert_kicad` reuses the native app's KiCad converter for an exact referenced
-board file and returns a temporary workspace STEP path, coverage, diagnostics
-and provenance. It does not import, register or commit geometry. All PCB requests
-go to Codex normally; the agent chooses whether conversion is useful and whether
-to import the resulting external PCB reference separately.
+are `lad_runtime`, `lad_versions`, `lad_version`, `lad_build`, `lad_inspect`,
+`lad_get_part_colors`, `lad_set_part_colors`, `lad_measure`, `lad_validate`,
+`lad_render`, `lad_screenshot`, `lad_export_step` and `lad_import`.
 
 Builds use this worker and the configured CAD runtime. Inspection/measurement
 use session topology and native BRep; PNG images use LAD's native Metal renderer
@@ -131,8 +131,9 @@ and releases waiting MCP calls. No listening port or global MCP configuration
 is installed. Source files, audit snapshots and geometry input references remain
 separate from the bounded initial prompt.
 
-The Codex task workspace supports command execution and workspace-local optional
-dependencies for analysis and alternative modeling approaches. Codex is instructed
+External tools are user-managed. The Codex task workspace supports command
+execution for analysis and prototyping with additional tools provided by the user;
+LAD and its agent do not download or install tools or dependencies. Codex is instructed
 to use `lad_import` only for pre-existing external inputs and faithful conversions
 of user sources, never geometry it creates or modifies as part of the design,
 including LAD exports or newly authored SDF/mesh outputs. Generated geometry must
@@ -192,9 +193,9 @@ The macOS app starts CAD programs through `sandbox-exec` using `script.sb`.
 This denies networking and process creation, allows reads only from the
 installed runtime, worker, system libraries/fonts and build directory, and
 allows writes only within that build directory. The worker receives a small
-environment allowlist without ambient API keys. Homebrew Python framework
-launchers are bypassed in favor of the actual interpreter, retaining the
-selected virtual environment. Font construction is supported using installed
+environment allowlist without ambient API keys. The interpreter and dependencies
+come from LAD’s managed runtime, provisioned offline from the bundled payload.
+Font construction is supported using installed
 system fonts. Runtime paths are provided as profile parameters rather than
 embedded user paths.
 
@@ -227,7 +228,7 @@ real native sandbox and verify denial of external reads/writes, sockets and
 subprocesses. Run these outside another sandbox:
 
 ```sh
-LAD_RUN_SANDBOX_TESTS=1 .venv/bin/python -m unittest discover -s Engine/tests -v
+LAD_RUN_SANDBOX_TESTS=1 .build/cad-runtime/arm64/expanded/python/bin/python3 -m unittest discover -s Engine/tests -v
 ```
 
 The preview preserves per-face vertex ranges and oriented triangle winding.

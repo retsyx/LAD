@@ -333,7 +333,6 @@ final class AppStateConversationReplyTests: XCTestCase {
         let codex: FakeCodex
         let autosaves: URL
         let oldCodex: Any?
-        let oldPython: Any?
 
         init(status: String = "message", message: String, delay: Double = 0.05) throws {
             let data = try JSONSerialization.data(withJSONObject: ["status": status, "message": message,
@@ -348,9 +347,7 @@ final class AppStateConversationReplyTests: XCTestCase {
             autosaves = codex.directory.appendingPathComponent("autosaves", isDirectory: true)
             try FileManager.default.createDirectory(at: autosaves, withIntermediateDirectories: false)
             oldCodex = UserDefaults.standard.object(forKey: "codexPath")
-            oldPython = UserDefaults.standard.object(forKey: "pythonPath")
             UserDefaults.standard.set(codex.executable.path, forKey: "codexPath")
-            UserDefaults.standard.set(EngineService.defaultPython, forKey: "pythonPath")
         }
 
         func state() -> AppState {
@@ -378,8 +375,6 @@ final class AppStateConversationReplyTests: XCTestCase {
         func cleanUp() {
             if let oldCodex { UserDefaults.standard.set(oldCodex, forKey: "codexPath") }
             else { UserDefaults.standard.removeObject(forKey: "codexPath") }
-            if let oldPython { UserDefaults.standard.set(oldPython, forKey: "pythonPath") }
-            else { UserDefaults.standard.removeObject(forKey: "pythonPath") }
             codex.remove()
         }
     }

@@ -72,6 +72,7 @@ private struct ProjectWindowRoot: View {
     private func configureOpenHandler() {
         let opening = openWindow
         let router = coordinator
+        router.onReopenProjectWindow = { opening(id: "project", value: $0) }
         state.onOpenProject = { [weak router] url in
             router?.openProject(at: url) { opening(id: "project", value: $0) }
         }
@@ -188,8 +189,9 @@ final class LADAppDelegate: NSObject, NSApplicationDelegate {
         guard !isTerminating else { return .terminateLater }
         isTerminating = true
         Task { @MainActor in
-            await projectWindows.prepareToQuit()
-            sender.reply(toApplicationShouldTerminate: true)
+            let shouldQuit = await projectWindows.prepareToQuit()
+            if !shouldQuit { isTerminating = false }
+            sender.reply(toApplicationShouldTerminate: shouldQuit)
         }
         return .terminateLater
     }

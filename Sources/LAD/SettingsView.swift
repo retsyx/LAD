@@ -3,43 +3,69 @@ import AppKit
 
 @MainActor
 struct LADSettingsView: View {
-    @AppStorage("codexPath") private var codexPath = ""
-    @AppStorage("pythonPath") private var pythonPath = ""
+    @AppStorage(ProjectSaveLocation.preferenceKey) private var projectSaveDirectory = ""
     @AppStorage("workerThreads") private var threads = 0
-    @ObservedObject private var codexHealth = CodexHealth.shared
-    @StateObject private var healthWindow = CodexSettingsWindowMonitor()
+    @ObservedObject private var cadRuntime = CADRuntimeManager.shared
+    @State private var folderChoice: ProjectSaveFolderChoice = .cloud
 
-    private var codexExecutable: String {
-        // Observe the hidden override without replacing the retained window anchor.
-        _ = codexPath
-        return CodexService.configuredExecutable
+    private enum ProjectSaveFolderChoice: Hashable { case cloud, documents, custom, choose }
+
+    private var saveDirectory: URL {
+        _ = projectSaveDirectory
+        return ProjectSaveLocation.directory()
+    }
+
+    private var savedFolderChoice: ProjectSaveFolderChoice {
+        let path = saveDirectory.resolvingSymlinksInPath().path
+        if path == ProjectSaveLocation.cloudDirectory().resolvingSymlinksInPath().path { return .cloud }
+        if path == ProjectSaveLocation.documentsDirectory().resolvingSymlinksInPath().path { return .documents }
+        return .custom
+    }
+
+    private var folderSelection: Binding<ProjectSaveFolderChoice> {
+        Binding(get: { folderChoice }, set: { choice in
+            folderChoice = choice
+            switch choice {
+            case .cloud: projectSaveDirectory = ""
+            case .documents: projectSaveDirectory = ProjectSaveLocation.documentsDirectory().path
+            case .custom, .choose: break
+            }
+        })
     }
 
     var body: some View {
         Form {
-            if let issue = codexHealth.issue {
-                Section("Codex") {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(issue.title).font(.headline)
-                        Text(issue.message).font(.caption).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .help(issue.details ?? issue.message)
+            Section("Design files") {
+                Picker("New designs", selection: folderSelection) {
+                    Text("iCloud Drive").tag(ProjectSaveFolderChoice.cloud)
+                        .disabled(!ProjectSaveLocation.isCloudAvailable())
+                    Text("Documents/LAD").tag(ProjectSaveFolderChoice.documents)
+                    if savedFolderChoice == .custom {
+                        Text(ProjectSaveLocation.displayName(for: saveDirectory))
+                            .tag(ProjectSaveFolderChoice.custom)
                     }
-                    HStack(spacing: 10) {
-                        Button("Check again") { healthWindow.refresh(force: true) }
-                            .disabled(codexHealth.isChecking)
-                        if codexHealth.isChecking { ProgressView().controlSize(.small) }
-                        Spacer()
-                        Link("Codex setup documentation ↗", destination: URL(string: "https://learn.chatgpt.com/docs/cli")!)
-                    }
+                    Divider()
+                    Text("Choose Folder…").tag(ProjectSaveFolderChoice.choose)
+                }
+                .pickerStyle(.menu)
+                .help(ProjectSaveLocation.displayName(for: saveDirectory))
+                .onAppear { folderChoice = savedFolderChoice }
+                .onChange(of: projectSaveDirectory) { _, _ in folderChoice = savedFolderChoice }
+                .task(id: folderChoice) {
+                    guard folderChoice == .choose else { return }
+                    // Let native popup tracking finish before opening a panel.
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    chooseProjectDirectory()
+                    folderChoice = savedFolderChoice
                 }
             }
             Section("CAD engine") {
-                LabeledContent("Python runtime") {
-                    TextField(EngineService.defaultPython, text: $pythonPath)
-                    Button("Choose…") { chooseExecutable { pythonPath = $0 } }
+                if cadRuntime.phase == .preparing {
+                    HStack { ProgressView().controlSize(.small); Text("Preparing CAD runtime…") }
+                } else if case .failed(let message) = cadRuntime.phase {
+                    Text(message).font(.caption).foregroundStyle(.secondary).help(message)
                 }
-                Text("Use the Python environment created by Scripts/setup.sh. CadQuery and OpenCascade must be installed in this runtime.").font(.caption).foregroundStyle(.secondary)
                 Picker("CAD threads", selection: $threads) {
                     Text("Automatic (\(ProcessInfo.processInfo.activeProcessorCount) cores)").tag(0)
                     ForEach(1...max(1, ProcessInfo.processInfo.activeProcessorCount), id: \.self) { n in Text("\(n)").tag(n) }
@@ -48,160 +74,18 @@ struct LADSettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 650, height: 420)
-        .background(CodexSettingsWindowAnchor(monitor: healthWindow,
-            executable: codexExecutable,
-            refresh: { [health = codexHealth] executable, force in
-                await health.refresh(executable: executable, force: force)
-            })
-            .frame(width: 0, height: 0))
     }
 
-    private func chooseExecutable(_ selected: (String) -> Void) {
-        let panel = NSOpenPanel(); panel.showsHiddenFiles = true; panel.canChooseDirectories = false
-        if panel.runModal() == .OK, let path = panel.url?.path { selected(path) }
-    }
-}
-
-/// SwiftUI retains the native Settings window after it closes. Observe that
-/// exact window so reopening it checks Codex without polling hidden content or
-/// reacting to other design windows becoming active.
-@MainActor
-final class CodexSettingsWindowMonitor: ObservableObject {
-    private weak var window: NSWindow?
-    private var observers: [NSObjectProtocol] = []
-    private var executable = ""
-    private var action: (@MainActor (String, Bool) async -> Void)?
-    private var task: Task<Void, Never>?
-    private var deferredRefresh: Task<Void, Never>?
-    private var generation: UUID?
-    private var isClosed = false
-
-    deinit {
-        task?.cancel()
-        deferredRefresh?.cancel()
-        for observer in observers { NotificationCenter.default.removeObserver(observer) }
-    }
-
-    func configure(executable: String, refresh: @escaping @MainActor (String, Bool) async -> Void) {
-        let changed = self.executable != executable
-        self.executable = executable
-        action = refresh
-        if changed {
-            cancelRefresh()
-            self.refresh()
+    private func chooseProjectDirectory() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Folder for New Designs"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.directoryURL = ProjectSaveLocation.directory()
+        if panel.runModal() == .OK, let url = panel.url {
+            projectSaveDirectory = url.standardizedFileURL.path
         }
-    }
-
-    func attach(to window: NSWindow?) {
-        guard self.window !== window else { return }
-        removeObservers()
-        cancelRefresh()
-        self.window = window
-        isClosed = false
-        guard let window else { return }
-        observe(NSWindow.didBecomeKeyNotification, object: window) { monitor in
-            monitor.isClosed = false
-            monitor.refreshAfterVisibilityUpdate()
-        }
-        observe(NSWindow.willCloseNotification, object: window) { monitor in
-            monitor.isClosed = true
-            monitor.cancelRefresh()
-        }
-        observe(NSWindow.didMiniaturizeNotification, object: window) { $0.cancelRefresh() }
-        observe(NSWindow.didDeminiaturizeNotification, object: window) { $0.refreshAfterVisibilityUpdate() }
-        observe(NSApplication.didBecomeActiveNotification, object: NSApplication.shared) { $0.refreshAfterVisibilityUpdate() }
-        refresh()
-    }
-
-    func refresh(force: Bool = false) {
-        guard let window, window.isVisible, !window.isMiniaturized, !isClosed, let action else { return }
-        if task != nil && !force { return }
-        cancelRefresh()
-        let token = UUID(), executable = executable
-        generation = token
-        task = Task { [weak self] in
-            await action(executable, force)
-            guard let self, self.generation == token else { return }
-            self.task = nil
-            self.generation = nil
-        }
-    }
-
-    func disconnect() {
-        removeObservers()
-        cancelRefresh()
-        window = nil
-        action = nil
-        isClosed = false
-    }
-
-    private func cancelRefresh() {
-        deferredRefresh?.cancel()
-        deferredRefresh = nil
-        generation = nil
-        task?.cancel()
-        task = nil
-    }
-
-    private func refreshAfterVisibilityUpdate() {
-        // AppKit can announce key/activation before finishing the window's
-        // ordering transition. Recheck visibility after that call unwinds.
-        deferredRefresh?.cancel()
-        deferredRefresh = Task { [weak self] in
-            await Task.yield()
-            guard !Task.isCancelled else { return }
-            self?.deferredRefresh = nil
-            self?.refresh()
-        }
-    }
-
-    private func removeObservers() {
-        for observer in observers { NotificationCenter.default.removeObserver(observer) }
-        observers.removeAll()
-    }
-
-    private func observe(_ name: Notification.Name, object: AnyObject,
-                         action: @escaping @MainActor (CodexSettingsWindowMonitor) -> Void) {
-        observers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { if let self { action(self) } }
-        })
-    }
-}
-
-struct CodexSettingsWindowAnchor: NSViewRepresentable {
-    var monitor: CodexSettingsWindowMonitor
-    var executable: String
-    var refresh: @MainActor (String, Bool) async -> Void
-
-    func makeNSView(context: Context) -> CodexSettingsWindowAnchorView {
-        let view = CodexSettingsWindowAnchorView(frame: .zero)
-        view.monitor = monitor
-        monitor.configure(executable: executable, refresh: refresh)
-        return view
-    }
-
-    func updateNSView(_ view: CodexSettingsWindowAnchorView, context: Context) {
-        view.monitor = monitor
-        monitor.configure(executable: executable, refresh: refresh)
-        monitor.attach(to: view.window)
-    }
-
-    static func dismantleNSView(_ view: CodexSettingsWindowAnchorView, coordinator: ()) {
-        view.monitor?.disconnect()
-        view.monitor = nil
-    }
-}
-
-@MainActor
-final class CodexSettingsWindowAnchorView: NSView {
-    weak var monitor: CodexSettingsWindowMonitor?
-    override var acceptsFirstResponder: Bool { false }
-    override var intrinsicContentSize: NSSize { .zero }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        monitor?.attach(to: window)
     }
 }
 

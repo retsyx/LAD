@@ -91,9 +91,9 @@ final class CodexVersionContextIntegrationTests: XCTestCase {
         let harness = try VersionHarness(queries: [["name": "lad_versions", "arguments": [:]],
             ["name": "lad_version", "arguments": ["reference": "v3"]]], waitsForResume: true)
         defer { harness.remove() }
-        let preferences = VersionPreferences(codex: harness.codex.executable.path, python: harness.python.path)
+        let preferences = VersionPreferences(codex: harness.codex.executable.path)
         defer { preferences.restore() }
-        let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: harness.directory.appendingPathComponent("autosaves")))
+        let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: harness.directory.appendingPathComponent("autosaves")), python: harness.python.path)
         state.newProject()
         defer { state.cancel() }
         let revisions = historicalRevisions()
@@ -217,16 +217,12 @@ private final class VersionActivityCapture: @unchecked Sendable {
 
 private struct VersionPreferences {
     private let previousCodex = UserDefaults.standard.object(forKey: "codexPath")
-    private let previousPython = UserDefaults.standard.object(forKey: "pythonPath")
-    init(codex: String, python: String) {
+    init(codex: String) {
         UserDefaults.standard.set(codex, forKey: "codexPath")
-        UserDefaults.standard.set(python, forKey: "pythonPath")
     }
     func restore() {
-        for (key, value) in [("codexPath", previousCodex), ("pythonPath", previousPython)] {
-            if let value { UserDefaults.standard.set(value, forKey: key) }
-            else { UserDefaults.standard.removeObject(forKey: key) }
-        }
+        if let previousCodex { UserDefaults.standard.set(previousCodex, forKey: "codexPath") }
+        else { UserDefaults.standard.removeObject(forKey: "codexPath") }
     }
 }
 

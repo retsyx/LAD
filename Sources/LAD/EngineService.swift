@@ -36,11 +36,7 @@ final class EngineService {
     deinit { job?.cancel() }
 
     static var defaultPython: String {
-        let configured = ResourcePaths.root.appendingPathComponent("python-runtime.txt")
-        if let path = try? String(contentsOf: configured, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           FileManager.default.isExecutableFile(atPath: path) { return path }
-        let local = ResourcePaths.root.appendingPathComponent(".venv/bin/python").path
-        return FileManager.default.isExecutableFile(atPath: local) ? local : "/opt/homebrew/bin/python3.11"
+        CADRuntimeManager.defaultPythonPath
     }
 
     func build(_ spec: ModelSpec, python: String, threads: Int) async throws -> PreviewMesh {
@@ -248,6 +244,7 @@ final class EngineService {
     private func run(python: String, threads: Int, scriptMode: Bool, deferSTEP: Bool = false,
                      action: String = "build this design",
                      prepare: @escaping @Sendable (URL) throws -> Void) async throws -> RunResult {
+        try Task.checkCancellation()
         cancel()
         let token = UUID()
         generation = token
@@ -257,13 +254,15 @@ final class EngineService {
         let request = folder.appendingPathComponent("request.json")
         try await Task.detached(priority: .userInitiated) { try prepare(folder) }.value
         guard token == generation, !Task.isCancelled else { throw CancellationError() }
+        let python = try await CADRuntimeManager.resolvePython(python)
+        guard token == generation, !Task.isCancelled else { throw CancellationError() }
         let worker = ResourcePaths.root.appendingPathComponent("Engine/worker.py").resolvingSymlinksInPath()
         guard FileManager.default.fileExists(atPath: worker.path) else {
-            throw LADError.message("CAD engine missing. Run LAD from its source folder, or rebuild the app with Scripts/build-app.sh.")
+            throw LADError.message("LAD’s CAD engine is missing. Reinstall LAD and try again.")
         }
         let runtime = URL(fileURLWithPath: (python as NSString).expandingTildeInPath).standardizedFileURL
         guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
-            throw LADError.message("Python runtime not found. Run Scripts/setup.sh, then choose .venv/bin/python in Settings.")
+            throw LADError.message("LAD’s CAD runtime is missing. Restart LAD and try again.")
         }
         let arguments = [worker.path, "--request", request.path, "--output", folder.path, "--threads", String(max(1, min(256, threads)))] + (deferSTEP ? ["--defer-step"] : [])
         let actualRuntime = runtime.resolvingSymlinksInPath()
@@ -278,11 +277,11 @@ final class EngineService {
             executable = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             let profile = worker.deletingLastPathComponent().appendingPathComponent("script.sb")
             guard FileManager.default.isExecutableFile(atPath: executable.path), FileManager.default.fileExists(atPath: profile.path) else {
-                throw LADError.message("Python CAD designs require the macOS execution sandbox. The sandbox tool or bundled Engine/script.sb is missing; rebuild LAD with Scripts/build-app.sh.")
+                throw LADError.message("LAD could not start its CAD execution sandbox. Reinstall LAD and try again.")
             }
             let parameters = [
                 ("RUNTIME", runtime.deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath().path),
-                ("PYTHON_BASE", actualRuntime.deletingLastPathComponent().deletingLastPathComponent().path),
+                ("PYTHON_BASE", Self.pythonBaseDirectory(runtime: runtime, actualRuntime: actualRuntime).path),
                 ("WORKER", worker.deletingLastPathComponent().path),
                 ("OUTPUT", folder.path),
                 ("PYTHON", interpreter.path), ("ENTRY_PYTHON", runtime.path)
@@ -319,10 +318,10 @@ final class EngineService {
             let logData = try? EngineArtifact.tail(folder.appendingPathComponent("stderr.log"), in: folder, maximumBytes: 65_536)
             let log = logData.map { String(decoding: $0, as: UTF8.self) } ?? ""
             if log.contains("No module named") {
-                throw LADError.message("The CAD runtime is missing dependencies. Run Scripts/setup.sh.\n\n\(log.suffix(1_200))")
+                throw LADError.message("LAD’s CAD runtime is incomplete. Reinstall LAD and try again.\n\n\(log.suffix(1_200))")
             }
             if scriptMode, log.contains("sandbox_apply") || log.contains("sandbox-exec:") {
-                throw LADError.message("The macOS sandbox could not start the Python CAD design. Run the packaged LAD app outside an enclosing sandbox and check the selected Python runtime.\n\n\(log.suffix(1_200))")
+                throw LADError.message("The macOS sandbox could not start this design. Restart LAD outside an enclosing sandbox and try again.\n\n\(log.suffix(1_200))")
             }
             throw LADError.message("The CAD engine could not \(action).\n\n\(log.suffix(3_000))")
         }
@@ -376,6 +375,15 @@ final class EngineService {
         generation = UUID()
         job?.cancel()
         job = nil
+    }
+
+    private static func pythonBaseDirectory(runtime: URL, actualRuntime: URL) -> URL {
+        let environment = runtime.deletingLastPathComponent().deletingLastPathComponent()
+        if let configuration = try? String(contentsOf: environment.appendingPathComponent("pyvenv.cfg"), encoding: .utf8),
+           let home = configuration.components(separatedBy: .newlines).first(where: { $0.hasPrefix("home = ") }) {
+            return URL(fileURLWithPath: String(home.dropFirst(7))).deletingLastPathComponent().resolvingSymlinksInPath()
+        }
+        return actualRuntime.deletingLastPathComponent().deletingLastPathComponent()
     }
 }
 

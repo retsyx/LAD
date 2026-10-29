@@ -3,6 +3,83 @@ import XCTest
 @testable import LAD
 
 final class CodexExecutableDiscoveryTests: XCTestCase {
+    func testExplicitChoiceWinsAndMissingChoiceNeverSwitchesInstallations() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let explicit = try fixture.executable("custom/codex")
+        let automatic = try fixture.executable("bin/codex")
+        var discoveryCalls = 0
+        func discover() -> String? { discoveryCalls += 1; return automatic.path }
+
+        XCTAssertEqual(CodexExecutable.configuredPath(override: "  \(explicit.path)\n", automatic: discover), explicit.path)
+        try FileManager.default.removeItem(at: explicit)
+        XCTAssertEqual(CodexExecutable.configuredPath(override: explicit.path, automatic: discover), explicit.path)
+        XCTAssertEqual(discoveryCalls, 0, "A missing explicit choice must remain visible instead of selecting another account or installation.")
+        XCTAssertEqual(CodexExecutable.configuredPath(override: " \n", automatic: discover), automatic.path)
+        XCTAssertEqual(discoveryCalls, 1)
+    }
+
+    func testNamedExplicitChoiceResolvesInItsSearchDirectories() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let explicit = try fixture.executable("custom/bin/codex")
+        let directories = [explicit.deletingLastPathComponent()]
+        XCTAssertEqual(CodexExecutable.configuredPath(override: "codex", searchDirectories: directories,
+                                                     automatic: { XCTFail("Explicit choice must win"); return nil }), explicit.path)
+    }
+
+    func testFinderDiscoveryWorksWithoutInteractiveShellPATH() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let expected = try fixture.executable("UserHome/.local/bin/codex")
+        let directories = CodexExecutable.searchDirectories(path: nil, home: fixture.root.appendingPathComponent("UserHome"),
+                                                            installationDirectories: [fixture.root.appendingPathComponent("system-bin")])
+        let found = CodexExecutable.find(applicationBundles: [], searchDirectories: directories,
+                                         extensionDirectories: [], platform: "macos-aarch64")
+        XCTAssertEqual(found.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path },
+                       expected.resolvingSymlinksInPath().path)
+    }
+
+    func testNVMDiscoveryUsesNewestAvailableInstallationWithoutRunningShell() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        _ = try fixture.executable("UserHome/.nvm/versions/node/v9.0.0/bin/codex")
+        let expected = try fixture.executable("UserHome/.nvm/versions/node/v20.0.0/bin/codex")
+        _ = try fixture.executable("UserHome/.nvm/versions/node/v22.0.0/bin/node")
+        let directories = CodexExecutable.searchDirectories(path: nil, home: fixture.root.appendingPathComponent("UserHome"),
+                                                            installationDirectories: [])
+        XCTAssertEqual(CodexExecutable.resolve("codex", searchDirectories: directories)?.resolvingSymlinksInPath(),
+                       expected.resolvingSymlinksInPath())
+    }
+
+    func testSearchIgnoresRelativeAndDuplicatePATHEntries() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let expected = try fixture.executable("bin/codex")
+        let directories = CodexExecutable.searchDirectories(path: ":.:relative-bin:\(expected.deletingLastPathComponent().path):\(expected.deletingLastPathComponent().path):",
+                                                            home: fixture.root.appendingPathComponent("UserHome"),
+                                                            installationDirectories: [])
+        // Foundation may standardize /private/var to /var on macOS. Compare
+        // these automatic search locations by their filesystem destinations.
+        let canonicalDirectories = directories.map { $0.resolvingSymlinksInPath().path }
+        let expectedDirectory = expected.deletingLastPathComponent().resolvingSymlinksInPath().path
+        XCTAssertEqual(canonicalDirectories.first, expectedDirectory)
+        XCTAssertEqual(canonicalDirectories.filter { $0 == expectedDirectory }.count, 1)
+        XCTAssertTrue(directories.allSatisfy { ($0.path as NSString).isAbsolutePath })
+        XCTAssertEqual(CodexExecutable.resolve("codex", searchDirectories: directories)?.resolvingSymlinksInPath(),
+                       expected.resolvingSymlinksInPath())
+        XCTAssertNil(CodexExecutable.resolve("bin/codex", searchDirectories: directories))
+        XCTAssertNil(CodexExecutable.resolve("", searchDirectories: directories))
+    }
+
+    func testCodexApplicationPrecedesChatGPTApplication() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let expected = try fixture.executable("Applications/Codex.app/Contents/Resources/codex-cli/bin/codex")
+        _ = try fixture.executable("Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
+        XCTAssertEqual(fixture.discover(), expected.path)
+    }
+
     func testAppLauncherTakesPriorityOverPATHAndEditorExtension() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }

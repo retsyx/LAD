@@ -85,7 +85,6 @@ final class AppStateCodexRoutingTests: XCTestCase {
         let capturedContext: URL
         let autosaves: URL
         let oldCodex: Any?
-        let oldPython: Any?
 
         init() throws {
             codex = try FakeCodex(responseJSON: "{\"status\":\"unsupported\",\"message\":\"AGENT_ROUTING_RESPONSE\",\"model\":null,\"assetIDs\":[]}", delay: 0.05)
@@ -96,9 +95,7 @@ final class AppStateCodexRoutingTests: XCTestCase {
             autosaves = directory.appendingPathComponent("autosaves", isDirectory: true)
             try FileManager.default.createDirectory(at: autosaves, withIntermediateDirectories: false)
             oldCodex = UserDefaults.standard.object(forKey: "codexPath")
-            oldPython = UserDefaults.standard.object(forKey: "pythonPath")
             UserDefaults.standard.set(executable.path, forKey: "codexPath")
-            UserDefaults.standard.set(EngineService.defaultPython, forKey: "pythonPath")
         }
 
         func state() -> AppState {
@@ -127,8 +124,6 @@ final class AppStateCodexRoutingTests: XCTestCase {
         func cleanUp() {
             if let oldCodex { UserDefaults.standard.set(oldCodex, forKey: "codexPath") }
             else { UserDefaults.standard.removeObject(forKey: "codexPath") }
-            if let oldPython { UserDefaults.standard.set(oldPython, forKey: "pythonPath") }
-            else { UserDefaults.standard.removeObject(forKey: "pythonPath") }
             codex.remove()
         }
     }

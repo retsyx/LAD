@@ -24,7 +24,6 @@ final class CADAgentTools {
     private let python: String
     private let threads: Int
     private let engine: EngineService
-    private let kicad: KiCadService
     private let current: ModelSpec?
     private let versions: ProjectVersionContext
     private weak var viewport: CADSceneView?
@@ -44,7 +43,7 @@ final class CADAgentTools {
 
     init(directory: URL, python: String, threads: Int, current: ModelSpec?, currentPreview: PreviewMesh?,
          engine: EngineService, viewport: CADSceneView? = nil, hiddenSolids: Set<Int> = [],
-         solidColors: [Int: PartColor] = [:], kicad: KiCadService? = nil,
+         solidColors: [Int: PartColor] = [:],
          referenceAssets: [CADInputAsset] = [], versions: ProjectVersionContext = .empty,
          partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:]) throws {
         workspace = try CADAgentWorkspace(directory: directory)
@@ -53,7 +52,6 @@ final class CADAgentTools {
         self.current = current
         self.versions = versions
         self.engine = engine
-        self.kicad = kicad ?? KiCadService()
         self.viewport = viewport
         self.hiddenSolids = hiddenSolids
         self.partLayout = partLayout
@@ -170,7 +168,6 @@ final class CADAgentTools {
         renderedImageData = nil
         versionTasks.values.forEach { $0.cancel() }
         engine.cancel()
-        kicad.cancel()
     }
 
     func consumeRenderedImage() -> Data? {
@@ -188,9 +185,8 @@ final class CADAgentTools {
             return try result(["pythonExecutable": python, "runtime": try json(runtime!), "threads": threads,
                                "workspace": workspace.root.path,
                                "programInterface": "Full installed CadQuery and OCP Python APIs; assign result. cq, math, np and imported_assets are preloaded. imported_model is available when the current design has an original STEP input.",
-                               "capabilities": ["sketches", "lofts", "sweeps", "splines", "surfaces", "shells", "offsets", "booleans", "assemblies", "direct OCP", "exact measurements", "PNG rendering", "STEP export", "KiCad PCB conversion"],
-                               "kicadAvailable": KiCadService.defaultExecutable != nil,
-                               "externalTools": "Use the selected Python or create a workspace-local environment with --system-site-packages. Install additional dependencies only inside this workspace for analysis or prototyping. Final authored geometry must remain in the replayable CAD program. lad_import is only for pre-existing external/reference inputs, including faithful conversion of a supplied PCB; never export/import or reimport geometry generated as part of this design by LAD or external tools.",
+                               "capabilities": ["sketches", "lofts", "sweeps", "splines", "surfaces", "shells", "offsets", "booleans", "assemblies", "direct OCP", "exact measurements", "PNG rendering", "STEP export"],
+                               "externalTools": "External tools are user-managed. Use an additional tool only when the user has provided it; do not download or install tools or dependencies. Keep analysis and prototyping outputs inside this task workspace without changing original sources or LAD's shared runtime. Final authored geometry must remain in the replayable CAD program. lad_import is only for pre-existing external/reference inputs and faithful format conversions of user-provided inputs; never export/import or reimport geometry generated as part of this design by LAD or external tools.",
                                "apiHelp": "The selected runtime is ready to use. Inspect Python help(cq.Workplane.loft), help(cq.Solid), or installed OCP classes with workspace commands; no CAD environment bootstrap is needed.",
                                "inputAssets": inputs.values.sorted { $0.id < $1.id }.map { ["assetID": $0.id, "name": $0.name, "format": $0.format] }])
         case "lad_versions":
@@ -235,51 +231,6 @@ final class CADAgentTools {
                                   sourceName: origin?.sourceName, inputAssets: selected.isEmpty ? nil : selected)
             let artifact = try await build(model, versionID: version?.id)
             return try result(summary(artifact))
-        case "lad_convert_kicad":
-            try allowed(arguments, ["boardPath", "path"])
-            let boardPath = try string("boardPath", arguments, required: true)!
-            let boardURL: URL
-            if let local = try? workspace.url(boardPath) {
-                // Explicit local references are allowed, but workspace aliases
-                // must not smuggle a privileged read through a replaced link.
-                _ = try workspace.read(boardPath, maximumBytes: 20 * 1024 * 1024)
-                boardURL = local
-            } else {
-                guard boardPath.hasPrefix("/") else { throw LADError.message("Choose an exact .kicad_pcb reference or a file inside the task workspace.") }
-                // A source PCB can live outside the writable task workspace.
-                // KiCad only reads it and its referenced models; its normal
-                // project directory is essential for component path resolution.
-                boardURL = URL(fileURLWithPath: boardPath).standardizedFileURL
-            }
-            guard boardURL.pathExtension.lowercased() == "kicad_pcb" else {
-                throw LADError.message("Choose an exact .kicad_pcb file to convert with KiCad.")
-            }
-            let outputPath = try string("path", arguments) ?? "conversions/\(UUID().uuidString)/pcb.step"
-            let destination = try workspace.url(outputPath)
-            guard ["step", "stp"].contains(destination.pathExtension.lowercased()) else {
-                throw LADError.message("Choose a .step or .stp output path inside the task workspace.")
-            }
-            let converted = try await kicad.exportSTEP(board: boardURL)
-            defer { try? FileManager.default.removeItem(at: converted.stepURL.deletingLastPathComponent()) }
-            try checkCancellation()
-            let data = try await Task.detached(priority: .userInitiated) {
-                try EngineArtifact.read(converted.stepURL, in: converted.stepURL.deletingLastPathComponent(),
-                                        maximumBytes: ProjectStore.maximumSTEPBytes)
-            }.value
-            try checkCancellation()
-            let output = try workspace.write(data, path: outputPath)
-            var info: [String: Any] = ["path": output.path, "format": "step", "byteCount": data.count,
-                                      "sha256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
-                                      "sourceBoardPath": converted.boardURL.path, "sourceSHA256": converted.sourceSHA256,
-                                      "modeledComponents": converted.modeledComponents,
-                                      "referencedComponents": converted.modeledComponents + converted.missingModels.count,
-                                      "missingModels": converted.missingModels, "recoveredModels": converted.recoveredModels,
-                                      "coverageComplete": converted.missingModels.isEmpty,
-                                      "diagnostics": converted.diagnostics,
-                                      "coordinateConvention": "Absolute PCB origin (0, 0); STEP Y is opposite PCB Y.",
-                                      "nextStep": "This tool only converts a supplied PCB reference. Inspect coverage, then explicitly call lad_import if its geometry is needed as a reference input. No design, artifact or input asset was created."]
-            if let thickness = converted.boardThickness { info["boardThickness"] = thickness }
-            return try result(info)
         case "lad_import":
             try allowed(arguments, ["path", "name", "producerPaths"])
             let path = try string("path", arguments, required: true)!

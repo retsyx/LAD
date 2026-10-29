@@ -1,0 +1,8 @@
+{
+  "pythonVersion": "3.11.18",
+  "release": "20261026",
+  "arm64": {
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.11.18%2B20261026-aarch64-apple-darwin-install_only_stripped.tar.gz",
+    "sha256": "f3e1cd83a7f1d70e58b0d69102c18bd6867d2f973068dc5cbfd5822e445c66df"
+  }
+}

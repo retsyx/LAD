@@ -27,9 +27,9 @@ INSTRUCTIONS = (
     "Lookups return metadata and local file references without building geometry or changing the viewport. Use the returned stable versionID after resolution; ambiguous names require clarification. "
     "Replay a saved program with lad_build.versionID to bind that version's exact original inputs. Never import generated geometry from earlier versions. "
     "Use lad_runtime for the selected Python, versions and asset IDs. Full installed CadQuery/OCP APIs are supported, including lofts, sweeps, "
-    "splines and surfaces; final results must be closed solids. Extra tools/dependencies may be used in this writable workspace, without "
-    "changing original sources or LAD's shared runtime. Use lad_convert_kicad when a supplied PCB reference needs faithful KiCad-to-STEP conversion; "
-    "conversion does not build, import or commit a design. lad_import is only for pre-existing external/reference geometry, including that PCB conversion. "
+    "splines and surfaces; final results must be closed solids. External tools are user-managed: use additional tools only when the user has provided them, "
+    "and never download or install tools or dependencies. Keep analysis and prototyping outputs inside this task workspace without changing original sources or LAD's shared runtime. "
+    "lad_import is only for pre-existing external/reference geometry and faithful format conversions of user-provided inputs. "
     "NEVER export/import, reimport or use lad_import for geometry generated as part of the current design, whether authored with LAD or external tools such as SDF software. "
     "Keep all authored geometry in the replayable CAD program; external tools may support analysis and prototyping. Mesh reference inputs remain faceted. "
     "Use lad_get_part_colors for effective sRGB colors and stable part IDs, and lad_set_part_colors to stage color assignments or null resets without rebuilding geometry. "
@@ -92,10 +92,7 @@ TOOLS = [
     ("lad_screenshot", "Capture the current LAD viewport as a PNG image attachment. Uses an explicitly disclosed offscreen fallback if no live viewport is attached.", schema(), True),
     ("lad_export_step", "Export exact whole or selected artifact geometry with its current part RGB colors as STEP into the task workspace. Includes staged colors and neutral finishes; preserves separate solids and original coordinates. Returns a file reference without sending the file bytes as text.",
      schema({**ARTIFACT, "path": prop("string"), "solidIndices": INDICES}), False),
-    ("lad_convert_kicad", "Faithfully convert an exact supplied .kicad_pcb reference to a task-workspace STEP using LAD's existing KiCad converter. Reads original board/project/component paths without modifying them. Returns coverage, missing-component diagnostics and provenance only; does not build, import, register an asset or commit the design. Decide whether conversion is needed and explicitly call lad_import afterward if appropriate.",
-     schema({"boardPath": prop("string", description="Exact .kicad_pcb path: workspace-relative or an absolute original source reference so KiCad resolves project component models correctly."),
-             "path": prop("string", description="Optional .step/.stp destination inside the task workspace.")}, ["boardPath"]), False),
-    ("lad_import", "Import pre-existing external/reference STEP/BREP or closed STL/OBJ geometry from the task workspace, including faithful conversion of a user-supplied PCB. Never import geometry generated as part of the current design by LAD or external tools. Returns an input asset ID, validated artifact and fidelity notes. Access the reference shape using imported_assets[assetID].",
+    ("lad_import", "Import pre-existing external/reference STEP/BREP or closed STL/OBJ geometry from the task workspace, including faithful format conversions of user-provided inputs. Never import geometry generated as part of the current design by LAD or external tools. Returns an input asset ID, validated artifact and fidelity notes. Access the reference shape using imported_assets[assetID].",
      schema({"path": prop("string"), "name": prop("string"), "producerPaths": prop("array", items=prop("string"), description="Optional source-conversion code and dependency file references for a pre-existing external/reference input's task audit.")}, ["path"]), False),
 ]
 TOOL_NAMES = {tool[0] for tool in TOOLS}

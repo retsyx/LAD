@@ -252,7 +252,7 @@ final class AppStateRequestQueueTests: XCTestCase {
         XCTAssertEqual(restored.taskAudits.first?.model, "captured-model")
         XCTAssertEqual(restored.taskAudits.first?.reasoningEffort, "high")
         try await waitForWork(restored)
-        XCTAssertTrue(restored.error?.contains("Codex CLI was not found") == true,
+        XCTAssertEqual(restored.error, CodexExecutable.setupMessage,
                       "A queued source snapshot must not be reread from its deleted original path.")
         XCTAssertEqual(restored.messages.first(where: { $0.role == "user" })?.attachments?.first?.content, contents)
         XCTAssertEqual(restored.model, "later-composer-model")
@@ -317,7 +317,7 @@ final class AppStateRequestQueueTests: XCTestCase {
             restored.loadProject(saved, from: file)
             restored.resumeQueue()
             try await waitForWork(restored)
-            XCTAssertTrue(restored.error?.contains("Codex CLI was not found") == true,
+            XCTAssertEqual(restored.error, CodexExecutable.setupMessage,
                           "A captured alias must not be reopened or rebound to a different file at dispatch.")
             XCTAssertEqual(restored.messages.first(where: { $0.role == "user" })?.attachments?.first?.content, original)
             await restored.prepareToQuit()

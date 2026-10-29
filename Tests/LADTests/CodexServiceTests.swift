@@ -141,15 +141,14 @@ final class CodexServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testPCBConversionAndReferenceOnlyImportPolicyReachCodex() async throws {
+    func testExternalToolsAndReferenceOnlyImportPolicyReachCodex() async throws {
         let fixture = try FakeCodex(body: outputBody(try readyResponse(.bracket)))
         defer { fixture.remove() }
-        _ = try await CodexService().generate(prompt: "Generate the STEP file for the PCB using KiCad", current: nil,
+        _ = try await CodexService().generate(prompt: "Use the supplied reference geometry", current: nil,
             history: [], executable: fixture.executable.path, model: "", onProgress: { _ in })
         let request = try String(contentsOf: fixture.inputURL, encoding: .utf8)
-        XCTAssertTrue(request.contains("lad_convert_kicad"), "The agent must know the existing converter is available.")
-        XCTAssertTrue(request.contains("Decide whether a KiCad conversion is useful."))
-        XCTAssertTrue(request.contains("The converter never imports geometry, registers an asset, or replaces the current design."))
+        XCTAssertFalse(request.contains("lad_convert_kicad"))
+        XCTAssertTrue(request.contains("External tools are user-managed"))
         XCTAssertTrue(request.contains("Never use lad_import for geometry you create or modify as part of this design"))
         XCTAssertTrue(request.contains("design-generated SDF/mesh outputs"))
         XCTAssertTrue(request.contains("faithful format conversions of user-provided inputs"))
@@ -503,7 +502,7 @@ final class CodexServiceTests: XCTestCase {
             _ = try await CodexService().generate(prompt: "Make a box", current: nil, history: [], executable: fixture.executable.path, model: "", onProgress: { _ in })
             XCTFail("Expected a sign-in error")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("codex login"))
+            XCTAssertTrue(error.localizedDescription.contains("Complete setup in your Codex installation"))
         }
     }
 

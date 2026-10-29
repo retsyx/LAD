@@ -45,7 +45,7 @@ final class ProjectWindowTests: XCTestCase {
     }
 
     @MainActor
-    func testManagedRenameReleasesOldPathButImportedSourceKeepsItsWindowAlias() {
+    func testRenamingReleasesFormerPathsInDefaultAndExternalFolders() {
         let coordinator = ProjectWindowCoordinator()
         let old = ProjectAutosaveStore.defaultDirectory.appendingPathComponent("Old name.lad")
         let renamed = ProjectAutosaveStore.defaultDirectory.appendingPathComponent("New name.lad")
@@ -66,7 +66,7 @@ final class ProjectWindowTests: XCTestCase {
         let importedID = UUID()
         coordinator.register(imported, id: importedID, sourceURL: source)
         coordinator.openProject(at: source) { requests.append($0) }
-        XCTAssertEqual(requests.count, 1, "Opening an imported source again should focus its existing copy")
+        XCTAssertEqual(requests.count, 2, "A former external filename may now identify a different design")
         coordinator.windowClosed(managedID)
         coordinator.windowClosed(importedID)
     }
@@ -141,7 +141,7 @@ final class ProjectWindowTests: XCTestCase {
     }
 
     @MainActor
-    func testReopeningAnImportedSourceUsesItsFinalSavedPathAfterClosingRename() async {
+    func testReopeningExternalFileWaitsForItsClosingRename() async {
         let gate = AsyncStream<Void>.makeStream()
         let started = expectation(description: "Close rename started")
         let opened = expectation(description: "Renamed design reopened")
@@ -150,16 +150,15 @@ final class ProjectWindowTests: XCTestCase {
             for await _ in gate.stream { break }
             await state.prepareToQuit()
         })
-        let original = state(prompt: "Imported design")
-        let imported = URL(fileURLWithPath: "/tmp/Original import.lad")
-        let old = ProjectAutosaveStore.defaultDirectory.appendingPathComponent("Before rename.lad")
-        let renamed = ProjectAutosaveStore.defaultDirectory.appendingPathComponent("After rename.lad")
+        let original = state(prompt: "External design")
+        let old = URL(fileURLWithPath: "/tmp/Before rename.lad")
+        let renamed = URL(fileURLWithPath: "/tmp/After rename.lad")
         original.projectURL = old
         let id = UUID()
-        coordinator.register(original, id: id, sourceURL: imported)
+        coordinator.register(original, id: id, sourceURL: old)
         coordinator.windowClosed(id)
         var requests: [ProjectWindowRequest] = []
-        coordinator.openProject(at: imported) { requests.append($0); opened.fulfill() }
+        coordinator.openProject(at: old) { requests.append($0); opened.fulfill() }
         coordinator.openProject(at: old) { requests.append($0); opened.fulfill() }
         await fulfillment(of: [started], timeout: 2)
         XCTAssertTrue(requests.isEmpty)
@@ -685,10 +684,9 @@ final class ProjectWindowTests: XCTestCase {
         let closeStarted = expectation(description: "Target close started")
         let replaced = expectation(description: "Closing target shared")
         let target = state(prompt: "Latest target edits")
-        let source = URL(fileURLWithPath: "/tmp/Closing imported design.lad")
-        let saved = ProjectAutosaveStore.defaultDirectory.appendingPathComponent("Before drop rename.lad")
-        let renamed = ProjectAutosaveStore.defaultDirectory.appendingPathComponent("After drop rename.lad")
-        target.projectURL = saved
+        let source = URL(fileURLWithPath: "/tmp/Before drop rename.lad")
+        let renamed = URL(fileURLWithPath: "/tmp/After drop rename.lad")
+        target.projectURL = source
         let session = ProjectWindowSession(state: state(prompt: "Receiving design"))
         let targetID = UUID(), receiverID = UUID()
         let coordinator = ProjectWindowCoordinator(closeSession: { state in

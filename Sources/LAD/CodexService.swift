@@ -21,7 +21,7 @@ enum CodexError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .executableMissing(let path):
-            return "Codex could not be found at \(path.isEmpty ? "an installed location" : path). Install the ChatGPT desktop app or Codex CLI and sign in, then try again."
+            return "Codex could not be found\(path.isEmpty ? "" : " at \(path)"). \(CodexExecutable.setupMessage)"
         case .resourcesMissing:
             return "LAD’s design instructions are missing from the app bundle. Rebuild LAD with its Resources directory included."
         case .failed(let detail):
@@ -90,10 +90,8 @@ final class CodexService {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-Codex-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
-        let runtime = python ?? EngineService.defaultPython
-        guard FileManager.default.isExecutableFile(atPath: (runtime as NSString).expandingTildeInPath) else {
-            throw LADError.message("Python runtime not found. Run Scripts/setup.sh, then choose .venv/bin/python in Settings.")
-        }
+        let runtime = try await CADRuntimeManager.resolvePython(python)
+        try Task.checkCancellation()
         let taskRuntime = URL(fileURLWithPath: (runtime as NSString).expandingTildeInPath).standardizedFileURL.path
         let server = ResourcePaths.root.appendingPathComponent("Engine/agent_server.py")
         guard FileManager.default.fileExists(atPath: server.path) else { throw CodexError.resourcesMissing }
@@ -147,7 +145,7 @@ final class CodexService {
             let diagnostic = error.localizedDescription
             let lower = diagnostic.lowercased()
             if ["unauthorized", "not logged in", "authentication", "401", "sign in", "login required"].contains(where: lower.contains) {
-                throw CodexError.failed("Codex needs to sign in. Run ‘codex login’ in Terminal, then try again.\n\n\(String(diagnostic.suffix(1_600)))")
+                throw CodexError.failed("Codex needs to be configured and signed in. Complete setup in your Codex installation, then try again.\n\n\(String(diagnostic.suffix(1_600)))")
             }
             throw error
         }
@@ -209,7 +207,7 @@ final class CodexService {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var request = instructions + "\n\nDESIGN CONTEXT\n"
         request += "TASK WORKSPACE: \(workspace.path)\nLAD PYTHON RUNTIME: \(python)\n"
-        request += "The LAD MCP server is connected for this turn. When constructing or modifying geometry, call lad_runtime, then build/inspect/measure/render with LAD tools while iterating. For questions, explanations or clarification, return a message response without building or changing the design; use tools only when their results are needed for an accurate answer. Write scripts and optional external-tool outputs only inside this task workspace. Use this Python for installed CadQuery/OCP; do not bootstrap another CAD runtime or modify LAD’s shared environment. Local tool dependencies may be installed into a workspace environment if needed.\n\n"
+        request += "The LAD MCP server is connected for this turn. When constructing or modifying geometry, call lad_runtime, then build/inspect/measure/render with LAD tools while iterating. For questions, explanations or clarification, return a message response without building or changing the design; use tools only when their results are needed for an accurate answer. Write scripts and optional external-tool outputs only inside this task workspace. Use this Python for installed CadQuery/OCP; do not bootstrap another CAD runtime or modify LAD’s shared environment. External tools are user-managed. Use additional tools only when the user has provided them; never download or install tools or dependencies.\n\n"
         request += "VERSION HISTORY: \(versions.versions.count) saved versions are available through lad_versions and lad_version."
         if let id = versions.selectedRevisionID { request += " The selected design version ID is \(id.uuidString)." }
         request += " These tools read a snapshot of this design's history for this task. Use them when the user refers to an older version, vN history position, or custom version name. Lookup leaves the current design and viewport unchanged and returns local program/input file references, never embedded source.\n\n"
@@ -362,93 +360,25 @@ final class CodexService {
         activeWorkspace = nil
     }
 
-    /// Settings health checks and design requests must inspect the same CLI.
-    /// The hidden override remains useful for local development and test tools.
+    /// Model lookup and requests use the same automatically discovered choice.
     nonisolated static var configuredExecutable: String {
-        UserDefaults.standard.string(forKey: "codexPath").flatMap { $0.isEmpty ? nil : $0 }
-            ?? findExecutable() ?? ""
+        CodexExecutable.configuredPath(override: UserDefaults.standard.string(forKey: CodexExecutable.preferenceKey))
     }
 
     nonisolated static func findExecutable() -> String? {
-        let manager = FileManager.default
-        let home = manager.homeDirectoryForCurrentUser
-        #if arch(arm64)
-        let platform = "macos-aarch64"
-        #else
-        let platform = "macos-x86_64"
-        #endif
-        return findExecutable(applicationBundles: [
-            URL(fileURLWithPath: "/Applications/Codex.app"),
-            home.appendingPathComponent("Applications/Codex.app"),
-            URL(fileURLWithPath: "/Applications/ChatGPT.app"),
-            home.appendingPathComponent("Applications/ChatGPT.app")
-        ], searchDirectories: executableSearchDirectories(), extensionDirectories: [
-            home.appendingPathComponent(".vscode/extensions"),
-            home.appendingPathComponent(".vscode-insiders/extensions")
-        ], platform: platform)
+        CodexExecutable.find()
     }
 
     /// Keep discovery independent of this Mac's installed applications so its
     /// priorities and architecture fallbacks can be checked with local fixtures.
     nonisolated static func findExecutable(applicationBundles: [URL], searchDirectories: [URL],
                                           extensionDirectories: [URL], platform: String) -> String? {
-        let manager = FileManager.default
-        // The app's public CLI launcher is stable across bundled CLI updates.
-        // It also preserves any environment setup the app may add in the future.
-        let appEntries = ["Contents/Resources/codex-cli/bin/codex",
-                          "Contents/Resources/codex",
-                          "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"]
-        for bundle in applicationBundles {
-            for entry in appEntries {
-                let binary = bundle.appendingPathComponent(entry)
-                if isExecutableFile(binary) { return binary.path }
-            }
-        }
-        if let executable = executable(named: "codex", in: searchDirectories) { return executable.path }
-        for directory in extensionDirectories {
-            let extensions = (try? manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-            for item in extensions.filter({ $0.lastPathComponent.hasPrefix("openai.chatgpt-") }).sorted(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedDescending }) {
-                let binary = item.appendingPathComponent("bin/\(platform)/codex")
-                if isExecutableFile(binary) { return binary.path }
-            }
-        }
-        return nil
+        CodexExecutable.find(applicationBundles: applicationBundles, searchDirectories: searchDirectories,
+                             extensionDirectories: extensionDirectories, platform: platform)
     }
 
     nonisolated static func resolveExecutable(_ requested: String) -> URL? {
-        let name = requested.isEmpty ? "codex" : requested
-        if name.contains("/") {
-            let path = (name as NSString).expandingTildeInPath
-            let binary = URL(fileURLWithPath: path)
-            return isExecutableFile(binary) ? binary : nil
-        }
-        return executable(named: name, in: executableSearchDirectories())
-    }
-
-    nonisolated private static func executable(named name: String, in directories: [URL]) -> URL? {
-        for directory in directories {
-            let binary = directory.appendingPathComponent(name)
-            if isExecutableFile(binary) { return binary }
-        }
-        return nil
-    }
-
-    nonisolated private static func isExecutableFile(_ binary: URL) -> Bool {
-        let manager = FileManager.default
-        var directory = ObjCBool(false)
-        return manager.fileExists(atPath: binary.path, isDirectory: &directory) && !directory.boolValue
-            && manager.isExecutableFile(atPath: binary.path)
-    }
-
-    nonisolated private static func executableSearchDirectories() -> [URL] {
-        let manager = FileManager.default
-        let home = manager.homeDirectoryForCurrentUser.path
-        var directories = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map(String.init)
-        directories += ["/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin", "\(home)/.npm-global/bin"]
-        let nvm = manager.homeDirectoryForCurrentUser.appendingPathComponent(".nvm/versions/node")
-        let versions = (try? manager.contentsOfDirectory(at: nvm, includingPropertiesForKeys: nil)) ?? []
-        directories += versions.sorted(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedDescending }).map { $0.appendingPathComponent("bin").path }
-        return directories.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        CodexExecutable.resolve(requested)
     }
 }
 

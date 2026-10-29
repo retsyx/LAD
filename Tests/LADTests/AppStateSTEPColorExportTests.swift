@@ -292,7 +292,6 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         let staleSTEP: Data
         let state: AppState
         let engine: EngineService
-        let oldPython: Any?
         let oldThreads: Any?
 
         init() async throws {
@@ -309,17 +308,13 @@ final class AppStateSTEPColorExportTests: XCTestCase {
             staleSTEP = try await engine.exportSTEP(preview, solidColors: [0: stale, 1: stale],
                                                     python: EngineService.defaultPython, threads: 2)
             state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory.appendingPathComponent("autosaves")))
-            oldPython = UserDefaults.standard.object(forKey: "pythonPath")
             oldThreads = UserDefaults.standard.object(forKey: "workerThreads")
-            UserDefaults.standard.set(EngineService.defaultPython, forKey: "pythonPath")
             UserDefaults.standard.set(2, forKey: "workerThreads")
         }
 
         func cleanUp() {
             state.cancel()
             engine.cancel()
-            if let oldPython { UserDefaults.standard.set(oldPython, forKey: "pythonPath") }
-            else { UserDefaults.standard.removeObject(forKey: "pythonPath") }
             if let oldThreads { UserDefaults.standard.set(oldThreads, forKey: "workerThreads") }
             else { UserDefaults.standard.removeObject(forKey: "workerThreads") }
             let paths = Set([preview.stepPath, state.mesh?.stepPath].compactMap { $0 })
