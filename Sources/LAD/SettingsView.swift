@@ -68,8 +68,6 @@ struct LADSettingsView: View {
                     Text("Always deny").tag(AgentPermissionPolicy.alwaysDeny)
                 }
                 .pickerStyle(.menu)
-                Text("Applies to all designs on this Mac.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("CAD engine") {
                 if cadRuntime.phase == .preparing {
