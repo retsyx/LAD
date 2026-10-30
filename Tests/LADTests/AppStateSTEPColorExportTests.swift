@@ -88,7 +88,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         XCTAssertTrue(fixture.state.canExport)
 
         let subset = fixture.directory.appendingPathComponent("remapped-snapshot.step")
-        fixture.state.exportSTEP(to: subset, solidIndices: Set(oldSecond.solidIndices), revealInFinder: false)
+        fixture.state.exportSTEP(to: subset, solidIndices: Set(oldSecond.solidIndices))
         XCTAssertTrue(fixture.state.isWorking)
         // Export owns its captured RGB. A later edit remains live, while the
         // replay must still map the requested body and captured color by ID.
@@ -195,7 +195,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
 
     @MainActor
     private func export(_ state: AppState, to url: URL, solidIndices: Set<Int>? = nil) async throws {
-        state.exportSTEP(to: url, solidIndices: solidIndices, revealInFinder: false)
+        state.exportSTEP(to: url, solidIndices: solidIndices)
         XCTAssertTrue(state.isWorking)
         try await finish(state, expecting: url)
     }

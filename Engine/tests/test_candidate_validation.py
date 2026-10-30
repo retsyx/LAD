@@ -1,0 +1,185 @@
+"""Candidate acceptance requires exact native and STEP-transfer integrity."""
+from pathlib import Path
+import json
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+import cadquery as cq
+from OCP.BRepCheck import BRepCheck_Analyzer
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import worker
+
+
+class CandidateNativeValidationTests(unittest.TestCase):
+    @staticmethod
+    def offset_curve_solid():
+        # One closed cubic trace is enough to reproduce the sampled check's
+        # false acceptance of the offset geometry used by the stamp design.
+        points = [cq.Vector(x * 0.06, y * 0.06, 0)
+                  for x, y in [(404, 330), (295, 386), (201, 418), (211, 500)]]
+        curve = cq.Edge.makeBezier(points)
+        trace = cq.Wire.assembleEdges([
+            curve, cq.Edge.makeLine(points[-1], points[0])])
+        offsets = trace.offset2D(0.75, "arc") + trace.offset2D(-0.75, "arc")
+        offsets.sort(key=lambda wire: cq.Face.makeFromWires(wire).Area(), reverse=True)
+        return cq.Solid.extrudeLinear(offsets[0], offsets[1:], cq.Vector(0, 0, 2))
+
+    def test_rejects_offset_geometry_that_passes_cadquery_sampled_validation(self):
+        shape = self.offset_curve_solid()
+        self.assertTrue(shape.isValid(), "The fixture must pass the old sampled check.")
+        self.assertFalse(BRepCheck_Analyzer(shape.wrapped, True, False, True).IsValid())
+        with self.assertRaises(worker.ModelError):
+            worker.validate_shape(shape)
+
+    def test_rejects_construction_geometry_beside_a_valid_solid(self):
+        shape = cq.Compound.makeCompound([
+            cq.Solid.makeBox(2, 3, 4), cq.Face.makePlane(1, 1)])
+        self.assertTrue(shape.isValid())
+        self.assertGreater(shape.Volume(), 0)
+        with self.assertRaises(worker.ModelError):
+            worker.validate_shape(shape)
+
+    def test_rejects_negative_volume_part_despite_positive_whole_design_volume(self):
+        reversed_part = cq.Shape.cast(cq.Solid.makeBox(1, 1, 1).wrapped.Reversed())
+        shape = cq.Compound.makeCompound([
+            cq.Solid.makeBox(2, 3, 4), reversed_part.translate((10, 0, 0))])
+        self.assertTrue(shape.isValid())
+        self.assertGreater(shape.Volume(), 0)
+        self.assertLess(shape.Solids()[1].Volume(), 0)
+        with self.assertRaises(worker.ModelError):
+            worker.validate_shape(shape)
+
+    def test_rejects_open_shell_wrapped_as_a_solid(self):
+        box = cq.Solid.makeBox(2, 3, 4)
+        shape = cq.Solid.makeSolid(cq.Shell.makeShell(box.Faces()[:-1]))
+        self.assertEqual(shape.ShapeType(), "Solid")
+        self.assertGreater(shape.Volume(), 0)
+        with self.assertRaises(worker.ModelError):
+            worker.validate_shape(shape)
+
+
+class CandidateSTEPRoundtripTests(unittest.TestCase):
+    @staticmethod
+    def write_step(shape, folder):
+        path = folder / "candidate.step"
+        cq.exporters.export(shape, str(path), exportType="STEP")
+        return path
+
+    def test_accepts_unchanged_parts_when_step_reorders_them(self):
+        parts = [cq.Solid.makeBox(2, 3, 4).translate((-20, 1, 2)),
+                 cq.Solid.makeCylinder(2, 5).translate((11, 2, -3))]
+        source = cq.Compound.makeCompound(parts)
+        with tempfile.TemporaryDirectory() as directory:
+            step = self.write_step(cq.Compound.makeCompound(parts[::-1]), Path(directory))
+            worker.validate_step_roundtrip(source, cq, step)
+
+    def test_near_coincident_part_matching_is_independent_of_import_order(self):
+        source = cq.Compound.makeCompound([
+            cq.Solid.makeBox(1, 1, 1),
+            cq.Solid.makeBox(1, 1, 1).translate((1e-6, 0, 0)),
+        ])
+        # The +0.5e-6 mm part can match either original within the allowed
+        # tolerance; the -0.5e-6 mm part can match only the first original.
+        # Matching the first available body greedily rejects one STEP order.
+        with tempfile.TemporaryDirectory() as directory:
+            for offsets in ((0.5e-6, -0.5e-6), (-0.5e-6, 0.5e-6)):
+                with self.subTest(offsets=offsets):
+                    transferred = cq.Compound.makeCompound([
+                        cq.Solid.makeBox(1, 1, 1).translate((offset, 0, 0))
+                        for offset in offsets])
+                    step = self.write_step(transferred, Path(directory))
+                    worker.validate_step_roundtrip(source, cq, step)
+
+    def test_rejects_missing_or_changed_bodies_and_equal_volume_displacement(self):
+        source = cq.Solid.makeBox(2, 3, 4)
+        replacements = {
+            "open surface instead of a body": cq.Shell.makeShell(source.Faces()[:-1]),
+            "different volume": cq.Solid.makeBox(2, 3, 5),
+            "same volume and area at a different location": source.translate((5, 0, 0)),
+            "same total volume split into separate bodies": cq.Compound.makeCompound([
+                cq.Solid.makeBox(1, 3, 4),
+                cq.Solid.makeBox(1, 3, 4).translate((1, 0, 0))]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for label, replacement in replacements.items():
+                with self.subTest(label=label):
+                    step = self.write_step(replacement, Path(directory))
+                    with self.assertRaises(worker.ModelError):
+                        worker.validate_step_roundtrip(source, cq, step)
+
+    def test_rejects_part_movement_hidden_by_unchanged_whole_design_totals(self):
+        enclosure = cq.Solid.makeBox(10, 10, 10)
+        inner = cq.Solid.makeBox(1, 1, 1).translate((2, 2, 2))
+        source = cq.Compound.makeCompound([enclosure, inner])
+        shifted = cq.Compound.makeCompound([enclosure, inner.translate((3, 0, 0))])
+        self.assertAlmostEqual(source.Volume(), shifted.Volume())
+        self.assertAlmostEqual(source.Area(), shifted.Area())
+        self.assertEqual(worker.exact_bounds(source), worker.exact_bounds(shifted))
+        with tempfile.TemporaryDirectory() as directory:
+            step = self.write_step(shifted, Path(directory))
+            with self.assertRaises(worker.ModelError):
+                worker.validate_step_roundtrip(source, cq, step)
+
+    def test_converts_step_read_failure_to_a_candidate_error(self):
+        source = cq.Solid.makeBox(2, 3, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            step = self.write_step(source, Path(directory))
+            with mock.patch.object(cq.importers, "importStep", side_effect=ValueError("bad transfer")):
+                with self.assertRaises(worker.ModelError):
+                    worker.validate_step_roundtrip(source, cq, step)
+
+    def test_deferred_build_rejects_bad_step_before_preview_or_native_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            request = folder / "request.json"
+            output = folder / "output"
+            request.write_text(json.dumps({
+                "title": "Box", "summary": "A box", "units": "mm",
+                "script": "result = cq.Solid.makeBox(2, 3, 4)",
+            }))
+            original_export = worker.write_step
+
+            def corrupted_export(solids, filename, runtime, colors=None, indices=None):
+                moved = [solid.translate((5, 0, 0)) for solid in solids]
+                return original_export(moved, filename, runtime, colors=colors, indices=indices)
+
+            with (mock.patch.object(worker, "write_step", side_effect=corrupted_export),
+                  mock.patch.object(worker, "make_preview", side_effect=AssertionError("No preview before acceptance"))):
+                with self.assertRaises(worker.ModelError):
+                    worker.run(request, output, 2, defer_step=True)
+            for name in ("result.json", "result.json.tmp", "model.brep", "model.step"):
+                self.assertFalse((output / name).exists(), f"Rejected candidate published {name}.")
+
+    def test_deferred_build_checks_step_then_removes_temporary_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            request = folder / "request.json"
+            output = folder / "output"
+            request.write_text(json.dumps({
+                "title": "Box", "summary": "A box", "units": "mm",
+                "script": "result = cq.Solid.makeBox(2, 3, 4)",
+            }))
+            checked_paths = []
+            original_validate = worker.validate_step_roundtrip
+
+            def capture_check(shape, runtime, step_path, preview_stats=None):
+                checked_paths.append(Path(step_path))
+                self.assertTrue(Path(step_path).is_file())
+                return original_validate(shape, runtime, step_path, preview_stats=preview_stats)
+
+            with mock.patch.object(worker, "validate_step_roundtrip", side_effect=capture_check):
+                result = worker.run(request, output, 2, defer_step=True)
+            self.assertEqual(len(checked_paths), 1)
+            self.assertTrue(all(not path.exists() for path in checked_paths))
+            self.assertFalse((output / "model.step").exists())
+            self.assertTrue(Path(result["brepPath"]).is_file())
+            self.assertEqual(result["solids"], 1)
+            self.assertEqual(result["faces"], 6)
+            self.assertAlmostEqual(result["volume"], 24)
+
+
+if __name__ == "__main__":
+    unittest.main()

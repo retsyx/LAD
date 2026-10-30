@@ -101,28 +101,40 @@ def _shape_entities(shape, kind):
 
 
 def validate_shape(shape, preview_stats=None):
-    """Validate final closed geometry before meshing or export."""
+    """Validate exact, closed geometry before meshing or accepting a build."""
+    from OCP.BRepCheck import BRepCheck_Analyzer, BRepCheck_Shell, BRepCheck_NoError
     if preview_stats is not None:
         preview_stats.clear()
-    if shape.isNull() or not shape.isValid():
+    if shape.isNull():
         raise ModelError("operation produced invalid geometry")
+    if not _only_solids(shape):
+        raise ModelError("Design must contain only closed solids; remove construction wires, faces and tools from result.")
     solids = _shape_entities(shape, "Solid")
-    volume = shape.Volume()
-    if not solids or not math.isfinite(volume) or volume <= 1e-10:
+    if not solids:
         raise ModelError("operation produced no solid; check dimensions and overlapping inputs")
     if len(solids) > 4_096:
         raise ModelError("geometry exceeds the 4,096 solid limit; simplify the design")
     face_count = len(_shape_entities(shape, "Face"))
     if face_count > 20_000:
         raise ModelError("geometry exceeds the 20,000 face limit; simplify the design")
+    # CadQuery's isValid() uses finitely sampled curve/surface checks. Exact
+    # checking catches parameterization defects that those samples can miss.
+    if not BRepCheck_Analyzer(shape.wrapped, True, False, True).IsValid():
+        raise ModelError("operation produced invalid geometry; exact curve-on-surface validation failed")
+    for shell in _shape_entities(shape, "Shell"):
+        check = BRepCheck_Shell(shell.wrapped)
+        if check.Closed() != BRepCheck_NoError or check.Orientation() != BRepCheck_NoError:
+            raise ModelError("Design contains an open or inconsistently oriented solid shell.")
+    solid_bounds, coordinates = _preview_bounds(solids)
+    properties = [part_metadata(solid, index, bounds=solid_bounds[index]) for index, solid in enumerate(solids)]
+    if any(not math.isfinite(part["volume"]) or part["volume"] <= 1e-10 for part in properties):
+        raise ModelError("Every design part must have a positive finite volume.")
+    volume = shape.Volume()
+    if not math.isfinite(volume) or volume <= 1e-10:
+        raise ModelError("operation produced no solid; check dimensions and overlapping inputs")
     area = shape.Area()
     if not math.isfinite(area) or area <= 0:
         raise ModelError("operation produced an invalid surface area")
-    if preview_stats is None:
-        bounds = shape.BoundingBox()
-        coordinates = (bounds.xmin, bounds.ymin, bounds.zmin, bounds.xmax, bounds.ymax, bounds.zmax)
-    else:
-        solid_bounds, coordinates = _preview_bounds(solids)
     if any(not math.isfinite(v) or abs(v) > LIMIT * 10 for v in coordinates):
         raise ModelError("geometry exceeds the design size limit")
     if preview_stats is not None:
@@ -130,8 +142,98 @@ def validate_shape(shape, preview_stats=None):
         # Do not attach these values to shapes: user programs can mutate native
         # geometry in place, invalidating any automatically retained statistics.
         preview_stats.update(shape=shape, solids=solids, solidBounds=solid_bounds,
-                             bounds=coordinates, volume=volume, area=area, faces=face_count)
+                             solidProperties=properties, bounds=coordinates,
+                             volume=volume, area=area, faces=face_count)
     return shape
+
+
+def _only_solids(shape):
+    if shape.ShapeType() in {"Solid", "CompSolid"}:
+        return True
+    if shape.ShapeType() == "Compound":
+        children = list(shape)
+        return bool(children) and all(_only_solids(child) for child in children)
+    return False
+
+
+def validate_step_roundtrip(shape, cq, step_path, preview_stats=None):
+    """Reject lossy STEP conversion before publishing a candidate's preview.
+
+    Compare unordered physical parts, never native feature indices: STEP can
+    reorder bodies or split faces. Keep the original native shape for picking,
+    measurements and final commit, and share measurements only within this
+    build's explicit single-use preview handoff.
+    """
+    from bisect import bisect_left, bisect_right
+    expected = preview_stats
+    if expected is None:
+        expected = {}
+        validate_shape(shape, preview_stats=expected)
+    if expected.get("shape") is not shape:
+        raise ModelError("STEP verification measurements belong to a different build.")
+    actual = {}
+    try:
+        if not 0 < Path(step_path).stat().st_size <= 128 * 1024 * 1024:
+            raise ModelError("The STEP design is empty or exceeds 128 MB.")
+        import_step(step_path, cq, preview_stats=actual)
+    except Exception as error:
+        raise ModelError(f"Design failed STEP verification before acceptance: {error}") from error
+    before, after = expected["solidProperties"], actual["solidProperties"]
+    if len(before) != len(after):
+        raise ModelError(f"Design failed STEP verification: expected {len(before)} closed solids, received {len(after)}.")
+    # Bounds and centroids use a linear tolerance relative to each part's own
+    # size, independent of world-space translation. Measures use a small
+    # relative allowance for analytic surface conversion and integration.
+    def tolerance(part):
+        bounds = part["bounds"]
+        return 1e-6 + math.hypot(*(bounds[i + 3] - bounds[i] for i in range(3))) * 1e-7
+
+    ordered = sorted(before, key=lambda part: part["bounds"][0])
+    starts = [part["bounds"][0] for part in ordered]
+    maximum_tolerance = max(map(tolerance, before))
+    def candidates(part):
+        return range(bisect_left(starts, part["bounds"][0] - maximum_tolerance),
+                     bisect_right(starts, part["bounds"][0] + maximum_tolerance))
+
+    def equivalent(original, part):
+        linear = tolerance(original)
+        return (all(abs(a - b) <= linear for key in ("bounds", "centroid")
+                    for a, b in zip(original[key], part[key]))
+                and all(math.isclose(original[key], part[key], rel_tol=1e-6, abs_tol=1e-7)
+                        for key in ("volume", "area")))
+
+    owners, assigned = {}, {}
+    for source_index, part in enumerate(after):
+        # Prefer a free equivalent part. Near-coincident parts can have
+        # overlapping tolerance ranges, so a greedy match alone is not enough:
+        # an augmenting path must be able to reassign earlier matches.
+        available = next((index for index in candidates(part)
+                          if index not in owners and equivalent(ordered[index], part)), None)
+        if available is not None:
+            owners[available], assigned[source_index] = source_index, available
+            continue
+        from collections import deque
+        pending, parents, visited = deque([source_index]), {}, {source_index}
+        while pending and available is None:
+            current = pending.popleft()
+            for index in candidates(after[current]):
+                if index in parents or not equivalent(ordered[index], after[current]):
+                    continue
+                parents[index] = current
+                if index not in owners:
+                    available = index
+                    break
+                previous = owners[index]
+                if previous not in visited:
+                    visited.add(previous)
+                    pending.append(previous)
+        if available is None:
+            raise ModelError("Design failed STEP verification: conversion changed a part's volume, surface area, dimensions or position.")
+        while available is not None:
+            current = parents[available]
+            previous = assigned.get(current)
+            owners[available], assigned[current] = current, available
+            available = previous
 
 
 def validate_part_color(color):
@@ -404,14 +506,7 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
         result = values[0] if len(values) == 1 else cq.Compound.makeCompound(values)
     if not isinstance(result, cq.Shape):
         raise ModelError("Python design result must be a CadQuery Shape, Workplane or Assembly.")
-    def only_solids(shape):
-        if shape.ShapeType() in {"Solid", "CompSolid"}:
-            return True
-        if shape.ShapeType() == "Compound":
-            children = list(shape)
-            return bool(children) and all(only_solids(child) for child in children)
-        return False
-    if not only_solids(result):
+    if not _only_solids(result):
         raise ModelError("Python design result must contain only closed solids; remove construction wires, faces and tools from result.")
     validate_shape(result, preview_stats=preview_stats)
     if assembly is not None:
@@ -699,7 +794,8 @@ def make_preview(shape, preview_stats=None):
     mesh_polylines = [{} for _ in solids]
     mesh_edge_segments = 0
     for solid_index, solid in enumerate(solids):
-        topology["parts"].append(part_metadata(solid, solid_index, bounds=solid_bounds[solid_index]))
+        topology["parts"].append(prepared["solidProperties"][solid_index] if prepared is not None
+                                 else part_metadata(solid, solid_index, bounds=solid_bounds[solid_index]))
         topology["vertices"].extend({"id": feature_id("vertex", solid_index, local_index),
                                       "position": list(vertex.toTuple())}
                                      for local_index, vertex in enumerate(_shape_entities(solid, "Vertex")))
@@ -1080,6 +1176,18 @@ def export_solid_colors(records, solid_count):
     return colors
 
 
+def write_step(solids, path, cq, colors=None, indices=None):
+    """Use one STEP serializer for candidate verification and actual exports."""
+    from cadquery.occ_impl.exporters.assembly import exportAssembly
+    assembly = cq.Assembly(name="Parts")
+    for index in range(len(solids)) if indices is None else indices:
+        rgb = (colors or {}).get(index)
+        color = cq.Color(rgb["red"], rgb["green"], rgb["blue"], 1) if rgb is not None else None
+        assembly.add(solids[index], name=f"Part {index + 1}", color=color)
+    if not exportAssembly(assembly, str(path), mode="default"):
+        raise ModelError("STEP export could not write the design parts.")
+
+
 def export_brep(spec, asset_directory, output, cq, threads):
     """Create whole or selected STEP without replaying or tessellating."""
     if set(spec) - {"operation", "brepAsset", "solidIndices", "solidColors"} or spec.get("brepAsset") != "source.brep":
@@ -1096,17 +1204,7 @@ def export_brep(spec, asset_directory, output, cq, threads):
     else:
         indices = list(range(len(solids)))
     step = output / "model.step"
-    if colors:
-        from cadquery.occ_impl.exporters.assembly import exportAssembly
-        assembly = cq.Assembly(name="Parts")
-        for index in indices:
-            rgb = colors.get(index)
-            color = cq.Color(rgb["red"], rgb["green"], rgb["blue"], 1) if rgb is not None else None
-            assembly.add(solids[index], name=f"Part {index + 1}", color=color)
-        if not exportAssembly(assembly, str(step), mode="default"):
-            raise ModelError("STEP export could not write the colored parts.")
-    else:
-        cq.exporters.export(shape, str(step), exportType="STEP")
+    write_step(solids, step, cq, colors=colors, indices=indices)
     return {"solids": len(shape.Solids()), "faces": len(shape.Faces())}
 
 
@@ -1241,9 +1339,21 @@ def run(request, output, threads, defer_step=False):
     else:
         preview_stats = {}
         shape = build_shape(spec, threads, request.parent.resolve(), preview_stats=preview_stats)
+        # A successful native build is not sufficient: STEP translation can
+        # turn closed native geometry into open shells. Verify it before the
+        # candidate can be rendered, reused by lad_validate or committed.
+        # Export the same unique physical solids as the app's colored exporter.
+        solids = preview_stats["solids"]
+        if defer_step:
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix=".step-validation-", dir=output) as directory:
+                validation_step = Path(directory) / "candidate.step"
+                write_step(solids, validation_step, cq)
+                validate_step_roundtrip(shape, cq, validation_step, preview_stats=preview_stats)
+        else:
+            write_step(solids, step, cq)
+            validate_step_roundtrip(shape, cq, step, preview_stats=preview_stats)
         preview = make_preview(shape, preview_stats=preview_stats)
-        if not defer_step:
-            cq.exporters.export(shape, str(step), exportType="STEP")
     if not is_export and not is_measurement and not is_preview and not is_runtime:
         # Both STEP imports and generated previews retain the identical native
         # topology so later measurements cannot be remapped by a STEP roundtrip.
@@ -1266,7 +1376,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--threads", type=int, default=max(1, min(32, os.cpu_count() or 1)))
     parser.add_argument("--defer-step", action="store_true",
-                        help="Build a preview and private native solid, exporting STEP only on demand.")
+                        help="Verify a temporary STEP, then retain only the preview and private native solid.")
     arguments = parser.parse_args()
     try:
         result = run(arguments.request, arguments.output, arguments.threads, arguments.defer_step)

@@ -8,7 +8,7 @@ final class EngineServiceTests: XCTestCase {
     @MainActor
     func testPreviewDefersSTEPThenExportsAndReusesExactSessionBytes() async throws {
         try requireRuntime()
-        let spec = ModelSpec(title: "Deferred STEP assembly", summary: "Located exact solids, STEP created only for export.", units: "mm", script: """
+        let spec = ModelSpec(title: "Deferred STEP assembly", summary: "Located exact solids, retaining STEP only for export.", units: "mm", script: """
         result = cq.Assembly(name='Case', metadata={'lad_id':'case'})
         result.add(cq.Solid.makeBox(7,8,2), name='Base', metadata={'lad_id':'base'})
         result.add(cq.Solid.makeCylinder(2,3), name='Post', loc=cq.Location((20,5,2)), metadata={'lad_id':'post'})
@@ -136,22 +136,36 @@ final class EngineServiceTests: XCTestCase {
     @MainActor
     func testSandboxedCadQueryAndDirectOpenCascadeAssembly() async throws {
         try requireRuntime()
-        let program = """
-        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
-        from OCP.gp import gp_Pnt
-        body = (cq.Workplane('XY').ellipse(20, 12)
-                .workplane(offset=8).ellipse(16, 10).loft()
-                .faces('>Z').shell(-1.5))
-        kernel_box = cq.Shape.cast(BRepPrimAPI_MakeBox(gp_Pnt(35, 0, 0), 5, 5, 5).Shape())
-        result = cq.Assembly().add(body, name='lofted_shell').add(kernel_box, name='kernel_box')
-        """
-        let spec = ModelSpec(title: "Loft and OCP assembly", summary: "Two positioned solids built through CadQuery and the direct kernel API.", units: "mm", script: program)
+        let source = ResourcePaths.root.appendingPathComponent("Examples/lofted-shell.json")
+        let spec = try JSONDecoder().decode(ModelSpec.self, from: Data(contentsOf: source))
         let mesh = try await EngineService().build(spec, python: EngineService.defaultPython, threads: 2)
         XCTAssertEqual(mesh.solids, 2)
         XCTAssertGreaterThan(mesh.volume, 125)
         XCTAssertEqual(Set(mesh.triangleSolids ?? []), Set([0, 1]))
         let step = try String(contentsOfFile: mesh.stepPath, encoding: .utf8)
         XCTAssertTrue(step.hasPrefix("ISO-10303-21;"))
+    }
+
+    @MainActor
+    func testPreviewRejectsSampledValidOffsetGeometryDuringGeneration() async throws {
+        try requireRuntime()
+        let program = """
+        points = [cq.Vector(x*0.06, y*0.06, 0)
+                  for x,y in [(404,330),(295,386),(201,418),(211,500)]]
+        curve = cq.Edge.makeBezier(points)
+        trace = cq.Wire.assembleEdges([curve, cq.Edge.makeLine(points[-1], points[0])])
+        offsets = trace.offset2D(0.75, 'arc') + trace.offset2D(-0.75, 'arc')
+        offsets.sort(key=lambda wire: cq.Face.makeFromWires(wire).Area(), reverse=True)
+        result = cq.Solid.extrudeLinear(offsets[0], offsets[1:], cq.Vector(0,0,2))
+        assert result.isValid()
+        """
+        let spec = ModelSpec(title: "Invalid curved ridge", summary: "Regression for sampled native validation.", units: "mm", script: program)
+        do {
+            _ = try await EngineService().buildPreview(spec, python: EngineService.defaultPython, threads: 2)
+            XCTFail("The candidate must fail before a preview can be accepted or saved.")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("exact curve-on-surface validation failed"), error.localizedDescription)
+        }
     }
 
     @MainActor

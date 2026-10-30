@@ -26,8 +26,12 @@ from that payload and does not depend on the checkout.
 .build/cad-runtime/arm64/expanded/python/bin/python3 -m unittest discover -s Engine/tests -v
 ```
 
-With `--defer-step`, builds write `result.json` and a private session
-`model.brep`, with no STEP file. The native BREP excludes triangulations and
+Every build passes exact native curve-on-surface and closed-solid checks,
+then a temporary STEP export/reimport must preserve the closed solids and each
+part's volume, surface area, analytic bounds and centroid before a preview is
+accepted. The imported verification geometry never replaces the native build.
+With `--defer-step`, builds remove the verification STEP and write `result.json`
+and a private session `model.brep`, with no retained STEP file. The native BREP excludes triangulations and
 normals; it is temporary worker IPC, never a project asset. The app retains
 display data in memory when revisiting revisions. An export request containing
 `{"operation":"export","brepAsset":"source.brep"}` converts a privately staged
@@ -230,8 +234,9 @@ fillets, chamfers, transforms, Bezier and nonuniform geometry, lofts, sweeps,
 direct OCP, transformed nested assemblies,
 multi-solid selection, per-part edge ownership, stable named identities across
 reparenting, script diagnostics and actual STEP reimport.
-Deferred-export checks ensure previews never call the STEP exporter, native
-session artifacts omit display triangulations, export never reruns the program
+Candidate-validation checks reject sampled-valid curved defects and lossy
+STEP conversion before publishing previews, and remove temporary STEP files.
+Deferred-export checks ensure native session artifacts omit display triangulations, export never reruns the program
 or mesher, and fast mesh extraction matches CadQuery's vertex data and winding.
 
 Two opt-in macOS integration tests check text/font construction inside the

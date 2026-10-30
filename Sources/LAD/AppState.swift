@@ -1726,7 +1726,7 @@ final class AppState: ObservableObject {
 
     /// Export the captured geometry and current colors. The engine caches
     /// session bytes by geometry, selected solids and RGB assignments.
-    func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil, revealInFinder: Bool = true) {
+    func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil) {
         guard canExport, let preview = mesh, let revisionID = selectedRevisionID,
               let revision = revisions.first(where: { $0.id == revisionID }) else { return }
         if let solidIndices, solidIndices.isEmpty || !solidIndices.isSubset(of: Set(0..<preview.solids)) { return }
@@ -1769,7 +1769,6 @@ final class AppState: ObservableObject {
                       !Task.isCancelled else { return }
                 notice = "STEP exported · \(url.lastPathComponent)"
                 activity = "Ready"; isWorking = false; operation = nil
-                if revealInFinder { NSWorkspace.shared.activateFileViewerSelecting([url]) }
             } catch is CancellationError {
                 if operationID == token { isWorking = false; activity = "Ready"; operation = nil }
             } catch {
@@ -1976,7 +1975,7 @@ final class AppState: ObservableObject {
         }
 
         // Generated geometry is reconstructed from the exact saved program.
-        // STEP serialization is deferred until an explicit export request.
+        // Native and temporary STEP validation finish before preview acceptance.
         let token = UUID(); operationID = token
         let runtime = python, cores = threads
         isWorking = true; activity = "Preparing preview…"; error = nil

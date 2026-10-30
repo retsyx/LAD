@@ -74,8 +74,9 @@ result = a.intersect(a.translate((50, 0, 0))).clean()
 
 
 class GeometryTests(unittest.TestCase):
-    def test_deferred_step_exports_native_solid_without_program_replay_or_meshing(self):
+    def test_deferred_step_verifies_then_discards_step_and_retains_native_solid(self):
         import cadquery as cq
+        from worker import write_step
         from OCP.BRep import BRep_Builder, BRep_Tool
         from OCP.BRepTools import BRepTools
         from OCP.TopLoc import TopLoc_Location
@@ -88,8 +89,12 @@ result = cq.Assembly(name='Case', metadata={'lad_id':'case'})
 result.add(cq.Solid.makeBox(7,8,2), name='Base', metadata={'lad_id':'base'})
 result.add(cq.Solid.makeCylinder(2,3), name='Post', loc=cq.Location((20,5,2)), metadata={'lad_id':'post'})
 """)))
-            with mock.patch.object(cq.exporters, 'export', side_effect=AssertionError('No STEP for preview')):
+            with mock.patch('worker.write_step', wraps=write_step) as export_step:
                 preview = run(request, folder, 4, defer_step=True)
+            self.assertEqual(export_step.call_count, 1, 'Candidates must pass STEP verification before preview acceptance')
+            validation_path = Path(export_step.call_args.args[1])
+            self.assertFalse(validation_path.exists(), 'Verification STEP must be removed after acceptance')
+            self.assertFalse(validation_path.parent.exists(), 'Verification workspace must be removed after acceptance')
             self.assertFalse((folder / 'model.step').exists())
             self.assertTrue(Path(preview['brepPath']).is_file())
             self.assert_part_ownership(preview)

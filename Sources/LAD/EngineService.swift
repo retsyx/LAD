@@ -43,8 +43,9 @@ final class EngineService {
         try await buildModel(spec, python: python, threads: threads, deferSTEP: false)
     }
 
-    /// Prepare display data without serializing STEP. A private native solid
-    /// lets a later export avoid executing the model a second time.
+    /// Validate native geometry and a temporary STEP roundtrip before preparing
+    /// display data. Retain the original native solid, without keeping STEP,
+    /// so later exports avoid executing the program a second time.
     func buildPreview(_ spec: ModelSpec, python: String, threads: Int) async throws -> PreviewMesh {
         try await buildModel(spec, python: python, threads: threads, deferSTEP: true)
     }
