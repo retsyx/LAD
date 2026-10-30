@@ -94,13 +94,7 @@ struct CADRuntimePayload: Codable, Sendable {
     var archive: String
     var sha256: String
 
-    static var hostArchitecture: String {
-        #if arch(arm64)
-        return "arm64"
-        #else
-        return "x86_64"
-        #endif
-    }
+    static let hostArchitecture = "arm64"
 
     static func load(from directory: URL) throws -> Self {
         let file = directory.appendingPathComponent("manifest.json")

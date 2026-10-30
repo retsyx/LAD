@@ -24,7 +24,40 @@ open dist/LAD.app
 
 The build-time payload preparation uses the pinned dependencies in `Engine/requirements-lock.txt`; users do not install Python, Homebrew or CAD libraries. LAD Settings (`⌘,`) contains the default save location, CAD thread count and agent permission policy. Model and reasoning choices are available only in the composer. Its dropdown lists models first, followed by the selected model’s supported reasoning levels, using the installed Codex [model catalog](https://learn.chatgpt.com/docs/app-server#models). Each design remembers its model and reasoning preferences per model. New designs start from the installed Codex configuration, then retain their explicit selections. Unsupported levels are replaced with the selected model’s advertised default. Changes apply to the next design request, including its repair attempt. No API key is stored by LAD.
 
-You can also open `Package.swift` in Xcode to work on the native target. `LAD_BUILD_CONFIGURATION=debug Scripts/build-app.sh` packages a debug build. The bundled CAD runtime currently targets Apple Silicon Macs running macOS 14 or later.
+You can also open `Package.swift` in Xcode to work on the native target. `LAD_BUILD_CONFIGURATION=debug Scripts/build-app.sh` packages a debug build. LAD supports **Apple Silicon (arm64) only**, on macOS 14 or later. All build and release tooling targets that architecture.
+
+## Downloadable releases
+
+`Scripts/build-app.sh` creates the local development app. `Scripts/release.sh` builds a versioned DMG, signs the runtime and app, notarizes them, staples tickets, and verifies the actual app copied out of the mounted DMG. End users drag `LAD.app` onto the DMG's Applications shortcut; CAD dependencies are provisioned offline from the app's payload.
+
+The release machine needs Apple Silicon, Xcode command-line tools, an unlocked keychain containing a **Developer ID Application** certificate and private key, and a `notarytool` keychain profile. Configure credentials through Apple's `xcrun notarytool store-credentials` command before invoking the release script. Credentials are not stored in this repository or passed to the app.
+
+From a clean, committed checkout with reviewed release notes:
+
+```sh
+LAD_RUN_ENGINE_TESTS=1 LAD_RUN_SANDBOX_TESTS=1 Scripts/test.sh
+Scripts/release.sh --version 0.3.0 --build-number 100 \
+  --notes path/to/release-notes.md \
+  --identity 'Developer ID Application: Your Name (TEAMID)' \
+  --notary-profile LAD-release
+```
+
+`--identity` and `--notary-profile` can also come from `LAD_SIGNING_IDENTITY` and `LAD_NOTARY_PROFILE`. Production builds use a private snapshot of the committed source and verify that the prepared runtime matches its exact recipes and artifact locks. Version/build metadata is injected into the packaged app without changing the source plist. The output directory defaults to `dist/releases/<version>+<build>` and must not already exist; `--output` selects another new directory. It contains the arm64 DMG, `SHA256SUMS`, `release-notes.md`, and `release.json` with source revision, runtime inventory, verification results, and notarization IDs. Nothing is placed there until all required checks pass. Complete notarization logs remain under `.build/releases`; failed builds preserve their staging workspace for diagnosis.
+
+The release process signs each of the runtime's native images individually with hardened runtime and a secure timestamp, then submits the **expanded runtime** in a ZIP for notarization. This is necessary because the app normally carries those images inside a compressed tar payload. Python alone receives `allow-unsigned-executable-memory`, required by the bundled LLVM/Numba implementation and verified by the hardened JIT smoke test; the LAD app and native libraries receive no exceptions. Production Python retains library validation. The final signed runtime receives a new content-addressed installation identity. The app is then signed, notarized and stapled, followed by the DMG. Signing never uses `codesign --deep`; verification uses it to inspect nested code. The offline DMG verification recreates the private venv, checks preserved signatures, exercises CAD and numeric solvers, and runs the packaged worker's file/network/process restrictions and STEP export.
+
+To validate packaging without release credentials:
+
+```sh
+Scripts/release.sh --local --version 0.3.0 --build-number 100 \
+  --notes path/to/release-notes.md
+```
+
+Local outputs have a `-local` suffix and `distributable: false` metadata. They are ad-hoc signed and are never submitted for notarization. They validate packaging and runtime behavior; Developer ID, Gatekeeper and stapling checks run only in the production path. Local Python may require an ad-hoc-only library-validation exception because ad-hoc signatures have no signing team; that exception is excluded from production signing.
+
+The manually dispatched [release workflow](.github/workflows/release.yml) runs on a dedicated Apple Silicon macOS runner labeled `lad-release`. Configure the repository variables `LAD_SIGNING_IDENTITY` and `LAD_NOTARY_PROFILE` to reference its preconfigured keychain. Restrict the runner group to this workflow on the protected default branch. The workflow runs native tests, builds the verified artifacts and retains them; its optional final job creates a **draft** GitHub release. Review that draft and the remaining real-machine acceptance checks before publishing. The workflow never publishes a public release automatically.
+
+Before publication, also test a browser-downloaded, quarantined DMG on a clean standard-user Mac: install, eject, launch from Finder, connect the user's Codex, generate/save/reopen/export, and exercise offline use and failed saves. Automated package verification does not replace this live clean-machine check. File-format migrations remain deferred until LAD's first release.
 
 ## Controls
 
@@ -214,6 +247,6 @@ A live Codex request was also verified in the macOS app: a 30 mm OD / 12 mm ID /
 
 ## Current scope
 
-This is a working local development build with a bundled, managed Python/CAD runtime. The app is still ad-hoc signed for local use. Developer ID signing, notarization and downloadable DMG release packaging are separate release work. Programs have access to the installed modeling APIs, subject to final solid/preview limits (20,000 faces, 1,000,000 vertices/triangles, and 200,000 UTF-8 bytes of source). There is no native FeatureScript/OpenSCAD interpreter, interactive sketch/constraint editor, or assembly mating UI. Assemblies are previewed as positioned solids with their part names and hierarchy. Current part colors are saved with the design and included in STEP exports; assembly mates are not exported.
+This is a working development app with a bundled, managed Python/CAD runtime and an Apple Silicon release pipeline. Local builds are ad-hoc signed; distributable DMGs require the Developer ID/notarization workflow described above. Programs have access to the installed modeling APIs, subject to final solid/preview limits (20,000 faces, 1,000,000 vertices/triangles, and 200,000 UTF-8 bytes of source). There is no native FeatureScript/OpenSCAD interpreter, interactive sketch/constraint editor, or assembly mating UI. Assemblies are previewed as positioned solids with their part names and hierarchy. Current part colors are saved with the design and included in STEP exports; assembly mates are not exported.
 
 The native viewport uses SceneKit with Metal; design files use exact OpenCascade geometry. The bundled runtime omits optional native plugins that require separately installed solver products or MATLAB, and uses Numba’s workqueue backend in place of its optional OpenMP backend. Core CadQuery/OCP construction, sketch solving and the bundled IPOPT solver remain included; the runtime manifest records the exact exclusions. Dependencies retain their own licenses; inspect the installed distributions before redistributing a bundled runtime.

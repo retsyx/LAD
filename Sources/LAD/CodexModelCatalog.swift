@@ -297,7 +297,7 @@ private final class CodexCatalogJob: @unchecked Sendable {
                           object["id"] as? Int == id else { continue }
                     if let error = object["error"] as? [String: Any] {
                         if optional { return nil }
-                        let detail = String((error["message"] as? String ?? "Check the Codex connection.").prefix(512))
+                        let detail = String(CodexAppServerClient.errorMessage(error).prefix(512))
                         throw CatalogError.failed(detail)
                     }
                     guard let result = object["result"] else { throw CatalogError.invalidResponse }
@@ -333,7 +333,7 @@ private final class CodexCatalogJob: @unchecked Sendable {
             throw CatalogError.timedOut
         }
 
-        try send("initialize", id: 1, params: ["clientInfo": ["name": "lad", "title": "LAD", "version": "1.0"],
+        try send("initialize", id: 1, params: ["clientInfo": CodexAppServerClient.info(),
                                               "capabilities": ["experimentalApi": false]])
         _ = try response(1)
         try send("initialized")

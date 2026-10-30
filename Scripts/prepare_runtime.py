@@ -42,16 +42,24 @@ def checked(command, **kwargs):
     subprocess.run(command, check=True, stdout=sys.stderr, **kwargs)
 
 
-def prepare(root, archive, architecture):
-    source = json.loads((root / "Engine/runtime-source.json").read_text())
+def payload_fingerprint(root, archive_name, architecture):
+    """Identify the exact preparation recipes and pinned artifact manifests."""
+    root = Path(root)
     requirements = root / "Engine/requirements-lock.txt"
     wheel_lock = root / f"Engine/runtime-wheels-{architecture}.json"
-    fingerprint = hashlib.sha256(
-        archive.name.encode() + requirements.read_bytes() + wheel_lock.read_bytes()
+    return hashlib.sha256(
+        Path(archive_name).name.encode() + requirements.read_bytes() + wheel_lock.read_bytes()
         + (root / "Scripts/prepare_runtime.py").read_bytes()
         + (root / "Scripts/audit_runtime.py").read_bytes() + (root / "Engine/runtime-source.json").read_bytes()
         + (root / "Scripts/check_runtime.py").read_bytes()
     ).hexdigest()[:16]
+
+
+def prepare(root, archive, architecture):
+    source = json.loads((root / "Engine/runtime-source.json").read_text())
+    requirements = root / "Engine/requirements-lock.txt"
+    wheel_lock = root / f"Engine/runtime-wheels-{architecture}.json"
+    fingerprint = payload_fingerprint(root, archive.name, architecture)
     destination = root / ".build/cad-runtime" / architecture
     manifest_path = destination / "manifest.json"
     if manifest_path.exists():

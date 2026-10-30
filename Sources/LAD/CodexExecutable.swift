@@ -18,11 +18,6 @@ enum CodexExecutable {
 
     static func find() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        #if arch(arm64)
-        let platform = "macos-aarch64"
-        #else
-        let platform = "macos-x86_64"
-        #endif
         return find(applicationBundles: [
             URL(fileURLWithPath: "/Applications/Codex.app"),
             home.appendingPathComponent("Applications/Codex.app"),
@@ -31,13 +26,13 @@ enum CodexExecutable {
         ], searchDirectories: searchDirectories(), extensionDirectories: [
             home.appendingPathComponent(".vscode/extensions"),
             home.appendingPathComponent(".vscode-insiders/extensions")
-        ], platform: platform)
+        ])
     }
 
     /// Stable selection order: app launchers, standalone CLI, editor extension.
     /// Keep these installation layouts explicit so fallback changes are tested.
     static func find(applicationBundles: [URL], searchDirectories: [URL],
-                     extensionDirectories: [URL], platform: String) -> String? {
+                     extensionDirectories: [URL]) -> String? {
         let entries = ["Contents/Resources/codex-cli/bin/codex",
                        "Contents/Resources/codex",
                        "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"]
@@ -52,7 +47,7 @@ enum CodexExecutable {
             let extensions = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
             for item in extensions.filter({ $0.lastPathComponent.hasPrefix("openai.chatgpt-") })
                 .sorted(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedDescending }) {
-                let binary = item.appendingPathComponent("bin/\(platform)/codex")
+                let binary = item.appendingPathComponent("bin/macos-aarch64/codex")
                 if isExecutableFile(binary) { return binary.path }
             }
         }

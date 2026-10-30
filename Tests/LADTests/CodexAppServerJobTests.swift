@@ -3,6 +3,23 @@ import XCTest
 @testable import LAD
 
 final class CodexAppServerJobTests: XCTestCase {
+    func testUnsupportedProtocolOperationsExplainHowToRepairCodex() async throws {
+        for (method, code) in [("initialize", -32601), ("thread/start", -32602), ("turn/start", -32602)] {
+            let fixture = try AppServerFixture(onTurn: "finish({'unexpected': True})", rejectMethod: method, rejectionCode: code)
+            defer { fixture.remove() }
+            do {
+                _ = try await fixture.job().run(input: Data("initial request".utf8))
+                XCTFail("Unsupported \(method) must fail")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("Update Codex and check its configuration"))
+                XCTAssertTrue(error.localizedDescription.contains("Unsupported \(method)"))
+            }
+            let requests = try fixture.requests()
+            XCTAssertEqual(requests.filter { $0["method"] as? String == method }.count, 1,
+                           "A rejected operation must not be retried or start another turn")
+        }
+    }
+
     func testSteeringUsesOneThreadAndOneTurnWithCapturedExecutionOptions() async throws {
         let fixture = try AppServerFixture(onSteer: """
         reply(rpc, {'turnId': 'turn-1'})
@@ -21,6 +38,8 @@ final class CodexAppServerJobTests: XCTestCase {
         let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: response) as? [String: String])
         XCTAssertEqual(object["supplement"], "Make the wall 3 mm")
         let requests = try fixture.requests()
+        let initialization = try XCTUnwrap(requests.first { $0["method"] as? String == "initialize" }?["params"] as? [String: Any])
+        XCTAssertEqual(initialization["clientInfo"] as? [String: String], CodexAppServerClient.info())
         XCTAssertEqual(requests.filter { $0["method"] as? String == "thread/start" }.count, 1)
         XCTAssertEqual(requests.filter { $0["method"] as? String == "turn/start" }.count, 1)
         let start = try XCTUnwrap(requests.first { $0["method"] as? String == "turn/start" }?["params"] as? [String: Any])
@@ -249,10 +268,14 @@ private final class AppServerCapture: @unchecked Sendable {
 private struct AppServerFixture {
     let directory: URL
     let executable: URL
-    init(onTurn: String = "pass", onSteer: String = "reply(rpc, {'turnId': 'turn-1'})", onInterrupt: String = "reply(rpc, {})") throws {
+    init(onTurn: String = "pass", onSteer: String = "reply(rpc, {'turnId': 'turn-1'})", onInterrupt: String = "reply(rpc, {})",
+         rejectMethod: String = "", rejectionCode: Int = -32601) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-AppServer-Test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         executable = directory.appendingPathComponent("codex")
+        let methodEncoder = JSONEncoder()
+        methodEncoder.outputFormatting = .withoutEscapingSlashes
+        let rejectedMethod = String(decoding: try methodEncoder.encode(rejectMethod), as: UTF8.self)
         func indent(_ code: String) -> String { code.split(separator: "\n", omittingEmptySubsequences: false).map { "    " + $0 }.joined(separator: "\n") }
         let script = """
         #!/usr/bin/python3
@@ -278,6 +301,9 @@ private struct AppServerFixture {
             with open(os.path.join(ROOT, 'requests.jsonl'), 'a') as file:
                 file.write(json.dumps(rpc) + '\\n')
             method, params = rpc.get('method'), rpc.get('params', {})
+            if method == \(rejectedMethod):
+                send({'id': rpc['id'], 'error': {'code': \(rejectionCode), 'message': 'Unsupported ' + method}})
+                continue
             if method == 'initialize': reply(rpc, {})
             elif method == 'thread/start': reply(rpc, {'thread': {'id': 'thread-1'}})
             elif method == 'turn/start':

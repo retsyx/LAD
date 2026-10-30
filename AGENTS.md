@@ -2,6 +2,7 @@
 
 ## General
 
+- LAD supports Apple Silicon (`arm64`) only. Build, package and test that architecture exclusively; do not add support for other architectures.
 - This project is in early development. There is no need for backward compatibility with prior revisions of the software. This remains true as long as this instruction is in this file. When the software is more mature, this instruction will be replaced with an instruction to ensure backward compatibility between software revisions.
 
 ## Naming
@@ -38,7 +39,8 @@
 ## Managed CAD runtime
 
 - Codex is LAD’s only separately installed dependency. Bundle a pinned self-contained Python/CadQuery/OCP payload; prepare it at build time and provision a versioned private runtime under Application Support/LAD/Runtimes offline before use. Keep runtime preparation asynchronous, coalesce concurrent first use, and publish only complete installs. Never depend on a checkout, Homebrew or a user-selected Python.
-- Keep the application bundle read-only. Do not expose runtime path selection in ordinary Settings; CAD thread configuration remains available. Signing, notarization and downloadable DMG release packaging are separate release work.
+- Keep the application bundle read-only. Do not expose runtime path selection in ordinary Settings; CAD thread configuration remains available.
+- Build downloadable releases through `Scripts/release.sh`. Sign every native runtime image before packing it, notarize the expanded runtime separately so compressed payloads cannot hide code from notarization, then sign and notarize the app and DMG. Keep local ad-hoc validation artifacts clearly marked and separate from distributable releases. Never publish or claim a notarized release when credentials, notarization, stapling or verification are incomplete.
 
 ## Codex file context
 

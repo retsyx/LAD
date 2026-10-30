@@ -1,0 +1,156 @@
+name: Build macOS release
+
+# This signing runner must be dedicated to trusted release work. Restrict its
+# runner group to this workflow on the protected default branch; do not attach
+# it to pull-request workflows. Its keychain is provisioned by the maintainer.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: App version (for example, 0.3.0)
+        required: true
+        type: string
+      build_number:
+        description: App build number (a positive integer)
+        required: true
+        type: string
+      notes_path:
+        description: Tracked repository file containing release notes
+        required: true
+        type: string
+      create_draft_release:
+        description: Create a GitHub draft release with the verified artifacts
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Serialize access to the signing keychain and keep an in-flight notarization
+# alive when another release is dispatched.
+concurrency:
+  group: lad-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, lad-release]
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      LAD_RELEASE_VERSION: ${{ inputs.version }}
+      LAD_RELEASE_BUILD: ${{ inputs.build_number }}
+      LAD_RELEASE_NOTES: ${{ inputs.notes_path }}
+      LAD_SIGNING_IDENTITY: ${{ vars.LAD_SIGNING_IDENTITY }}
+      LAD_NOTARY_PROFILE: ${{ vars.LAD_NOTARY_PROFILE }}
+    outputs:
+      artifact_name: ${{ steps.inputs.outputs.artifact_name }}
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate release inputs and runner
+        id: inputs
+        run: |
+          set -euo pipefail
+          [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || {
+            echo 'An Apple Silicon macOS release runner is required.' >&2
+            exit 1
+          }
+          [[ "$LAD_RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo 'Version must contain three numeric components.' >&2
+            exit 1
+          }
+          [[ "$LAD_RELEASE_BUILD" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'Build number must be a positive integer.' >&2
+            exit 1
+          }
+          [[ -n "$LAD_SIGNING_IDENTITY" && -n "$LAD_NOTARY_PROFILE" ]] || {
+            echo 'Configure LAD_SIGNING_IDENTITY and LAD_NOTARY_PROFILE repository variables.' >&2
+            exit 1
+          }
+          [[ -f "$LAD_RELEASE_NOTES" ]] && git ls-files --error-unmatch -- "$LAD_RELEASE_NOTES" >/dev/null || {
+            echo 'Release notes must be an existing tracked repository file.' >&2
+            exit 1
+          }
+          release_directory="dist/releases/$LAD_RELEASE_VERSION+$LAD_RELEASE_BUILD"
+          [[ ! -e "$release_directory" && ! -L "$release_directory" ]] || {
+            echo 'The release output already exists; retain it and choose a new build number.' >&2
+            exit 1
+          }
+          printf 'release_directory=%s\n' "$release_directory" >> "$GITHUB_ENV"
+          printf 'artifact_name=LAD-%s-%s-arm64-%s-%s\n' \
+            "$LAD_RELEASE_VERSION" "$LAD_RELEASE_BUILD" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Run Swift, native engine, and sandbox checks
+        env:
+          LAD_RUN_ENGINE_TESTS: '1'
+          LAD_RUN_SANDBOX_TESTS: '1'
+        run: Scripts/test.sh
+
+      - name: Build, sign, notarize, and verify the DMG
+        run: |
+          set -euo pipefail
+          Scripts/release.sh \
+            --version "$LAD_RELEASE_VERSION" \
+            --build-number "$LAD_RELEASE_BUILD" \
+            --notes "$LAD_RELEASE_NOTES" \
+            --identity "$LAD_SIGNING_IDENTITY" \
+            --notary-profile "$LAD_NOTARY_PROFILE" \
+            --output "$release_directory"
+
+      - name: Retain verified release artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.inputs.outputs.artifact_name }}
+          path: |
+            ${{ env.release_directory }}/LAD-${{ inputs.version }}-${{ inputs.build_number }}-arm64.dmg
+            ${{ env.release_directory }}/SHA256SUMS
+            ${{ env.release_directory }}/release-notes.md
+            ${{ env.release_directory }}/release.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  draft:
+    if: inputs.create_draft_release
+    needs: package
+    runs-on: [self-hosted, macOS, ARM64, lad-release]
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download this run's verified artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/lad-release-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Create a draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LAD_RELEASE_VERSION: ${{ inputs.version }}
+          LAD_RELEASE_BUILD: ${{ inputs.build_number }}
+          LAD_RELEASE_ARTIFACTS: ${{ runner.temp }}/lad-release-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          cd "$LAD_RELEASE_ARTIFACTS"
+          shasum -a 256 -c SHA256SUMS
+          gh release create "v$LAD_RELEASE_VERSION" \
+            "LAD-$LAD_RELEASE_VERSION-$LAD_RELEASE_BUILD-arm64.dmg" \
+            SHA256SUMS release-notes.md release.json \
+            --repo "$GH_REPO" \
+            --target "$GITHUB_SHA" \
+            --title "LAD $LAD_RELEASE_VERSION (build $LAD_RELEASE_BUILD)" \
+            --notes-file release-notes.md \
+            --draft

@@ -371,11 +371,11 @@ final class CodexService {
     }
 
     /// Keep discovery independent of this Mac's installed applications so its
-    /// priorities and architecture fallbacks can be checked with local fixtures.
+    /// priorities can be checked with local fixtures.
     nonisolated static func findExecutable(applicationBundles: [URL], searchDirectories: [URL],
-                                          extensionDirectories: [URL], platform: String) -> String? {
+                                          extensionDirectories: [URL]) -> String? {
         CodexExecutable.find(applicationBundles: applicationBundles, searchDirectories: searchDirectories,
-                             extensionDirectories: extensionDirectories, platform: platform)
+                             extensionDirectories: extensionDirectories)
     }
 
     nonisolated static func resolveExecutable(_ requested: String) -> URL? {

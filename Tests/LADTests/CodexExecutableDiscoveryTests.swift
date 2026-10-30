@@ -35,7 +35,7 @@ final class CodexExecutableDiscoveryTests: XCTestCase {
         let directories = CodexExecutable.searchDirectories(path: nil, home: fixture.root.appendingPathComponent("UserHome"),
                                                             installationDirectories: [fixture.root.appendingPathComponent("system-bin")])
         let found = CodexExecutable.find(applicationBundles: [], searchDirectories: directories,
-                                         extensionDirectories: [], platform: "macos-aarch64")
+                                         extensionDirectories: [])
         XCTAssertEqual(found.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path },
                        expected.resolvingSymlinksInPath().path)
     }
@@ -118,18 +118,15 @@ final class CodexExecutableDiscoveryTests: XCTestCase {
         XCTAssertEqual(fixture.discover(), first.path)
     }
 
-    func testEditorFallbackChoosesNewestExecutableForTheRequestedArchitecture() throws {
+    func testEditorFallbackChoosesNewestExecutable() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
-        _ = try fixture.executable("extensions/openai.chatgpt-99.0.0/bin/macos-x86_64/codex")
         _ = try fixture.executable("extensions/openai.chatgpt-12.0.0/bin/macos-aarch64/codex", permissions: 0o644)
         _ = try fixture.executable("extensions/openai.chatgpt-9.0.0/bin/macos-aarch64/codex")
         let expected = try fixture.executable("extensions/openai.chatgpt-10.0.0/bin/macos-aarch64/codex")
         _ = try fixture.executable("extensions/unrelated.extension-999.0.0/bin/macos-aarch64/codex")
         XCTAssertEqual(fixture.discover(), expected.path,
-                       "Version ordering must be numeric and incompatible or nonexecutable entries must be skipped.")
-        XCTAssertEqual(fixture.discover(platform: "macos-x86_64"),
-                       fixture.root.appendingPathComponent("extensions/openai.chatgpt-99.0.0/bin/macos-x86_64/codex").path)
+                       "Version ordering must be numeric and nonexecutable entries must be skipped.")
     }
 
     func testEditorInsidersIsAnAvailableFallback() throws {
@@ -186,15 +183,14 @@ final class CodexExecutableDiscoveryTests: XCTestCase {
             return url
         }
 
-        func discover(platform: String = "macos-aarch64") -> String? {
+        func discover() -> String? {
             CodexService.findExecutable(applicationBundles: [
                 root.appendingPathComponent("Applications/Codex.app"),
                 root.appendingPathComponent("UserApplications/Codex.app"),
                 root.appendingPathComponent("Applications/ChatGPT.app"),
                 root.appendingPathComponent("UserApplications/ChatGPT.app")
             ], searchDirectories: [root.appendingPathComponent("bin"), root.appendingPathComponent("second-bin")],
-               extensionDirectories: [root.appendingPathComponent("extensions"), root.appendingPathComponent("insiders-extensions")],
-               platform: platform)
+               extensionDirectories: [root.appendingPathComponent("extensions"), root.appendingPathComponent("insiders-extensions")])
         }
 
         func remove() { try? FileManager.default.removeItem(at: root) }

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="$(uname -m)"
 if [[ "$ARCH" != arm64 ]]; then
-    echo "The packaged CAD runtime currently supports Apple Silicon only." >&2
+    echo "LAD supports Apple Silicon (arm64) only." >&2
     exit 1
 fi
 SOURCE="$ROOT/Engine/runtime-source.json"

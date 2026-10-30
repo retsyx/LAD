@@ -3,6 +3,19 @@ import XCTest
 @testable import LAD
 
 final class CodexModelCatalogTests: XCTestCase {
+    @MainActor
+    func testUnsupportedModelLookupExplainsHowToRepairCodex() async throws {
+        let rejection = try data(["id": 2, "error": ["code": -32601, "message": "Unknown method model/list"]])
+        let fake = try FakeCatalog(responses: [rejection], configuration: nil)
+        defer { fake.remove() }
+        let catalog = CodexModelCatalog()
+        await catalog.refresh(executable: fake.executable.path)
+        XCTAssertTrue(catalog.models.isEmpty)
+        XCTAssertFalse(catalog.isLoading)
+        XCTAssertTrue(catalog.error?.contains("Update Codex and check its configuration") == true)
+        XCTAssertTrue(catalog.error?.contains("Unknown method model/list") == true)
+    }
+
     func testCatalogUsesActualModelIdentifiersAndAdvertisedCapabilities() throws {
         let page: [String: Any] = ["data": [
             ["id": "catalog-row", "model": "provider/model-a", "displayName": "Model A", "description": "A model",

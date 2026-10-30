@@ -199,7 +199,7 @@ final class CodexAppServerJob: @unchecked Sendable {
         }
         _ = fcntl(inputFD, F_SETNOSIGPIPE, 1)
         try enqueue("initialize", purpose: .initialize, params: [
-            "clientInfo": ["name": "lad", "title": "LAD", "version": "1.0"],
+            "clientInfo": CodexAppServerClient.info(),
             "capabilities": ["experimentalApi": false]
         ])
         var buffer = [UInt8](repeating: 0, count: 16_384)
@@ -392,7 +392,7 @@ final class CodexAppServerJob: @unchecked Sendable {
         lock.lock(); let request = pending.removeValue(forKey: id); lock.unlock()
         guard let request else { return }
         if let error = object["error"] as? [String: Any] {
-            let message = error["message"] as? String ?? "Codex rejected the request."
+            let message = CodexAppServerClient.errorMessage(error)
             if request.purpose == .steer {
                 request.continuation?.resume(throwing: CodexSteeringError.rejected(message))
                 return

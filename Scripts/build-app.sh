@@ -2,39 +2,58 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+[[ "$(uname -m)" == arm64 ]] || { echo "LAD requires Apple Silicon (arm64)." >&2; exit 1; }
 CONFIG="${LAD_BUILD_CONFIGURATION:-release}"
-RUNTIME_PAYLOAD="$("$ROOT/Scripts/prepare-runtime.sh")"
+RUNTIME_PAYLOAD="${LAD_RUNTIME_PAYLOAD:-}"
+if [[ -z "$RUNTIME_PAYLOAD" ]]; then RUNTIME_PAYLOAD="$("$ROOT/Scripts/prepare-runtime.sh")"; fi
+[[ -f "$RUNTIME_PAYLOAD/manifest.json" && -f "$RUNTIME_PAYLOAD/payload.tar.gz" ]] || {
+    echo "The prepared CAD runtime payload is incomplete." >&2; exit 1;
+}
+APP="${LAD_APP_OUTPUT:-$ROOT/dist/LAD.app}"
+[[ "$(basename "$APP")" == LAD.app ]] || { echo "The app output must be named LAD.app." >&2; exit 1; }
+mkdir -p "$(dirname "$APP")"
+STAGING="$(mktemp -d "$(dirname "$APP")/.LAD-build.XXXXXX")"
+trap 'rm -rf "$STAGING"' EXIT
+ASSEMBLED="$STAGING/LAD.app"
 export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-/tmp/lad-clang-cache}"
 export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-/tmp/lad-swift-cache}"
-swift build --disable-sandbox -c "$CONFIG"
-BIN="$(swift build --disable-sandbox -c "$CONFIG" --show-bin-path)"
-APP="$ROOT/dist/LAD.app"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN/LAD" "$APP/Contents/MacOS/LAD"
+swift build --disable-sandbox --arch arm64 -c "$CONFIG"
+BIN="$(swift build --disable-sandbox --arch arm64 -c "$CONFIG" --show-bin-path)"
+mkdir -p "$ASSEMBLED/Contents/MacOS" "$ASSEMBLED/Contents/Resources"
+cp "$BIN/LAD" "$ASSEMBLED/Contents/MacOS/LAD"
 # Bundle.module searches Contents/Resources in a packaged macOS app.
-if [[ -d "$BIN/LAD_LAD.bundle" ]]; then
-    ditto "$BIN/LAD_LAD.bundle" "$APP/Contents/Resources/LAD_LAD.bundle"
-fi
-# Rebuild the engine resources from an explicit runtime-only list. Copying over
-# an old app can otherwise retain deleted modules, tests or Python bytecode.
-PACKAGED_ENGINE="$APP/Contents/Resources/Engine"
-rm -rf "$PACKAGED_ENGINE"
+[[ -d "$BIN/LAD_LAD.bundle" ]] || { echo "The Swift resource bundle is missing." >&2; exit 1; }
+ditto "$BIN/LAD_LAD.bundle" "$ASSEMBLED/Contents/Resources/LAD_LAD.bundle"
+PACKAGED_ENGINE="$ASSEMBLED/Contents/Resources/Engine"
 mkdir -p "$PACKAGED_ENGINE"
 cp "$ROOT/Engine/worker.py" "$ROOT/Engine/agent_server.py" \
    "$ROOT/Engine/script.sb" "$ROOT/Engine/requirements-lock.txt" "$PACKAGED_ENGINE/"
-ditto "$ROOT/Examples" "$APP/Contents/Resources/Examples"
+ditto "$ROOT/Examples" "$ASSEMBLED/Contents/Resources/Examples"
 # Ship a verified offline payload. First use prepares a versioned private
 # interpreter/venv in Application Support without changing the signed app.
-rm -f "$APP/Contents/Resources/python-runtime.txt"
-mkdir -p "$APP/Contents/Resources/CADRuntime"
-cp "$RUNTIME_PAYLOAD/manifest.json" "$RUNTIME_PAYLOAD/payload.tar.gz" "$APP/Contents/Resources/CADRuntime/"
-cp "$ROOT/Scripts/Info.plist" "$APP/Contents/Info.plist"
-xcrun swift "$ROOT/Scripts/make-icon.swift" "$ROOT/dist"
-cp "$ROOT/dist/LAD.icns" "$APP/Contents/Resources/LAD.icns"
-cp "$ROOT/dist/LADDocument.icns" "$APP/Contents/Resources/LADDocument.icns"
-cp "$ROOT/dist/LADFolder.icns" "$APP/Contents/Resources/LADFolder.icns"
-codesign --force --deep --sign - "$APP"
-# Refresh this app's document-type and icon registration after each rebuild.
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
+mkdir -p "$ASSEMBLED/Contents/Resources/CADRuntime"
+cp "$RUNTIME_PAYLOAD/manifest.json" "$RUNTIME_PAYLOAD/payload.tar.gz" "$ASSEMBLED/Contents/Resources/CADRuntime/"
+cp "$ROOT/LICENSE" "$ASSEMBLED/Contents/Resources/LICENSE.txt"
+cp "$ROOT/Scripts/Info.plist" "$ASSEMBLED/Contents/Info.plist"
+if [[ -n "${LAD_VERSION:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $LAD_VERSION" "$ASSEMBLED/Contents/Info.plist"
+fi
+if [[ -n "${LAD_BUILD_NUMBER:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $LAD_BUILD_NUMBER" "$ASSEMBLED/Contents/Info.plist"
+fi
+mkdir -p "$STAGING/icons"
+xcrun swift "$ROOT/Scripts/make-icon.swift" "$STAGING/icons"
+for ICON in LAD LADDocument LADFolder; do
+    cp "$STAGING/icons/$ICON.icns" "$ASSEMBLED/Contents/Resources/"
+done
+if [[ "${LAD_APP_SIGNING:-adhoc}" != none ]]; then
+    codesign --force --sign - "$ASSEMBLED"
+fi
+# A fresh assembly never retains deleted resources or old runtime payloads.
+if [[ -e "$APP" ]]; then rm -rf "$APP"; fi
+mv "$ASSEMBLED" "$APP"
+if [[ "${LAD_REGISTER_APP:-1}" == 1 ]]; then
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
+fi
 echo "Built $APP"
 echo "Launch: open \"$APP\""
