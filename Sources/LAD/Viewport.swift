@@ -239,6 +239,10 @@ final class CADSceneView: SCNView {
     var onHideSelected: (() -> Void)?
     var onShowAll: (() -> Void)?
     var onActivated: ((CADSceneView) -> Void)?
+    private(set) var gridSpacing: Double = 0
+    var onGridSpacingChanged: ((Double) -> Void)? {
+        didSet { onGridSpacingChanged?(gridSpacing) }
+    }
     var onCameraOrientationChanged: ((SIMD3<Double>, SIMD3<Double>, SIMD3<Double>) -> Void)? {
         didSet { notifyCameraOrientation() }
     }
@@ -933,6 +937,10 @@ final class CADSceneView: SCNView {
         // Guides must not intercept solid selection or cursor zoom hit tests.
         for node in gridNode.childNodes { node.categoryBitMask = 2 }
         gridNode.isHidden = !gridVisible
+        if gridSpacing != step {
+            gridSpacing = step
+            onGridSpacingChanged?(step)
+        }
     }
 
     private func perform(_ action: ViewportCommand.Action) {

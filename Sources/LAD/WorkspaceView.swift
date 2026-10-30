@@ -5,13 +5,24 @@ private final class WorkspaceViewportReference: ObservableObject {
     weak var view: CADSceneView?
     weak var window: NSWindow?
     private weak var cube: ViewportOrientationCube?
+    @Published private(set) var gridSpacing: Double?
 
     func bindViewport(_ view: CADSceneView) {
         guard self.view !== view else { return }
         self.view?.onCameraOrientationChanged = nil
+        self.view?.onGridSpacingChanged = nil
         self.view = view
         view.onCameraOrientationChanged = { [weak self] right, up, backward in
             self?.cube?.setOrientation(right: right, up: up, backward: backward)
+        }
+        view.onGridSpacingChanged = { [weak self, weak view] _ in
+            // Grid rebuilding can occur during updateNSView. Publish the latest
+            // drawn spacing after SwiftUI finishes that update.
+            Task { @MainActor [weak self, weak view] in
+                guard let self, let view, self.view === view,
+                      self.gridSpacing != view.gridSpacing else { return }
+                self.gridSpacing = view.gridSpacing
+            }
         }
     }
 
@@ -236,13 +247,24 @@ struct WorkspaceView: View {
                         })
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
-                    Button { state.showGrid.toggle() } label: {
-                        Image(systemName: "grid").frame(width: 28, height: 28)
-                            .foregroundStyle(state.showGrid ? Palette.accent : Palette.muted)
+                    HStack(spacing: 8) {
+                        Button { state.showGrid.toggle() } label: {
+                            Image(systemName: "grid").frame(width: 28, height: 28)
+                                .foregroundStyle(state.showGrid ? Palette.accent : Palette.muted)
+                        }
+                        .buttonStyle(.plain).padding(5)
+                        .background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
+                        .help("Toggle grid").accessibilityValue(state.showGrid ? "On" : "Off")
+                        if state.showGrid, let gridSpacing = viewportReference.gridSpacing {
+                            let spacing = gridSpacing.formatted(.number.precision(.fractionLength(0...2)))
+                            Text("\(spacing) mm")
+                                .font(.system(size: 12)).monospacedDigit()
+                                .foregroundStyle(Palette.muted).fixedSize()
+                                .help("Grid square size")
+                                .accessibilityLabel("Grid square size: \(spacing) millimetres")
+                                .accessibilityIdentifier("gridSquareSize")
+                        }
                     }
-                    .buttonStyle(.plain).padding(5)
-                    .background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
-                    .help("Toggle grid").accessibilityValue(state.showGrid ? "On" : "Off")
                     Spacer()
                     ViewportOrientationCubeControl(reference: viewportReference).frame(width: 108, height: 108)
                 }.padding(22)
