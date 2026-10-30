@@ -10,6 +10,13 @@ struct ProjectWindowRequest: Hashable, Codable {
         self.id = id
         self.fileURL = fileURL
     }
+
+    static func initialSource(request: Self?, storedPath: String, storedProjectID: String) -> (url: URL?, projectID: UUID?) {
+        let stored = storedPath.isEmpty ? nil : URL(fileURLWithPath: storedPath)
+        let source = request?.fileURL ?? stored
+        let sameFile = source?.standardizedFileURL.resolvingSymlinksInPath() == stored?.standardizedFileURL.resolvingSymlinksInPath()
+        return (source, sameFile ? UUID(uuidString: storedProjectID) : nil)
+    }
 }
 
 /// A window can change documents while SwiftUI keeps the same window identity.
@@ -25,6 +32,12 @@ final class ProjectWindowSession: ObservableObject {
     init(state: AppState? = nil) {
         self.state = state ?? AppState()
         observeState()
+    }
+
+    fileprivate var canReceiveInitialProject: Bool {
+        state.projectURL == nil && state.projectName == nil && state.revisions.isEmpty && state.messages.isEmpty &&
+            state.prompt.isEmpty && state.pendingAttachments.isEmpty && state.queuedRequests.isEmpty &&
+            !state.isReadingPromptAttachments && !state.hasUnsavedChanges && !state.canSaveProject
     }
 
     private func observeState() {
@@ -74,6 +87,11 @@ final class ProjectWindowCoordinator: ObservableObject {
     private var entries: [UUID: Entry] = [:]
     private var windows: [UUID: WindowReference] = [:]
     private var pendingURLs: [URL: PendingRequest] = [:]
+    private var initialExternalURLs: [UUID: URL] = [:]
+    private var receivedExternalProject = false
+    private var unusedInitialWindows: Set<UUID> = []
+    private var implicitInitialWindows: Set<UUID> = []
+    private var retiringInitialWindows = false
     private var replacements: [UUID: Replacement] = [:]
     // Canceled reads/saves may still be finishing after their window closes.
     private var replacementTasks: [UUID: Replacement] = [:]
@@ -125,7 +143,9 @@ final class ProjectWindowCoordinator: ObservableObject {
     /// register the same file before either read has completed.
     /// Returns whether this window owns the document's initial start.
     @discardableResult
-    func register(_ session: ProjectWindowSession, id: UUID, sourceURL: URL?) -> Bool {
+    func register(_ session: ProjectWindowSession, id: UUID, sourceURL: URL?, isImplicitWindow: Bool = false) -> Bool {
+        if isImplicitWindow { implicitInitialWindows.insert(id) }
+        else { implicitInitialWindows.remove(id) }
         var aliases = Set<URL>()
         var shouldStart = !hasWindow(for: session.state)
         let source = sourceURL.map(Self.canonicalURL)
@@ -149,6 +169,7 @@ final class ProjectWindowCoordinator: ObservableObject {
         } else {
             updateActiveStates()
         }
+        retireUnusedInitialWindows()
         return shouldStart
     }
 
@@ -203,9 +224,74 @@ final class ProjectWindowCoordinator: ObservableObject {
         createWindow(request)
     }
 
+    /// SwiftUI may create an implicit window to deliver a Finder open event.
+    /// Let that pristine receiver become the requested design instead of
+    /// creating another window and leaving an empty launch window above it.
+    /// Explicit New Design windows, restored files and drafts remain separate.
+    func openExternalProject(at url: URL, in session: ProjectWindowSession, id: UUID,
+                             reusingInitialWindow: Bool,
+                             createWindow: @escaping (ProjectWindowRequest) -> Void) -> ProjectWindowRequest? {
+        guard !isQuitting else { return nil }
+        receivedExternalProject = true
+        initialRestoreClaimed = true
+        guard reusingInitialWindow, session.canReceiveInitialProject,
+              !unusedInitialWindows.contains(id), initialExternalURLs[id] == nil else {
+            openProject(at: url, createWindow: createWindow)
+            discardRegisteredInitialWindows()
+            return nil
+        }
+        implicitInitialWindows.remove(id)
+        let canonical = Self.canonicalURL(url)
+        let request = ProjectWindowRequest(id: id, fileURL: canonical)
+        if entries[id] != nil {
+            replaceProject(at: canonical, in: id)
+        } else {
+            // onOpenURL can precede the root's task/registration. The scene's
+            // bound request carries this source into that single initial start.
+            reserve(canonical, for: id, token: id)
+            initialExternalURLs[id] = canonical
+            session.sourceURL = canonical
+        }
+        discardRegisteredInitialWindows()
+        return request
+    }
+
+    private func discardRegisteredInitialWindows() {
+        for id in Array(implicitInitialWindows) {
+            guard let session = entries[id]?.session, replacements[id] == nil else { continue }
+            _ = discardUnusedInitialWindow(session, id: id, isImplicitWindow: true)
+        }
+    }
+
+    /// SwiftUI can finish creating its ordinary launch window after opening
+    /// the external file's scene. Retire only this untouched implicit window;
+    /// explicit New Design and restored document windows remain independent.
+    func discardUnusedInitialWindow(_ session: ProjectWindowSession, id: UUID, isImplicitWindow: Bool) -> Bool {
+        guard isImplicitWindow, receivedExternalProject, session.canReceiveInitialProject,
+              initialExternalURLs[id] == nil else { return false }
+        unusedInitialWindows.insert(id)
+        windows[id]?.window?.orderOut(nil)
+        retireUnusedInitialWindows()
+        return true
+    }
+
+    /// Finish an event delivered before the SwiftUI root registered. Reuse
+    /// the coordinated replacement flow so a closing writer can finish before
+    /// this window reads the file, including an in-flight filename change.
+    @discardableResult
+    func startInitialExternalProject(in id: UUID) -> Bool {
+        guard let url = initialExternalURLs.removeValue(forKey: id) else { return false }
+        replaceProject(at: url, in: id, sharingInitialRead: true)
+        return true
+    }
+
     /// Open a dropped design in its receiving window. Keep the old document
     /// intact until the incoming archive validates and the outgoing save succeeds.
     func replaceProject(at url: URL, in id: UUID) {
+        replaceProject(at: url, in: id, sharingInitialRead: false)
+    }
+
+    private func replaceProject(at url: URL, in id: UUID, sharingInitialRead: Bool) {
         guard !isQuitting, let entry = entries[id] else { return }
         let canonical = Self.canonicalURL(url)
         let previous = cancelReplacement(in: id)
@@ -278,10 +364,21 @@ final class ProjectWindowCoordinator: ObservableObject {
                     aliases.formUnion(other.inheritedAliases)
                 }
                 aliases.formUnion(adoptClosedState(incoming))
-                entries[id] = Entry(session: session, sourceURL: source, inheritedAliases: aliases)
-                session.sourceURL = source
-                session.state = incoming
-                if !hasWindow(for: outgoing) { outgoing.setActiveProject(false) }
+                // Restored views may have joined this document before its
+                // initial read completed. Finish that shared read for all of
+                // them; an ordinary file drop still replaces only its receiver.
+                let receivers = sharingInitialRead
+                    ? entries.filter { $0.value.state === outgoing }.map(\.key) : [id]
+                for receiverID in receivers {
+                    guard let receiver = entries[receiverID]?.session else { continue }
+                    entries[receiverID] = Entry(session: receiver, sourceURL: source, inheritedAliases: aliases)
+                    receiver.sourceURL = source
+                    receiver.state = incoming
+                }
+                if !hasWindow(for: outgoing) {
+                    outgoing.setActiveProject(false)
+                    if sharingInitialRead { outgoing.cancel() }
+                }
                 focus(id)
             } catch {
                 guard replacementIsCurrent(token, in: id, session: session) else { return }
@@ -295,13 +392,22 @@ final class ProjectWindowCoordinator: ObservableObject {
 
     func markActive(_ id: UUID) {
         guard !isQuitting else { return }
+        if unusedInitialWindows.contains(id) {
+            windows[id]?.window?.orderOut(nil)
+            retireUnusedInitialWindows()
+            return
+        }
         activeID = id
         focusOrder.removeAll { $0 == id }
         focusOrder.append(id)
         updateActiveStates()
+        retireUnusedInitialWindows()
     }
 
     func windowClosed(_ id: UUID) {
+        implicitInitialWindows.remove(id)
+        unusedInitialWindows.remove(id)
+        initialExternalURLs.removeValue(forKey: id)
         reopeningStates.removeValue(forKey: id)
         cancelReplacement(in: id)
         windows.removeValue(forKey: id)
@@ -380,7 +486,32 @@ final class ProjectWindowCoordinator: ObservableObject {
 
     fileprivate func bind(_ window: NSWindow, id: UUID) {
         windows[id] = WindowReference(window)
-        if window.isKeyWindow { markActive(id) }
+        if unusedInitialWindows.contains(id) { window.orderOut(nil) }
+        else if window.isKeyWindow { markActive(id) }
+        retireUnusedInitialWindows()
+    }
+
+    private func retireUnusedInitialWindows() {
+        guard !isQuitting, !retiringInitialWindows, !unusedInitialWindows.isEmpty,
+              let targetID = focusOrder.reversed().first(where: { id in
+                  !unusedInitialWindows.contains(id) && entries[id] != nil && windows[id]?.window?.isVisible == true
+              }) else { return }
+        // Keep a hidden placeholder alive until the requested file has a
+        // visible window, so closing it cannot terminate the application.
+        let closing = unusedInitialWindows.compactMap { id -> (UUID, NSWindow)? in
+            guard let window = windows[id]?.window else { return nil }
+            return (id, window)
+        }
+        guard !closing.isEmpty else { return }
+        retiringInitialWindows = true
+        defer { retiringInitialWindows = false }
+        for (id, window) in closing {
+            unusedInitialWindows.remove(id)
+            window.close()
+            // bind() may run before the anchor installs its close observer.
+            windowClosed(id)
+        }
+        focus(targetID)
     }
 
     fileprivate func unbind(_ window: NSWindow?, id: UUID) {

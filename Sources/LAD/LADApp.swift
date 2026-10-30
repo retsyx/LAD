@@ -8,7 +8,7 @@ struct LADApp: App {
 
     var body: some Scene {
         WindowGroup("LAD", id: "project", for: ProjectWindowRequest.self) { $request in
-            ProjectWindowRoot(request: request, coordinator: delegate.projectWindows, recentProjects: delegate.recentProjects)
+            ProjectWindowRoot(request: $request, coordinator: delegate.projectWindows, recentProjects: delegate.recentProjects)
         }
         .defaultSize(width: 1440, height: 900)
         .commands { ProjectCommands(coordinator: delegate.projectWindows, recentProjects: delegate.recentProjects,
@@ -19,7 +19,7 @@ struct LADApp: App {
 
 @MainActor
 private struct ProjectWindowRoot: View {
-    let request: ProjectWindowRequest?
+    @Binding var request: ProjectWindowRequest?
     let coordinator: ProjectWindowCoordinator
     let recentProjects: RecentProjects
     @StateObject private var session = ProjectWindowSession()
@@ -46,12 +46,19 @@ private struct ProjectWindowRoot: View {
             .task {
                 guard !started else { return }
                 started = true
-                let source = storedFilePath.isEmpty ? request?.fileURL : URL(fileURLWithPath: storedFilePath)
+                let initial = ProjectWindowRequest.initialSource(request: request, storedPath: storedFilePath,
+                                                                 storedProjectID: storedDocumentID)
+                let source = initial.url
+                if coordinator.discardUnusedInitialWindow(session, id: windowID,
+                    isImplicitWindow: request == nil && storedFilePath.isEmpty) { return }
                 let restoreRecent = source == nil && request == nil && coordinator.claimInitialRestore()
-                let shouldStart = coordinator.register(session, id: windowID, sourceURL: source ?? (restoreRecent ? AppState.recentProjectURL : nil))
+                let shouldStart = coordinator.register(session, id: windowID,
+                    sourceURL: source ?? (restoreRecent ? AppState.recentProjectURL : nil),
+                    isImplicitWindow: request == nil && storedFilePath.isEmpty)
                 configureOpenHandler()
-                if shouldStart {
-                    state.start(restoringRecent: restoreRecent, opening: source, restoringProjectID: UUID(uuidString: storedDocumentID))
+                let openedExternal = coordinator.startInitialExternalProject(in: windowID)
+                if shouldStart && !openedExternal {
+                    state.start(restoringRecent: restoreRecent, opening: source, restoringProjectID: initial.projectID)
                 }
             }
             .onChange(of: state.projectURL) { _, _ in
@@ -64,8 +71,13 @@ private struct ProjectWindowRoot: View {
             .onChange(of: session.sourceURL) { _, _ in
                 persistWindowProject()
             }
+            .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
             .onOpenURL { url in
-                coordinator.openProject(at: url) { openWindow(id: "project", value: $0) }
+                if let adopted = coordinator.openExternalProject(at: url, in: session, id: windowID,
+                    reusingInitialWindow: request == nil && storedFilePath.isEmpty,
+                    createWindow: { openWindow(id: "project", value: $0) }) {
+                    request = adopted
+                }
             }
     }
 
@@ -91,6 +103,13 @@ private struct ProjectWindowRoot: View {
             let path = session.sourceURL?.path ?? ""
             if storedFilePath != path { storedDocumentID = "" }
             storedFilePath = path
+        }
+        // SwiftUI restores this value as well as SceneStorage. Keep it in
+        // sync after an inline rename or a file dropped into this window.
+        let source = state.projectURL ?? session.sourceURL
+        if var current = request, current.fileURL != source {
+            current.fileURL = source
+            request = current
         }
     }
 }
