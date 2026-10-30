@@ -125,7 +125,7 @@ private struct ProjectCommands: Commands {
             Button("Save New…") { state?.saveNewProject() }.keyboardShortcut("s")
                 .disabled(state?.canSaveNew != true)
             Button("Save Design As…") { state?.saveProject(as: true) }
-                .keyboardShortcut("s", modifiers: [.command, .shift]).disabled(state == nil)
+                .keyboardShortcut("s", modifiers: [.command, .shift]).disabled(state?.canSaveProject != true)
             Divider()
             Button("Export STEP…") { state?.exportSTEP() }
                 .keyboardShortcut("e", modifiers: [.command, .shift]).disabled(state?.canExport != true)

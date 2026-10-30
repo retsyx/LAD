@@ -161,7 +161,8 @@ final class AppStateActivityTests: XCTestCase {
         state.recordTaskEvent(event("late", status: "completed"))
         XCTAssertTrue(state.taskAudits.isEmpty)
         await state.prepareToQuit()
-        XCTAssertNil(try ProjectStore.read(from: XCTUnwrap(state.projectURL)).taskAudits)
+        XCTAssertNil(state.projectURL)
+        XCTAssertFalse(state.hasUnsavedChanges)
     }
 
     private func event(_ id: String, status: String, output: String = "native geometry checked") -> ProjectActivityEvent {

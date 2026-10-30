@@ -413,10 +413,8 @@ final class AppStateRequestQueueTests: XCTestCase {
         state.cancelEditingQueuedRequest()
         XCTAssertTrue(state.prompt.isEmpty, "An old editor backup must never reappear in a new design.")
         await state.prepareToQuit()
-        let saved = try ProjectStore.read(from: XCTUnwrap(state.projectURL))
-        XCTAssertNil(saved.queuedRequests)
-        XCTAssertNil(saved.draftPrompt)
-        XCTAssertNil(saved.draftAttachments)
+        XCTAssertNil(state.projectURL)
+        XCTAssertFalse(state.hasUnsavedChanges)
     }
 
     @MainActor

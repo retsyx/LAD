@@ -7,7 +7,7 @@ final class AppStateSidebarLayoutTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-sidebar-state-\(UUID())")
         defer { try? FileManager.default.removeItem(at: directory) }
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory))
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let url = try XCTUnwrap(state.projectURL)
         XCTAssertEqual(state.partsPaneFraction, 0.75)
@@ -28,6 +28,7 @@ final class AppStateSidebarLayoutTests: XCTestCase {
         reopened.newProject()
         XCTAssertEqual(reopened.partsPaneFraction, 0.75)
         await reopened.prepareToQuit()
+        XCTAssertNil(reopened.projectURL)
     }
 
     @MainActor

@@ -110,6 +110,7 @@ final class AppState: ObservableObject {
     private var promptAttachmentReads: [PromptAttachmentInput] = []
     private var loaded = false
     private var projectReady = false
+    private var projectSavingEnabled = false
     private var pendingProjectRename = false
     private var builtRevisionID: UUID?
     private var projectSessionID = UUID()
@@ -185,7 +186,8 @@ final class AppState: ObservableObject {
     var selectedPartSolids: Set<Int> { selectedSolids.union(featureSelectedSolids) }
     var canExportSelectedParts: Bool { canExport && !selectedPartSolids.isEmpty }
     var hasMeasurementSelection: Bool { !selectedSolids.isEmpty || !selectedFeatures.isEmpty }
-    var canSaveNew: Bool { projectReady && !preserveUnreadableSession && !revisions.isEmpty && !isWorking }
+    var canSaveProject: Bool { projectReady && projectSavingEnabled && !preserveUnreadableSession }
+    var canSaveNew: Bool { canSaveProject && !revisions.isEmpty && !isWorking }
     var python: String { runtimeOverride ?? EngineService.defaultPython }
     var executable: String { CodexService.configuredExecutable }
     var model: String { codexSettings.model }
@@ -366,7 +368,7 @@ final class AppState: ObservableObject {
     }
 
     private func flushProject() async throws {
-        guard projectReady, !preserveUnreadableSession else { return }
+        guard canSaveProject else { return }
         if let saveConflict { throw saveConflict }
         autosaveSequence += 1
         let sequence = autosaveSequence, sessionID = projectSessionID
@@ -396,6 +398,7 @@ final class AppState: ObservableObject {
     /// A quit-time recovery copy preserves the complete design. Unlike the
     /// ordinary Save As action, it is awaited and does not retry cloud autosave.
     func saveProjectForQuit(to url: URL) async throws {
+        guard canSaveProject else { return }
         autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         let sequence = autosaveSequence, sessionID = projectSessionID
         do {
@@ -427,6 +430,7 @@ final class AppState: ObservableObject {
         cancel()
         activityImages.reset()
         projectReady = false
+        projectSavingEnabled = false
         saveConflict = nil
         presentedSaveConflict = nil
         saveConflictPromptTask?.cancel(); saveConflictPromptTask = nil
@@ -457,7 +461,6 @@ final class AppState: ObservableObject {
         viewportCommand = nil
         selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = []
         projectReady = true
-        autosave()
     }
 
     func submit() {
@@ -483,6 +486,9 @@ final class AppState: ObservableObject {
         catch { self.error = error.localizedDescription; return }
         let request = ProjectQueuedRequest(content: enteredText, attachments: pendingAttachments.isEmpty ? nil : pendingAttachments,
                                            codexSettings: settings, selection: selection)
+        // A submitted request starts persistence, even if it is later canceled
+        // or fails. Drafts and settings alone must not create an empty file.
+        projectSavingEnabled = true
         prompt = ""; pendingAttachments = []
         if enqueue {
             queuedRequests.append(request)
@@ -795,7 +801,7 @@ final class AppState: ObservableObject {
     }
 
     private func scheduleDebouncedAutosave() {
-        guard projectReady, !preserveUnreadableSession else { return }
+        guard canSaveProject else { return }
         // Invalidate older in-flight writes immediately, and coalesce typing
         // or divider dragging before serializing the complete project.
         autosaveSequence += 1
@@ -1608,6 +1614,7 @@ final class AppState: ObservableObject {
     }
 
     func saveProject(as newLocation: Bool = false) {
+        guard canSaveProject else { return }
         // The regular Save command flushes the open project. Save As
         // still offers an explicit portable copy at a user-selected location.
         if !newLocation {
@@ -1809,6 +1816,8 @@ final class AppState: ObservableObject {
 
     private func restore(_ project: LADProject) {
         projectReady = false
+        // Existing files retain normal autosaving, including empty archives.
+        projectSavingEnabled = true
         saveConflict = nil
         presentedSaveConflict = nil
         saveConflictPromptTask?.cancel(); saveConflictPromptTask = nil
@@ -1852,7 +1861,7 @@ final class AppState: ObservableObject {
         selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = []
     }
     private func autosave() {
-        guard projectReady, !preserveUnreadableSession else { return }
+        guard canSaveProject else { return }
         hasUnsavedChanges = true
         autosaveSequence += 1
         guard saveConflict == nil else { return }

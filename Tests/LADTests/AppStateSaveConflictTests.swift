@@ -10,7 +10,7 @@ final class AppStateSaveConflictTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let state = fixture.state
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let url = try XCTUnwrap(state.projectURL)
         var remote = try ProjectStore.read(from: url)
@@ -55,7 +55,7 @@ final class AppStateSaveConflictTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let state = fixture.state
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let url = try XCTUnwrap(state.projectURL)
         var remote = try ProjectStore.read(from: url)
@@ -91,7 +91,7 @@ final class AppStateSaveConflictTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let state = fixture.state
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let url = try XCTUnwrap(state.projectURL)
         var remote = try ProjectStore.read(from: url)
@@ -125,8 +125,7 @@ final class AppStateSaveConflictTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let state = fixture.state
-        state.newProject()
-        state.messages = [ChatMessage(role: "user", content: "Keep my complete conversation")]
+        state.newProjectWithSubmittedRequest("Keep my complete conversation")
         await state.prepareToQuit()
         let original = try XCTUnwrap(state.projectURL)
         let identity = state.projectDocumentID
@@ -160,7 +159,7 @@ final class AppStateSaveConflictTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let state = fixture.state
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let url = try XCTUnwrap(state.projectURL)
         var remote = try ProjectStore.read(from: url)

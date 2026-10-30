@@ -10,7 +10,7 @@ final class AppStateRecentProjectTests: XCTestCase {
         let recent = RecentProjects(defaults: fixture.defaults)
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: fixture.directory))
         state.onRecentProjectChanged = { recent.record($0, replacing: $1) }
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let savedURL = try XCTUnwrap(state.projectURL)
         XCTAssertEqual(recent.urls, [savedURL])
@@ -33,7 +33,7 @@ final class AppStateRecentProjectTests: XCTestCase {
         let recent = RecentProjects(defaults: fixture.defaults)
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: fixture.directory))
         state.onRecentProjectChanged = { recent.record($0, replacing: $1) }
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let originalURL = try XCTUnwrap(state.projectURL)
         let otherURL = fixture.directory.appendingPathComponent("Other.lad")
@@ -55,10 +55,10 @@ final class AppStateRecentProjectTests: XCTestCase {
         let recent = RecentProjects(defaults: fixture.defaults)
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: fixture.directory))
         state.onRecentProjectChanged = { recent.record($0, replacing: $1) }
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let firstURL = try XCTUnwrap(state.projectURL)
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let secondURL = try XCTUnwrap(state.projectURL)
         XCTAssertEqual(recent.urls, [secondURL, firstURL])

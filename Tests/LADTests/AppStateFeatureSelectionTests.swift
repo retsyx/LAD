@@ -174,7 +174,10 @@ final class AppStateFeatureSelectionTests: XCTestCase {
         XCTAssertNil(state.measurementReport)
         XCTAssertFalse(state.isMeasuring)
         await state.prepareToQuit()
-        let directory = try XCTUnwrap(state.projectURL?.deletingLastPathComponent())
+        XCTAssertNil(state.projectURL)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-feature-reset-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
 
         let incomingRevision = ProjectRevision(model: .bracket, preview: preview(path: "loaded-preview"), parts: parts())
         let incoming = LADProject(messages: [], revisions: [incomingRevision], selectedRevisionID: incomingRevision.id,

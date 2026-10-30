@@ -5,6 +5,30 @@ import XCTest
 
 final class ProjectWindowUnsavedTests: XCTestCase {
     @MainActor
+    func testClosingUnrequestedProjectDoesNotCreateFileOrOfferQuitRecovery() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: fixture.saveDirectory))
+        state.start(restoringRecent: false)
+        state.prompt = "An unsent first request"
+        let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { _ in
+            XCTFail("A design without a submitted request must not need quit recovery")
+            return false
+        })
+        let id = UUID()
+        coordinator.register(state, id: id, sourceURL: nil)
+        coordinator.windowClosed(id)
+
+        let shouldQuit = await coordinator.prepareToQuit()
+
+        XCTAssertTrue(shouldQuit)
+        XCTAssertNil(state.projectURL)
+        XCTAssertNil(state.saveStatus)
+        XCTAssertFalse(state.hasUnsavedChanges)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: fixture.directory.path).isEmpty)
+    }
+
+    @MainActor
     func testClosingRenamedExternalDesignDoesNotReserveItsFormerPath() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
@@ -226,6 +250,7 @@ final class ProjectWindowUnsavedTests: XCTestCase {
         func state() -> AppState {
             let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: saveDirectory))
             state.start(restoringRecent: false)
+            state.newProjectWithSubmittedRequest()
             state.prompt = "Latest unsaved draft"
             return state
         }

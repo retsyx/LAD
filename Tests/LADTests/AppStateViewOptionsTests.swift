@@ -8,7 +8,7 @@ final class AppStateViewOptionsTests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let first = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory))
-        first.newProject()
+        first.newProjectWithSubmittedRequest()
         first.projectionMode = .isometric
         first.displayMode = .translucent
         first.showGrid = false
@@ -16,7 +16,7 @@ final class AppStateViewOptionsTests: XCTestCase {
         let firstURL = try XCTUnwrap(first.projectURL)
 
         let second = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory))
-        second.newProject()
+        second.newProjectWithSubmittedRequest()
         second.displayMode = .wireframe
         await second.prepareToQuit()
         let secondURL = try XCTUnwrap(second.projectURL)
@@ -49,7 +49,7 @@ final class AppStateViewOptionsTests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory))
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         state.projectionMode = .isometric
         state.displayMode = .translucent
         state.showGrid = false
@@ -61,7 +61,8 @@ final class AppStateViewOptionsTests: XCTestCase {
         XCTAssertEqual(state.projectionMode, .perspective)
         XCTAssertEqual(state.displayMode, .edges)
         XCTAssertTrue(state.showGrid)
-        XCTAssertNotEqual(state.projectURL, previousURL)
+        XCTAssertNil(state.projectURL)
+        XCTAssertFalse(state.hasUnsavedChanges)
         XCTAssertEqual(try ProjectStore.read(from: previousURL).projectionMode, .isometric)
         XCTAssertEqual(try ProjectStore.read(from: previousURL).displayMode, .translucent)
     }

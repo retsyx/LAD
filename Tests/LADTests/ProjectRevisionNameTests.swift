@@ -8,7 +8,7 @@ final class ProjectRevisionNameTests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory))
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         state.revisions = (0..<4).map { _ in ProjectRevision(model: .bracket) }
         let ids = state.revisions.map(\.id)
         XCTAssertEqual(ids.map { state.revisionName(for: $0) }, ["v1", "v2", "v3", "v4"])
@@ -28,13 +28,13 @@ final class ProjectRevisionNameTests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory))
-        state.newProject()
+        state.newProjectWithSubmittedRequest("Build an enclosure")
         let preview = preview()
         var firstModel = ModelSpec.bracket
         firstModel.title = "First enclosure"
         var latestModel = ModelSpec.bracket
         latestModel.title = "Latest enclosure"
-        let user = ChatMessage(role: "user", content: "Build an enclosure")
+        let user = try XCTUnwrap(state.messages.first)
         let response = ChatMessage(role: "assistant", content: "The enclosure is ready.", phase: "final_answer")
         let first = ProjectRevision(model: firstModel, date: Date(timeIntervalSinceReferenceDate: 1), preview: preview)
         let latest = ProjectRevision(model: latestModel, date: Date(timeIntervalSinceReferenceDate: 2), preview: preview,
@@ -98,7 +98,7 @@ final class ProjectRevisionNameTests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory))
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         let first = ProjectRevision(model: .bracket, name: "Initial design")
         let last = ProjectRevision(model: .bracket)
         state.revisions = [first, last]

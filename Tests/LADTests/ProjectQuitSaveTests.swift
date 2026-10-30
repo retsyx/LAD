@@ -9,7 +9,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         let fixture = try Fixture(unavailable: true)
         defer { fixture.cleanUp() }
         let state = fixture.state()
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         state.prompt = "Recovered draft"
         await state.prepareToQuit()
         let target = fixture.directory.appendingPathComponent("Recovered.lad")
@@ -27,7 +27,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         let fixture = try Fixture(unavailable: true)
         defer { fixture.cleanUp() }
         let state = fixture.state()
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         state.prompt = "Keep this draft"
         await state.prepareToQuit()
         let canceled = await ProjectQuitSave.save(state, chooseAction: { _ in .cancel }, chooseURL: { _ in
@@ -52,7 +52,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         let fixture = try Fixture(unavailable: true)
         defer { fixture.cleanUp() }
         let state = fixture.state()
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         state.prompt = "Keep this draft after the failed autosave"
         await state.prepareToQuit()
 
@@ -152,7 +152,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let state = fixture.state()
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         await state.prepareToQuit()
         let originalURL = try XCTUnwrap(state.projectURL)
 
@@ -185,7 +185,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         let fixture = try Fixture(unavailable: true)
         defer { fixture.cleanUp() }
         let state = fixture.state()
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         state.prompt = "Preserve this draft after an unsuccessful recovery write"
         await state.prepareToQuit()
         let invalidDestination = fixture.directory.appendingPathComponent("missing-destination/Recovered.lad")
@@ -212,7 +212,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         let fixture = try Fixture(unavailable: true)
         defer { fixture.cleanUp() }
         let state = fixture.state()
-        state.newProject()
+        state.newProjectWithSubmittedRequest()
         state.prompt = "Earlier draft"
         await state.prepareToQuit()
         let destination = fixture.directory.appendingPathComponent("Latest draft.lad")
