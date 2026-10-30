@@ -15,6 +15,7 @@ enum CADStrokeGeometry {
     float cadEdgeViewportHeight;
     #pragma body
     float cadEdgeWidth = \(Float(normalWidth));
+    float4 cadViewPosition = scn_node.modelViewTransform * _geometry.position;
     float4 cadClip = scn_node.modelViewProjectionTransform * _geometry.position;
     float4 cadDirection = scn_node.modelViewProjectionTransform * float4(_geometry.normal, 0.0);
     float2 cadPixels = (cadDirection.xy * cadClip.w - cadClip.xy * cadDirection.w) * scn_frame.viewportSize.xy;
@@ -23,13 +24,28 @@ enum CADStrokeGeometry {
         float2 cadAlong = cadPixels * rsqrt(cadLengthSquared);
         float2 cadAcross = float2(-cadAlong.y, cadAlong.x);
         float cadScale = scn_frame.viewportSize.y / max(cadEdgeViewportHeight, 1.0);
-        float2 cadOffset = cadAcross * _geometry.texcoords[0].x + cadAlong * _geometry.texcoords[0].y;
-        float2 cadClipOffset = cadOffset * cadEdgeWidth * cadScale * scn_frame.inverseResolution * cadClip.w;
         // Square caps extend the endpoint along the projected edge. Extend
         // its depth by the same tangent, otherwise every curved-edge joint
         // cuts into the surface and leaves a tooth in the expanded stroke.
         float cadDepthTangent = (cadDirection.z * cadClip.w - cadClip.z * cadDirection.w) * rsqrt(cadLengthSquared);
-        float cadDepthOffset = _geometry.texcoords[0].y * cadEdgeWidth * cadScale * cadDepthTangent * cadClip.w;
+        float cadCapDepth = cadEdgeWidth * cadScale * cadDepthTangent * cadClip.w;
+        // A nearly view-aligned edge has an unbounded depth tangent. Shrink
+        // the cap along that same tangent before it can project hidden edges
+        // through a solid face. Bound it to eight times its view-space width,
+        // matching the adjacent-plane slope limit below. Retain the full
+        // across-edge width and the cap's actual depth direction.
+        float cadCapDepthGradient = (scn_frame.projectionTransform[2][2] * cadClip.w
+            - scn_frame.projectionTransform[2][3] * cadClip.z) / cadClip.w;
+        float cadCapFootprint = abs(cadClip.w) * cadEdgeWidth * cadScale * scn_frame.inverseResolution.y
+            / max(abs(scn_frame.projectionTransform[1][1]), 1e-8);
+        float cadCapDepthLimit = 8.0 * cadCapFootprint * abs(cadCapDepthGradient);
+        float cadCapWeight = abs(cadCapDepth) > cadCapDepthLimit
+            ? cadCapDepthLimit / abs(cadCapDepth) : 1.0;
+        float cadBoundedCapDepth = clamp(cadCapDepth, -cadCapDepthLimit, cadCapDepthLimit);
+        float cadCap = _geometry.texcoords[0].y * cadCapWeight;
+        float2 cadOffset = cadAcross * _geometry.texcoords[0].x + cadAlong * cadCap;
+        float2 cadClipOffset = cadOffset * cadEdgeWidth * cadScale * scn_frame.inverseResolution * cadClip.w;
+        float cadDepthOffset = _geometry.texcoords[0].y * cadBoundedCapDepth;
         // Match the actual adjacent triangle planes across the complete width
         // too. Keeping a wide ribbon at centerline depth lets curved faces
         // cut repeated teeth into its inner edge. These cached planes use the
@@ -39,7 +55,7 @@ enum CADStrokeGeometry {
             float3(_geometry.texcoords[2].y, _geometry.texcoords[3])
         };
         float3 cadEye = scn_frame.projectionTransform[3][3] == 0.0
-            ? normalize(-(scn_node.modelViewTransform * _geometry.position).xyz) : float3(0.0, 0.0, 1.0);
+            ? normalize(-cadViewPosition.xyz) : float3(0.0, 0.0, 1.0);
         bool cadHasSurface = false;
         for (int cadFace = 0; cadFace < 2; ++cadFace) {
             float3 cadNormal = cadSurfaceNormals[cadFace];
@@ -59,7 +75,7 @@ enum CADStrokeGeometry {
                 // Ease back to the conservative centerline at silhouettes;
                 // switching the full correction on abruptly makes a notch.
                 float cadWeight = smoothstep(0.125, 0.25, cadFacing);
-                float cadFallback = _geometry.texcoords[0].y * cadEdgeWidth * cadScale * cadDepthTangent * cadClip.w;
+                float cadFallback = _geometry.texcoords[0].y * cadBoundedCapDepth;
                 cadSurfaceDepth = mix(cadFallback, cadSurfaceDepth, cadWeight);
                 cadDepthOffset = cadHasSurface ? max(cadDepthOffset, cadSurfaceDepth) : cadSurfaceDepth;
                 cadHasSurface = true;
@@ -67,10 +83,14 @@ enum CADStrokeGeometry {
         }
         cadClip.z += cadDepthOffset;
         cadClip.xy += cadClipOffset;
-        // Keep the stroke above its own tessellated face after the inverse
-        // transform round trip. This tiny clip-depth offset retains testing
-        // against genuinely nearer faces, rather than drawing through solids.
-        cadClip.z += 2e-6 * cadClip.w;
+        // Bound the precision allowance in view space. A constant normalized
+        // depth offset grows quadratically with distance under reverse-Z
+        // perspective and can pull hidden edges through a smooth front face.
+        // Convert a small relative view-depth allowance through the projection
+        // derivative, retaining the projection's actual depth direction.
+        float cadDepthGradient = (scn_frame.projectionTransform[2][2] * cadClip.w
+            - scn_frame.projectionTransform[2][3] * cadClip.z) / cadClip.w;
+        cadClip.z += 2e-6 * abs(cadViewPosition.z) * cadDepthGradient;
         _geometry.position = scn_node.inverseModelViewProjectionTransform * cadClip;
     }
     """
