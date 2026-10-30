@@ -419,6 +419,14 @@ struct WorkspaceView: View {
         let editingRequestID = state.editingQueuedRequestID
         let submissionLabel = editingRequestID != nil ? "Save queued request" :
             state.submissionWillQueue ? "Queue request" : state.awaitingResponse ? "Send reply" : "Generate design"
+        let canSubmit = !state.isReadingPromptAttachments && (editingRequestID != nil ? state.canCommitQueuedRequest :
+            !state.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !state.pendingAttachments.isEmpty)
+        let submitRequest = {
+            // A removed or replaced queued edit must not turn a stale action
+            // into sending the restored draft.
+            guard state.editingQueuedRequestID == editingRequestID else { return }
+            state.submit()
+        }
         return VStack(spacing: 10) {
             VStack(spacing: 5) {
                 if state.editingQueuedRequestID != nil {
@@ -467,7 +475,11 @@ struct WorkspaceView: View {
                     }
                     PromptTextEditor(text: $state.prompt, isFocused: promptFocused,
                         onFocus: { promptFocused = true }, onBlur: { promptFocused = false },
-                        onAttachFiles: { state.attachSourceFiles(urls: $0) }, onAttachImages: { state.attachPromptImages($0) })
+                        onAttachFiles: { state.attachSourceFiles(urls: $0) }, onAttachImages: { state.attachPromptImages($0) },
+                        onSubmit: submitRequest, onDispatchNextQueuedRequest: {
+                            if let next = state.queuedRequests.first { state.sendQueuedRequestNow(id: next.id) }
+                            else { submitRequest() }
+                        })
                         .frame(height: 78)
                         .accessibilityLabel("Design prompt")
                 }
@@ -489,20 +501,13 @@ struct WorkspaceView: View {
                             Image(systemName: "stop.fill").font(.system(size: 11)).frame(width: 20, height: 22)
                         }.controlSize(.small).buttonStyle(.bordered).help("Stop current request").accessibilityLabel("Stop")
                     }
-                    Button {
-                        // A removed or replaced queued edit must not turn a
-                        // stale Save click into sending the restored draft.
-                        guard state.editingQueuedRequestID == editingRequestID else { return }
-                        if editingRequestID != nil { state.commitEditingQueuedRequest() }
-                        else { state.submit() }
-                    } label: {
+                    Button(action: submitRequest) {
                         Image(systemName: state.editingQueuedRequestID == nil ? "arrow.up" : "checkmark")
                             .font(.system(size: 13, weight: .semibold)).frame(width: 20, height: 22)
                     }
-                        .buttonStyle(.borderedProminent).keyboardShortcut(.return, modifiers: .command)
-                        .disabled(state.isReadingPromptAttachments || (state.editingQueuedRequestID != nil ? !state.canCommitQueuedRequest :
-                                  state.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && state.pendingAttachments.isEmpty))
-                        .help("\(submissionLabel) (⌘Return)")
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canSubmit)
+                        .help("\(submissionLabel) (\(state.queuedRequests.isEmpty ? "Return or ⌘Return" : "Return"))")
                         .accessibilityLabel(submissionLabel)
                         .accessibilityIdentifier("projectSubmitRequest")
                 }

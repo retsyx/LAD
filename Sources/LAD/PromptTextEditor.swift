@@ -76,6 +76,8 @@ struct PromptTextEditor: NSViewRepresentable {
     var onBlur: @MainActor () -> Void
     var onAttachFiles: @MainActor ([URL]) -> Void
     var onAttachImages: @MainActor ([PromptImagePayload]) -> Void
+    var onSubmit: (@MainActor () -> Void)? = nil
+    var onDispatchNextQueuedRequest: (@MainActor () -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -121,6 +123,7 @@ struct PromptTextEditor: NSViewRepresentable {
         guard let editor = scroll.documentView as? PromptTextView else { return }
         editor.onFocus = nil; editor.onBlur = nil
         editor.onAttachFiles = nil; editor.onAttachImages = nil
+        editor.onSubmit = nil; editor.onDispatchNextQueuedRequest = nil
         editor.delegate = nil
         coordinator.editor = nil
     }
@@ -129,6 +132,7 @@ struct PromptTextEditor: NSViewRepresentable {
         coordinator.writeText = { text = $0 }
         editor.onFocus = onFocus; editor.onBlur = onBlur
         editor.onAttachFiles = onAttachFiles; editor.onAttachImages = onAttachImages
+        editor.onSubmit = onSubmit; editor.onDispatchNextQueuedRequest = onDispatchNextQueuedRequest
         if editor.string != text {
             let range = editor.selectedRange()
             editor.string = text
@@ -173,6 +177,45 @@ final class PromptTextView: NSTextView {
     var onBlur: (() -> Void)?
     var onAttachFiles: (([URL]) -> Void)?
     var onAttachImages: (([PromptImagePayload]) -> Void)?
+    var onSubmit: (() -> Void)?
+    var onDispatchNextQueuedRequest: (() -> Void)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if window?.firstResponder === self, !hasMarkedText(), isReturn(event),
+           requestModifiers(event) == .command {
+            onDispatchNextQueuedRequest?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // Let the input method confirm composed text before interpreting a
+        // Return as a request action.
+        if !hasMarkedText(), isReturn(event) {
+            switch requestModifiers(event) {
+            case []:
+                onSubmit?()
+                return
+            case .option:
+                insertNewline(nil)
+                return
+            case .command:
+                onDispatchNextQueuedRequest?()
+                return
+            default: break
+            }
+        }
+        super.keyDown(with: event)
+    }
+
+    private func isReturn(_ event: NSEvent) -> Bool {
+        event.keyCode == 36 || event.keyCode == 76
+    }
+
+    private func requestModifiers(_ event: NSEvent) -> NSEvent.ModifierFlags {
+        event.modifierFlags.intersection([.command, .option, .control, .shift])
+    }
 
     override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
         PromptAttachmentPasteboard.draggedTypes + super.readablePasteboardTypes.filter {

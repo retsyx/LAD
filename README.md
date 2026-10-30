@@ -92,7 +92,9 @@ Drop a `.lad` file on a design window's title bar, viewer, parts tree or convers
 | Zoom toward the gesture anchor | Trackpad pinch |
 | Fit design | `F`, toolbar, or `⌘F` |
 | Isometric / front / top / right | `0` / `1` / `2` / `3` with viewport focused, or Design menu |
-| Submit prompt | `⌘Return` |
+| Submit prompt | `Return` |
+| New line in prompt | `⌥Return` |
+| Add next queued request to the current request, or submit prompt when the queue is empty | `⌘Return` |
 | Save New / open design | `⌘S` / `⌘O` |
 | Save design as | `⇧⌘S` |
 | Export STEP | `⇧⌘E` |

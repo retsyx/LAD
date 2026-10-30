@@ -31,7 +31,8 @@ struct ProjectRequestQueueView: View {
                 VStack(spacing: 6) {
                     ForEach(Array(state.queuedRequests.enumerated()), id: \.element.id) { index, request in
                         ProjectQueuedRequestCard(state: state, request: request,
-                                                 nextID: state.queuedRequests.dropFirst(index + 1).first?.id)
+                                                 nextID: state.queuedRequests.dropFirst(index + 1).first?.id,
+                                                 isNext: index == 0)
                     }
                 }
                 .background(GeometryReader { geometry in
@@ -56,6 +57,7 @@ private struct ProjectQueuedRequestCard: View {
     @ObservedObject var state: AppState
     let request: ProjectQueuedRequest
     let nextID: UUID?
+    let isNext: Bool
     @State private var rowHeight: CGFloat = 44
     @State private var dropEdge: ProjectQueueDropEdge?
 
@@ -94,8 +96,10 @@ private struct ProjectQueuedRequestCard: View {
                             .scaleEffect(x: 1, y: -1).frame(width: 20, height: 20)
                     }
                     .buttonStyle(.plain).foregroundStyle(Palette.muted)
+                    .keyboardShortcut(isNext ? KeyboardShortcut(.return, modifiers: .command) : nil)
                     .disabled(!state.canSteerQueuedRequests || isPreparing || state.editingQueuedRequestID != nil)
-                    .help("Add to current request").accessibilityLabel("Add queued request to current request")
+                    .help(isNext ? "Add to current request (⌘Return)" : "Add to current request")
+                    .accessibilityLabel("Add queued request to current request")
                 }
                 if !isEditing {
                     Button { beginEditing() } label: { Image(systemName: "pencil").font(.system(size: 10)).frame(width: 20, height: 20) }
