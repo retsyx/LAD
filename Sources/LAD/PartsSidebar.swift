@@ -216,7 +216,7 @@ private struct PartTreeItem: View {
                         if partiallyHidden {
                             Image(systemName: "minus.circle.fill").font(.system(size: 7))
                                 .symbolRenderingMode(.palette)
-                                .foregroundStyle(Palette.accent, Palette.panel)
+                                .foregroundStyle(Palette.panel, Palette.accent)
                                 .offset(x: 3, y: 3)
                         }
                     }
@@ -259,7 +259,7 @@ private struct PartTreeItem: View {
                 if selection.isPartial {
                     Image(systemName: "minus.circle.fill").font(.system(size: 7))
                         .symbolRenderingMode(.palette)
-                        .foregroundStyle(Palette.accent, Palette.panel)
+                        .foregroundStyle(Palette.panel, Palette.accent)
                         .offset(x: 3, y: 3)
                 }
             }
