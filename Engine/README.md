@@ -19,6 +19,12 @@ CAD payload under `.build/cad-runtime/arm64`. The app
 provisions its own versioned runtime under `~/Library/Application Support/LAD/Runtimes`
 from that payload and does not depend on the checkout.
 
+Provisioning warms CadQuery and its dependencies once in the private installed
+runtime, generating bytecode caches before marking it ready. Existing installs
+without the warmup marker are warmed offline on their next use. Ordinary CAD
+workers read those caches while keeping bytecode writes disabled; caches are
+not included in the downloadable payload.
+
 ```sh
 .build/cad-runtime/arm64/expanded/python/bin/python3 Engine/worker.py \
   --request Examples/mounting-bracket.json \

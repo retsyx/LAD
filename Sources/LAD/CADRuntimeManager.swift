@@ -142,7 +142,10 @@ enum CADRuntimeInstaller {
         let python = destination.appendingPathComponent("venv/bin/python")
         let marker = destination.appendingPathComponent(".ready")
         if (try? String(contentsOf: marker, encoding: .utf8)) == payload.sha256,
-           manager.isExecutableFile(atPath: python.path) { return python.path }
+           manager.isExecutableFile(atPath: python.path) {
+            try warmBytecode(python: python, directory: destination, payloadHash: payload.sha256)
+            return python.path
+        }
 
         let archive = payloadDirectory.appendingPathComponent(payload.archive)
         guard try fileHash(archive) == payload.sha256 else {
@@ -183,10 +186,23 @@ enum CADRuntimeInstaller {
         if manager.fileExists(atPath: destination.path) { try manager.removeItem(at: destination) }
         try manager.moveItem(at: staging, to: destination)
         promoted = true
-        try run(python, ["-I", "-B", "-c", "import cadquery as cq, OCP, numpy, ssl, venv; assert cq.Workplane('XY').box(2,3,4).val().Volume() > 23.99"], in: destination)
+        try warmBytecode(python: python, directory: destination, payloadHash: payload.sha256)
         try payload.sha256.write(to: marker, atomically: true, encoding: .utf8)
         completed = true
         return python.path
+    }
+
+    private static func warmBytecode(python: URL, directory: URL, payloadHash: String) throws {
+        let marker = directory.appendingPathComponent(".bytecode-ready")
+        let identity = "1:\(payloadHash)"
+        guard (try? String(contentsOf: marker, encoding: .utf8)) != identity else { return }
+        // Warm the installed CAD dependency tree once, including existing runtimes
+        // from earlier app builds. -I ignores ambient Python settings; omit -B
+        // here so imports can cache bytecode in this private installation.
+        // Ordinary CAD workers continue to disable writes. No bundle files change.
+        try run(python, ["-I", "-c", "import cadquery as cq, OCP, numpy, ssl, venv; assert cq.Workplane('XY').box(2,3,4).val().Volume() > 23.99"],
+                in: directory, allowBytecodeWrites: true)
+        try identity.write(to: marker, atomically: true, encoding: .utf8)
     }
 
     private static func fileHash(_ file: URL) throws -> String {
@@ -199,7 +215,7 @@ enum CADRuntimeInstaller {
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func run(_ executable: URL, _ arguments: [String], in directory: URL) throws {
+    private static func run(_ executable: URL, _ arguments: [String], in directory: URL, allowBytecodeWrites: Bool = false) throws {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
@@ -217,6 +233,7 @@ enum CADRuntimeInstaller {
         process.environment = ["PATH": "/usr/bin:/bin", "HOME": temporary.path, "TMPDIR": temporary.path,
                                "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1", "LANG": "en_US.UTF-8",
                                "MPLCONFIGDIR": temporary.path, "XDG_CACHE_HOME": temporary.path]
+        if allowBytecodeWrites { process.environment?.removeValue(forKey: "PYTHONDONTWRITEBYTECODE") }
         try process.run()
         let deadline = Date().addingTimeInterval(600)
         while process.isRunning {

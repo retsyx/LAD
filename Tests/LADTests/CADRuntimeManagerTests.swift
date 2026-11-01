@@ -91,6 +91,10 @@ final class CADRuntimeManagerTests: XCTestCase {
         XCTAssertEqual(manager.phase, .ready)
         let python = URL(fileURLWithPath: paths[0])
         let installed = python.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let bytecodeMarker = installed.appendingPathComponent(".bytecode-ready")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bytecodeMarker.path))
+        let caches = installed.appendingPathComponent("python/lib/python3.11/site-packages/cadquery/__pycache__")
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: caches.path).contains { $0.hasPrefix("__init__.") && $0.hasSuffix(".pyc") })
         let config = try String(contentsOf: installed.appendingPathComponent("venv/pyvenv.cfg"))
         XCTAssertTrue(config.contains(installed.appendingPathComponent("python/bin").path))
         XCTAssertFalse(config.contains(".install-"))
@@ -98,12 +102,26 @@ final class CADRuntimeManagerTests: XCTestCase {
         // A new process/manager must reuse a complete installation without its
         // archive, network, source checkout interpreter or environment setup.
         try FileManager.default.removeItem(at: copiedPayload.appendingPathComponent("payload.tar.gz"))
+        // Existing installations lacking the warmup marker are upgraded offline.
+        try FileManager.default.removeItem(at: bytecodeMarker)
         let reopened = CADRuntimeManager(payloadDirectory: copiedPayload, installationRoot: root)
         let reopenedPath = try await reopened.ensureReady()
         XCTAssertEqual(reopenedPath, paths[0])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bytecodeMarker.path))
         let process = Process(), output = Pipe()
         process.executableURL = python
-        process.arguments = ["-I", "-B", "-c", "import cadquery,sys; print(sys.base_prefix); print(cadquery.__file__)"]
+        process.arguments = ["-I", "-B", "-c", """
+        import builtins, sys
+        original_compile = builtins.compile
+        def check_compile(source, filename, *args, **kwargs):
+            if filename.endswith('.py'):
+                raise AssertionError('Unexpected source compilation: ' + filename)
+            return original_compile(source, filename, *args, **kwargs)
+        builtins.compile = check_compile
+        import cadquery
+        print(sys.base_prefix)
+        print(cadquery.__file__)
+        """]
         process.environment = ["PATH": "/usr/bin:/bin"]
         process.standardOutput = output
         try process.run()
