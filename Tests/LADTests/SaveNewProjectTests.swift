@@ -5,7 +5,7 @@ import XCTest
 final class SaveNewProjectTests: XCTestCase {
     private let step = Data("ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n".utf8)
 
-    func testLatestModelAndItsLegacyTurnExcludeCommentaryAndLaterFailedRequest() throws {
+    func testLatestModelStartsWithNoConversationEvenWhenAnotherRevisionIsSelected() throws {
         let first = ProjectRevision(model: .bracket, date: date(10))
         var model = ModelSpec.bracket
         model.summary = "Added connector openings."
@@ -27,16 +27,98 @@ final class SaveNewProjectTests: XCTestCase {
         let result = try SaveNewProject.snapshot(from: original)
         XCTAssertEqual(result.revisions.map(\.id), [latest.id])
         XCTAssertEqual(result.selectedRevisionID, latest.id)
-        XCTAssertEqual(result.messages, [user, response])
-        XCTAssertEqual(result.revisions[0].userMessageID, user.id)
-        XCTAssertEqual(result.revisions[0].responseMessageID, response.id)
+        XCTAssertTrue(result.messages.isEmpty)
+        XCTAssertNil(result.revisions[0].userMessageID)
+        XCTAssertNil(result.revisions[0].responseMessageID)
         XCTAssertNotEqual(result.projectID, original.projectID)
         XCTAssertEqual(original.messages.count, 9)
         XCTAssertEqual(original.revisions.count, 2)
         XCTAssertEqual(original.selectedRevisionID, first.id)
     }
 
-    func testExplicitTurnLinksSurviveZIPRoundtripAndPruneUnrelatedAssets() throws {
+    func testSpecifiedHistoricalRevisionKeepsRequiredGeometryAndMetadataWithCleanConversation() throws {
+        let historicalSource = source("historical source", name: "first.py")
+        let laterSource = source("later source", name: "later.py")
+        let user = message("user", "Create the first design", at: 1, attachments: [historicalSource])
+        let response = message("assistant", "First design ready.", at: 10, phase: "final_answer")
+        let laterUser = message("user", "Make a later design", at: 11, attachments: [laterSource])
+        let laterResponse = message("assistant", "Later design ready.", at: 20, phase: "final_answer")
+        let input = CADInputAsset(id: "reference", name: "reference.step", format: "step", data: step)
+        var model = ModelSpec.bracket
+        model.script = "result = imported_assets['reference']"
+        model.inputAssets = [input]
+        let parts = [PartNode(id: "case", name: "Case", solidIndices: [], children: [
+            PartNode(id: "base", name: "Base", solidIndices: [0])
+        ])]
+        let layout = PartLayout(nodes: parts, collapsedNodeIDs: ["case"])
+        let runtime = CADRuntime(python: "3.11.18", cadquery: "2.8.0", ocp: "7.9.3")
+        let historical = ProjectRevision(model: model, date: date(10), stepData: step,
+                                         partLayout: layout, hiddenSolids: [0], parts: parts, runtime: runtime,
+                                         userMessageID: user.id, responseMessageID: response.id,
+                                         partColors: ["base": PartColor(red: 0.2, green: 0.4, blue: 0.6)],
+                                         name: "First enclosure", validatedHash: String(repeating: "a", count: 64))
+        let latest = ProjectRevision(model: .bracket, date: date(20), userMessageID: laterUser.id,
+                                     responseMessageID: laterResponse.id)
+        let audit = ProjectTaskAudit(userMessageID: user.id, model: "first-model", reasoningEffort: "high",
+                                     status: "completed", events: [])
+        let laterAudit = ProjectTaskAudit(userMessageID: laterUser.id, model: "later-model", reasoningEffort: "low",
+                                          status: "completed", events: [])
+        let original = LADProject(messages: [user, response, laterUser, laterResponse],
+                                  revisions: [historical, latest], selectedRevisionID: latest.id,
+                                  projectID: UUID(), projectName: "Existing design", showGrid: false,
+                                  projectionMode: .isometric, displayMode: .translucent, taskAudits: [audit, laterAudit],
+                                  queuedRequests: [ProjectQueuedRequest(content: "Another change", attachments: [laterSource])],
+                                  draftPrompt: "Unsent draft", draftAttachments: [laterSource], queuePaused: true)
+
+        let snapshot = try SaveNewProject.snapshot(from: original, revisionID: historical.id)
+        let restored = try ProjectStore.decode(ProjectStore.encode(snapshot))
+        XCTAssertEqual(restored.revisions.count, 1)
+        let saved = try XCTUnwrap(restored.revisions.first)
+        XCTAssertEqual(saved.id, historical.id)
+        XCTAssertEqual(saved.model, historical.model)
+        XCTAssertEqual(saved.name, historical.name)
+        XCTAssertEqual(saved.partLayout, layout)
+        XCTAssertEqual(saved.parts, parts)
+        XCTAssertEqual(saved.hiddenSolids, [0])
+        XCTAssertEqual(saved.partColors, historical.partColors)
+        XCTAssertEqual(saved.runtime, runtime)
+        XCTAssertEqual(saved.validatedHash, historical.validatedHash)
+        XCTAssertNil(saved.stepData)
+        XCTAssertNil(saved.preview)
+        XCTAssertEqual(restored.selectedRevisionID, historical.id)
+        XCTAssertTrue(restored.messages.isEmpty)
+        XCTAssertNil(saved.userMessageID)
+        XCTAssertNil(saved.responseMessageID)
+        XCTAssertNil(restored.taskAudits)
+        XCTAssertNil(restored.queuedRequests)
+        XCTAssertNil(restored.draftPrompt)
+        XCTAssertNil(restored.draftAttachments)
+        XCTAssertNil(restored.queuePaused)
+        XCTAssertEqual(restored.showGrid, false)
+        XCTAssertEqual(restored.projectionMode, .isometric)
+        XCTAssertEqual(restored.displayMode, .translucent)
+        XCTAssertNotEqual(restored.projectID, original.projectID)
+        XCTAssertEqual(original.selectedRevisionID, latest.id)
+        XCTAssertEqual(original.revisions.count, 2)
+        XCTAssertEqual(original.messages.count, 4)
+        XCTAssertNotNil(original.revisions[0].stepData)
+        let manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectZIP.decode(ProjectStore.encode(snapshot))) as? [String: Any])
+        let assets = try XCTUnwrap(manifest["assets"] as? [String: String])
+        XCTAssertNil(assets[historicalSource.sha256])
+        XCTAssertNil(assets[laterSource.sha256])
+        XCTAssertNil(assets[digest(Data(latest.model.script.utf8))])
+        XCTAssertNotNil(assets[digest(step)])
+    }
+
+    func testMissingRequestedRevisionCannotFallBackToLatest() {
+        let latest = ProjectRevision(model: .bracket)
+        let original = LADProject(messages: [], revisions: [latest], selectedRevisionID: latest.id)
+        XCTAssertThrowsError(try SaveNewProject.snapshot(from: original, revisionID: UUID())) {
+            XCTAssertEqual($0.localizedDescription, "That design version is no longer available.")
+        }
+    }
+
+    func testOnlyRequiredGeometrySurvivesZIPRoundtripWithoutConversationAssets() throws {
         let oldSource = source("obsolete board", name: "old.kicad_pcb")
         let currentSource = source("current board", name: "board.kicad_pcb")
         let user = message("user", "Build an enclosure around this board", at: 10, attachments: [currentSource])
@@ -73,12 +155,12 @@ final class SaveNewProjectTests: XCTestCase {
         let bytes = try ProjectStore.encode(snapshot)
         XCTAssertEqual(bytes.prefix(4), Data([0x50, 0x4B, 0x03, 0x04]))
         let restored = try ProjectStore.decode(bytes)
-        XCTAssertEqual(restored.messages, [user, response])
+        XCTAssertTrue(restored.messages.isEmpty)
         XCTAssertEqual(restored.revisions.count, 1)
         let saved = try XCTUnwrap(restored.revisions.first)
         XCTAssertEqual(saved.model, model)
-        XCTAssertEqual(saved.userMessageID, user.id)
-        XCTAssertEqual(saved.responseMessageID, response.id)
+        XCTAssertNil(saved.userMessageID)
+        XCTAssertNil(saved.responseMessageID)
         XCTAssertEqual(saved.parts, parts)
         XCTAssertEqual(saved.partLayout, layout)
         XCTAssertEqual(saved.hiddenSolids, [0])
@@ -94,41 +176,12 @@ final class SaveNewProjectTests: XCTestCase {
 
         let manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectZIP.decode(bytes)) as? [String: Any])
         let assets = try XCTUnwrap(manifest["assets"] as? [String: String])
-        XCTAssertEqual(Set(assets.keys), Set([digest(step), digest(Data(model.script.utf8)), currentSource.sha256]))
+        XCTAssertEqual(Set(assets.keys), Set([digest(step), digest(Data(model.script.utf8))]))
         XCTAssertNil(assets[oldSource.sha256])
+        XCTAssertNil(assets[currentSource.sha256])
         XCTAssertNil(assets[digest(Data(oldModel.script.utf8))])
         XCTAssertEqual(original.messages.count, 5)
         XCTAssertNotNil(original.revisions.last?.stepData)
-    }
-
-    func testFinalAnswerFallbackUsesCommitBoundsInsteadOfLaterResponses() throws {
-        let user = message("user", "Make a bracket", at: 10)
-        let response = message("assistant", "Created the requested bracket.", at: 20.001, phase: "final_answer")
-        let revision = ProjectRevision(model: .bracket, date: date(20))
-        let original = LADProject(messages: [
-            user,
-            message("assistant", revision.model.summary, at: 12, phase: "commentary"),
-            response,
-            message("user", "Make it larger", at: 30),
-            message("assistant", revision.model.summary, at: 40, phase: "final_answer")
-        ], revisions: [revision], selectedRevisionID: revision.id)
-        XCTAssertEqual(try SaveNewProject.snapshot(from: original).messages, [user, response])
-    }
-
-    func testUnmatchedOrInvalidConversationProducesModelOnlyWithoutInventingPrompt() throws {
-        var revision = ProjectRevision(model: .bracket, date: date(20))
-        revision.userMessageID = UUID()
-        revision.responseMessageID = UUID()
-        let original = LADProject(messages: [
-            message("assistant", "Welcome to LAD", at: 1),
-            message("user", "A later unsuccessful request", at: 30),
-            message("assistant", revision.model.summary, at: 31, phase: "commentary")
-        ], revisions: [revision], selectedRevisionID: revision.id)
-        let result = try SaveNewProject.snapshot(from: original)
-        XCTAssertTrue(result.messages.isEmpty)
-        XCTAssertEqual(result.revisions.first?.model, revision.model)
-        XCTAssertNil(result.revisions.first?.userMessageID)
-        XCTAssertNil(result.revisions.first?.responseMessageID)
     }
 
     func testEmptyProjectCannotBeSaved() {

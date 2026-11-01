@@ -1587,10 +1587,10 @@ final class AppState: ObservableObject {
         }
     }
 
-    func saveNewProject() {
+    func saveNewProject(revisionID: UUID? = nil) {
         guard canSaveNew else { return }
         let snapshot: LADProject
-        do { snapshot = try SaveNewProject.snapshot(from: projectSnapshot()) }
+        do { snapshot = try SaveNewProject.snapshot(from: projectSnapshot(), revisionID: revisionID) }
         catch { self.error = error.localizedDescription; return }
         let sessionID = projectSessionID, sourceID = projectID, sourceURL = projectURL
         let panel = NSSavePanel()

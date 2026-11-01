@@ -61,11 +61,11 @@ final class ProjectRequestQueueStorageTests: XCTestCase {
         let restored = try ProjectStore.decode(ProjectStore.encode(project))
         XCTAssertEqual(restored.taskAudits?.first?.additionalUserMessageIDs, [supplement.id])
         let copy = try SaveNewProject.snapshot(from: restored)
-        XCTAssertEqual(copy.messages.map(\.id), [user.id, response.id])
+        XCTAssertTrue(copy.messages.isEmpty)
         XCTAssertNil(copy.queuedRequests)
         XCTAssertNil(copy.draftPrompt)
         XCTAssertNil(copy.draftAttachments)
-        XCTAssertNil(copy.taskAudits?.first?.additionalUserMessageIDs)
+        XCTAssertNil(copy.taskAudits)
         XCTAssertNoThrow(try ProjectStore.encode(copy))
         project.taskAudits?[0].additionalUserMessageIDs = [response.id]
         XCTAssertThrowsError(try ProjectStore.encode(project), "A supplemental input must reference an actual user message.")

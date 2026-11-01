@@ -146,7 +146,7 @@ struct WorkspaceView: View {
             Spacer()
             Button { state.openProject() } label: { Image(systemName: "folder") }.help("Open design (⌘O)")
             Button { state.saveNewProject() } label: { Label("Save New", systemImage: "square.and.arrow.down") }
-                .help("Save the latest design with its prompt and response (⌘S)")
+                .help("Save the latest design as a new file (⌘S)")
                 .disabled(!state.canSaveNew)
             Button { state.exportSTEP() } label: {
                 HStack(spacing: 7) { Image(systemName: "arrow.up.right.square"); Text("Export STEP").fontWeight(.semibold) }

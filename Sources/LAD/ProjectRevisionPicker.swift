@@ -152,11 +152,31 @@ struct ProjectRevisionPickerList: View {
         .padding(.horizontal, 6).padding(.vertical, 3)
         .background(state.selectedRevisionID == id ? Palette.raised : Color.clear,
                     in: RoundedRectangle(cornerRadius: 5))
+        .contentShape(Rectangle())
+        .contextMenu {
+            Button("Save New…") { saveNew(from: id) }
+                .disabled(!state.canSaveNew)
+                .accessibilityIdentifier("projectRevisionSaveNew-\(id.uuidString)")
+        }
         .background {
             if editingRevisionID == id {
                 // Include Apply and Cancel in the edit region, so their clicks
                 // reach the intended action before any outside cancellation.
                 ProjectRenameOutsideClickRegion(onCancel: cancelRename)
+            }
+        }
+    }
+
+    private func saveNew(from id: UUID) {
+        let projectID = state.projectEditingID
+        cancelRename()
+        onDismiss()
+        // A main-queue block can run inside AppKit's menu-tracking loop.
+        // Present the modal dialog only after returning to the default mode.
+        RunLoop.main.perform(inModes: [.default]) {
+            MainActor.assumeIsolated {
+                guard state.projectEditingID == projectID else { return }
+                state.saveNewProject(revisionID: id)
             }
         }
     }

@@ -61,7 +61,7 @@ final class ProjectToolStorageTests: XCTestCase {
         XCTAssertEqual(restored.taskAudits?[0].events[1].output, "")
     }
 
-    func testSaveNewKeepsOnlyTheValidatedTurnsAuditAndRequiredImportedInputs() throws {
+    func testSaveNewKeepsRequiredImportedInputsWithoutConversationOrAudit() throws {
         var original = fixture()
         let firstUser = original.messages[0]
         let firstResponse = ChatMessage(role: "assistant", content: "First design ready.", phase: "final_answer")
@@ -82,13 +82,16 @@ final class ProjectToolStorageTests: XCTestCase {
         original.taskAudits?.append(ProjectTaskAudit(userMessageID: failedUser.id, model: "test-model", reasoningEffort: "high", status: "failed"))
 
         let copy = try SaveNewProject.snapshot(from: original)
-        XCTAssertEqual(copy.messages, [secondUser, secondResponse])
+        XCTAssertTrue(copy.messages.isEmpty)
         XCTAssertEqual(copy.revisions.map(\.id), [second.id])
         XCTAssertEqual(copy.revisions[0].model.inputAssets, [input])
-        XCTAssertEqual(copy.taskAudits, [secondAudit])
+        XCTAssertNil(copy.taskAudits)
+        XCTAssertNil(copy.revisions[0].userMessageID)
+        XCTAssertNil(copy.revisions[0].responseMessageID)
         XCTAssertNotEqual(copy.projectID, original.projectID)
         let restored = try ProjectStore.decode(ProjectStore.encode(copy))
-        XCTAssertEqual(restored.taskAudits, [secondAudit])
+        XCTAssertNil(restored.taskAudits)
+        XCTAssertTrue(restored.messages.isEmpty)
         XCTAssertEqual(restored.revisions[0].model.inputAssets, [input])
     }
 
