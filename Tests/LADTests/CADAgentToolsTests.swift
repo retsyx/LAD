@@ -156,6 +156,46 @@ final class CADAgentToolsTests: XCTestCase {
         catch { XCTAssertTrue(error.localizedDescription.contains("closed mesh")) }
     }
 
+    @MainActor
+    func testAgentImportsSTLAndReplaysWithoutOriginalFile() async throws {
+        guard ProcessInfo.processInfo.environment["LAD_RUN_ENGINE_TESTS"] == "1" else {
+            throw XCTSkip("Set LAD_RUN_ENGINE_TESTS=1 to exercise native STL import.")
+        }
+        let root = temporary()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A pre-existing closed tetrahedron, independent of any LAD-generated geometry.
+        let triangles = [
+            [[0, 0, 0], [0, 3, 0], [2, 0, 0]],
+            [[0, 0, 0], [2, 0, 0], [0, 0, 4]],
+            [[2, 0, 0], [0, 3, 0], [0, 0, 4]],
+            [[0, 3, 0], [0, 0, 0], [0, 0, 4]]
+        ]
+        let text = "solid reference\n" + triangles.map { triangle in
+            "facet normal 0 0 0\nouter loop\n" + triangle.map {
+                "vertex \($0[0]) \($0[1]) \($0[2])\n"
+            }.joined() + "endloop\nendfacet\n"
+        }.joined() + "endsolid reference\n"
+        let bytes = Data(text.utf8)
+        let path = root.appendingPathComponent("reference.STL")
+        try bytes.write(to: path)
+        let engine = EngineService()
+        let tools = try CADAgentTools(directory: root, python: EngineService.defaultPython, threads: 2,
+                                      current: nil, currentPreview: nil, engine: engine)
+        let imported = try content(try await tools.handle(name: "lad_import", arguments: ["path": path.path]))
+        let id = try XCTUnwrap(imported["assetID"] as? String)
+        XCTAssertEqual(imported["format"] as? String, "stl")
+        XCTAssertEqual(imported["solids"] as? Int, 1)
+        XCTAssertTrue((imported["fidelity"] as? String)?.contains("faceted") == true)
+        let assets = try tools.resolveAssets(ids: [id])
+        XCTAssertEqual(assets.first?.data, bytes)
+        try FileManager.default.removeItem(at: path)
+        let model = ModelSpec(title: "STL reference", summary: "Portable mesh input", units: "mm",
+                              script: "result = imported_assets['\(id)']", inputAssets: assets)
+        let preview = try await engine.buildPreview(model, python: EngineService.defaultPython, threads: 2)
+        XCTAssertEqual(preview.solids, 1)
+        XCTAssertEqual(preview.volume, 4, accuracy: 1e-7)
+    }
+
     private func content(_ result: [String: Any]) throws -> [String: Any] {
         let content = try XCTUnwrap(result["content"] as? [[String: Any]])
         let text = try XCTUnwrap(content.first?["text"] as? String)
