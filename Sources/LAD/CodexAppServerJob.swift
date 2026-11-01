@@ -421,7 +421,7 @@ final class CodexAppServerJob: @unchecked Sendable {
                                   "excludeTmpdirEnvVar": true, "excludeSlashTmp": true]]
             if !model.isEmpty { params["model"] = model }
             if let effort, !effort.isEmpty { params["effort"] = effort }
-            onProgress("Codex is creating your design…")
+            onProgress("Creating your design…")
             try enqueue("turn/start", purpose: .turnStart, params: params)
         case .turnStart:
             guard let turn = result["turn"] as? [String: Any], let id = turn["id"] as? String else {
