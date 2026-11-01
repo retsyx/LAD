@@ -108,13 +108,16 @@ struct PreviewMesh: Codable, Sendable {
     /// previews may omit these when no native CAD surface is available.
     var normals: [[Double]]? = nil
 
+    /// Successful worker validation receipt, bound to complete replay inputs.
+    var validatedHash: String? = nil
+
     /// Keeps private native files alive across copies and history navigation.
     /// Decoding derived worker JSON never grants ownership of arbitrary paths.
     var buildArtifacts: EngineBuildArtifacts? = nil
 
     private enum CodingKeys: String, CodingKey {
         case vertices, triangles, edges, bounds, volume, area, solids, faces, buildSeconds, threads, stepPath
-        case triangleSolids, edgeSolids, parts, brepPath, runtime, topology, triangleFaces, edgeFeatures, normals
+        case triangleSolids, edgeSolids, parts, brepPath, runtime, topology, triangleFaces, edgeFeatures, normals, validatedHash
     }
 
     var hasValidNormals: Bool {
@@ -178,6 +181,8 @@ struct ProjectRevision: Codable, Sendable, Identifiable {
     var partColors: [String: PartColor]? = nil
     /// Optional user label; unnamed revisions display their stable history position.
     var name: String? = nil
+    /// Reuse expensive validation only while the exact replay inputs match.
+    var validatedHash: String? = nil
 }
 
 /// Revision labels are document metadata, not filenames or generated model titles.

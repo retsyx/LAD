@@ -254,3 +254,14 @@ edges. STEP is exported from the exact solid, independently of preview quality.
 `requirements.txt` pins the top-level tested engine version. The full tested
 Python 3.11 / Apple Silicon environment is in `requirements-lock.txt`. CadQuery
 and its dependencies are third-party packages; their licenses remain applicable.
+
+Saved revisions carry one optional `validated_hash` field. The worker computes
+SHA-256 over the complete staged request, exact required input bytes, runtime
+versions, and worker source. A matching receipt skips exact BRep/shell checks
+and STEP roundtrip validation during replay. Missing or changed hashes require
+full validation; only successful builds return a new receipt. This is an
+accidental-change detector, not an authenticity mechanism or proof that Python
+is deterministic. Replay keeps its process sandbox, solid-only and size limits,
+finite analytic measurements, and app-side preview/topology checks. Native
+geometry, topology and meshes remain session-only. No local receipt database is
+used. New receipts are autosaved with the revision.

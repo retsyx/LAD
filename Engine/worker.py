@@ -8,6 +8,8 @@ The macOS app additionally sandboxes CAD programs before launch.
 from __future__ import annotations
 
 import argparse
+from contextvars import ContextVar
+import hashlib
 import json
 import math
 import os
@@ -21,6 +23,8 @@ MAX_VERTICES = 1_000_000
 MAX_EDGE_SEGMENTS = 250_000
 MAX_SCRIPT_BYTES = 200_000
 LIMIT = 100_000.0
+_validated_replay = ContextVar("validated_replay", default=False)
+
 ROOT_KEYS = {"title", "summary", "units", "script"}
 
 
@@ -117,14 +121,15 @@ def validate_shape(shape, preview_stats=None):
     face_count = len(_shape_entities(shape, "Face"))
     if face_count > 20_000:
         raise ModelError("geometry exceeds the 20,000 face limit; simplify the design")
-    # CadQuery's isValid() uses finitely sampled curve/surface checks. Exact
-    # checking catches parameterization defects that those samples can miss.
-    if not BRepCheck_Analyzer(shape.wrapped, True, False, True).IsValid():
-        raise ModelError("operation produced invalid geometry; exact curve-on-surface validation failed")
-    for shell in _shape_entities(shape, "Shell"):
-        check = BRepCheck_Shell(shell.wrapped)
-        if check.Closed() != BRepCheck_NoError or check.Orientation() != BRepCheck_NoError:
-            raise ModelError("Design contains an open or inconsistently oriented solid shell.")
+    if not _validated_replay.get():
+        # CadQuery's isValid() uses finitely sampled curve/surface checks. Exact
+        # checking catches parameterization defects that those samples can miss.
+        if not BRepCheck_Analyzer(shape.wrapped, True, False, True).IsValid():
+            raise ModelError("operation produced invalid geometry; exact curve-on-surface validation failed")
+        for shell in _shape_entities(shape, "Shell"):
+            check = BRepCheck_Shell(shell.wrapped)
+            if check.Closed() != BRepCheck_NoError or check.Orientation() != BRepCheck_NoError:
+                raise ModelError("Design contains an open or inconsistently oriented solid shell.")
     solid_bounds, coordinates = _preview_bounds(solids)
     properties = [part_metadata(solid, index, bounds=solid_bounds[index]) for index, solid in enumerate(solids)]
     if any(not math.isfinite(part["volume"]) or part["volume"] <= 1e-10 for part in properties):
@@ -1307,7 +1312,31 @@ def runtime_info(cq):
     return {"python": platform.python_version(), "cadquery": cq.__version__, "ocp": ocp_version}
 
 
-def run(request, output, threads, defer_step=False):
+def validation_hash(spec, directory, cq):
+    """Bind validation to exact replay inputs, kernel versions and worker rules.
+
+    This is an accidental-change detector, not an authenticity signature.
+    Never hash a user-supplied flag or generated geometry into the receipt.
+    """
+    import stat
+    digest = hashlib.sha256()
+    def add(data):
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    add(Path(__file__).read_bytes())
+    add(json.dumps(runtime_info(cq), sort_keys=True, separators=(",", ":")).encode())
+    add(json.dumps(spec, sort_keys=True, separators=(",", ":")).encode())
+    paths = ([directory / "source.step"] if spec.get("sourceAsset") else [])
+    paths += [directory / asset["path"] for asset in spec.get("inputAssets", [])]
+    for path in paths:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 128 * 1024 * 1024:
+            raise ModelError("Imported geometry must be a regular private file of at most 128 MB.")
+        add(path.read_bytes())
+    return digest.hexdigest()
+
+
+def run(request, output, threads, defer_step=False, validated_hash=None):
     if not 1 <= threads <= 256:
         raise ModelError("Thread count must be between 1 and 256.")
     size = request.stat().st_size
@@ -1337,23 +1366,33 @@ def run(request, output, threads, defer_step=False):
     elif is_preview:
         preview = preview_step(spec, request.parent.resolve(), output, cq, threads)
     else:
+        fingerprint = validation_hash(spec, request.parent.resolve(), cq)
+        reuse_validation = validated_hash == fingerprint
         preview_stats = {}
-        shape = build_shape(spec, threads, request.parent.resolve(), preview_stats=preview_stats)
-        # A successful native build is not sufficient: STEP translation can
-        # turn closed native geometry into open shells. Verify it before the
-        # candidate can be rendered, reused by lad_validate or committed.
-        # Export the same unique physical solids as the app's colored exporter.
-        solids = preview_stats["solids"]
-        if defer_step:
-            import tempfile
-            with tempfile.TemporaryDirectory(prefix=".step-validation-", dir=output) as directory:
-                validation_step = Path(directory) / "candidate.step"
-                write_step(solids, validation_step, cq)
-                validate_step_roundtrip(shape, cq, validation_step, preview_stats=preview_stats)
-        else:
-            write_step(solids, step, cq)
-            validate_step_roundtrip(shape, cq, step, preview_stats=preview_stats)
-        preview = make_preview(shape, preview_stats=preview_stats)
+        token = _validated_replay.set(reuse_validation)
+        try:
+            shape = build_shape(spec, threads, request.parent.resolve(), preview_stats=preview_stats)
+            # A successful native build is not sufficient: STEP translation can
+            # turn closed native geometry into open shells. Verify it before the
+            # candidate can be rendered, reused by lad_validate or committed.
+            # Export the same unique physical solids as the app's colored exporter.
+            solids = preview_stats["solids"]
+            if reuse_validation:
+                if not defer_step:
+                    write_step(solids, step, cq)
+            elif defer_step:
+                import tempfile
+                with tempfile.TemporaryDirectory(prefix=".step-validation-", dir=output) as directory:
+                    validation_step = Path(directory) / "candidate.step"
+                    write_step(solids, validation_step, cq)
+                    validate_step_roundtrip(shape, cq, validation_step, preview_stats=preview_stats)
+            else:
+                write_step(solids, step, cq)
+                validate_step_roundtrip(shape, cq, step, preview_stats=preview_stats)
+            preview = make_preview(shape, preview_stats=preview_stats)
+        finally:
+            _validated_replay.reset(token)
+        preview["validatedHash"] = fingerprint
     if not is_export and not is_measurement and not is_preview and not is_runtime:
         # Both STEP imports and generated previews retain the identical native
         # topology so later measurements cannot be remapped by a STEP roundtrip.
@@ -1377,9 +1416,10 @@ def main():
     parser.add_argument("--threads", type=int, default=max(1, min(32, os.cpu_count() or 1)))
     parser.add_argument("--defer-step", action="store_true",
                         help="Verify a temporary STEP, then retain only the preview and private native solid.")
+    parser.add_argument("--validated-hash", help="Reuse successful validation of identical replay inputs.")
     arguments = parser.parse_args()
     try:
-        result = run(arguments.request, arguments.output, arguments.threads, arguments.defer_step)
+        result = run(arguments.request, arguments.output, arguments.threads, arguments.defer_step, arguments.validated_hash)
         print(json.dumps({"status": "complete", "solids": result.get("solids"), "faces": result.get("faces")}))
     except Exception as error:
         print(f"LAD CAD engine: {error}", file=sys.stderr)

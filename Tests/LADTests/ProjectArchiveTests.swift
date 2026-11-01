@@ -5,6 +5,18 @@ import XCTest
 final class ProjectArchiveTests: XCTestCase {
     private let step = Data("ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n".utf8)
 
+    func testValidationReceiptRoundTripsAsOneOptionalRevisionField() throws {
+        var value = project(attachments: [])
+        value.revisions[0].validatedHash = String(repeating: "a", count: 64)
+        let json = try archive(value)
+        let stored = try XCTUnwrap(json["revisions"] as? [[String: Any]])
+        XCTAssertEqual(stored[0]["validated_hash"] as? String, value.revisions[0].validatedHash)
+        let restored = try ProjectStore.decode(ProjectStore.encode(value))
+        XCTAssertEqual(restored.revisions[0].validatedHash, value.revisions[0].validatedHash)
+        value.revisions[0].validatedHash = nil
+        XCTAssertNil(try ProjectStore.decode(ProjectStore.encode(value)).revisions[0].validatedHash)
+    }
+
     func testCommentaryAndValidatedFinalSummaryRemainInSavedConversation() throws {
         var value = project()
         value.messages = [

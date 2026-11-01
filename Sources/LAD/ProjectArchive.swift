@@ -365,6 +365,7 @@ enum ProjectArchive {
         var responseMessageID: UUID?
         var partColors: [String: PartColor]?
         var name: String?
+        var validatedHash: String?
 
         init(_ revision: ProjectRevision, writer: inout AssetWriter) throws {
             id = revision.id
@@ -390,12 +391,14 @@ enum ProjectArchive {
             responseMessageID = revision.responseMessageID
             partColors = revision.partColors
             name = revision.name
+            validatedHash = revision.validatedHash
         }
 
         private enum CodingKeys: String, CodingKey {
             case id, model, date, sourceSTEPAsset, scriptAsset, parts, partLayout, hiddenSolids, runtime
             case userMessageID, responseMessageID, partColors, name
             case inputAssets
+            case validatedHash = "validated_hash"
         }
 
         init(from decoder: Decoder) throws {
@@ -415,6 +418,7 @@ enum ProjectArchive {
             responseMessageID = try values.decodeIfPresent(UUID.self, forKey: .responseMessageID)
             partColors = try values.decodeIfPresent([String: PartColor].self, forKey: .partColors)
             name = try values.decodeIfPresent(String.self, forKey: .name)
+            validatedHash = try values.decodeIfPresent(String.self, forKey: .validatedHash)
         }
 
         func restored(reader: inout AssetReader) throws -> ProjectRevision {
@@ -432,6 +436,7 @@ enum ProjectArchive {
             revision.responseMessageID = responseMessageID
             revision.partColors = partColors
             revision.name = name
+            revision.validatedHash = validatedHash
             return revision
         }
     }

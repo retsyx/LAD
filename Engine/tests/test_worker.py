@@ -20,6 +20,82 @@ def script_spec(script):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_validation_receipt_reuses_checks_and_invalidates_changed_program(self):
+        import worker
+        import OCP.BRepCheck
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = root / "request.json"
+            spec = script_spec("result = cq.Solid.makeBox(1,2,3)")
+            request.write_text(json.dumps(spec))
+            first = run(request, root / "first", 2, defer_step=True)
+            receipt = first["validatedHash"]
+            self.assertRegex(receipt, r"^[0-9a-f]{64}$")
+            with (mock.patch.object(worker, 'validate_step_roundtrip', side_effect=AssertionError('Repeated STEP validation')),
+                  mock.patch.object(OCP.BRepCheck, 'BRepCheck_Analyzer', side_effect=AssertionError('Repeated exact validation'))):
+                replay = run(request, root / "replay", 2, defer_step=True, validated_hash=receipt)
+            self.assertEqual(replay["validatedHash"], receipt)
+            for key in ('bounds', 'volume', 'area', 'solids', 'faces', 'topology'):
+                self.assertEqual(first[key], replay[key])
+            self.assertFalse((root / 'replay/model.step').exists())
+            spec['script'] = "result = cq.Solid.makeBox(2,2,3)"
+            request.write_text(json.dumps(spec))
+            with mock.patch.object(worker, 'validate_step_roundtrip', wraps=worker.validate_step_roundtrip) as checked:
+                changed = run(request, root / "changed", 2, defer_step=True, validated_hash=receipt)
+                checked.assert_called_once()
+            self.assertNotEqual(changed['validatedHash'], receipt)
+            # A failed matching replay cannot leave the scoped bypass enabled.
+            spec['script'] = "raise ValueError('replay failure')"
+            request.write_text(json.dumps(spec))
+            import cadquery as cq
+            failed_receipt = worker.validation_hash(spec, root, cq)
+            with self.assertRaisesRegex(ModelError, 'replay failure'):
+                run(request, root / "failed", 2, defer_step=True, validated_hash=failed_receipt)
+            self.assertFalse(worker._validated_replay.get())
+            with self.assertRaises(ModelError):
+                worker.build_shape(script_spec('result = cq.Solid.makeBox(1,1,1).translate((2e6,0,0))'))
+
+    def test_matching_receipt_keeps_structural_and_size_guards(self):
+        import cadquery as cq
+        import worker
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = root / 'request.json'
+            for index, (script, error) in enumerate([
+                ("result = cq.Workplane('XY').circle(4)", 'only closed solids'),
+                ("result = cq.Solid.makeBox(1,1,1).translate((2e6,0,0))", 'size limit')
+            ]):
+                spec = script_spec(script)
+                request.write_text(json.dumps(spec))
+                receipt = worker.validation_hash(spec, root, cq)
+                with self.assertRaisesRegex(ModelError, error):
+                    run(request, root / str(index), 2, defer_step=True, validated_hash=receipt)
+                self.assertFalse(worker._validated_replay.get())
+
+    def test_validation_hash_covers_external_bytes_runtime_and_worker_rules(self):
+        import cadquery as cq
+        import worker
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = {**script_spec('result = imported_model'), 'sourceAsset': 'source.step'}
+            source = root / 'source.step'
+            source.write_bytes(b'first reference bytes')
+            first = worker.validation_hash(spec, root, cq)
+            source.write_bytes(b'changed reference bytes')
+            self.assertNotEqual(first, worker.validation_hash(spec, root, cq))
+            spec = {**script_spec('result = imported_assets["a"]'), 'inputAssets': [
+                {'id': 'a', 'name': 'Reference', 'format': 'brep', 'path': 'input-000.brep'}]}
+            asset = root / 'input-000.brep'
+            asset.write_bytes(b'asset bytes')
+            first = worker.validation_hash(spec, root, cq)
+            asset.write_bytes(b'changed asset bytes')
+            self.assertNotEqual(first, worker.validation_hash(spec, root, cq))
+            first = worker.validation_hash(spec, root, cq)
+            with mock.patch.object(worker, 'runtime_info', return_value={'python': 'changed'}):
+                self.assertNotEqual(worker.validation_hash(spec, root, cq), first)
+            with mock.patch.object(worker, '__file__', str(source)):
+                self.assertNotEqual(worker.validation_hash(spec, root, cq), first)
+
     def test_script_validation_happens_before_execution(self):
         invalid = [script_spec(None), script_spec(17), script_spec("x" * 200_001),
                    script_spec("é" * 100_001), script_spec(""), script_spec(" \n")]

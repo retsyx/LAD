@@ -43,15 +43,14 @@ final class EngineService {
         try await buildModel(spec, python: python, threads: threads, deferSTEP: false)
     }
 
-    /// Validate native geometry and a temporary STEP roundtrip before preparing
-    /// display data. Retain the original native solid, without keeping STEP,
-    /// so later exports avoid executing the program a second time.
-    func buildPreview(_ spec: ModelSpec, python: String, threads: Int) async throws -> PreviewMesh {
-        try await buildModel(spec, python: python, threads: threads, deferSTEP: true)
+    /// Validate new or changed inputs, or reuse a matching saved validation hash.
+    /// Retain the original native solid without keeping generated STEP bytes.
+    func buildPreview(_ spec: ModelSpec, python: String, threads: Int, validatedHash: String? = nil) async throws -> PreviewMesh {
+        try await buildModel(spec, python: python, threads: threads, deferSTEP: true, validatedHash: validatedHash)
     }
 
-    private func buildModel(_ spec: ModelSpec, python: String, threads: Int, deferSTEP: Bool) async throws -> PreviewMesh {
-        let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: deferSTEP) { folder in
+    private func buildModel(_ spec: ModelSpec, python: String, threads: Int, deferSTEP: Bool, validatedHash: String? = nil) async throws -> PreviewMesh {
+        let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: deferSTEP, validatedHash: validatedHash) { folder in
             var definition = spec
             definition.sourceSTEP = nil
             definition.sourceName = nil
@@ -242,7 +241,7 @@ final class EngineService {
         var folder: URL { artifacts.folder }
     }
 
-    private func run(python: String, threads: Int, scriptMode: Bool, deferSTEP: Bool = false,
+    private func run(python: String, threads: Int, scriptMode: Bool, deferSTEP: Bool = false, validatedHash: String? = nil,
                      action: String = "build this design",
                      prepare: @escaping @Sendable (URL) throws -> Void) async throws -> RunResult {
         try Task.checkCancellation()
@@ -265,7 +264,11 @@ final class EngineService {
         guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
             throw LADError.message("LAD’s CAD runtime is missing. Restart LAD and try again.")
         }
-        let arguments = [worker.path, "--request", request.path, "--output", folder.path, "--threads", String(max(1, min(256, threads)))] + (deferSTEP ? ["--defer-step"] : [])
+        var arguments = [worker.path, "--request", request.path, "--output", folder.path, "--threads", String(max(1, min(256, threads)))] + (deferSTEP ? ["--defer-step"] : [])
+        if let validatedHash, validatedHash.utf8.count == 64,
+           validatedHash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) {
+            arguments.append("--validated-hash=\(validatedHash)")
+        }
         let actualRuntime = runtime.resolvingSymlinksInPath()
         // Homebrew/framework bin/python is a launcher that spawns Python.app.
         // Start the interpreter directly so generated code can never fork.

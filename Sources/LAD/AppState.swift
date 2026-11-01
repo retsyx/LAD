@@ -1096,7 +1096,7 @@ final class AppState: ObservableObject {
         let response = ChatMessage(role: "assistant", content: spec.summary + "\n\nDesign ready.", phase: "final_answer")
         let revision = ProjectRevision(model: spec, date: response.date, preview: preview, partLayout: layout, hiddenSolids: hidden.sorted(), parts: defaults, runtime: preview.runtime,
                                       userMessageID: userMessageID, responseMessageID: response.id,
-                                      partColors: colors.isEmpty ? nil : colors)
+                                      partColors: colors.isEmpty ? nil : colors, validatedHash: preview.validatedHash)
         revisions.append(revision)
         selectedRevisionID = revision.id; builtRevisionID = revision.id
         mesh = preview; selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = hidden
@@ -1547,11 +1547,12 @@ final class AppState: ObservableObject {
     private func buildExisting(_ spec: ModelSpec) {
         let token = UUID(); operationID = token
         let revisionID = selectedRevisionID, runtime = python, cores = threads
+        let validatedHash = revisions.first(where: { $0.id == revisionID })?.validatedHash
         let previousLayout = selectedPartLayout, previouslyHidden = hiddenSolids
         isWorking = true; activity = "Building solid geometry…"; error = nil
         operation = Task {
             do {
-                let preview = try await engine.buildPreview(spec, python: runtime, threads: cores)
+                let preview = try await engine.buildPreview(spec, python: runtime, threads: cores, validatedHash: validatedHash)
                 guard operationID == token, !Task.isCancelled else { return }
                 if let index = revisions.firstIndex(where: { $0.id == revisionID }) {
                     let defaults = Self.defaultParts(for: preview)
@@ -1564,6 +1565,7 @@ final class AppState: ObservableObject {
                         !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: oldHidden)
                     }.map(\.id))
                     revisions[index].preview = preview; revisions[index].stepData = nil
+                    revisions[index].validatedHash = preview.validatedHash
                     if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
                     revisions[index].parts = defaults
                     revisions[index].partLayout = layout
@@ -1746,7 +1748,7 @@ final class AppState: ObservableObject {
                 } catch EngineExportError.nativeArtifactUnavailable {
                     // Replay can enumerate solids differently. Bind the
                     // captured colors and subset to fresh stable ownership.
-                    let rebuilt = try await engine.buildPreview(revision.model, python: runtime, threads: cores)
+                    let rebuilt = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash)
                     guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
                           !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
                     let restored = try Self.restoredPartState(for: revision, preview: rebuilt, selected: solidIndices ?? [])
@@ -1981,12 +1983,13 @@ final class AppState: ObservableObject {
         isWorking = true; activity = "Preparing preview…"; error = nil
         operation = Task {
             do {
-                let preview = try await engine.buildPreview(revision.model, python: runtime, threads: cores)
+                let preview = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash)
                 guard operationID == token, selectedRevisionID == revision.id, !Task.isCancelled,
                       let index = revisions.firstIndex(where: { $0.id == revision.id }) else { return }
                 // Only transient geometry changes here. User edits made while
                 // the worker was busy remain authoritative.
                 try cacheReplayedPreview(preview, at: index)
+                if revision.validatedHash != preview.validatedHash { autosave() }
                 viewportCommand = ViewportCommand(.fit)
                 activity = "Ready"; isWorking = false; operation = nil
             } catch is CancellationError {
@@ -2008,6 +2011,7 @@ final class AppState: ObservableObject {
         revisions[index].partLayout = restored.layout
         revisions[index].hiddenSolids = restored.hidden.sorted()
         revisions[index].preview = preview
+        revisions[index].validatedHash = preview.validatedHash
         if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
         revisions[index].stepData = nil
         mesh = preview; builtRevisionID = revisions[index].id
