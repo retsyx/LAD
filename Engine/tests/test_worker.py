@@ -31,6 +31,8 @@ class ValidationTests(unittest.TestCase):
             first = run(request, root / "first", 2, defer_step=True)
             receipt = first["validatedHash"]
             self.assertRegex(receipt, r"^[0-9a-f]{64}$")
+            spec.update(title="Final saved title", summary="Final user-facing description")
+            request.write_text(json.dumps(spec))
             with (mock.patch.object(worker, 'validate_step_roundtrip', side_effect=AssertionError('Repeated STEP validation')),
                   mock.patch.object(OCP.BRepCheck, 'BRepCheck_Analyzer', side_effect=AssertionError('Repeated exact validation'))):
                 replay = run(request, root / "replay", 2, defer_step=True, validated_hash=receipt)
@@ -54,6 +56,35 @@ class ValidationTests(unittest.TestCase):
             self.assertFalse(worker._validated_replay.get())
             with self.assertRaises(ModelError):
                 worker.build_shape(script_spec('result = cq.Solid.makeBox(1,1,1).translate((2e6,0,0))'))
+
+    def test_validation_receipt_ignores_asset_name_but_revalidates_changed_bytes(self):
+        import cadquery as cq
+        import OCP.BRepCheck
+        import worker
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = root / "request.json"
+            asset = root / "input-000.step"
+            cq.exporters.export(cq.Solid.makeBox(1, 2, 3), str(asset))
+            spec = {**script_spec('result = imported_assets["reference"]'), 'inputAssets': [
+                {'id': 'reference', 'name': 'Candidate reference', 'format': 'step', 'path': asset.name}]}
+            request.write_text(json.dumps(spec))
+            first = run(request, root / "first", 2, defer_step=True)
+            receipt = first['validatedHash']
+            spec.update(title="Saved title", summary="Saved summary")
+            spec['inputAssets'][0]['name'] = "Renamed reference"
+            request.write_text(json.dumps(spec))
+            with (mock.patch.object(worker, 'validate_step_roundtrip', side_effect=AssertionError('Repeated STEP validation')),
+                  mock.patch.object(OCP.BRepCheck, 'BRepCheck_Analyzer', side_effect=AssertionError('Repeated exact validation'))):
+                replay = run(request, root / "replay", 2, defer_step=True, validated_hash=receipt)
+            self.assertEqual(replay['validatedHash'], receipt)
+            self.assertEqual(replay['volume'], first['volume'])
+            cq.exporters.export(cq.Solid.makeBox(2, 2, 3), str(asset))
+            with mock.patch.object(worker, 'validate_step_roundtrip', wraps=worker.validate_step_roundtrip) as checked:
+                changed = run(request, root / "changed", 2, defer_step=True, validated_hash=receipt)
+                checked.assert_called_once()
+            self.assertNotEqual(changed['validatedHash'], receipt)
+            self.assertAlmostEqual(changed['volume'], 2 * first['volume'])
 
     def test_matching_receipt_keeps_structural_and_size_guards(self):
         import cadquery as cq
@@ -95,6 +126,28 @@ class ValidationTests(unittest.TestCase):
                 self.assertNotEqual(worker.validation_hash(spec, root, cq), first)
             with mock.patch.object(worker, '__file__', str(source)):
                 self.assertNotEqual(worker.validation_hash(spec, root, cq), first)
+
+    def test_validation_hash_covers_input_presence_identity_format_and_order(self):
+        import cadquery as cq
+        import worker
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('source.step', 'input-000.brep', 'input-001.brep', 'input-000.step'):
+                (root / name).write_bytes(b'identical reference bytes')
+            spec = script_spec('result = imported_assets["a"]')
+            no_inputs = worker.validation_hash(spec, root, cq)
+            spec['sourceAsset'] = 'source.step'
+            self.assertNotEqual(no_inputs, worker.validation_hash(spec, root, cq))
+            del spec['sourceAsset']
+            spec['inputAssets'] = [
+                {'id': 'a', 'name': 'A', 'format': 'brep', 'path': 'input-000.brep'},
+                {'id': 'b', 'name': 'B', 'format': 'brep', 'path': 'input-001.brep'}]
+            original = worker.validation_hash(spec, root, cq)
+            spec['inputAssets'][0]['id'], spec['inputAssets'][1]['id'] = 'b', 'a'
+            self.assertNotEqual(original, worker.validation_hash(spec, root, cq))
+            spec['inputAssets'][0]['id'], spec['inputAssets'][1]['id'] = 'a', 'b'
+            spec['inputAssets'][0].update(format='step', path='input-000.step')
+            self.assertNotEqual(original, worker.validation_hash(spec, root, cq))
 
     def test_script_validation_happens_before_execution(self):
         invalid = [script_spec(None), script_spec(17), script_spec("x" * 200_001),

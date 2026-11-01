@@ -1325,7 +1325,14 @@ def validation_hash(spec, directory, cq):
         digest.update(data)
     add(Path(__file__).read_bytes())
     add(json.dumps(runtime_info(cq), sort_keys=True, separators=(",", ":")).encode())
-    add(json.dumps(spec, sort_keys=True, separators=(",", ":")).encode())
+    # Match the app's validated-preview reuse contract: display metadata can
+    # change between a successful candidate and its final saved revision.
+    # Imported-assets insertion order remains significant to Python programs.
+    construction = {"units": spec["units"], "script": spec["script"],
+                    "sourceAsset": bool(spec.get("sourceAsset")),
+                    "inputAssets": [{"id": asset["id"], "format": asset["format"]}
+                                    for asset in spec.get("inputAssets", [])]}
+    add(json.dumps(construction, sort_keys=True, separators=(",", ":")).encode())
     paths = ([directory / "source.step"] if spec.get("sourceAsset") else [])
     paths += [directory / asset["path"] for asset in spec.get("inputAssets", [])]
     for path in paths:

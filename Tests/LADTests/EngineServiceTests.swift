@@ -6,6 +6,28 @@ import XCTest
 /// sandbox, so ordinary swift test remains independent of native dependencies.
 final class EngineServiceTests: XCTestCase {
     @MainActor
+    func testCandidateValidationSurvivesFinalMetadataAndProjectRoundtrip() async throws {
+        try requireRuntime()
+        let candidate = ModelSpec(title: "Candidate", summary: "Build-time description", units: "mm",
+                                  script: "result = cq.Solid.makeBox(2,3,4)")
+        let engine = EngineService()
+        let built = try await engine.buildPreview(candidate, python: EngineService.defaultPython, threads: 2)
+        let hash = try XCTUnwrap(built.validatedHash)
+        var final = candidate
+        final.title = "Final design title"
+        final.summary = "A different final description after reviewing the validated candidate."
+        let revision = ProjectRevision(model: final, validatedHash: hash)
+        let project = LADProject(messages: [], revisions: [revision], selectedRevisionID: revision.id)
+        let saved = try ProjectStore.decode(ProjectStore.encode(project)).revisions[0]
+        let replay = try await engine.buildPreview(saved.model, python: EngineService.defaultPython, threads: 2,
+                                                  validatedHash: saved.validatedHash)
+        XCTAssertEqual(replay.validatedHash, hash,
+                       "Changing only final presentation metadata must not invalidate the reviewed candidate.")
+        XCTAssertEqual(replay.volume, built.volume)
+        XCTAssertEqual(replay.bounds, built.bounds)
+    }
+
+    @MainActor
     func testPreviewDefersSTEPThenExportsAndReusesExactSessionBytes() async throws {
         try requireRuntime()
         let spec = ModelSpec(title: "Deferred STEP assembly", summary: "Located exact solids, retaining STEP only for export.", units: "mm", script: """
