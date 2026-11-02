@@ -194,7 +194,8 @@ final class ProjectStoreTests: XCTestCase {
             { $0.volume = -1 },
             { $0.area = 0 },
             { $0.solids = 0 },
-            { $0.faces = 20_001 },
+            { $0.faces = 0 },
+            { $0.faces = -1 },
             { $0.threads = 0 },
             { $0.buildSeconds = -1 },
             { $0.triangleSolids = [0] },
@@ -215,6 +216,15 @@ final class ProjectStoreTests: XCTestCase {
         var excessive = preview()
         excessive.vertices = Array(repeating: [0, 0, 0], count: 1_000_001)
         XCTAssertThrowsError(try ProjectStore.validatePreview(excessive))
+    }
+
+    func testPreviewAcceptsMoreThanTwentyThousandNativeFaces() throws {
+        var mesh = preview()
+        mesh.faces = 56_156
+        XCTAssertNoThrow(try ProjectStore.validatePreview(mesh))
+        var value = project()
+        value.revisions[0].preview = mesh
+        XCTAssertNoThrow(try roundtrip(value))
     }
 
     func testRejectsMalformedSessionSTEPAssets() throws {

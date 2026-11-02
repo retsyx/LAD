@@ -164,7 +164,7 @@ preview/STEP/BREP/render outputs remain temporary. See the main README for the
 optional Tool Activity pane, which is hidden by default.
 
 The final geometry must contain valid nonempty solids and finite positive
-volume and area. Geometry is limited to 4,096 solids, 20,000 faces, and bounds
+volume and area. Geometry is limited to 4,096 solids and bounds
 within ±1,000,000 mm. The preview is capped at one million vertices/triangles
 and 250,000 analytic edge segments. These output limits bound native resource
 use; programs can use the full installed CAD API without an operation whitelist.
@@ -208,7 +208,8 @@ with their child and root locations applied and their named hierarchy retained
 in preview metadata; disconnected bodies remain separately selectable. The final result must contain valid closed solids with
 nonzero finite volume. Construction wires and sheet faces can be used while
 modeling, but must be converted to solids or excluded from `result` before STEP
-export. The same 20,000-face, 4,096-solid, bounds and preview limits apply.
+export. The same 4,096-solid, bounds and preview limits apply. STL/OBJ imports have
+no separate 20,000-face cap; file-size and preview resource limits still apply.
 
 The macOS app starts CAD programs through `sandbox-exec` using `script.sb`.
 This denies networking and process creation, allows reads only from the

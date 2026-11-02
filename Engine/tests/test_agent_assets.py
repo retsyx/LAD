@@ -2,6 +2,7 @@
 import base64
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -36,6 +37,33 @@ def prism_obj(outline, low, high, offset=0):
 def spec(asset, script=None):
     return {'title': 'External geometry', 'summary': 'Imported input test', 'units': 'mm',
             'script': script or "result = imported_assets['external']", 'inputAssets': [asset]}
+
+
+def binary_stl(triangles):
+    return (b'LAD mesh import regression'.ljust(80, b'\0') + struct.pack('<I', len(triangles)) +
+            b''.join(struct.pack('<12fH', 0, 0, 0, *(value for point in triangle for value in point), 0)
+                     for triangle in triangles))
+
+
+def subdivided_cube_triangles(divisions):
+    # Six grids keep the native sewing test's vertex valence bounded even with
+    # tens of thousands of faces. Each basis has an outward cross product.
+    sides = [((0, 0, 1), (1, 0, 0), (0, 1, 0)),
+             ((0, 0, 0), (0, 1, 0), (1, 0, 0)),
+             ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+             ((0, 0, 0), (0, 0, 1), (0, 1, 0)),
+             ((0, 1, 0), (0, 0, 1), (1, 0, 0)),
+             ((0, 0, 0), (1, 0, 0), (0, 0, 1))]
+    triangles = []
+    for origin, u, v in sides:
+        def point(i, j):
+            return tuple(origin[axis] + u[axis] * i / divisions + v[axis] * j / divisions
+                         for axis in range(3))
+        for i in range(divisions):
+            for j in range(divisions):
+                a, b, c, d = point(i, j), point(i + 1, j), point(i, j + 1), point(i + 1, j + 1)
+                triangles.extend(((a, b, d), (a, d, c)))
+    return triangles
 
 
 class AgentAssetTests(unittest.TestCase):
@@ -114,6 +142,78 @@ class AgentAssetTests(unittest.TestCase):
             path.write_text('solid open\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid\n')
             with self.assertRaisesRegex(ModelError, 'open|closed|watertight'):
                 import_input_asset(path, 'stl', cq)
+
+    def test_mesh_readers_preserve_56156_faces(self):
+        # Match the reported STL count in every reader, using a closed mesh
+        # rather than duplicated faces that could hide parsing mistakes.
+        count = 28_078
+        ring = [(math.cos(2 * math.pi * i / count), math.sin(2 * math.pi * i / count), 0)
+                for i in range(count)]
+        triangles = [triangle for i in range(count)
+                     for triangle in [((0, 0, 1), ring[i], ring[(i + 1) % count]),
+                                      ((0, 0, -1), ring[(i + 1) % count], ring[i])]]
+        ascii_stl = ('solid reference\n' + ''.join(
+            'facet normal 0 0 0\nouter loop\n' + ''.join('vertex %s %s %s\n' % point for point in triangle) +
+            'endloop\nendfacet\n' for triangle in triangles) + 'endsolid reference\n')
+        obj = ''.join('v %s %s %s\n' % point for triangle in triangles for point in triangle)
+        obj += ''.join('f %d %d %d\n' % (i * 3 + 1, i * 3 + 2, i * 3 + 3) for i in range(len(triangles)))
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            for name, contents, format in [('binary.stl', binary_stl(triangles), 'stl'),
+                                           ('ascii.stl', ascii_stl.encode(), 'stl'),
+                                           ('reference.obj', obj.encode(), 'obj')]:
+                with self.subTest(format=name):
+                    path = folder / name
+                    path.write_bytes(contents)
+                    parsed = read_mesh(path, format)
+                    self.assertEqual(len(parsed), 56_156)
+                    for index in (0, len(triangles) - 1):
+                        for actual, expected in zip(parsed[index], triangles[index]):
+                            for value, coordinate in zip(actual, expected):
+                                self.assertAlmostEqual(value, coordinate, places=6)
+
+    def test_dense_closed_stl_build_and_validated_replay_preserve_faces(self):
+        triangles = subdivided_cube_triangles(41)
+        self.assertEqual(len(triangles), 20_172)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = folder / 'input-000.stl'
+            source.write_bytes(binary_stl(triangles))
+            original = source.read_bytes()
+            request = folder / 'request.json'
+            asset = {'id': 'external', 'name': 'Dense cube', 'format': 'stl', 'path': source.name}
+            request.write_text(json.dumps(spec(asset, "result = imported_assets['external'].translate((10,20,30))")))
+            first = run(request, folder / 'first', 2, defer_step=True)
+            replay = run(request, folder / 'replay', 2, defer_step=True, validated_hash=first['validatedHash'])
+            for preview in (first, replay):
+                self.assertEqual(preview['solids'], 1)
+                self.assertEqual(preview['faces'], len(triangles))
+                self.assertEqual(len(preview['topology']['faces']), len(triangles))
+                self.assertEqual(len(preview['triangles']), len(triangles))
+                self.assertEqual(set(preview['triangleFaces']), set(range(len(triangles))))
+                self.assertEqual(set(preview['triangleSolids']), {0})
+                self.assertEqual(preview['bounds'], [10, 20, 30, 11, 21, 31])
+                self.assertAlmostEqual(preview['volume'], 1, places=6)
+                self.assertAlmostEqual(preview['area'], 6, places=6)
+                self.assertTrue(Path(preview['brepPath']).is_file())
+                self.assertFalse(Path(preview['stepPath']).exists())
+            self.assertEqual(first['validatedHash'], replay['validatedHash'])
+            self.assertEqual(source.read_bytes(), original)
+
+    def test_empty_and_incomplete_meshes_remain_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            for name, contents, format, error in [
+                ('empty-binary.stl', binary_stl([]), 'stl', 'nonempty'),
+                ('empty-ascii.stl', b'solid empty\nendsolid empty\n', 'stl', 'nonempty'),
+                ('empty.obj', b'v 0 0 0\n', 'obj', 'nonempty'),
+                ('incomplete.stl', b'solid broken\nvertex 0 0 0\nvertex 1 0 0\nendsolid broken\n', 'stl', 'incomplete'),
+            ]:
+                with self.subTest(format=name):
+                    path = folder / name
+                    path.write_bytes(contents)
+                    with self.assertRaisesRegex(ModelError, error):
+                        read_mesh(path, format)
 
     def test_staged_inputs_replay_with_full_cad_api_and_all_native_formats(self):
         import cadquery as cq
@@ -201,6 +301,10 @@ class MCPTransportTests(unittest.TestCase):
                 tools = call({'jsonrpc':'2.0','id':2,'method':'tools/list'})['result']['tools']
                 names = {tool['name'] for tool in tools}
                 self.assertTrue({'lad_build','lad_inspect','lad_measure','lad_render','lad_screenshot','lad_import','lad_validate','lad_export_step','lad_runtime'} <= names)
+                import_description = next(tool['description'] for tool in tools if tool['name'] == 'lad_import')
+                self.assertIn('watertight', import_description)
+                self.assertNotIn('20,000', import_description)
+                self.assertNotIn('20000', import_description)
                 def native():
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:

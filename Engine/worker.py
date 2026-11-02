@@ -119,8 +119,6 @@ def validate_shape(shape, preview_stats=None):
     if len(solids) > 4_096:
         raise ModelError("geometry exceeds the 4,096 solid limit; simplify the design")
     face_count = len(_shape_entities(shape, "Face"))
-    if face_count > 20_000:
-        raise ModelError("geometry exceeds the 20,000 face limit; simplify the design")
     if not _validated_replay.get():
         # CadQuery's isValid() uses finitely sampled curve/surface checks. Exact
         # checking catches parameterization defects that those samples can miss.
@@ -970,8 +968,6 @@ def read_mesh(path, format):
         data = path.read_bytes()
         count = struct.unpack_from("<I", data, 80)[0] if len(data) >= 84 else 0
         if count and 84 + count * 50 == len(data):
-            if count > 20_000:
-                raise ModelError("The imported mesh exceeds the 20,000 face limit; reduce its resolution before importing.")
             triangles = [[list(values[index:index + 3]) for index in (3, 6, 9)]
                          for values in (struct.unpack_from("<12fH", data, 84 + index * 50) for index in range(count))]
         else:
@@ -980,8 +976,6 @@ def read_mesh(path, format):
                 vertices = []
                 for match in re.finditer(r"(?im)^\s*vertex\s+(\S+)\s+(\S+)\s+(\S+)\s*$", text):
                     vertices.append([float(value) for value in match.groups()])
-                    if len(vertices) > 60_000:
-                        raise ModelError("The imported mesh exceeds the 20,000 face limit; reduce its resolution before importing.")
             except (UnicodeError, ValueError) as error:
                 raise ModelError("The imported STL is not a valid binary or ASCII triangle mesh.") from error
             if len(vertices) % 3:
@@ -1018,14 +1012,12 @@ def read_mesh(path, format):
                     # native polygons rather than a fan that could cross a
                     # concave boundary. STEP keeps their original faceted form.
                     triangles.append(points)
-                    if len(triangles) > 20_000:
-                        raise ModelError("The imported mesh exceeds the 20,000 face limit; reduce its resolution before importing.")
         except (UnicodeError, ValueError) as error:
             if isinstance(error, ModelError):
                 raise
             raise ModelError("The imported OBJ is not a valid polygon mesh.") from error
-    if not triangles or len(triangles) > 20_000:
-        raise ModelError("Import a nonempty closed mesh with at most 20,000 faces.")
+    if not triangles:
+        raise ModelError("Import a nonempty closed mesh.")
     for triangle in triangles:
         if any(len(point) != 3 or any(not math.isfinite(value) or abs(value) > LIMIT * 10 for value in point) for point in triangle):
             raise ModelError("The imported mesh has invalid or out-of-range coordinates.")
