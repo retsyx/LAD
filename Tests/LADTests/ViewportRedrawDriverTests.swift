@@ -4,6 +4,73 @@ import XCTest
 @testable import LAD
 
 final class ViewportRedrawDriverTests: XCTestCase {
+    func testFinalFrameCountTracksProgressWithoutAcknowledgingIntermediateOrOlderFrames() {
+        let driver = ViewportRedrawDriver()
+        let renderer = SCNRenderer(device: nil, options: nil)
+        let scene = SCNScene()
+        renderer.scene = scene
+        driver.setTechniqueCompletionEnabled(true)
+        driver.request(at: 10)
+        driver.renderer(renderer, updateAtTime: 10)
+        driver.renderer(renderer, didRenderScene: scene, atTime: 10)
+        XCTAssertEqual(driver.finalFrameCount, 0, "An intermediate native callback cannot prove the viewport is making progress.")
+
+        driver.request(at: 10.01)
+        driver.techniqueDidRender(renderer)
+        XCTAssertEqual(driver.finalFrameCount, 1, "An older final frame still proves the display link is running.")
+        XCTAssertNil(driver.pauseDelay(at: 11, quietPeriod: 0.12), "Progress alone must not acknowledge the latest generation.")
+        driver.renderer(renderer, updateAtTime: 11)
+        driver.techniqueDidRender(renderer)
+        XCTAssertEqual(driver.finalFrameCount, 2)
+        XCTAssertEqual(driver.pauseDelay(at: 11, quietPeriod: 0.12), 0)
+
+        driver.stop()
+        driver.techniqueDidRender(renderer)
+        XCTAssertEqual(driver.finalFrameCount, 3, "Natural exposure frames count without an active redraw burst.")
+        driver.setTechniqueCompletionEnabled(false)
+        driver.techniqueDidRender(renderer)
+        XCTAssertEqual(driver.finalFrameCount, 3)
+        driver.renderer(renderer, didRenderScene: scene, atTime: 12)
+        XCTAssertEqual(driver.finalFrameCount, 4, "Without a technique, native completion is the final frame.")
+    }
+
+    func testRecoveryWaitsForFinalFrameProgressAndBoundsRestartAttempts() {
+        var recovery = ViewportRedrawRecoveryState()
+        XCTAssertFalse(recovery.shouldRestart(at: 10, finalFrameCount: 5))
+        for time in [10.1, 10.2, 10.3] {
+            XCTAssertFalse(recovery.shouldRestart(at: time, finalFrameCount: 5),
+                           "Repeated requests must not restart healthy playback or extend a stalled burst's deadline.")
+        }
+        XCTAssertTrue(recovery.shouldRestart(at: 10.36, finalFrameCount: 5))
+        XCTAssertFalse(recovery.shouldRestart(at: 10.5, finalFrameCount: 5), "Recovery itself needs time to produce a frame.")
+        XCTAssertTrue(recovery.shouldRestart(at: 10.72, finalFrameCount: 5))
+        XCTAssertTrue(recovery.shouldRestart(at: 11.08, finalFrameCount: 5))
+        XCTAssertEqual(recovery.restartAttempts, 3)
+        XCTAssertFalse(recovery.shouldRestart(at: 100, finalFrameCount: 5), "A broken renderer must not cause an unbounded restart loop.")
+    }
+
+    func testRecoveryResetsItsDeadlineAndBudgetAfterFinalFrameProgress() {
+        var recovery = ViewportRedrawRecoveryState()
+        XCTAssertFalse(recovery.shouldRestart(at: 10, finalFrameCount: 5))
+        XCTAssertTrue(recovery.shouldRestart(at: 10.36, finalFrameCount: 5))
+        XCTAssertFalse(recovery.shouldRestart(at: 10.5, finalFrameCount: 6))
+        XCTAssertEqual(recovery.restartAttempts, 0)
+        XCTAssertFalse(recovery.shouldRestart(at: 10.8, finalFrameCount: 6))
+        XCTAssertTrue(recovery.shouldRestart(at: 10.86, finalFrameCount: 6))
+        XCTAssertEqual(recovery.restartAttempts, 1)
+    }
+
+    func testStoppingRecoveryStartsTheNextBurstWithAFreshDeadline() {
+        var recovery = ViewportRedrawRecoveryState()
+        XCTAssertFalse(recovery.shouldRestart(at: 10, finalFrameCount: 5))
+        XCTAssertTrue(recovery.shouldRestart(at: 10.36, finalFrameCount: 5))
+        recovery.stop()
+        XCTAssertEqual(recovery.restartAttempts, 0)
+        XCTAssertFalse(recovery.shouldRestart(at: 100, finalFrameCount: 5))
+        XCTAssertFalse(recovery.shouldRestart(at: 100.3, finalFrameCount: 5))
+        XCTAssertTrue(recovery.shouldRestart(at: 100.36, finalFrameCount: 5))
+    }
+
     func testTechniqueCompletionWaitsForTheFinalPassAndRejectsOlderOrDuplicateFrames() {
         let driver = ViewportRedrawDriver()
         let callbacks = ViewportRedrawCallbackCapture()

@@ -37,6 +37,35 @@ struct ViewportRedrawState: Sendable {
     }
 }
 
+/// SceneKit can suspend its display link while its public playback flags still
+/// report active. Bound recovery attempts without restarting healthy rendering
+/// on every input event, or confusing an old frame with the latest request.
+struct ViewportRedrawRecoveryState: Sendable {
+    private var observedFrameCount: UInt64?
+    private var lastProgressTime: TimeInterval = 0
+    private(set) var restartAttempts = 0
+
+    mutating func shouldRestart(at time: TimeInterval, finalFrameCount: UInt64,
+                                timeout: TimeInterval = 0.35, maximumAttempts: Int = 3) -> Bool {
+        guard observedFrameCount == finalFrameCount else {
+            observedFrameCount = finalFrameCount
+            lastProgressTime = time
+            restartAttempts = 0
+            return false
+        }
+        guard restartAttempts < maximumAttempts, time - lastProgressTime >= timeout else { return false }
+        restartAttempts += 1
+        lastProgressTime = time
+        return true
+    }
+
+    mutating func stop() {
+        observedFrameCount = nil
+        lastProgressTime = 0
+        restartAttempts = 0
+    }
+}
+
 /// SceneKit calls its delegate on the renderer thread. Keep generation facts
 /// locked there, while the view controls playback only from the main actor.
 final class ViewportRedrawDriver: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
@@ -44,6 +73,7 @@ final class ViewportRedrawDriver: NSObject, SCNSceneRendererDelegate, @unchecked
     private var state = ViewportRedrawState()
     private var frameGeneration: UInt64?
     private var frameTime: TimeInterval = 0
+    private var completedFrameCount: UInt64 = 0
     private var usesTechniqueCompletion = false
     private weak var externalDelegate: (any SCNSceneRendererDelegate)?
     private var frameHandler: (@Sendable () -> Void)?
@@ -68,6 +98,11 @@ final class ViewportRedrawDriver: NSObject, SCNSceneRendererDelegate, @unchecked
     var isActive: Bool {
         lock.lock(); defer { lock.unlock() }
         return state.isActive
+    }
+
+    var finalFrameCount: UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return completedFrameCount
     }
 
     func pauseDelay(at time: TimeInterval, quietPeriod: TimeInterval) -> TimeInterval? {
@@ -96,6 +131,7 @@ final class ViewportRedrawDriver: NSObject, SCNSceneRendererDelegate, @unchecked
     func renderer(_ renderer: any SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
         lock.lock()
         guard !usesTechniqueCompletion else { lock.unlock(); return }
+        completedFrameCount &+= 1
         let acknowledged = frameGeneration.map { state.frameDidRender(generation: $0) } ?? false
         frameGeneration = nil
         let handler = acknowledged ? frameHandler : nil
@@ -108,6 +144,7 @@ final class ViewportRedrawDriver: NSObject, SCNSceneRendererDelegate, @unchecked
     func techniqueDidRender(_ renderer: any SCNSceneRenderer) {
         lock.lock()
         guard usesTechniqueCompletion else { lock.unlock(); return }
+        completedFrameCount &+= 1
         // AppKit also draws natural layout/exposure frames while playback is
         // paused. Report those actual frames to external delegates without
         // acknowledging a redraw generation that did not start with them.

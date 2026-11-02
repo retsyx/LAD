@@ -199,6 +199,8 @@ final class CADSceneView: SCNView {
     private var techniqueFrameObserver: ViewportTechniqueFrameObserver?
     private var redrawDelegateInstalled = false
     private var redrawPauseTask: Task<Void, Never>?
+    private var redrawRecoveryTask: Task<Void, Never>?
+    private var redrawRecoveryState = ViewportRedrawRecoveryState()
     private(set) var isPreparingResources = false
     var hasRenderableGeometry: Bool { hasModel }
     var isPreparingCaptureResources: Bool {
@@ -1113,15 +1115,48 @@ final class CADSceneView: SCNView {
         // Active navigation uses SceneKit's normal per-frame commits, rather
         // than synchronously flushing its transaction for every mouse event.
         if !wasActive { SCNTransaction.flush() }
-        redrawDriver.request(at: ProcessInfo.processInfo.systemUptime)
-        if !wasActive { refreshRedrawDelegate() }
+        let now = ProcessInfo.processInfo.systemUptime
+        redrawDriver.request(at: now)
+        if !wasActive {
+            redrawRecoveryState.stop()
+            _ = redrawRecoveryState.shouldRestart(at: now, finalFrameCount: redrawDriver.finalFrameCount)
+            refreshRedrawDelegate()
+        }
         if !rendersContinuously { rendersContinuously = true }
         if !isPlaying { isPlaying = true }
+        scheduleRedrawRecovery()
+    }
+
+    private func scheduleRedrawRecovery() {
+        guard redrawRecoveryTask == nil else { return }
+        redrawRecoveryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .milliseconds(350)) }
+            catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.redrawRecoveryTask = nil
+            guard self.canDrawViewport, self.redrawDriver.isActive else { self.stopRedraw(); return }
+            if self.redrawRecoveryState.shouldRestart(at: ProcessInfo.processInfo.systemUptime,
+                                                     finalFrameCount: self.redrawDriver.finalFrameCount) {
+                // SceneKit can retain true playback flags after its display link
+                // stops. Rearm only a stalled burst, preserving its generation
+                // and external delegate; ordinary navigation does no extra work.
+                self.isPlaying = false
+                self.rendersContinuously = false
+                self.refreshRedrawDelegate()
+                SCNTransaction.flush()
+                self.rendersContinuously = true
+                self.isPlaying = true
+                self.needsDisplay = true
+            }
+            if self.redrawRecoveryState.restartAttempts < 3 { self.scheduleRedrawRecovery() }
+        }
     }
 
     private var canDrawViewport: Bool {
         guard let window, window.isVisible, !window.isMiniaturized, !isHiddenOrHasHiddenAncestor else { return false }
-        return window.occlusionState.contains(.visible) || window.isKeyWindow
+        // Direct input and window captures can arrive while AppKit's occlusion
+        // state is stale. Allow their bounded bursts on an attached visible view.
+        return true
     }
 
     private func refreshRedrawDelegate() {
@@ -1147,6 +1182,9 @@ final class CADSceneView: SCNView {
     }
 
     private func stopRedraw() {
+        redrawRecoveryTask?.cancel()
+        redrawRecoveryTask = nil
+        redrawRecoveryState.stop()
         redrawPauseTask?.cancel()
         redrawPauseTask = nil
         isPlaying = false
@@ -1230,8 +1268,10 @@ final class CADSceneView: SCNView {
         // An explicit hidden/covered notification stops the burst even if
         // AppKit temporarily retains the key-window flag. Input and wake
         // requests can still recover from a stale occlusion bit afterward.
-        if window?.occlusionState.contains(.visible) == true { requestRedraw() }
-        else {
+        if window?.occlusionState.contains(.visible) == true {
+            stopRedraw()
+            requestRedraw()
+        } else {
             cancelCameraTransition()
             stopRedraw()
         }
