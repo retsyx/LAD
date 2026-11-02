@@ -207,7 +207,7 @@ enum ProjectStore {
               (0..<3).allSatisfy({ mesh.bounds[$0] <= mesh.bounds[$0 + 3] }),
               (0..<3).contains(where: { mesh.bounds[$0] < mesh.bounds[$0 + 3] }),
               mesh.volume.isFinite, mesh.volume > 0, mesh.area.isFinite, mesh.area > 0,
-              (1...4_096).contains(mesh.solids), (1...20_000).contains(mesh.faces),
+              (1...4_096).contains(mesh.solids), mesh.faces > 0,
               mesh.buildSeconds.isFinite, mesh.buildSeconds >= 0, (1...256).contains(mesh.threads),
               mesh.stepPath.utf8.count <= 16_384 else { throw invalid("Embedded preview metadata is invalid.") }
         let span = (0..<3).map { mesh.bounds[$0 + 3] - mesh.bounds[$0] }.max() ?? 0
