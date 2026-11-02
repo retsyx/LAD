@@ -22,6 +22,7 @@ MAX_TRIANGLES = 1_000_000
 MAX_VERTICES = 1_000_000
 MAX_EDGE_SEGMENTS = 250_000
 MAX_SCRIPT_BYTES = 200_000
+MAX_GEOMETRY_BYTES = 512_000_000
 LIMIT = 100_000.0
 _validated_replay = ContextVar("validated_replay", default=False)
 
@@ -176,8 +177,8 @@ def validate_step_roundtrip(shape, cq, step_path, preview_stats=None):
         raise ModelError("STEP verification measurements belong to a different build.")
     actual = {}
     try:
-        if not 0 < Path(step_path).stat().st_size <= 128 * 1024 * 1024:
-            raise ModelError("The STEP design is empty or exceeds 128 MB.")
+        if not 0 < Path(step_path).stat().st_size <= MAX_GEOMETRY_BYTES:
+            raise ModelError("The STEP design is empty or exceeds 512 MB.")
         import_step(step_path, cq, preview_stats=actual)
     except Exception as error:
         raise ModelError(f"Design failed STEP verification before acceptance: {error}") from error
@@ -457,7 +458,7 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
     # Bound individual files (including stderr) before generated Python runs.
     # The hard limit cannot be raised again by the model's process.
     _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
-    ceiling = 256 * 1024 * 1024
+    ceiling = MAX_GEOMETRY_BYTES
     if hard != resource.RLIM_INFINITY:
         ceiling = min(ceiling, hard)
     resource.setrlimit(resource.RLIMIT_FSIZE, (ceiling, ceiling))
@@ -471,8 +472,8 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
         import stat
         try:
             info = source_asset.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 128 * 1024 * 1024:
-                raise ModelError("The imported STEP asset must be a regular private file of at most 128 MB.")
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
+                raise ModelError("The imported STEP asset must be a regular private file of at most 512 MB.")
             imported = import_step(source_asset, cq)
             namespace["imported_model"] = imported
         except ModelError:
@@ -941,8 +942,8 @@ def import_input_asset(path, format, cq):
     """Read an app-staged recipe input, never an arbitrary program path."""
     import stat
     info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 128 * 1024 * 1024:
-        raise ModelError("Imported geometry must be a regular private file of at most 128 MB.")
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
+        raise ModelError("Imported geometry must be a regular private file of at most 512 MB.")
     if format in {"step", "stp"}:
         return import_step(path, cq)
     if format == "brep":
@@ -1093,8 +1094,8 @@ def preview_step(spec, asset_directory, output, cq, threads):
     import stat
     source = asset_directory / "preview.step"
     info = source.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 128_000_000:
-        raise ModelError("The saved STEP must be a regular private file of at most 128 MB.")
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
+        raise ModelError("The saved STEP must be a regular private file of at most 512 MB.")
     data = source.read_bytes()
     if not data[:512].lstrip().startswith(b"ISO-10303-21;") or b"END-ISO-10303-21;" not in data[-512:]:
         raise ModelError("The saved STEP asset is incomplete.")
@@ -1133,8 +1134,8 @@ def read_brep(spec, asset_directory, cq, threads):
     from OCP.TopoDS import TopoDS_Shape
     source = asset_directory / "source.brep"
     info = source.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 256_000_000:
-        raise ModelError("The native solid must be a regular private file of at most 256 MB.")
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
+        raise ModelError("The native solid must be a regular private file of at most 512 MB.")
     with source.open("rb") as stream:
         if not stream.read(128).startswith(b"DBRep_DrawableShape\n"):
             raise ModelError("The native solid asset is invalid.")
@@ -1329,8 +1330,8 @@ def validation_hash(spec, directory, cq):
     paths += [directory / asset["path"] for asset in spec.get("inputAssets", [])]
     for path in paths:
         info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= 128 * 1024 * 1024:
-            raise ModelError("Imported geometry must be a regular private file of at most 128 MB.")
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
+            raise ModelError("Imported geometry must be a regular private file of at most 512 MB.")
         add(path.read_bytes())
     return digest.hexdigest()
 

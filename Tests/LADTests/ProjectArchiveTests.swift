@@ -388,8 +388,10 @@ final class ProjectArchiveTests: XCTestCase {
         payload.append(footer)
         let model = program("result = imported_model", sourceSTEP: payload)
         let attachment = source(String(decoding: payload, as: UTF8.self))
-        let referenceCount = 300
-        XCTAssertGreaterThan(referenceCount * payload.count, ProjectStore.maximumFileBytes)
+        let referenceCount = 600
+        // The same bytes occur in both each revision's imported input and
+        // each message's attachment; only their unique payload is stored.
+        XCTAssertGreaterThan(2 * referenceCount * payload.count, ProjectStore.maximumFileBytes)
         var value = project()
         value.revisions = (0..<referenceCount).map { _ in ProjectRevision(model: model) }
         value.selectedRevisionID = value.revisions.last?.id
@@ -406,6 +408,12 @@ final class ProjectArchiveTests: XCTestCase {
         XCTAssertTrue(restored.revisions.allSatisfy { $0.model.sourceSTEP == payload && $0.model.script == model.script })
         XCTAssertTrue(restored.messages.allSatisfy { $0.attachments == [attachment] })
         XCTAssertTrue(restored.revisions.allSatisfy { $0.stepData == nil })
+    }
+
+    func testArchiveEnvelopeCanContainMaximumGeometryInputAndMetadata() {
+        let encodedInputBytes = ((ProjectStore.maximumSTEPBytes + 2) / 3) * 4
+        XCTAssertGreaterThanOrEqual(ProjectStore.maximumFileBytes, encodedInputBytes + 1_048_576,
+                                    "A supported imported input must fit the base64 manifest with room for its recipe and metadata.")
     }
 
     private func project(attachments: [SourceAttachment]? = nil) -> LADProject {

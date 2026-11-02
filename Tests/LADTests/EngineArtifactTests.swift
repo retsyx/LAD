@@ -23,6 +23,24 @@ final class EngineArtifactTests: XCTestCase {
         }
     }
 
+    func testGeometryArtifactsSupport512MBAndRejectLargerFilesBeforeReading() throws {
+        try withFolder { _, folder in
+            let file = folder.appendingPathComponent("model.brep")
+            FileManager.default.createFile(atPath: file.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: file)
+            defer { try? handle.close() }
+            // Sparse files exercise the actual file-size boundary without
+            // allocating or reading a full native geometry payload.
+            try handle.truncate(atOffset: 512_000_000)
+            try handle.seek(toOffset: 512_000_000 - 4)
+            try handle.write(contentsOf: Data("END\n".utf8))
+            XCTAssertEqual(try EngineArtifact.tail(file, in: folder, maximumBytes: 4), Data("END\n".utf8))
+            try handle.truncate(atOffset: 512_000_001)
+            XCTAssertThrowsError(try EngineArtifact.tail(file, in: folder, maximumBytes: 4))
+            XCTAssertThrowsError(try EngineArtifact.read(file, in: folder, maximumBytes: 512_000_001))
+        }
+    }
+
     func testSymbolicLinksHardLinksAndPipesAreRejectedWithoutFollowingThem() throws {
         try withFolder { root, folder in
             let outside = root.appendingPathComponent("private.txt")

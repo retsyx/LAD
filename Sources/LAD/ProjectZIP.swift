@@ -17,7 +17,7 @@ enum ProjectZIP {
     }
 
     static func encode(_ payload: Data) throws -> Data {
-        guard payload.count <= ProjectStore.maximumFileBytes else { throw invalid("Uncompressed design exceeds the 256 MB limit.") }
+        guard payload.count <= ProjectStore.maximumFileBytes else { throw invalid("Uncompressed design exceeds the 1,024 MB limit.") }
         let compressed = try deflate(payload)
         let checksum = crc(payload)
         let compressedSize = UInt32(compressed.count)
@@ -71,7 +71,7 @@ enum ProjectZIP {
     }
 
     static func decode(_ archive: Data) throws -> Data {
-        guard archive.count <= ProjectStore.maximumFileBytes else { throw invalid("File exceeds the 256 MB limit.") }
+        guard archive.count <= ProjectStore.maximumFileBytes else { throw invalid("File exceeds the 1,024 MB limit.") }
         guard archive.count >= overhead else { throw invalid("The ZIP container is incomplete.") }
         return try archive.withUnsafeBytes { bytes in
             let reader = Reader(bytes: bytes)
@@ -108,7 +108,7 @@ enum ProjectZIP {
             let compressedSize = Int((try reader.u32(central + 20)))
             let uncompressedSize = Int((try reader.u32(central + 24)))
             guard compressedSize <= ProjectStore.maximumFileBytes,
-                  uncompressedSize <= ProjectStore.maximumFileBytes else { throw invalid("Uncompressed design exceeds the 256 MB limit.") }
+                  uncompressedSize <= ProjectStore.maximumFileBytes else { throw invalid("Uncompressed design exceeds the 1,024 MB limit.") }
             let nameSize = Int((try reader.u16(central + 28)))
             let extraSize = Int((try reader.u16(central + 30)))
             let commentSize = Int((try reader.u16(central + 32)))
@@ -159,7 +159,7 @@ enum ProjectZIP {
                     let status = zlib.deflate(&stream, Z_FINISH)
                     guard status == Z_OK || status == Z_STREAM_END else { throw invalid("ZIP compression failed.") }
                     let written = output.count - Int(stream.avail_out)
-                    guard result.count + written <= ProjectStore.maximumFileBytes - overhead else { throw invalid("Compressed design exceeds the 256 MB limit.") }
+                    guard result.count + written <= ProjectStore.maximumFileBytes - overhead else { throw invalid("Compressed design exceeds the 1,024 MB limit.") }
                     result.append(output.bindMemory(to: UInt8.self).baseAddress!, count: written)
                     if status == Z_STREAM_END { break }
                 }

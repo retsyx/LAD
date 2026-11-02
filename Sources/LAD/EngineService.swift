@@ -70,7 +70,7 @@ final class EngineService {
                 for (index, asset) in assets.enumerated() {
                     guard CADInputAsset.supportedFormats.contains(asset.format), !asset.data.isEmpty,
                           asset.data.count <= ProjectStore.maximumSTEPBytes else {
-                        throw LADError.message("An imported geometry input is invalid or exceeds 128 MB.")
+                        throw LADError.message("An imported geometry input is invalid or exceeds 512 MB.")
                     }
                     let name = String(format: "input-%03d.%@", index, asset.format)
                     try asset.data.write(to: folder.appendingPathComponent(name), options: .atomic)
@@ -171,7 +171,7 @@ final class EngineService {
         // Recoloring can produce many large STEP variants of one assembly.
         // Keep a small, byte-bounded LRU rather than retaining every finish.
         while !exportedSTEPOrder.isEmpty &&
-                (exportedSTEP.count >= 8 || exportedSTEPBytes + data.count > ProjectStore.maximumFileBytes) {
+                (exportedSTEP.count >= 8 || exportedSTEPBytes + data.count > ProjectStore.maximumSTEPBytes) {
             let oldest = exportedSTEPOrder.removeFirst()
             if let removed = exportedSTEP.removeValue(forKey: oldest) { exportedSTEPBytes -= removed.count }
         }
@@ -220,7 +220,7 @@ final class EngineService {
         let source = URL(fileURLWithPath: path)
         do {
             return try await Task.detached(priority: .userInitiated) {
-                let data = try EngineArtifact.read(source, in: source.deletingLastPathComponent(), maximumBytes: ProjectStore.maximumFileBytes)
+                let data = try EngineArtifact.read(source, in: source.deletingLastPathComponent(), maximumBytes: ProjectStore.maximumSTEPBytes)
                 guard data.starts(with: Data("DBRep_DrawableShape\n".utf8)) else { throw EngineExportError.nativeArtifactUnavailable }
                 return data
             }.value
@@ -231,7 +231,7 @@ final class EngineService {
         guard !data.isEmpty, data.count <= ProjectStore.maximumSTEPBytes,
               String(decoding: data.prefix(512), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("ISO-10303-21;"),
               String(decoding: data.suffix(512), as: UTF8.self).contains("END-ISO-10303-21;") else {
-            throw LADError.message("The STEP design is invalid or exceeds 128 MB.")
+            throw LADError.message("The STEP design is invalid or exceeds 512 MB.")
         }
     }
 
@@ -336,7 +336,7 @@ final class EngineService {
         let folder = output.folder
         let resultURL = folder.appendingPathComponent("result.json")
         var mesh = try await Task.detached(priority: .userInitiated) {
-            let data = try EngineArtifact.read(resultURL, in: folder, maximumBytes: ProjectStore.maximumFileBytes)
+            let data = try EngineArtifact.read(resultURL, in: folder, maximumBytes: 256_000_000)
             let result = try JSONDecoder().decode(PreviewMesh.self, from: data)
             guard result.normals != nil else {
                 throw LADError.message("The CAD engine returned an incomplete design preview.")
@@ -352,7 +352,7 @@ final class EngineService {
                     throw LADError.message("CAD engine returned an unexpected native solid path.")
                 }
                 let brep = try EngineArtifact.read(folder.appendingPathComponent("model.brep"), in: folder,
-                                                   maximumBytes: ProjectStore.maximumFileBytes)
+                                                   maximumBytes: ProjectStore.maximumSTEPBytes)
                 guard brep.starts(with: Data("DBRep_DrawableShape\n".utf8)) else {
                     throw LADError.message("CAD engine did not return native solid geometry.")
                 }
@@ -430,7 +430,7 @@ enum EngineArtifact {
         var info = stat()
         guard Darwin.fstat(descriptor, &info) == 0,
               info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG), info.st_nlink == 1,
-              info.st_size >= 0, info.st_size <= 256 * 1024 * 1024 else {
+              info.st_size >= 0, info.st_size <= ProjectStore.maximumSTEPBytes else {
             try? file.close()
             throw LADError.message("CAD engine design asset must be a regular file with one link and a supported size.")
         }

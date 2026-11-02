@@ -378,15 +378,32 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertNoThrow(try roundtrip(valid))
     }
 
-    func testRejectsOversizeNativeSTEPSourceWithoutAllocatingItsContents() throws {
-        let file = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-source-oversize-\(UUID()).step")
+    func testNativeSTEPSourceAndImportedInputsSupport512MBBoundary() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-source-boundary-\(UUID()).step")
         FileManager.default.createFile(atPath: file.path, contents: nil)
         defer { try? FileManager.default.removeItem(at: file) }
         let handle = try FileHandle(forWritingTo: file)
-        try handle.truncate(atOffset: UInt64(ProjectStore.maximumSTEPBytes + 1))
-        try handle.close()
-        var value = project()
-        value.revisions[0].model.sourceSTEP = try Data(contentsOf: file, options: .alwaysMapped)
-        XCTAssertThrowsError(try ProjectStore.validate(value))
+        defer { try? handle.close() }
+        for size in [512_000_000, 512_000_001] {
+            try handle.truncate(atOffset: UInt64(size))
+            try handle.seek(toOffset: 0)
+            try handle.write(contentsOf: Data("ISO-10303-21;\n".utf8))
+            let footer = Data("\nEND-ISO-10303-21;\n".utf8)
+            try handle.seek(toOffset: UInt64(size - footer.count))
+            try handle.write(contentsOf: footer)
+            // The application boundary checks metadata and STEP delimiters;
+            // exact geometry validation remains the native worker's job.
+            let data = try Data(contentsOf: file, options: .alwaysMapped)
+            var model = ModelSpec.bracket
+            model.sourceSTEP = data
+            let asset = CADInputAsset(id: "reference", name: "reference.step", format: "step", data: data)
+            if size == 512_000_000 {
+                XCTAssertNoThrow(try ProjectStore.validateModel(model))
+                XCTAssertNoThrow(try ProjectStore.validateInputAssets([asset]))
+            } else {
+                XCTAssertThrowsError(try ProjectStore.validateModel(model))
+                XCTAssertThrowsError(try ProjectStore.validateInputAssets([asset]))
+            }
+        }
     }
 }

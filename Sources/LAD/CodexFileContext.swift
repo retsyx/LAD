@@ -39,6 +39,7 @@ struct CodexSelectionHistoryReference: Codable, Sendable {
 }
 
 struct CodexFileContext: Sendable {
+    private static let maximumContextBytes = 256_000_000
     var currentModelPath: String?
     var sources: [CodexSourceReference]
     /// Bounded metadata for images attached to the current request.
@@ -139,7 +140,7 @@ struct CodexFileContext: Sendable {
                     guard existing.data == data else { throw LADError.message("An image reference failed its integrity check.") }
                     path = existing.path
                 } else {
-                    guard data.count <= ProjectStore.maximumFileBytes - totalBytes else {
+                    guard data.count <= maximumContextBytes - totalBytes else {
                         throw LADError.message("The image references exceed the design's 256 MB asset limit.")
                     }
                     totalBytes += data.count
@@ -161,7 +162,7 @@ struct CodexFileContext: Sendable {
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
             encoder.dateEncodingStrategy = .iso8601
             let data = try encoder.encode(manifest)
-            guard data.count <= ProjectStore.maximumFileBytes else {
+            guard data.count <= maximumContextBytes else {
                 throw LADError.message("The image reference index exceeds the design limit.")
             }
             let url = context.appendingPathComponent("images.json")
@@ -274,7 +275,7 @@ struct CodexFileContext: Sendable {
             let bytes = try encoder.encode(model)
             let modelPath = (originFolder ?? folder) + "/selection-origin-model.json"
             let url: URL
-            if let existing = try? workspace.read(modelPath, maximumBytes: ProjectStore.maximumFileBytes), existing == bytes {
+            if let existing = try? workspace.read(modelPath, maximumBytes: maximumContextBytes), existing == bytes {
                 url = try workspace.url(modelPath)
             } else { url = try workspace.write(bytes, path: modelPath) }
             modelReference = CodexSourceReference(name: "selection-origin-model.json", path: url.path, readPath: url.path,
@@ -282,7 +283,7 @@ struct CodexFileContext: Sendable {
             if !inputs.isEmpty {
                 let path = (originFolder ?? folder) + "/selection-geometry-inputs.json"
                 let data = try JSONSerialization.data(withJSONObject: inputs, options: [.sortedKeys, .withoutEscapingSlashes])
-                if let existing = try? workspace.read(path, maximumBytes: ProjectStore.maximumFileBytes), existing == data {
+                if let existing = try? workspace.read(path, maximumBytes: maximumContextBytes), existing == data {
                     inputsPath = try workspace.url(path).path
                 } else { inputsPath = try workspace.write(data, path: path).path }
             }
