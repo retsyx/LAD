@@ -95,6 +95,43 @@ final class EngineService {
         return try JSONDecoder().decode(RuntimeResult.self, from: data).runtime
     }
 
+    struct MeshOutput {
+        var metadata: Data
+        var record: Data
+        var preview: PreviewMesh?
+        var native: Data?
+        var step: Data?
+    }
+
+    /// All reconstruction operations, including authored programs, use the
+    /// existing CAD process sandbox and cancellation/deadline enforcement.
+    func meshOperation(request: Data, files: [String: Data], python: String, threads: Int) async throws -> MeshOutput {
+        let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: true,
+                                   action: "inspect or revise the mesh reconstruction") { folder in
+            for (name, data) in files {
+                guard name == URL(fileURLWithPath: name).lastPathComponent, !name.isEmpty else {
+                    throw LADError.message("A reconstruction asset has an invalid private name.")
+                }
+                try data.write(to: folder.appendingPathComponent(name), options: .atomic)
+            }
+            try request.write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+        }
+        let folder = output.folder
+        let values = try await Task.detached(priority: .userInitiated) {
+            let metadata = try EngineArtifact.read(folder.appendingPathComponent("mesh-result.json"), in: folder, maximumBytes: 4_000_000)
+            let record = try EngineArtifact.read(folder.appendingPathComponent("mesh-record.json"), in: folder, maximumBytes: ProjectStore.maximumSTEPBytes)
+            let object = try JSONSerialization.jsonObject(with: metadata) as? [String: Any] ?? [:]
+            let native = object["native_preview"] as? Bool == true
+                ? try EngineArtifact.read(folder.appendingPathComponent("model.brep"), in: folder, maximumBytes: ProjectStore.maximumFileBytes) : nil
+            let step = object["step_available"] as? Bool == true
+                ? try EngineArtifact.read(folder.appendingPathComponent("export.step"), in: folder, maximumBytes: ProjectStore.maximumSTEPBytes) : nil
+            return (metadata, record, native, step, object["native_preview"] as? Bool == true)
+        }.value
+        let preview = values.4 ? try await readPreview(output, deferSTEP: true) : nil
+        try Task.checkCancellation()
+        return MeshOutput(metadata: values.0, record: values.1, preview: preview, native: values.2, step: values.3)
+    }
+
     /// Prepare display data for an imported STEP source without evaluating a
     /// generated CAD program.
     func previewSTEP(_ stepData: Data, parts: [PartNode]?, python: String, threads: Int) async throws -> PreviewMesh {

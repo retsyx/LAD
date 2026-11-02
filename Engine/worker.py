@@ -1350,6 +1350,18 @@ def run(request, output, threads, defer_step=False, validated_hash=None):
     if size > 16 * 1024 * 1024:
         raise ModelError("CAD request exceeds the 16 MiB size limit.")
     spec = json.loads(request.read_text())
+    if isinstance(spec, dict) and str(spec.get("operation", "")).startswith("mesh_"):
+        from mesh_tools import execute, envelope, diagnostic, canonical
+        try:
+            return execute(spec, request.parent.resolve(), output, threads)
+        except Exception as error:
+            # Domain failures remain inspectable tool results. The native host
+            # never receives a candidate artifact from an unsuccessful call.
+            result = envelope({}, None, "error", [diagnostic(getattr(error, "code", "INVALID_REQUEST"), str(error))])
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "mesh-result.json").write_bytes(canonical(result))
+            (output / "mesh-record.json").write_bytes(canonical(result))
+            return result
     is_preview = isinstance(spec, dict) and spec.get("operation") == "preview"
     is_export = isinstance(spec, dict) and spec.get("operation") == "export"
     is_measurement = isinstance(spec, dict) and spec.get("operation") == "measure"

@@ -178,6 +178,7 @@ final class CodexService {
             specification.sourceName = current?.sourceName
             let assets = try bridge.tools.resolveAssets(ids: response.assetIDs ?? current?.inputAssets?.map(\.id) ?? [])
             specification.inputAssets = assets.isEmpty ? nil : assets
+            specification = bridge.tools.resolvingReconstructionInputs(in: specification)
             guard specification.units == "mm" else {
                 throw CodexError.invalidModel("The response uses unsupported units.")
             }
