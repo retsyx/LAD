@@ -117,7 +117,7 @@ final class CADAgentTools {
         var bytes = 0
         for asset in merged.values {
             guard asset.data.count <= ProjectStore.maximumFileBytes - bytes else {
-                throw LADError.message("The selection's reference inputs exceed the design's 256 MB storage limit.")
+                throw LADError.message("The selection's reference inputs exceed the design's 1,024 MB storage limit.")
             }
             bytes += asset.data.count
         }
@@ -139,7 +139,7 @@ final class CADAgentTools {
         var total = 0
         for asset in assets {
             guard asset.data.count <= ProjectStore.maximumFileBytes - total else {
-                throw LADError.message("Imported geometry inputs exceed the design's 256 MB storage limit.")
+                throw LADError.message("Imported geometry inputs exceed the design's 1,024 MB storage limit.")
             }
             total += asset.data.count
         }
@@ -495,7 +495,7 @@ final class CADAgentTools {
         var total = 0
         for count in sizes.values {
             guard count <= ProjectStore.maximumFileBytes - total else {
-                throw LADError.message("Saved version inputs exceed the design's 256 MB storage limit.")
+                throw LADError.message("Saved version inputs exceed the design's 1,024 MB storage limit.")
             }
             total += count
         }

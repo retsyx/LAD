@@ -1,6 +1,8 @@
 """Candidate acceptance requires exact native and STEP-transfer integrity."""
 from pathlib import Path
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -67,6 +69,64 @@ class CandidateSTEPRoundtripTests(unittest.TestCase):
         path = folder / "candidate.step"
         cq.exporters.export(shape, str(path), exportType="STEP")
         return path
+
+    def test_native_step_verification_and_import_accept_more_than_128_mib(self):
+        source = cq.Solid.makeBox(2, 3, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            step = self.write_step(source, folder)
+            header, marker, rest = step.read_bytes().partition(b"HEADER;")
+            self.assertTrue(marker)
+            # A legal STEP comment exercises the real parser above the former
+            # cap. Write bounded chunks rather than allocate a huge string.
+            prefix, suffix = header, marker + rest
+            remaining = 128 * 1024 * 1024 + 1 - len(prefix) - len(suffix)
+            comment = b"/* LAD size boundary fixture */\n"
+            chunk = comment * (1_048_576 // len(comment))
+            with step.open("wb") as stream:
+                stream.write(prefix)
+                while remaining >= len(comment):
+                    count = min(remaining, len(chunk))
+                    count -= count % len(comment)
+                    stream.write(chunk[:count])
+                    remaining -= count
+                stream.write(b" " * remaining)
+                stream.write(suffix)
+            self.assertGreater(step.stat().st_size, 128 * 1024 * 1024)
+            worker.validate_step_roundtrip(source, cq, step)
+            imported = worker.import_input_asset(step, "step", cq)
+            self.assertAlmostEqual(imported.Volume(), source.Volume(), places=7)
+
+    def test_step_size_boundary_is_512_mb_and_rejects_larger_before_reading(self):
+        source = cq.Solid.makeBox(2, 3, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            step = Path(directory) / "boundary.step"
+            # Sparse files exercise size gates at the actual boundary without
+            # allocating 512 MB. Native STEP parsing has real coverage above.
+            with step.open("wb") as stream:
+                stream.truncate(512_000_000)
+            original_import = worker.import_step
+
+            def import_fixture(path, runtime, preview_stats=None):
+                self.assertEqual(path, step)
+                return worker.validate_shape(source, preview_stats=preview_stats)
+
+            with mock.patch.object(worker, "import_step", side_effect=import_fixture) as reader:
+                worker.validate_step_roundtrip(source, cq, step)
+                reader.assert_called_once()
+            # Earlier build tests lower this process's hard file cap, so model
+            # the one-byte-oversize stat rather than trying to exceed that cap.
+            fields = list(step.stat())
+            fields[6] = 512_000_001
+            oversized = os.stat_result(fields)
+            with (mock.patch.object(Path, "stat", return_value=oversized),
+                  mock.patch.object(worker, "import_step", wraps=original_import) as reader):
+                with self.assertRaisesRegex(worker.ModelError, "512 MB"):
+                    worker.validate_step_roundtrip(source, cq, step)
+                reader.assert_not_called()
+            with (mock.patch.object(Path, "lstat", return_value=oversized),
+                  self.assertRaisesRegex(worker.ModelError, "512 MB")):
+                worker.import_input_asset(step, "step", cq)
 
     def test_accepts_unchanged_parts_when_step_reorders_them(self):
         parts = [cq.Solid.makeBox(2, 3, 4).translate((-20, 1, 2)),
@@ -179,6 +239,56 @@ class CandidateSTEPRoundtripTests(unittest.TestCase):
             self.assertEqual(result["solids"], 1)
             self.assertEqual(result["faces"], 6)
             self.assertAlmostEqual(result["volume"], 24)
+
+
+class GeometryFileResourceLimitTests(unittest.TestCase):
+    def test_worker_allows_512_mb_files_and_preserves_a_stricter_inherited_limit(self):
+        # build_script sets an irreversible hard cap. Run each case in a child
+        # so the unittest process and its other native fixtures stay unaffected.
+        code = """
+import errno
+import json
+from pathlib import Path
+import resource
+import signal
+import sys
+import cadquery as cq
+
+sys.path.insert(0, sys.argv[1])
+import worker
+requested = int(sys.argv[2])
+if requested:
+    resource.setrlimit(resource.RLIMIT_FSIZE, (requested, requested))
+before = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+worker.build_script('result = cq.Solid.makeBox(1,1,1)', cq)
+expected = 512_000_000 if before == resource.RLIM_INFINITY else min(512_000_000, before)
+actual = resource.getrlimit(resource.RLIMIT_FSIZE)
+assert actual == (expected, expected), (actual, expected)
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+path = Path(sys.argv[3])
+with path.open('wb') as stream:
+    stream.truncate(expected)
+assert path.stat().st_size == expected
+blocked = False
+try:
+    with path.open('r+b') as stream:
+        stream.truncate(expected + 1)
+except OSError as error:
+    blocked = error.errno == errno.EFBIG
+assert blocked, 'The worker file cap did not prevent a larger file'
+print(json.dumps({'limit': expected, 'blocked': blocked}))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            for inherited in (0, 96_000_000):
+                with self.subTest(inherited=inherited):
+                    result = subprocess.run([
+                        sys.executable, "-c", code, str(Path(worker.__file__).parent),
+                        str(inherited), str(Path(directory) / "output.bin"),
+                    ], capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    report = json.loads(result.stdout)
+                    self.assertEqual(report["limit"], inherited or 512_000_000)
+                    self.assertTrue(report["blocked"])
 
 
 if __name__ == "__main__":

@@ -223,7 +223,8 @@ embedded user paths.
 
 The native process runner enforces a 10-minute deadline and cancellation with
 a hard-kill fallback. Python model files, including stderr logs, have a hard
-256 MiB per-file limit. On completion the app accepts only bounded regular
+512 MB (512,000,000-byte) per-file limit. Geometry inputs, STEP verification,
+exports and native BREP artifacts share that limit. On completion the app accepts only bounded regular
 output files, rejects symbolic links and hardlinks, verifies private native
 solid paths and STEP delimiters, and reads only a bounded diagnostic tail on failure.
 The sandbox fails closed if its tool or profile is unavailable. Direct CLI

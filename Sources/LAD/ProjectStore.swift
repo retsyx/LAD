@@ -3,19 +3,21 @@ import Foundation
 /// Portable project serialization. All methods are nonisolated so callers can
 /// read, validate and encode large geometry snapshots on a background task.
 enum ProjectStore {
-    static let maximumFileBytes = 256_000_000
-    static let maximumSTEPBytes = 128_000_000
+    // Leave room for a maximum-size input encoded in the archive asset table.
+    static let maximumFileBytes = 1_024_000_000
+    static let maximumSTEPBytes = 512_000_000
+    static let maximumActivityTextBytes = 256_000_000
     private static let coordinateLimit = 1_000_000.0
 
     static func encode(_ project: LADProject) throws -> Data {
         try validate(project)
         let data = try ProjectZIP.encode(ProjectArchive.encode(project))
-        guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 256 MB design limit.") }
+        guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 1,024 MB design limit.") }
         return data
     }
 
     static func decode(_ data: Data) throws -> LADProject {
-        guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 256 MB design limit.") }
+        guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 1,024 MB design limit.") }
         let payload = ProjectZIP.isZIP(data) ? try ProjectZIP.decode(data) : data
         let project = try ProjectArchive.decode(payload)
         try validate(project)
@@ -32,7 +34,7 @@ enum ProjectStore {
     static func readArchive(from url: URL) throws -> Data {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         if let size = attributes[.size] as? NSNumber, size.uint64Value > UInt64(maximumFileBytes) {
-            throw invalid("File exceeds the 256 MB design limit.")
+            throw invalid("File exceeds the 1,024 MB design limit.")
         }
         let file = try FileHandle(forReadingFrom: url)
         defer { try? file.close() }
@@ -41,7 +43,7 @@ enum ProjectStore {
         // file grows between the two operations.
         while let chunk = try file.read(upToCount: min(1_048_576, maximumFileBytes + 1 - data.count)), !chunk.isEmpty {
             data.append(chunk)
-            guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 256 MB design limit.") }
+            guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 1,024 MB design limit.") }
         }
         return data
     }
@@ -281,7 +283,7 @@ enum ProjectStore {
               header.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("ISO-10303-21;"),
               let footer = String(data: data.suffix(512), encoding: .utf8),
               footer.contains("END-ISO-10303-21;") else {
-            throw invalid("Embedded STEP asset is invalid or exceeds 128 MB.")
+            throw invalid("Embedded STEP asset is invalid or exceeds 512 MB.")
         }
     }
 
@@ -362,8 +364,8 @@ enum ProjectStore {
                       event.title.utf8.count <= 16_384, !event.title.contains("\0"),
                       event.date.timeIntervalSinceReferenceDate.isFinite,
                       event.durationSeconds.map({ $0.isFinite && $0 >= 0 }) ?? true,
-                      event.input.map({ $0.utf8.count <= maximumFileBytes }) ?? true,
-                      event.output.map({ $0.utf8.count <= maximumFileBytes }) ?? true else {
+                      event.input.map({ $0.utf8.count <= maximumActivityTextBytes }) ?? true,
+                      event.output.map({ $0.utf8.count <= maximumActivityTextBytes }) ?? true else {
                     throw invalid("A saved tool activity event is invalid.")
                 }
                 if let files = event.files {

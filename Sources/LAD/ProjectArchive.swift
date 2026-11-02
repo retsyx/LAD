@@ -29,14 +29,14 @@ enum ProjectArchive {
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(archive)
         guard data.count <= ProjectStore.maximumFileBytes else {
-            throw invalid("File exceeds the 256 MB design limit.")
+            throw invalid("File exceeds the 1,024 MB design limit.")
         }
         return data
     }
 
     static func decode(_ data: Data) throws -> LADProject {
         guard data.count <= ProjectStore.maximumFileBytes else {
-            throw invalid("File exceeds the 256 MB design limit.")
+            throw invalid("File exceeds the 1,024 MB design limit.")
         }
         let archive = try JSONDecoder().decode(Document.self, from: data)
         guard archive.formatVersion == formatVersion else {
@@ -451,7 +451,7 @@ enum ProjectArchive {
             case .script: return 200_000
             case .step: return ProjectStore.maximumSTEPBytes
             case .input: return ProjectStore.maximumSTEPBytes
-            case .activity: return ProjectStore.maximumFileBytes
+            case .activity: return ProjectStore.maximumActivityTextBytes
             case .activityFile: return ProjectActivityFile.maximumBytes
             }
         }
@@ -521,7 +521,7 @@ enum ProjectArchive {
     }
 
     private static func addBytes(_ count: Int, to total: inout Int, limit: Int) throws {
-        guard count <= limit - total else { throw invalid("Saved file assets exceed the 256 MB design limit.") }
+        guard count <= limit - total else { throw invalid("Saved file assets exceed the 1,024 MB design limit.") }
         total += count
     }
 

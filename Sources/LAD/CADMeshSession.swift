@@ -59,7 +59,7 @@ final class CADMeshSession {
             }
             let access = workspace
             assets["source." + suffix] = try await Task.detached(priority: .userInitiated) {
-                try access.read(path, maximumBytes: ProjectStore.maximumSTEPBytes)
+                try access.read(path, maximumBytes: 128_000_000)
             }.value
             request["sourceAsset"] = "source." + suffix
             options = ["units": try text("units", arguments), "max_deviation": number.doubleValue,
