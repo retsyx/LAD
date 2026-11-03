@@ -1114,23 +1114,120 @@ def _preview_patch_triangles(loop, points, normals, face, tolerance):
     return result
 
 
+def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary):
+    """Improve folded native cells without moving or adding mesh nodes.
+
+    A sheared surface chart can give Delaunay-in-UV a physically long diagonal.
+    Re-triangulate only convex UV quads across shared interior edges. Every
+    change preserves their oriented UV coverage and native trim polygons,
+    shortens the physical diagonal, and improves the worst surface orientation.
+    """
+    import numpy as np
+    from collections import defaultdict
+    from OCP.TopAbs import TopAbs_Orientation
+    xyz, exact = np.asarray(points), np.asarray(normals)
+    indices = np.asarray(triangles, dtype=np.int64)
+    threshold = -1e-8 / 3
+
+    def audit(cells):
+        corners = xyz[cells]
+        planes = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        lengths = np.linalg.norm(planes, axis=1)
+        unit = np.divide(planes, lengths[:, None], out=np.zeros_like(planes), where=lengths[:, None] > 1e-20)
+        dots = (unit * exact[cells].mean(axis=1)).sum(axis=1)
+        return dots, lengths
+
+    dots, lengths = audit(indices)
+    if not np.any((lengths > 1e-12) & (dots < threshold)):
+        return triangles
+    if face.geomType() not in {"BSPLINE", "BEZIER"}:
+        raise _PreviewMeshError("the triangulation contains inward surface triangles")
+    if not poly.HasUVNodes():
+        raise _PreviewMeshError("inward surface triangles have no native UV coordinates")
+    boundary = boundary()
+    uv = np.asarray([poly.UVNode(index).Coord() for index in range(1, poly.NbNodes() + 1)])
+    sign = -1 if face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED else 1
+
+    def key(a, b):
+        return (min(a, b), max(a, b))
+
+    def signed(a, b, c):
+        ab, ac = uv[b] - uv[a], uv[c] - uv[a]
+        return float(ab[0] * ac[1] - ab[1] * ac[0])
+
+    if any(sign * signed(*cell) <= 0 for cell, length in zip(indices, lengths) if length > 1e-12):
+        raise _PreviewMeshError("the triangulation contains inward surface triangles with reversed UV winding")
+    for iteration in range(20):
+        dots, lengths = audit(indices)
+        adjacent = defaultdict(list)
+        for index, (a, b, c) in enumerate(indices.tolist()):
+            for left, right in ((a, b), (b, c), (c, a)):
+                adjacent[key(left, right)].append(index)
+        if any(len(owners) > 2 for owners in adjacent.values()):
+            raise _PreviewMeshError("the triangulation contains nonmanifold surface edges")
+        candidates = [edge for edge, owners in adjacent.items() if len(owners) == 2 and edge not in boundary]
+        candidates.sort(key=lambda edge: -float(np.linalg.norm(xyz[edge[0]] - xyz[edge[1]])))
+        touched, changed = set(), False
+        for edge in candidates:
+            first, second = adjacent[edge]
+            if first == second or first in touched or second in touched:
+                continue
+            cell, other = indices[first].tolist(), indices[second].tolist()
+            position = next(index for index in range(3) if key(cell[index], cell[(index + 1) % 3]) == edge)
+            a, b, c = [cell[(position + index) % 3] for index in range(3)]
+            if not any(other[index] == b and other[(index + 1) % 3] == a for index in range(3)):
+                raise _PreviewMeshError("the triangulation has inconsistent shared-edge directions")
+            d = next(node for node in other if node not in edge)
+            if len({a, b, c, d}) != 4:
+                continue
+            if key(c, d) in adjacent:
+                continue  # A new diagonal must not create a nonmanifold edge.
+            proposed = np.asarray([[c, a, d], [c, d, b]], dtype=np.int64)
+            if any(sign * signed(*triangle) <= 1e-16 for triangle in proposed):
+                continue
+            new_dots, new_lengths = audit(proposed)
+            if np.any(new_lengths <= 1e-12):
+                continue
+            old_bad = int(dots[first] < threshold) + int(dots[second] < threshold)
+            if np.count_nonzero(new_dots < threshold) > old_bad:
+                continue
+            if new_dots.min() <= min(dots[first], dots[second]) + 1e-6:
+                continue
+            if np.linalg.norm(xyz[c] - xyz[d]) >= np.linalg.norm(xyz[a] - xyz[b]) - 1e-10:
+                continue
+            indices[first], indices[second] = proposed
+            touched.update((first, second))
+            changed = True
+        if not changed:
+            break
+    dots, lengths = audit(indices)
+    if np.any((lengths > 1e-12) & (dots < threshold)):
+        raise _PreviewMeshError("inward surface triangles remain after bounded metric triangulation")
+    return indices.tolist()
+
+
 def _preview_face_triangles(face, poly, location, points, normals, edges, tolerance):
     """Audit native coverage and complete small gaps at curved trim corners."""
     from collections import Counter, defaultdict
     from OCP.BRep import BRep_Tool
     from OCP.TopAbs import TopAbs_Orientation
     from OCP.TopoDS import TopoDS
-    import numpy as np
     reverse = face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
     triangles = [[a - 1, (c if reverse else b) - 1, (b if reverse else c) - 1]
                  for a, b, c in (poly.Triangle(index).Get() for index in range(1, poly.NbTriangles() + 1))]
-    xyz, exact = np.asarray(points), np.asarray(normals)
-    corners = xyz[np.asarray(triangles)]
-    planes = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
-    lengths = np.linalg.norm(planes, axis=1)
-    dots = (planes * exact[np.asarray(triangles)].sum(axis=1)).sum(axis=1)
-    if np.any((lengths > 1e-12) & (dots < -lengths * 1e-8)):
-        raise _PreviewMeshError("the triangulation contains inward surface triangles")
+    # Boundary edges are immutable; only interior diagonals may change. Build
+    # their constraints lazily so healthy faceted imports retain the fast path.
+    def boundary():
+        result = set()
+        for edge in edges:
+            for wrapped in (edge.wrapped, TopoDS.Edge(edge.wrapped.Reversed())):
+                polygon = BRep_Tool.PolygonOnTriangulation_s(wrapped, poly, location)
+                if polygon is not None:
+                    nodes = polygon.Nodes()
+                    sequence = [nodes.Value(index) - 1 for index in range(nodes.Lower(), nodes.Upper() + 1)]
+                    result.update(tuple(sorted(pair)) for pair in zip(sequence, sequence[1:]))
+        return result
+    triangles = _preview_retriangulate_face(face, poly, points, normals, triangles, boundary)
     if len(points) == 3 and len(triangles) == 1:
         return triangles  # Common faceted imports need no boundary graph.
 
@@ -1282,7 +1379,7 @@ def _preview_mesh(shape, solids, tolerance):
                     triangles = _preview_face_triangles(face, poly, location, points, normals, edges, tolerance)
                     total_nodes += len(points)
                     total_triangles += len(triangles)
-                    if total_triangles > MAX_TRIANGLES:
+                    if total_nodes > MAX_VERTICES or total_triangles > MAX_TRIANGLES:
                         raise ModelError("Preview exceeds the mesh size limit; simplify the design.")
                     chunks.append((face, edges, poly, location, points, normals, triangles))
                 result.append(chunks)
