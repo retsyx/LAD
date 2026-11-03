@@ -509,7 +509,7 @@ final class CodexServiceTests: XCTestCase {
             _ = try await CodexService().generate(prompt: "Make a box", current: nil, history: [], executable: fixture.executable.path, model: "", onProgress: { _ in })
             XCTFail("Expected a sign-in error")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("Complete setup in your Codex installation"))
+            XCTAssertTrue(error.localizedDescription.contains("Complete setup in your installed app or CLI"))
         }
     }
 

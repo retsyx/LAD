@@ -10,8 +10,8 @@ enum CodexAppServerClient {
     }
 
     static func errorMessage(_ error: [String: Any]) -> String {
-        let detail = error["message"] as? String ?? "Codex rejected the request."
+        let detail = error["message"] as? String ?? "The request was rejected."
         guard let code = error["code"] as? Int, code == -32601 || code == -32602 else { return detail }
-        return "The installed Codex does not support this LAD operation. Update Codex and check its configuration, then try again.\n\n\(detail)"
+        return "The installed app or CLI does not support this LAD operation. Update the app or CLI and check its configuration, then try again.\n\n\(detail)"
     }
 }

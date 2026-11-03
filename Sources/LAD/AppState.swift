@@ -731,7 +731,7 @@ final class AppState: ObservableObject {
                     self.taskAudits[index].additionalUserMessageIDs = (self.taskAudits[index].additionalUserMessageIDs ?? []) + [message.id]
                     self.taskAudits[index].events.append(ProjectActivityEvent(id: "steer:\(id.uuidString)", category: "steering",
                         title: "Additional design information sent", status: "completed", input: content,
-                        output: "Accepted by Codex turn \(turn)."))
+                        output: "Accepted by task turn \(turn)."))
                 }
                 self.queuedRequests.removeAll { $0.id == id }
                 self.queuedRequestErrors.removeValue(forKey: id)
@@ -926,7 +926,7 @@ final class AppState: ObservableObject {
         let userMessage = ChatMessage(role: "user", content: text, attachments: attached.isEmpty ? nil : attached,
                                       selection: request.selection)
         messages.append(userMessage)
-        error = nil; notice = nil; isWorking = true; activity = "Codex is designing…"
+        error = nil; notice = nil; isWorking = true; activity = "Designing…"
         let token = UUID(); operationID = token
         let feedback = CodexConversationFeedback()
         generationFeedback = feedback
@@ -1032,8 +1032,8 @@ final class AppState: ObservableObject {
                     let diagnostic = briefDiagnostic(error)
                     recordTaskEvent(ProjectActivityEvent(id: "final:validation", category: "validation",
                         title: "Final CAD validation failed", status: "failed", output: description))
-                    messages.append(ChatMessage(role: "system", content: "CAD validation failed: \(diagnostic)\nCodex is repairing the design (one attempt)."))
-                    activity = "Codex is repairing the geometry…"
+                    messages.append(ChatMessage(role: "system", content: "CAD validation failed: \(diagnostic)\nRepairing the design (one attempt)."))
+                    activity = "Repairing the geometry…"
                     autosave()
                     let repairRequest = """
                     Repair the current design for the original request below. The CAD engine rejected its CadQuery program.

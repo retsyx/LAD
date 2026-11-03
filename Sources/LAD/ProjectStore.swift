@@ -204,7 +204,7 @@ enum ProjectStore {
         guard validModel(settings.model), CodexReasoningEffort(rawValue: settings.reasoningEffort) != nil,
               settings.reasoningByModel.count <= 256,
               settings.reasoningByModel.allSatisfy({ validModel($0.key) && CodexReasoningEffort(rawValue: $0.value) != nil }) else {
-            throw invalid("The saved Codex model or reasoning selection is invalid.")
+            throw invalid("The saved model or reasoning selection is invalid.")
         }
     }
 

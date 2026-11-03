@@ -11,7 +11,7 @@ final class CodexAppServerJobTests: XCTestCase {
                 _ = try await fixture.job().run(input: Data("initial request".utf8))
                 XCTFail("Unsupported \(method) must fail")
             } catch {
-                XCTAssertTrue(error.localizedDescription.contains("Update Codex and check its configuration"))
+                XCTAssertTrue(error.localizedDescription.contains("Update the app or CLI and check its configuration"))
                 XCTAssertTrue(error.localizedDescription.contains("Unsupported \(method)"))
             }
             let requests = try fixture.requests()
@@ -160,7 +160,7 @@ final class CodexAppServerJobTests: XCTestCase {
         XCTAssertFalse(response.isEmpty)
         XCTAssertLessThan(Date().timeIntervalSince(started), 5,
             "Incremental framing must remain linear for an unterminated 32 MB event")
-        XCTAssertEqual(capture.events.filter { $0.title == "Oversized Codex event" }.count, 1)
+        XCTAssertEqual(capture.events.filter { $0.title == "Oversized task event" }.count, 1)
         XCTAssertEqual(capture.messages.map(\.text), ["The connection recovered."])
     }
 

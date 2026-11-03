@@ -7,7 +7,7 @@ enum CodexActivity {
         guard let eventType = object["type"] as? String else { return nil }
         if eventType == "thread.started" || eventType == "turn.completed" || eventType == "turn.failed" || eventType == "error" {
             let failed = eventType == "turn.failed" || eventType == "error"
-            let title = eventType == "thread.started" ? "Codex session started" : eventType == "turn.completed" ? "Codex turn finished" : "Codex error"
+            let title = eventType == "thread.started" ? "Session started" : eventType == "turn.completed" ? "Task finished" : "Task error"
             return ProjectActivityEvent(id: "cli:\(eventType):\(object["thread_id"] as? String ?? UUID().uuidString)",
                 category: failed ? "diagnostic" : "lifecycle", title: title,
                 status: failed ? "failed" : "completed", output: json(sanitize(object)))

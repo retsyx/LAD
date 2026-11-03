@@ -14,9 +14,9 @@ enum CodexSteeringError: LocalizedError {
     }
     var errorDescription: String? {
         switch self {
-        case .unavailable: return "Codex is no longer accepting information for this turn. The follow-up remains queued."
-        case .rejected(let detail): return "Codex did not accept the additional information: \(detail) The follow-up remains queued."
-        case .uncertain(let detail): return "\(detail) Codex may have received the information. Review the conversation before resuming the queue."
+        case .unavailable: return "This task is no longer accepting information. The follow-up remains queued."
+        case .rejected(let detail): return "The additional information was not accepted: \(detail) The follow-up remains queued."
+        case .uncertain(let detail): return "\(detail) The information may have been received. Review the conversation before resuming the queue."
         }
     }
 }
@@ -189,7 +189,7 @@ final class CodexAppServerJob: @unchecked Sendable {
         lock.lock()
         if cancelled { lock.unlock(); throw CancellationError() }
         do { try process.run(); running = true; lock.unlock() }
-        catch { lock.unlock(); throw CodexError.failed("Could not start Codex: \(error.localizedDescription)") }
+        catch { lock.unlock(); throw CodexError.failed("Could not start the design task: \(error.localizedDescription)") }
         defer { shutdown() }
         let outputFD = outputPipe.fileHandleForReading.fileDescriptor
         let errorFD = errorPipe.fileHandleForReading.fileDescriptor
@@ -220,7 +220,7 @@ final class CodexAppServerJob: @unchecked Sendable {
             if isCancelled, Date().timeIntervalSince(cancelDate ?? Date()) >= 0.35 { throw CancellationError() }
             if let ending, !awaitingSteer { return try terminalData(ending) }
             if ending != nil, awaitingSteer, Date().timeIntervalSince(endingDate ?? Date()) > 5 {
-                rejectPendingSteers("Codex finished before acknowledging this information.")
+                rejectPendingSteers("The task finished before acknowledging this information.")
                 continue
             }
             if !process.isRunning, exitedAt == nil { exitedAt = Date() }
@@ -229,7 +229,7 @@ final class CodexAppServerJob: @unchecked Sendable {
                 if let ending { return try terminalData(ending) }
                 let status = process.isRunning ? "" : " with status \(process.terminationStatus)"
                 let detail = String(decoding: stderrTail, as: UTF8.self)
-                throw CodexError.failed("Codex exited\(status).\n\n\(detail.isEmpty ? "The app-server connection closed before the design was complete." : String(detail.suffix(2_400)))")
+                throw CodexError.failed("The design task exited\(status).\n\n\(detail.isEmpty ? "The app-server connection closed before the design was complete." : String(detail.suffix(2_400)))")
             }
             var descriptors = [
                 pollfd(fd: outputFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
@@ -246,7 +246,7 @@ final class CodexAppServerJob: @unchecked Sendable {
                     if writeOffset == writing.count { writeBuffer = nil }
                 } else if written < 0, errno != EAGAIN, errno != EINTR {
                     if isCancelled { throw CancellationError() }
-                    throw CodexError.failed("The Codex app-server input connection closed unexpectedly.")
+                    throw CodexError.failed("The task’s input connection closed unexpectedly.")
                 }
             }
             for index in 0..<2 where descriptors[index].revents != 0 {
@@ -274,7 +274,7 @@ final class CodexAppServerJob: @unchecked Sendable {
         switch terminal {
         case .completed(let data): return data
         case .failed(let message): throw CodexError.failed(message)
-        case .interrupted: throw CodexError.failed("Codex’s turn was interrupted before the design was complete.")
+        case .interrupted: throw CodexError.failed("The task was interrupted before the design was complete.")
         }
     }
 
@@ -287,7 +287,7 @@ final class CodexAppServerJob: @unchecked Sendable {
         lock.unlock()
         publishAvailability(false)
         for continuation in remaining {
-            continuation.resume(throwing: CodexSteeringError.uncertain(wasCancelled ? "The task stopped before Codex acknowledged the additional information." : "The Codex connection closed before it acknowledged the additional information."))
+            continuation.resume(throwing: CodexSteeringError.uncertain(wasCancelled ? "The task stopped before acknowledging the additional information." : "The task’s connection closed before acknowledging the additional information."))
         }
         try? inputPipe.fileHandleForWriting.close()
         if process.isRunning { process.terminate() }
@@ -330,9 +330,9 @@ final class CodexAppServerJob: @unchecked Sendable {
         lock.unlock()
         for (_, request) in expired {
             if request.purpose == .steer {
-                request.continuation?.resume(throwing: CodexSteeringError.uncertain("Codex did not acknowledge the additional information."))
+                request.continuation?.resume(throwing: CodexSteeringError.uncertain("The additional information was not acknowledged."))
             } else if request.purpose != .interrupt {
-                throw CodexError.failed("The Codex app-server connection timed out while starting the task. Check the installed CLI and its sign-in.")
+                throw CodexError.failed("The connection timed out while starting the task. Check the installed app or CLI and its sign-in.")
             }
         }
     }
@@ -377,7 +377,7 @@ final class CodexAppServerJob: @unchecked Sendable {
     }
     private func oversizedEvent() {
         onActivity(ProjectActivityEvent(id: "server:oversized:\(UUID().uuidString)", category: "diagnostic",
-            title: "Oversized Codex event", status: "failed", output: "An app-server event exceeded 32 MB and could not be retained. This execution record is incomplete."))
+            title: "Oversized task event", status: "failed", output: "An app-server event exceeded 32 MB and could not be retained. This execution record is incomplete."))
     }
 
     private func receive(_ line: Data, prompt: String, imagePaths: [String]) throws {
@@ -410,10 +410,10 @@ final class CodexAppServerJob: @unchecked Sendable {
             try enqueue("thread/start", purpose: .threadStart, params: params)
         case .threadStart:
             guard let thread = result["thread"] as? [String: Any], let id = thread["id"] as? String, !id.isEmpty else {
-                throw CodexError.failed("Codex returned an unreadable thread identifier.")
+                throw CodexError.failed("The task returned an unreadable session identifier.")
             }
             lock.lock(); threadID = id; lock.unlock()
-            onActivity(ProjectActivityEvent(id: "server:thread:\(id)", category: "lifecycle", title: "Codex session started", status: "completed", output: "Ephemeral thread \(id)"))
+            onActivity(ProjectActivityEvent(id: "server:thread:\(id)", category: "lifecycle", title: "Session started", status: "completed", output: "Ephemeral thread \(id)"))
             guard let schema = try JSONSerialization.jsonObject(with: schema) as? [String: Any] else { throw CodexError.resourcesMissing }
             var params: [String: Any] = ["threadId": id, "input": Self.userInput(text: prompt, imagePaths: imagePaths),
                 "cwd": directory.path, "approvalPolicy": "never", "outputSchema": schema,
@@ -425,13 +425,13 @@ final class CodexAppServerJob: @unchecked Sendable {
             try enqueue("turn/start", purpose: .turnStart, params: params)
         case .turnStart:
             guard let turn = result["turn"] as? [String: Any], let id = turn["id"] as? String else {
-                throw CodexError.failed("Codex returned an unreadable turn identifier.")
+                throw CodexError.failed("The task returned an unreadable turn identifier.")
             }
             activateTurn(id)
             if turn["status"] as? String != "inProgress" { completeTurn(turn) }
         case .steer:
             guard let accepted = result["turnId"] as? String, accepted == request.expectedTurnID else {
-                request.continuation?.resume(throwing: CodexSteeringError.uncertain("Codex did not acknowledge the expected active turn."))
+                request.continuation?.resume(throwing: CodexSteeringError.uncertain("The expected active task was not acknowledged."))
                 return
             }
             request.continuation?.resume(returning: accepted)
@@ -462,7 +462,7 @@ final class CodexAppServerJob: @unchecked Sendable {
             var message = messages[id] ?? Message(text: "", phase: nil)
             if message.text.utf8.count + delta.utf8.count <= Self.maximumFinalBytes { message.text += delta }
             else {
-                onActivity(ProjectActivityEvent(id: "server:message-limit:\(id)", category: "diagnostic", title: "Codex message exceeded its size limit", status: "failed"))
+                onActivity(ProjectActivityEvent(id: "server:message-limit:\(id)", category: "diagnostic", title: "Task message exceeded its size limit", status: "failed"))
             }
             messages[id] = message
             // Unknown-phase deltas might be final JSON or tool/code text. Wait
@@ -484,7 +484,7 @@ final class CodexAppServerJob: @unchecked Sendable {
         case "turn/plan/updated":
             onActivity(ProjectActivityEvent(id: "server:plan:\(params["turnId"] as? String ?? "plan")", category: "plan", title: "Task plan", status: "running", output: CodexActivity.json(CodexActivity.sanitize(params))))
         case "error":
-            onActivity(ProjectActivityEvent(id: "server:error:\(UUID().uuidString)", category: "diagnostic", title: "Codex error", status: "failed", output: CodexActivity.json(CodexActivity.sanitize(params))))
+            onActivity(ProjectActivityEvent(id: "server:error:\(UUID().uuidString)", category: "diagnostic", title: "Task error", status: "failed", output: CodexActivity.json(CodexActivity.sanitize(params))))
         default: break
         }
     }
@@ -557,18 +557,18 @@ final class CodexAppServerJob: @unchecked Sendable {
         if status == "completed" {
             if let response = finalResponse, !response.isEmpty, response.utf8.count <= Self.maximumFinalBytes {
                 ending = .completed(Data(response.utf8))
-            } else { ending = .failed("Codex completed without a bounded structured CAD response.") }
+            } else { ending = .failed("The task completed without a bounded structured CAD response.") }
         } else if status == "interrupted" { ending = .interrupted }
         else {
             let error = turn["error"] as? [String: Any]
-            ending = .failed(error?["message"] as? String ?? "Codex could not complete the design.")
+            ending = .failed(error?["message"] as? String ?? "The task could not complete the design.")
         }
         lock.lock()
         if terminal == nil { terminal = ending; completedAt = Date(); turnID = nil }
         lock.unlock()
         publishAvailability(false)
         onProgress("Checking the CAD design…")
-        onActivity(ProjectActivityEvent(id: "server:turn:\(turn["id"] as? String ?? "turn")", category: "lifecycle", title: "Codex turn finished",
+        onActivity(ProjectActivityEvent(id: "server:turn:\(turn["id"] as? String ?? "turn")", category: "lifecycle", title: "Task finished",
             status: status == "completed" ? "completed" : status == "interrupted" ? "canceled" : "failed", output: "Turn \(turn["id"] as? String ?? "") · \(status)"))
     }
 
@@ -586,7 +586,7 @@ final class CodexAppServerJob: @unchecked Sendable {
             lock.lock(); outbound.append(data); lock.unlock()
             return
         }
-        onActivity(ProjectActivityEvent(id: "server:request:\(String(describing: id))", category: "diagnostic", title: "Interactive Codex request declined", status: "failed",
+        onActivity(ProjectActivityEvent(id: "server:request:\(String(describing: id))", category: "diagnostic", title: "Interactive request declined", status: "failed",
             input: method, output: "The task’s configured approval policy does not allow this interactive request. \(CodexActivity.json(CodexActivity.sanitize(params)))"))
         let data = try Self.frame(["id": id, "result": result])
         lock.lock(); outbound.append(data); lock.unlock()

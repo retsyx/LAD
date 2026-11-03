@@ -67,7 +67,7 @@ struct CodexFileContext: Sendable {
 
         func write(_ data: Data, to url: URL) throws {
             guard manager.createFile(atPath: url.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
-                throw LADError.message("Could not stage a local design reference for Codex.")
+                throw LADError.message("Could not stage a local design reference.")
             }
             try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }

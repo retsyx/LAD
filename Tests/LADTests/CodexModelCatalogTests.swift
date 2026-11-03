@@ -12,7 +12,7 @@ final class CodexModelCatalogTests: XCTestCase {
         await catalog.refresh(executable: fake.executable.path)
         XCTAssertTrue(catalog.models.isEmpty)
         XCTAssertFalse(catalog.isLoading)
-        XCTAssertTrue(catalog.error?.contains("Update Codex and check its configuration") == true)
+        XCTAssertTrue(catalog.error?.contains("Update the app or CLI and check its configuration") == true)
         XCTAssertTrue(catalog.error?.contains("Unknown method model/list") == true)
     }
 

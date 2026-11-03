@@ -180,9 +180,9 @@ private enum CatalogError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .executableMissing: return "Install the ChatGPT desktop app or Codex CLI to load models."
-        case .invalidResponse: return "Codex returned an unreadable model catalog."
-        case .timedOut: return "Codex model lookup timed out. Try refreshing the model list."
-        case .failed(let detail): return "Could not load Codex models. \(detail)"
+        case .invalidResponse: return "The model catalog could not be read."
+        case .timedOut: return "Model lookup timed out. Try refreshing the model list."
+        case .failed(let detail): return "Could not load models. \(detail)"
         }
     }
 }
@@ -238,7 +238,7 @@ private final class CodexCatalogJob: @unchecked Sendable {
         lock.lock()
         if cancelled { lock.unlock(); throw CancellationError() }
         do { try process.run(); running = true; lock.unlock() }
-        catch { lock.unlock(); throw CatalogError.failed("Check the Codex installation and sign-in.") }
+        catch { lock.unlock(); throw CatalogError.failed("Check your installed app or CLI and its sign-in.") }
         defer {
             try? input.fileHandleForWriting.close()
             lock.lock()
@@ -327,7 +327,7 @@ private final class CodexCatalogJob: @unchecked Sendable {
                         // truncated response after the stream has closed.
                         throw CatalogError.invalidResponse
                     }
-                    throw CatalogError.failed("Check the Codex installation and sign-in.")
+                    throw CatalogError.failed("Check your installed app or CLI and its sign-in.")
                 }
             }
             throw CatalogError.timedOut

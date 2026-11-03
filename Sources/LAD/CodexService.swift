@@ -27,7 +27,7 @@ enum CodexError: LocalizedError {
         case .failed(let detail):
             return detail
         case .invalidModel(let detail):
-            return "Codex returned an unreadable CAD design. \(detail)"
+            return "Received an unreadable CAD design. \(detail)"
         case .unsupported(let detail):
             return detail
         }
@@ -77,7 +77,7 @@ final class CodexService {
         selectionModelsByRevision: [UUID: ModelSpec] = [:], versions: ProjectVersionContext = .empty,
         permissionController: AgentPermissionController? = nil
     ) async throws -> CodexProjectResult {
-        guard activeJob == nil else { throw CodexError.failed("A Codex request is already running.") }
+        guard activeJob == nil else { throw CodexError.failed("A design request is already running.") }
         validatedModel = nil; validatedMesh = nil; partColorChanges = []
         let requestedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let executableURL = Self.resolveExecutable(requestedExecutable) else {
@@ -146,7 +146,7 @@ final class CodexService {
             let diagnostic = error.localizedDescription
             let lower = diagnostic.lowercased()
             if ["unauthorized", "not logged in", "authentication", "401", "sign in", "login required"].contains(where: lower.contains) {
-                throw CodexError.failed("Codex needs to be configured and signed in. Complete setup in your Codex installation, then try again.\n\n\(String(diagnostic.suffix(1_600)))")
+                throw CodexError.failed("Configuration and sign-in are required. Complete setup in your installed app or CLI, then try again.\n\n\(String(diagnostic.suffix(1_600)))")
             }
             throw error
         }
@@ -188,7 +188,7 @@ final class CodexService {
             }
             if attachments.contains(where: { !$0.isImage }), let current,
                specification.script == current.script {
-                throw CodexError.unsupported("Source file references were provided, but Codex returned the existing design without importing its geometry. The current design has been preserved. Try describing the features you want translated, or request an approximation explicitly.")
+                throw CodexError.unsupported("Source file references were provided, but the existing design was returned without importing their geometry. The current design has been preserved. Try describing the features you want translated, or request an approximation explicitly.")
             }
             // Construction reuse skips the worker. Validate the complete final
             // metadata here so every accepted revision can be saved.
@@ -264,7 +264,7 @@ final class CodexService {
         }
         request += "USER REQUEST:\n\(prompt)\n\nFor construction work, start with the brief user-facing plan described above and provide useful progress commentary while working. Finish with only the response JSON, using status message for an answer or clarification that does not change geometry."
         guard request.utf8.count <= maximumRequestBytes else {
-            throw CodexError.failed("The design request is too long to send to Codex. Shorten the message or reference a local source file instead of pasting its contents. No request was sent; the current design is preserved.")
+            throw CodexError.failed("The design request is too long to send. Shorten the message or reference a local source file instead of pasting its contents. No request was sent; the current design is preserved.")
         }
         return request
     }
@@ -339,7 +339,7 @@ final class CodexService {
                 featureCount: selection.features.count, originMatchesCurrent: false, encoder: encoder))
         }
         guard request.utf8.count <= maximumRequestBytes else {
-            throw CodexError.failed("The follow-up is too long to send to Codex. Shorten the message or reference a local source file instead of pasting its contents. The follow-up remains queued.")
+            throw CodexError.failed("The follow-up is too long to send. Shorten the message or reference a local source file instead of pasting its contents. The follow-up remains queued.")
         }
         return (request, imagePaths)
     }

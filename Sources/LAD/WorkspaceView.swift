@@ -302,7 +302,7 @@ struct WorkspaceView: View {
         VStack(spacing: 0) {
             HStack(spacing: 9) {
                 Image(systemName: "sparkle").foregroundStyle(Palette.accent)
-                Text("Design with Codex").font(.system(size: 13, weight: .semibold))
+                Text("Design").font(.system(size: 13, weight: .semibold))
                 Spacer()
                 Button { activityPanel.toggle(state: state, owner: viewportReference.window ?? viewportReference.view?.window) } label: {
                     Image(systemName: "list.bullet.rectangle")
@@ -351,7 +351,7 @@ struct WorkspaceView: View {
                 Image(systemName: message.role == "user" ? "person.crop.circle" : message.role == "system" ? "exclamationmark.circle" : "sparkle")
                     .foregroundStyle(message.role == "assistant" ? Palette.accent : Palette.muted)
                 Text(message.role == "user" ? "YOU" : message.role == "system" ? "STATUS" :
-                     message.phase == "commentary" ? "UPDATE" : message.phase == "final_answer" ? "COMPLETE" : "LAD / CODEX")
+                     message.phase == "commentary" ? "UPDATE" : message.phase == "final_answer" ? "COMPLETE" : "LAD")
                     .font(.system(size: 9, weight: .semibold)).tracking(1.1).foregroundStyle(Palette.muted)
                 Spacer()
                 Text(message.date, style: .time).font(.system(size: 9)).foregroundStyle(Palette.muted.opacity(0.6))

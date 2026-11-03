@@ -28,7 +28,7 @@ struct CodexReasoningEffort: RawRepresentable, CaseIterable, Identifiable, Senda
 
     var title: String {
         switch rawValue {
-        case "": return "Use Codex default"
+        case "": return "Use model default"
         case "xhigh": return "Extra High"
         default: return rawValue.split(whereSeparator: { $0 == "_" || $0 == "-" }).map { $0.capitalized }.joined(separator: " ")
         }
