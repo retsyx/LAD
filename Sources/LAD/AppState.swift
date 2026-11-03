@@ -9,13 +9,14 @@ final class AppState: ObservableObject {
     let activityImages = ProjectActivityImages()
     weak var viewportView: CADSceneView?
     @Published var revisions: [ProjectRevision] = [] {
-        didSet { scheduleProjectThumbnail() }
+        didSet { projectThumbnailRevisionsChanged(from: oldValue) }
     }
     @Published var selectedRevisionID: UUID? {
         didSet { if selectedRevisionID != oldValue { scheduleProjectThumbnail() } }
     }
     @Published var mesh: PreviewMesh? {
         didSet {
+            projectThumbnailMeshModel = mesh == nil ? nil : current
             // Feature IDs belong to one native topology. Even a replacement
             // at the same artifact path must not keep old feature selections.
             selectedFeatures = []
@@ -119,7 +120,9 @@ final class AppState: ObservableObject {
     private var projectReady = false
     private var projectSavingEnabled = false
     private var pendingProjectRename = false
-    private var builtRevisionID: UUID?
+    private var builtRevisionID: UUID? {
+        didSet { if builtRevisionID != oldValue { scheduleProjectThumbnail() } }
+    }
     private var projectSessionID = UUID()
     private var projectID = UUID()
     private var autosavedProjectURL: URL?
@@ -128,6 +131,32 @@ final class AppState: ObservableObject {
     private var projectThumbnailToken = UUID()
     private var projectThumbnailInput: ProjectThumbnail.Input?
     private var projectThumbnailData: Data?
+    private var projectThumbnailMeshModel: ModelSpec?
+    private var projectThumbnailRevisionGeneration: UInt64 = 0
+    private struct ProjectThumbnailPresentation: Equatable {
+        var revisionID: UUID
+        var generation: UInt64
+        var validationHash: String?
+        var projection: ViewportProjectionMode
+        var display: ViewportDisplayMode
+        var hiddenSolids: Set<Int>
+    }
+    private var projectThumbnailImagePresentation: ProjectThumbnailPresentation?
+    private struct ProjectThumbnailInputKey: Equatable {
+        var presentation: ProjectThumbnailPresentation
+        var geometryPath: String
+        var nativePath: String?
+    }
+    private var projectThumbnailInputKey: ProjectThumbnailInputKey?
+    private var projectThumbnailCachedInput: ProjectThumbnail.Input?
+    struct ProjectThumbnailWork {
+        var inputResolutions = 0
+        var scheduledRenders = 0
+        var renders = 0
+        var reusedImages = 0
+    }
+    private(set) var projectThumbnailWork = ProjectThumbnailWork()
+    private let projectThumbnailRenderer: @MainActor (PreviewMesh, ProjectThumbnail.Input) async throws -> Data
     private var saveConflictPromptTask: Task<Void, Never>?
     private var presentedSaveConflict: ProjectSaveConflict?
     private var autosaveSequence = 0
@@ -136,6 +165,7 @@ final class AppState: ObservableObject {
     private let runtimeOverride: String?
     private var isActiveProject = false
     private var lastNotedRecentURL: URL?
+    private var lastRememberedProjectURL: URL?
     private var measurementTask: Task<Void, Never>?
     private var measurementToken = UUID()
     private struct MeasurementKey: Hashable {
@@ -146,9 +176,14 @@ final class AppState: ObservableObject {
     }
     private var measurementCache: [MeasurementKey: CADMeasurementReport] = [:]
 
-    init(autosaveStore: ProjectAutosaveStore = ProjectAutosaveStore(), python: String? = nil) {
+    init(autosaveStore: ProjectAutosaveStore = ProjectAutosaveStore(), python: String? = nil,
+         thumbnailRenderer: @escaping @MainActor (PreviewMesh, ProjectThumbnail.Input) async throws -> Data = { preview, input in
+             try await ProjectThumbnail.render(preview: preview, projection: input.projection, display: input.display,
+                                               hiddenSolids: input.hiddenSolids, solidColors: input.solidColors)
+         }) {
         self.autosaveStore = autosaveStore
         runtimeOverride = python
+        projectThumbnailRenderer = thumbnailRenderer
     }
 
     private static let recentProjectPathKey = "lastAutosavedProjectPath"
@@ -395,7 +430,7 @@ final class AppState: ObservableObject {
             autosavedProjectURL = url
             rememberAutosavedProject(url)
             if sequence == autosaveSequence {
-                projectURL = url
+                if projectURL != url { projectURL = url }
                 pendingProjectRename = false
                 hasUnsavedChanges = false
                 saveStatus = nil
@@ -420,7 +455,7 @@ final class AppState: ObservableObject {
             if projectSessionID == sessionID, autosaveSequence == sequence {
                 projectFileOrigin = origin
                 autosavedProjectURL = url
-                projectURL = url
+                if projectURL != url { projectURL = url }
                 pendingProjectRename = false
                 hasUnsavedChanges = false
                 saveStatus = nil
@@ -453,6 +488,7 @@ final class AppState: ObservableObject {
         projectID = UUID()
         autosavedProjectURL = nil
         lastNotedRecentURL = nil
+        lastRememberedProjectURL = nil
         measurementCache = [:]
         preserveUnreadableSession = false
         projectURL = nil
@@ -1798,11 +1834,20 @@ final class AppState: ObservableObject {
 
     private func rememberAutosavedProject(_ url: URL) {
         guard projectReady else { return }
-        let canonical = ProjectFileOrigin.canonicalURL(url)
-        if canonical != lastNotedRecentURL { noteRecentProject(at: canonical) }
+        // Ordinary saves keep their established URL. Canonicalization and
+        // recent-menu updates are needed only for a newly opened/moved file.
+        if url != lastRememberedProjectURL || (lastNotedRecentURL == nil && onRecentProjectChanged != nil) {
+            let canonical = ProjectFileOrigin.canonicalURL(url)
+            if canonical != lastNotedRecentURL { noteRecentProject(at: canonical) }
+            lastRememberedProjectURL = url
+        }
         guard isActiveProject else { return }
-        UserDefaults.standard.set(url.path, forKey: Self.recentProjectPathKey)
-        UserDefaults.standard.set(projectID.uuidString, forKey: Self.recentProjectIDKey)
+        if UserDefaults.standard.string(forKey: Self.recentProjectPathKey) != url.path {
+            UserDefaults.standard.set(url.path, forKey: Self.recentProjectPathKey)
+        }
+        if UserDefaults.standard.string(forKey: Self.recentProjectIDKey) != projectID.uuidString {
+            UserDefaults.standard.set(projectID.uuidString, forKey: Self.recentProjectIDKey)
+        }
     }
 
     func noteProjectOpened(fallbackURL: URL? = nil) {
@@ -1840,6 +1885,7 @@ final class AppState: ObservableObject {
         projectID = project.projectID ?? UUID()
         autosavedProjectURL = nil
         lastNotedRecentURL = nil
+        lastRememberedProjectURL = nil
         measurementCache = [:]
         preserveUnreadableSession = false
         pendingProjectRename = false
@@ -1870,6 +1916,16 @@ final class AppState: ObservableObject {
         pendingAttachments = project.draftAttachments ?? []
         error = nil; notice = nil; saveStatus = nil
         selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = []
+        // Package loading already checks this optional image against its
+        // persisted presentation identity. Keep it during replay; a matching
+        // validation receipt can bind it to the new session's artifact paths.
+        if let bytes = project.thumbnailData,
+           let revision = revisions.first(where: { $0.id == selectedRevisionID }) {
+            projectThumbnailData = bytes
+            projectThumbnailImagePresentation = ProjectThumbnailPresentation(revisionID: revision.id,
+                generation: projectThumbnailRevisionGeneration, validationHash: revision.validatedHash,
+                projection: projectionMode, display: displayMode, hiddenSolids: Set(revision.hiddenSolids ?? []))
+        }
     }
     private func autosave() {
         guard canSaveProject else { return }
@@ -1890,7 +1946,7 @@ final class AppState: ObservableObject {
                                                        sequence: sequence, preferredURL: preferredURL,
                                                        preferExactName: preferExactName)
                 guard projectSessionID == sessionID, autosaveSequence == sequence else { return }
-                projectURL = url
+                if projectURL != url { projectURL = url }
                 autosavedProjectURL = url
                 rememberAutosavedProject(url)
                 pendingProjectRename = false
@@ -1945,7 +2001,8 @@ final class AppState: ObservableObject {
                     sequence: sequence, preferredURL: conflict.file.url, preferExactName: pendingProjectRename,
                     resolving: conflict)
                 guard projectSessionID == session else { return }
-                autosavedProjectURL = url; projectURL = url
+                autosavedProjectURL = url
+                if projectURL != url { projectURL = url }
                 rememberAutosavedProject(url)
                 pendingProjectRename = false
             case .saveAs(let target):
@@ -2097,20 +2154,87 @@ final class AppState: ObservableObject {
                    draftAttachments: draftAttachments.isEmpty ? nil : draftAttachments,
                    queuePaused: queuedRequests.isEmpty ? nil : queuePaused,
                    partsPaneFraction: partsPaneFraction, fileOrigin: projectFileOrigin,
-                   thumbnailData: currentProjectThumbnailInput() == projectThumbnailInput ? projectThumbnailData : nil)
+                   thumbnailData: currentProjectThumbnailPresentation() == projectThumbnailImagePresentation ? projectThumbnailData : nil)
+    }
+
+    /// This descriptor is cheap to compare during an unrelated autosave. Its
+    /// generation changes only for the selected recipe or effective colors.
+    private func currentProjectThumbnailPresentation() -> ProjectThumbnailPresentation? {
+        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return nil }
+        return ProjectThumbnailPresentation(revisionID: revision.id, generation: projectThumbnailRevisionGeneration,
+            validationHash: revision.validatedHash, projection: projectionMode, display: displayMode, hiddenSolids: hiddenSolids)
+    }
+
+    private static func projectThumbnailNodes(_ revision: ProjectRevision) -> [PartNode] {
+        revision.partLayout?.nodes ?? revision.parts ?? revision.preview?.parts ?? []
+    }
+
+    private func projectThumbnailRevisionsChanged(from previous: [ProjectRevision]) {
+        // An unrendered history selection can still retain the previous
+        // version's image. Editing that inactive version must invalidate it.
+        if let imageID = projectThumbnailImagePresentation?.revisionID, imageID != selectedRevisionID,
+           Self.projectThumbnailRevisionChanged(previous.first(where: { $0.id == imageID }),
+                                                revisions.first(where: { $0.id == imageID })) {
+            projectThumbnailInput = nil; projectThumbnailData = nil; projectThumbnailImagePresentation = nil
+        }
+        let old = previous.first(where: { $0.id == selectedRevisionID })
+        let new = revisions.first(where: { $0.id == selectedRevisionID })
+        guard Self.projectThumbnailRevisionChanged(old, new) else { return }
+        projectThumbnailRevisionGeneration &+= 1
+        if var image = projectThumbnailImagePresentation, image.revisionID != selectedRevisionID {
+            // The inactive-image check above proved this other version's
+            // presentation unchanged. A selected version's edits must not
+            // invalidate that image when navigation returns to its owner.
+            image.generation = projectThumbnailRevisionGeneration
+            projectThumbnailImagePresentation = image
+        }
+        projectThumbnailInputKey = nil; projectThumbnailCachedInput = nil
+        scheduleProjectThumbnail()
+    }
+
+    private static func projectThumbnailRevisionChanged(_ old: ProjectRevision?, _ new: ProjectRevision?) -> Bool {
+        var changed = !sameProjectThumbnailRecipe(old?.model, new?.model) || old?.validatedHash != new?.validatedHash
+        if !changed, let old, let new {
+            let oldNodes = Self.projectThumbnailNodes(old), newNodes = Self.projectThumbnailNodes(new)
+            if oldNodes != newNodes || old.partColors != new.partColors {
+                changed = PartColorState.solidColors(in: oldNodes, overrides: old.partColors ?? [:]) !=
+                          PartColorState.solidColors(in: newNodes, overrides: new.partColors ?? [:])
+            }
+        }
+        return changed
+    }
+
+    private static func sameProjectThumbnailRecipe(_ first: ModelSpec?, _ second: ModelSpec?) -> Bool {
+        guard let first, let second else { return first == nil && second == nil }
+        let firstInputs = first.inputAssets ?? [], secondInputs = second.inputAssets ?? []
+        return first.units == second.units && first.script == second.script && first.sourceSTEP == second.sourceSTEP &&
+            firstInputs.count == secondInputs.count && zip(firstInputs, secondInputs).allSatisfy { pair in
+                pair.0.id == pair.1.id && pair.0.format == pair.1.format && pair.0.data == pair.1.data
+            }
     }
 
     private func currentProjectThumbnailInput() -> ProjectThumbnail.Input? {
-        guard let mesh, let selectedRevisionID, builtRevisionID == selectedRevisionID else { return nil }
-        return ProjectThumbnail.Input(revisionID: selectedRevisionID, geometryPath: mesh.stepPath,
+        guard let mesh, let selectedRevisionID, builtRevisionID == selectedRevisionID,
+              Self.sameProjectThumbnailRecipe(current, projectThumbnailMeshModel),
+              let presentation = currentProjectThumbnailPresentation(),
+              presentation.validationHash == mesh.validatedHash else { return nil }
+        let key = ProjectThumbnailInputKey(presentation: presentation, geometryPath: mesh.stepPath, nativePath: mesh.brepPath)
+        if key == projectThumbnailInputKey { return projectThumbnailCachedInput }
+        let input = ProjectThumbnail.Input(revisionID: selectedRevisionID, geometryPath: mesh.stepPath,
             nativePath: mesh.brepPath, validationHash: mesh.validatedHash,
             projection: projectionMode, display: displayMode, hiddenSolids: hiddenSolids, solidColors: solidColors)
+        projectThumbnailInputKey = key; projectThumbnailCachedInput = input
+        projectThumbnailWork.inputResolutions += 1
+        return input
     }
 
     private func cancelProjectThumbnail(clearImage: Bool = true) {
         projectThumbnailToken = UUID()
         projectThumbnailTask?.cancel(); projectThumbnailTask = nil
-        if clearImage { projectThumbnailInput = nil; projectThumbnailData = nil }
+        if clearImage {
+            projectThumbnailInput = nil; projectThumbnailData = nil; projectThumbnailImagePresentation = nil
+            projectThumbnailInputKey = nil; projectThumbnailCachedInput = nil
+        }
     }
 
     /// Coalesce presentation edits without delaying typing, geometry acceptance,
@@ -2119,19 +2243,30 @@ final class AppState: ObservableObject {
         projectThumbnailTask?.cancel()
         let token = UUID(), session = projectSessionID
         projectThumbnailToken = token
-        guard projectReady else { projectThumbnailTask = nil; return }
+        projectThumbnailTask = nil
+        guard projectReady, let input = currentProjectThumbnailInput(),
+              let presentation = currentProjectThumbnailPresentation() else { return }
+        if presentation == projectThumbnailImagePresentation, projectThumbnailData != nil,
+           projectThumbnailInput == input || (presentation.validationHash != nil && presentation.validationHash == input.validationHash) {
+            if projectThumbnailInput != input { projectThumbnailWork.reusedImages += 1 }
+            projectThumbnailInput = input
+            return
+        }
+        projectThumbnailWork.scheduledRenders += 1
         projectThumbnailTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: .milliseconds(350))
                 guard let self, self.projectSessionID == session, self.projectThumbnailToken == token,
-                      let input = self.currentProjectThumbnailInput(), let preview = self.mesh else { return }
-                if input == self.projectThumbnailInput, self.projectThumbnailData != nil { return }
-                let data = try await ProjectThumbnail.render(preview: preview, projection: input.projection,
-                    display: input.display, hiddenSolids: input.hiddenSolids, solidColors: input.solidColors)
+                      self.currentProjectThumbnailPresentation() == presentation,
+                      self.currentProjectThumbnailInput() == input, let preview = self.mesh else { return }
+                self.projectThumbnailWork.renders += 1
+                let data = try await self.projectThumbnailRenderer(preview, input)
                 guard !Task.isCancelled, self.projectSessionID == session, self.projectThumbnailToken == token,
+                      self.currentProjectThumbnailPresentation() == presentation,
                       self.currentProjectThumbnailInput() == input else { return }
                 self.projectThumbnailInput = input
                 self.projectThumbnailData = data
+                self.projectThumbnailImagePresentation = presentation
                 self.projectThumbnailTask = nil
                 self.autosave()
             } catch {

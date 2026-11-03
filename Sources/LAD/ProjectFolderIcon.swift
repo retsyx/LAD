@@ -2,11 +2,59 @@ import AppKit
 import Darwin
 import Foundation
 
+/// A fresh directory identity supplied by the autosave actor's ordinary
+/// location validation. Cache optional branding, never filesystem validity.
+struct ProjectFolderIdentity: Hashable, Sendable {
+    var device: UInt64
+    var inode: UInt64
+
+    init?(attributes: [FileAttributeKey: Any]) {
+        guard let device = attributes[.systemNumber] as? NSNumber,
+              let inode = attributes[.systemFileNumber] as? NSNumber,
+              inode.uint64Value != 0 else { return nil }
+        self.device = device.uint64Value
+        self.inode = inode.uint64Value
+    }
+}
+
 /// The ordinary iCloud folder needs custom Finder metadata; .lad documents use
 /// the application's registered document icon and require no per-file writes.
 enum ProjectFolderIcon {
-    static func apply(to url: URL) {
-        Task { @MainActor in ProjectFolderIconCoordinator.shared.apply(to: url) }
+    private struct Key: Hashable, Sendable {
+        var path: String
+        var identity: ProjectFolderIdentity
+    }
+    private static let lock = NSLock()
+    private static var completed: Set<Key> = []
+    private static var pending: Set<Key> = []
+
+    private static func reserve(_ key: Key) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !completed.contains(key), !pending.contains(key) else { return false }
+        pending.insert(key)
+        return true
+    }
+
+    private static func finish(_ key: Key, succeeded: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        pending.remove(key)
+        if succeeded { completed.insert(key) }
+    }
+
+    static func apply(to url: URL, identity: ProjectFolderIdentity?,
+                      schedule: (@escaping @MainActor () -> Void) -> Void = { work in Task { @MainActor in work() } },
+                      perform: @escaping @MainActor (URL, ProjectFolderIdentity?) -> Bool = {
+                          ProjectFolderIconCoordinator.shared.apply(to: $0, expectedIdentity: $1)
+                      }) {
+        let key = identity.map { Key(path: url.standardizedFileURL.path, identity: $0) }
+        if let key, !reserve(key) { return }
+        schedule {
+            var succeeded = false
+            defer { if let key { finish(key, succeeded: succeeded) } }
+            // Recheck the actual directory on the main actor before AppKit:
+            // it may have been replaced after the writer released coordination.
+            succeeded = perform(url, identity)
+        }
     }
 }
 
@@ -21,17 +69,27 @@ final class ProjectFolderIconCoordinator {
     }
 
     private let setIcon: @MainActor (URL) -> Bool
+    private let readCustomIcon: @MainActor (URL) -> Bool?
+    private var completed: Set<ProjectFolderIdentity> = []
 
-    init(setIcon: @escaping @MainActor (URL) -> Bool) {
+    init(readCustomIcon: @escaping @MainActor (URL) -> Bool? = { ProjectFolderIconCoordinator.hasCustomIcon(at: $0) },
+         setIcon: @escaping @MainActor (URL) -> Bool) {
+        self.readCustomIcon = readCustomIcon
         self.setIcon = setIcon
     }
 
-    func apply(to url: URL) {
+    @discardableResult
+    func apply(to url: URL, expectedIdentity: ProjectFolderIdentity? = nil) -> Bool {
         guard url.isFileURL,
               let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              attributes[.type] as? FileAttributeType == .typeDirectory,
-              Self.hasCustomIcon(at: url) == false else { return }
-        _ = setIcon(url.standardizedFileURL)
+              attributes[.type] as? FileAttributeType == .typeDirectory else { return false }
+        let identity = ProjectFolderIdentity(attributes: attributes)
+        if let expectedIdentity, identity != expectedIdentity { return false }
+        if let identity, completed.contains(identity) { return true }
+        guard let hasIcon = readCustomIcon(url) else { return false }
+        guard hasIcon || setIcon(url.standardizedFileURL) else { return false }
+        if let identity { completed.insert(identity) }
+        return true
     }
 
     private static func hasCustomIcon(at url: URL) -> Bool? {

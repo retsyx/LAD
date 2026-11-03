@@ -6,8 +6,8 @@ import zlib
 
 /// Incremental directory storage. Only project.json publishes a save. Every
 /// dependency is immutable except the two explicitly alternated index slots.
-/// Calls are coordinated by the document writer; this lock also serializes
-/// direct reads, tests and multiple writer instances within this process.
+/// Calls are coordinated by the document writer. In-process package locks also
+/// protect direct readers and multiple writers without blocking other designs.
 enum ProjectPackage {
     static let formatVersion = 5
     static let maximumRootBytes = 32_000_000
@@ -15,8 +15,42 @@ enum ProjectPackage {
     static let maximumMetadataRecordBytes = 8_000_000
     static let maximumMetadataBytes = 256_000_000
     static let maximumChunkRecords = 128
-    private static let lock = NSRecursiveLock()
+    private static let cacheLock = NSLock()
     private static var sessions: [String: Session] = [:]
+    private static var packageLocks: [String: PackageLock] = [:]
+
+    private final class PackageLock {
+        let lock = NSRecursiveLock()
+        // Counts both owners and waiters. Access only while holding cacheLock.
+        var users = 0
+    }
+
+    private static func acquirePackage(_ url: URL) -> (key: String, entry: PackageLock) {
+        // The coordinated document writer also owns initial creation and moves.
+        // Existing case, symlink and standardized-path aliases resolve together.
+        let key = url.standardizedFileURL.resolvingSymlinksInPath().path
+        cacheLock.lock()
+        let entry = packageLocks[key] ?? PackageLock()
+        entry.users += 1
+        packageLocks[key] = entry
+        cacheLock.unlock()
+        // Never hold the shared cache lock while waiting or doing file work.
+        entry.lock.lock()
+        return (key, entry)
+    }
+
+    private static func releasePackage(_ lease: (key: String, entry: PackageLock)) {
+        lease.entry.lock.unlock()
+        cacheLock.lock()
+        lease.entry.users -= 1
+        if lease.entry.users == 0 { packageLocks.removeValue(forKey: lease.key) }
+        cacheLock.unlock()
+    }
+
+    private static func cachedSession(_ key: String) -> Session? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return sessions[key]
+    }
 
     struct Reference: Codable, Equatable {
         var path: String
@@ -74,13 +108,13 @@ enum ProjectPackage {
     }
 
     static func rootData(from url: URL) throws -> Data {
-        lock.lock(); defer { lock.unlock() }
+        let lease = acquirePackage(url); defer { releasePackage(lease) }
         try requirePackage(url)
         return try readFile("project.json", in: url, limit: maximumRootBytes)
     }
 
     static func read(from url: URL) throws -> LADProject {
-        lock.lock(); defer { lock.unlock() }
+        let lease = acquirePackage(url); defer { releasePackage(lease) }
         return try load(url).project
     }
 
@@ -90,11 +124,11 @@ enum ProjectPackage {
     static func write(_ project: LADProject, to url: URL, thumbnail: Data? = nil,
                       beforePublication: (() throws -> Void)? = nil,
                       didFinish: ((WriteMetrics) -> Void)? = nil) throws -> Data {
-        lock.lock(); defer { lock.unlock() }
+        let lease = acquirePackage(url); defer { releasePackage(lease) }
         var metrics = WriteMetrics()
         var phaseStart = ProcessInfo.processInfo.systemUptime
         defer { didFinish?(metrics) }
-        let key = url.standardizedFileURL.resolvingSymlinksInPath().path
+        let key = lease.key
         let manager = FileManager.default
         let exists = manager.fileExists(atPath: url.path)
         if !exists { try manager.createDirectory(at: url, withIntermediateDirectories: false) }
@@ -103,7 +137,7 @@ enum ProjectPackage {
         var previous: Session?
         if manager.fileExists(atPath: rootURL.path) {
             let data = try readFile("project.json", in: url, limit: maximumRootBytes)
-            if let cached = sessions[key], cached.rootData == data { previous = cached }
+            if let cached = cachedSession(key), cached.rootData == data { previous = cached }
             else { previous = try load(url) }
             guard previous?.project.projectID == project.projectID else {
                 throw invalid("The destination belongs to a different design.")
@@ -128,9 +162,8 @@ enum ProjectPackage {
         }
         if historyChanged { try ProjectStore.validate(portable, verifiedAttachmentPayloads: &verified, validatedPrevious: previous?.project) }
         else {
-            var state = portable
-            state.messages = []; state.revisions = []; state.taskAudits = nil; state.selectedRevisionID = nil
-            try ProjectStore.validate(state, verifiedAttachmentPayloads: &verified)
+            try ProjectStore.validate(inlineProject(portable), verifiedAttachmentPayloads: &verified,
+                                      validatedPrevious: previous.map { inlineProject($0.project) })
         }
         metrics.phaseSeconds["validation"] = ProcessInfo.processInfo.systemUptime - phaseStart
         phaseStart = ProcessInfo.processInfo.systemUptime
@@ -422,8 +455,12 @@ enum ProjectPackage {
 
     /// Tests and one-time development conversion can discard process caches.
     static func clearSessionCache() {
-        lock.lock(); defer { lock.unlock() }
-        sessions.removeAll()
+        cacheLock.lock()
+        let discarded = sessions
+        sessions = [:]
+        cacheLock.unlock()
+        // Releasing a large parsed history is not shared-cache bookkeeping.
+        withExtendedLifetime(discarded) {}
     }
 
     private static func load(_ url: URL) throws -> Session {
@@ -534,6 +571,7 @@ enum ProjectPackage {
         project.fileOrigin = ProjectFileOrigin(url: url, data: data)
         _ = try cacheRecords(metadata, dependencies: &dependencies)
         if let thumbnail = root["thumbnail"] as? [String: Any],
+           let identity = try? thumbnailIdentity(metadata), root["thumbnailIdentity"] as? String == identity,
            let hash = thumbnail["sha256"] as? String, validHash(hash),
            thumbnail["path"] as? String == assetPath(hash),
            let bytes = try? readFile(assetPath(hash), in: url, limit: 8_000_000),
@@ -552,8 +590,7 @@ enum ProjectPackage {
     /// Serialize only inline state. History and exact payload references are
     /// already validated in the cached session and remain shared with it.
     private static func stateMetadata(_ project: LADProject, previous: Session) throws -> [String: Any] {
-        var state = project
-        state.messages = []; state.revisions = []; state.taskAudits = nil; state.selectedRevisionID = nil
+        var state = inlineProject(project)
         state.draftAttachments = nil
         for index in state.queuedRequests?.indices ?? 0..<0 where state.queuedRequests![index].attachments != nil {
             state.queuedRequests![index].attachments = nil
@@ -578,6 +615,12 @@ enum ProjectPackage {
             metadata["queuedRequests"] = queue
         }
         return metadata
+    }
+
+    private static func inlineProject(_ project: LADProject) -> LADProject {
+        var state = project
+        state.messages = []; state.revisions = []; state.taskAudits = nil; state.selectedRevisionID = nil
+        return state
     }
 
     private static func sameQueuedAttachments(_ lhs: [ProjectQueuedRequest]?, _ rhs: [ProjectQueuedRequest]?) -> Bool {
@@ -941,8 +984,12 @@ enum ProjectPackage {
     }
 
     private static func remember(_ session: Session, key: String) {
-        if sessions[key] == nil, sessions.count >= 8 { sessions.removeValue(forKey: sessions.keys.sorted().first!) }
-        sessions[key] = session
+        var evicted: Session?
+        cacheLock.lock()
+        if sessions[key] == nil, sessions.count >= 8 { evicted = sessions.removeValue(forKey: sessions.keys.sorted().first!) }
+        let replaced = sessions.updateValue(session, forKey: key)
+        cacheLock.unlock()
+        withExtendedLifetime((evicted, replaced)) {}
     }
 
     private static func requirePackage(_ url: URL) throws {

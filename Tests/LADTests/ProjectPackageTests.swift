@@ -64,6 +64,112 @@ final class ProjectPackageTests: XCTestCase {
         return try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
     }
 
+    private final class ConcurrentPackageResults: @unchecked Sendable {
+        private let lock = NSLock()
+        private var errors = [String]()
+        private var project: LADProject?
+        private var manifest: Data?
+
+        func perform(_ name: String, _ action: () throws -> Void) {
+            do { try action() }
+            catch {
+                lock.lock(); defer { lock.unlock() }
+                errors.append("\(name): \(error)")
+            }
+        }
+
+        func record(project: LADProject) {
+            lock.lock(); defer { lock.unlock() }
+            self.project = project
+        }
+
+        func record(manifest: Data) {
+            lock.lock(); defer { lock.unlock() }
+            self.manifest = manifest
+        }
+
+        func values() -> (errors: [String], project: LADProject?, manifest: Data?) {
+            lock.lock(); defer { lock.unlock() }
+            return (errors, project, manifest)
+        }
+    }
+
+    func testBusyPackageDoesNotBlockOtherDesignsAndSamePackageOperationsWait() throws {
+        let firstURL = try temporaryPackage(), secondURL = try temporaryPackage()
+        let first = project(), second = project()
+        try ProjectStore.write(first, to: firstURL)
+        try ProjectStore.write(second, to: secondURL)
+        let aliasParent = firstURL.deletingLastPathComponent().appendingPathComponent("alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: aliasParent, withDestinationURL: firstURL.deletingLastPathComponent())
+        let aliasURL = aliasParent.appendingPathComponent(firstURL.lastPathComponent, isDirectory: true)
+        let caseAliasURL = firstURL.deletingLastPathComponent().appendingPathComponent(firstURL.lastPathComponent.lowercased(), isDirectory: true)
+        let rootReadURL = FileManager.default.fileExists(atPath: caseAliasURL.path) ? caseAliasURL : firstURL
+        var changedFirst = first, changedSecond = second
+        changedFirst.showGrid = false
+        changedSecond.showGrid = false
+        var laterFirst = changedFirst
+        laterFirst.partsPaneFraction = 0.63
+        let firstWrite = changedFirst, secondWrite = changedSecond, subsequentWrite = laterFirst
+        let enteredFirst = DispatchSemaphore(value: 0), releaseFirst = DispatchSemaphore(value: 0)
+        let readStarted = DispatchSemaphore(value: 0), readFinished = DispatchSemaphore(value: 0)
+        let rootStarted = DispatchSemaphore(value: 0), rootFinished = DispatchSemaphore(value: 0)
+        let writeStarted = DispatchSemaphore(value: 0), writeFinished = DispatchSemaphore(value: 0)
+        let secondFinished = DispatchSemaphore(value: 0), cacheCleared = DispatchSemaphore(value: 0)
+        let group = DispatchGroup(), results = ConcurrentPackageResults()
+        func launch(_ action: @escaping @Sendable () -> Void) {
+            group.enter()
+            DispatchQueue.global().async { action(); group.leave() }
+        }
+        defer { releaseFirst.signal(); _ = group.wait(timeout: .now() + 10) }
+        launch {
+            results.perform("first write") {
+                try ProjectPackage.write(firstWrite, to: firstURL, beforePublication: {
+                    enteredFirst.signal()
+                    guard releaseFirst.wait(timeout: .now() + 10) == .success else { throw CocoaError(.userCancelled) }
+                })
+            }
+        }
+        guard enteredFirst.wait(timeout: .now() + 10) == .success else { return XCTFail("The first save did not reach publication") }
+        launch {
+            readStarted.signal()
+            results.perform("same package read through alias") { results.record(project: try ProjectPackage.read(from: aliasURL)) }
+            readFinished.signal()
+        }
+        launch {
+            rootStarted.signal()
+            results.perform("same package manifest read through case alias") { results.record(manifest: try ProjectPackage.rootData(from: rootReadURL)) }
+            rootFinished.signal()
+        }
+        launch {
+            writeStarted.signal()
+            results.perform("same package next write") { try ProjectPackage.write(subsequentWrite, to: aliasURL) }
+            writeFinished.signal()
+        }
+        launch {
+            results.perform("independent design write") { try ProjectPackage.write(secondWrite, to: secondURL) }
+            secondFinished.signal()
+        }
+        launch { ProjectPackage.clearSessionCache(); cacheCleared.signal() }
+        XCTAssertEqual(secondFinished.wait(timeout: .now() + 5), .success, "An unrelated design must save while the first publication is blocked")
+        XCTAssertEqual(cacheCleared.wait(timeout: .now() + 5), .success, "Clearing derived caches must not wait for file work")
+        XCTAssertEqual(readStarted.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(rootStarted.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(writeStarted.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(readFinished.wait(timeout: .now() + .milliseconds(100)), .timedOut)
+        XCTAssertEqual(rootFinished.wait(timeout: .now() + .milliseconds(100)), .timedOut)
+        XCTAssertEqual(writeFinished.wait(timeout: .now() + .milliseconds(100)), .timedOut)
+        releaseFirst.signal()
+        XCTAssertEqual(group.wait(timeout: .now() + 10), .success)
+        let captured = results.values()
+        XCTAssertEqual(captured.errors, [])
+        XCTAssertEqual(captured.project?.showGrid, false)
+        let manifest = try XCTUnwrap(captured.manifest)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: manifest) as? [String: Any])
+        XCTAssertEqual(root["showGrid"] as? Bool, false)
+        try assertColdRoundtrip(subsequentWrite, at: firstURL)
+        try assertColdRoundtrip(secondWrite, at: secondURL)
+    }
+
     func testPackageRoundtripStoresOnlyRecipesAndExactSharedInputs() throws {
         let url = try temporaryPackage()
         var value = project()
@@ -187,6 +293,22 @@ final class ProjectPackageTests: XCTestCase {
         value.queuedRequests = [ProjectQueuedRequest(content: "")]
         XCTAssertThrowsError(try ProjectStore.write(value, to: url))
         XCTAssertEqual(committed, try ProjectStore.readArchive(from: url))
+
+        let text = "# A retained input\n"
+        let hash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let attachment = SourceAttachment(name: "input.py", path: "/missing/input.py", content: text, sha256: hash)
+        value.queuedRequests = [ProjectQueuedRequest(content: "Refine this input", attachments: [attachment])]
+        value.draftAttachments = [attachment]
+        try ProjectStore.write(value, to: url)
+        let inlineCommitted = try ProjectStore.readArchive(from: url)
+        var changed = value
+        changed.queuedRequests![0].content = ""
+        changed.queuedRequests![0].attachments = nil
+        XCTAssertThrowsError(try ProjectStore.write(changed, to: url), "A cached request ID cannot authorize changed invalid contents")
+        changed = value
+        changed.draftAttachments![0].content += "changed bytes"
+        XCTAssertThrowsError(try ProjectStore.write(changed, to: url), "Changed draft bytes must still match their digest")
+        XCTAssertEqual(inlineCommitted, try ProjectStore.readArchive(from: url))
     }
 
     func testIndexesAlternateAndSupersededRecordsAreRemovedAfterPublication() throws {
@@ -499,6 +621,22 @@ final class ProjectPackageTests: XCTestCase {
         XCTAssertNil(try root(url)["thumbnail"])
         ProjectPackage.clearSessionCache()
         XCTAssertNil(try ProjectStore.read(from: url).thumbnailData)
+    }
+
+    func testLoadingDropsValidThumbnailWhosePresentationIdentityIsStale() throws {
+        let url = try temporaryPackage()
+        let value = project(), png = try thumbnailPNG()
+        try ProjectPackage.write(value, to: url, thumbnail: png)
+        let originalRoot = try root(url)
+        for change in [["displayMode": "shaded"], ["projectionMode": "isometric"]] {
+            var changed = originalRoot
+            for (key, value) in change { changed[key] = value }
+            try JSONSerialization.data(withJSONObject: changed, options: [.sortedKeys]).write(to: url.appendingPathComponent("project.json"), options: .atomic)
+            ProjectPackage.clearSessionCache()
+            let restored = try ProjectStore.read(from: url)
+            XCTAssertNil(restored.thumbnailData, "A decoded PNG must still match the current saved presentation")
+            XCTAssertEqual(restored.revisions.map(\.model), value.revisions.map(\.model))
+        }
     }
 
     func testSignedZeroSelectionAnchorsSurviveWarmAndColdJSONRecordsExactly() throws {

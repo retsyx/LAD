@@ -107,6 +107,80 @@ final class ProjectFolderIconTests: XCTestCase {
     }
 
     @MainActor
+    func testSuccessfulFolderIdentitySkipsRepeatedFinderMetadataReads() throws {
+        let root = try folder()
+        let target = root.appendingPathComponent("LAD", isDirectory: true)
+        let replacement = root.appendingPathComponent("Replacement", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: false)
+        var reads = 0, writes = 0
+        let coordinator = ProjectFolderIconCoordinator(readCustomIcon: { _ in reads += 1; return false }, setIcon: { _ in writes += 1; return true })
+        for _ in 0..<16 { XCTAssertTrue(coordinator.apply(to: target)) }
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(writes, 1)
+
+        try FileManager.default.removeItem(at: target)
+        try FileManager.default.moveItem(at: replacement, to: target)
+        XCTAssertTrue(coordinator.apply(to: target))
+        XCTAssertEqual(reads, 2, "A replacement directory must be inspected, not covered by the old path's cache")
+        XCTAssertEqual(writes, 2)
+    }
+
+    @MainActor
+    func testUnreadableMetadataAndReplacedPreparedIdentityDoNotAuthorizeBranding() throws {
+        let root = try folder()
+        let first = root.appendingPathComponent("First", isDirectory: true)
+        let second = root.appendingPathComponent("Second", isDirectory: true)
+        try FileManager.default.createDirectory(at: first, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: false)
+        let identity = try XCTUnwrap(ProjectFolderIdentity(attributes: FileManager.default.attributesOfItem(atPath: first.path)))
+        var readable = false, reads = 0, writes = 0
+        let coordinator = ProjectFolderIconCoordinator(readCustomIcon: { _ in
+            reads += 1
+            return readable ? false : nil
+        }, setIcon: { _ in writes += 1; return true })
+        XCTAssertFalse(coordinator.apply(to: second, expectedIdentity: identity))
+        XCTAssertEqual(reads, 0)
+        XCTAssertEqual(writes, 0)
+        XCTAssertFalse(coordinator.apply(to: first, expectedIdentity: identity))
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(writes, 0)
+        readable = true
+        XCTAssertTrue(coordinator.apply(to: first, expectedIdentity: identity))
+        XCTAssertEqual(reads, 2, "A failed metadata read must remain retryable")
+        XCTAssertEqual(writes, 1)
+    }
+
+    @MainActor
+    func testDispatcherCoalescesPendingRequestsAndReleasesFailedReservations() throws {
+        let root = try folder()
+        let identity = try XCTUnwrap(ProjectFolderIdentity(attributes: FileManager.default.attributesOfItem(atPath: root.path)))
+        var jobs = [@MainActor () -> Void]()
+        var attempts = 0, successful = false
+        func request() {
+            ProjectFolderIcon.apply(to: root, identity: identity, schedule: { jobs.append($0) }, perform: { _, _ in
+                attempts += 1
+                return successful
+            })
+        }
+
+        for _ in 0..<16 { request() }
+        XCTAssertEqual(jobs.count, 1, "The initial burst must reserve its directory before dispatching to AppKit")
+        XCTAssertEqual(attempts, 0)
+        jobs.removeFirst()()
+        XCTAssertEqual(attempts, 1)
+        XCTAssertTrue(jobs.isEmpty)
+
+        successful = true
+        for _ in 0..<16 { request() }
+        XCTAssertEqual(jobs.count, 1, "An unsuccessful check must release its reservation so a later save retries")
+        jobs.removeFirst()()
+        XCTAssertEqual(attempts, 2)
+        request()
+        XCTAssertTrue(jobs.isEmpty, "Successful initialization must not schedule more per-save tasks")
+    }
+
+    @MainActor
     private final class Recorder {
         var folders: [URL] = []
     }

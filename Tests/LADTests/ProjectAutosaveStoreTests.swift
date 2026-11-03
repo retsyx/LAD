@@ -407,4 +407,97 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         let discovered = try await ProjectAutosaveStore(rootDirectory: root).restoreRecent(preferredURL: nil, projectID: id)
         XCTAssertEqual(discovered?.url, url)
     }
+
+    func testEstablishedProjectDoesNotConsultChangedDefaultDirectory() async throws {
+        let parent = try folder()
+        let originalDirectory = parent.appendingPathComponent("First", isDirectory: true)
+        let nextDirectory = parent.appendingPathComponent("Next", isDirectory: true)
+        let provider = DirectoryProvider(originalDirectory)
+        let store = ProjectAutosaveStore(defaultDirectoryProvider: { provider.directory() })
+        let id = UUID()
+        var project = makeProject()
+        let original = try await store.write(project: project, projectID: id, title: "Case", sequence: 1)
+        XCTAssertEqual(provider.reads, 1)
+        provider.setDirectory(nextDirectory)
+
+        project.draftPrompt = "Keep this file in its original folder"
+        let updated = try await store.write(project: project, projectID: id, title: "Case", sequence: 2, preferredURL: original)
+        XCTAssertEqual(updated, original)
+        XCTAssertEqual(provider.reads, 1, "An established autosave must not resolve the new-design default")
+        let renamed = try await store.write(project: project, projectID: id, title: "Later generated title", sequence: 3, preferredURL: original)
+        XCTAssertEqual(renamed.deletingLastPathComponent().path, originalDirectory.path)
+        XCTAssertEqual(renamed.lastPathComponent, "Later generated title.lad")
+        XCTAssertEqual(provider.reads, 1, "Managed filename policy belongs to this existing design")
+
+        let newProject = try await store.write(project: makeProject(), projectID: UUID(), title: "New design", sequence: 1)
+        XCTAssertEqual(newProject.deletingLastPathComponent().path, nextDirectory.path)
+        XCTAssertEqual(provider.reads, 2, "A new design must use the current default")
+    }
+
+    func testEstablishedExternalProjectKeepsFilenameAndChecksCurrentConflictsWithoutResolvingDefault() async throws {
+        let parent = try folder()
+        let source = parent.appendingPathComponent("External.lad")
+        let id = UUID()
+        var original = makeProject()
+        original.projectID = id
+        try ProjectStore.write(original, to: source)
+        var opened = try ProjectAutosaveStore.readProject(from: source)
+        let provider = DirectoryProvider(parent.appendingPathComponent("Unused default", isDirectory: true))
+        let store = ProjectAutosaveStore(defaultDirectoryProvider: { provider.directory() })
+        let adopted = try await store.write(project: opened, projectID: id, title: "Different generated title", sequence: 1, preferredURL: source)
+        XCTAssertEqual(adopted.path, source.path)
+        let adoptionReads = provider.reads
+        provider.setDirectory(parent.appendingPathComponent("A changed default", isDirectory: true))
+        opened.draftPrompt = "A small edit"
+        _ = try await store.write(project: opened, projectID: id, title: "Another generated title", sequence: 2, preferredURL: source)
+        XCTAssertEqual(provider.reads, adoptionReads)
+
+        var remote = try ProjectStore.read(from: source)
+        remote.messages.append(ChatMessage(role: "user", content: "Remote changes must survive"))
+        try ProjectStore.write(remote, to: source)
+        let remoteRoot = try ProjectStore.readArchive(from: source)
+        do {
+            _ = try await store.write(project: opened, projectID: id, title: "Another generated title", sequence: 3, preferredURL: source)
+            XCTFail("Same-path saves must still check for a committed external change")
+        } catch is ProjectSaveConflict {
+            // The authoritative check is retained inside coordinated writing.
+        }
+        XCTAssertEqual(try ProjectStore.readArchive(from: source), remoteRoot)
+        XCTAssertEqual(provider.reads, adoptionReads)
+    }
+
+    func testEstablishedProjectRejectsReplacementSaveFolderSymlink() async throws {
+        let parent = try folder()
+        let root = parent.appendingPathComponent("LAD", isDirectory: true)
+        let retained = parent.appendingPathComponent("Retained", isDirectory: true)
+        let unrelated = parent.appendingPathComponent("Unrelated", isDirectory: true)
+        let store = ProjectAutosaveStore(rootDirectory: root)
+        let project = makeProject(), id = UUID()
+        let source = try await store.write(project: project, projectID: id, title: "Case", sequence: 1)
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: false)
+        var other = makeProject()
+        other.projectID = UUID()
+        let otherURL = unrelated.appendingPathComponent("Case.lad")
+        try ProjectStore.write(other, to: otherURL)
+        let otherRoot = try ProjectStore.readArchive(from: otherURL)
+        try FileManager.default.moveItem(at: root, to: retained)
+        try FileManager.default.createSymbolicLink(at: root, withDestinationURL: unrelated)
+
+        do {
+            _ = try await store.write(project: project, projectID: id, title: "Case", sequence: 2, preferredURL: source)
+            XCTFail("Location validation must be fresh even after an earlier successful save")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("directory")) }
+        XCTAssertEqual(try ProjectStore.readArchive(from: otherURL), otherRoot)
+        XCTAssertEqual(try ProjectStore.read(from: retained.appendingPathComponent("Case.lad")).projectID, id)
+    }
+
+    private final class DirectoryProvider: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: URL
+        private var count = 0
+        init(_ value: URL) { self.value = value }
+        var reads: Int { lock.lock(); defer { lock.unlock() }; return count }
+        func directory() -> URL { lock.lock(); defer { lock.unlock() }; count += 1; return value }
+        func setDirectory(_ url: URL) { lock.lock(); defer { lock.unlock() }; value = url }
+    }
 }
