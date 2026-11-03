@@ -46,7 +46,11 @@ enum ProjectStore {
         try validate(project, verifiedAttachmentPayloads: &verified)
     }
 
-    static func validate(_ project: LADProject, verifiedAttachmentPayloads: inout [String: Data]) throws {
+    /// A previous value may be supplied only from a fully validated package
+    /// session whose authoritative manifest bytes are still unchanged. Reuse
+    /// record-local checks, while rechecking counts, identities and links.
+    static func validate(_ project: LADProject, verifiedAttachmentPayloads: inout [String: Data],
+                         validatedPrevious: LADProject? = nil) throws {
         guard project.formatVersion == 1 else { throw invalid("Unsupported format version \(project.formatVersion).") }
         guard project.partsPaneFraction.isFinite, (0...1).contains(project.partsPaneFraction) else {
             throw invalid("The saved sidebar layout is invalid.")
@@ -59,12 +63,16 @@ enum ProjectStore {
         if let draft = project.draftPrompt, draft.utf8.count > 1_000_000 {
             throw invalid("The saved draft exceeds the request size limit.")
         }
-        if let attachments = project.draftAttachments { try validateAttachments(attachments, verifiedPayloads: &verifiedAttachmentPayloads) }
+        if let attachments = project.draftAttachments,
+           validatedPrevious == nil || attachments != validatedPrevious?.draftAttachments {
+            try validateAttachments(attachments, verifiedPayloads: &verifiedAttachmentPayloads)
+        }
         if let queue = project.queuedRequests {
             guard queue.count <= 10_000, Set(queue.map(\.id)).count == queue.count else {
                 throw invalid("The request queue contains too many items or duplicate IDs.")
             }
-            for request in queue {
+            let oldRequests = Dictionary(uniqueKeysWithValues: (validatedPrevious?.queuedRequests ?? []).map { ($0.id, $0) })
+            for request in queue where oldRequests[request.id] != request {
                 guard request.content.utf8.count <= 1_000_000,
                       !request.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || request.attachments?.isEmpty == false,
                       request.date.timeIntervalSinceReferenceDate.isFinite else {
@@ -99,7 +107,8 @@ enum ProjectStore {
         if let selected = project.selectedRevisionID, !project.revisions.contains(where: { $0.id == selected }) {
             throw invalid("The selected revision does not exist.")
         }
-        for message in project.messages {
+        let oldMessages = Dictionary(uniqueKeysWithValues: (validatedPrevious?.messages ?? []).map { ($0.id, $0) })
+        for message in project.messages where oldMessages[message.id] != message {
             guard ["user", "assistant", "system"].contains(message.role),
                   message.content.utf8.count <= 1_000_000, message.date.timeIntervalSinceReferenceDate.isFinite else {
                 throw invalid("Chat history contains an invalid message.")
@@ -115,14 +124,12 @@ enum ProjectStore {
                 }
             }
         }
-        if let taskAudits = project.taskAudits { try validateTaskAudits(taskAudits, messages: project.messages) }
+        if let taskAudits = project.taskAudits {
+            try validateTaskAudits(taskAudits, messages: project.messages, validatedPrevious: validatedPrevious?.taskAudits)
+        }
         let messageIndices = Dictionary(uniqueKeysWithValues: project.messages.enumerated().map { ($0.element.id, $0.offset) })
+        let oldRevisions = Dictionary(uniqueKeysWithValues: (validatedPrevious?.revisions ?? []).map { ($0.id, $0) })
         for revision in project.revisions {
-            guard revision.date.timeIntervalSinceReferenceDate.isFinite else { throw invalid("A revision date is invalid.") }
-            if let name = revision.name {
-                do { try ProjectRevisionNaming.validateSavedName(name) }
-                catch { throw invalid("A saved version name is invalid. \(error.localizedDescription)") }
-            }
             if revision.userMessageID != nil || revision.responseMessageID != nil {
                 guard let userID = revision.userMessageID, let responseID = revision.responseMessageID,
                       let userIndex = messageIndices[userID], let responseIndex = messageIndices[responseID],
@@ -133,48 +140,59 @@ enum ProjectStore {
                     throw invalid("A saved design contains invalid conversation references.")
                 }
             }
-            if let runtime = revision.runtime {
-                guard [runtime.python, runtime.cadquery, runtime.ocp].allSatisfy({
-                    !$0.isEmpty && $0.utf8.count <= 256 &&
-                    $0.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
-                }) else { throw invalid("The saved CAD runtime metadata is invalid.") }
+            if let previous = oldRevisions[revision.id], ProjectPackage.sameRevision(revision, previous),
+               revision.preview == nil, revision.stepData == nil { continue }
+            try validateRevision(revision)
+        }
+    }
+
+    private static func validateRevision(_ revision: ProjectRevision) throws {
+        guard revision.date.timeIntervalSinceReferenceDate.isFinite else { throw invalid("A revision date is invalid.") }
+        if let name = revision.name {
+            do { try ProjectRevisionNaming.validateSavedName(name) }
+            catch { throw invalid("A saved version name is invalid. \(error.localizedDescription)") }
+        }
+        if let runtime = revision.runtime {
+            guard [runtime.python, runtime.cadquery, runtime.ocp].allSatisfy({
+                !$0.isEmpty && $0.utf8.count <= 256 &&
+                $0.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+            }) else { throw invalid("The saved CAD runtime metadata is invalid.") }
+        }
+        try validateModel(revision.model)
+        if let preview = revision.preview { try validatePreview(preview) }
+        if let step = revision.stepData { try validateSTEP(step) }
+        let parts = revision.parts ?? revision.preview?.parts
+        let indices = parts?.flatMap(\.allSolidIndices) ?? []
+        guard indices.allSatisfy({ (0..<4_096).contains($0) }) else { throw invalid("The saved parts contain invalid solid indices.") }
+        let solidCount = revision.preview?.solids ?? indices.max().map { $0 + 1 } ?? 0
+        if let parts { try validatePartHierarchy(parts, solidCount: solidCount) }
+        if let layout = revision.partLayout {
+            try validatePartHierarchy(layout.nodes, solidCount: solidCount)
+            let folderIDs = Set(layout.nodes.flatMap(\.flattened).filter(\.isGroup).map(\.id))
+            guard layout.movedNodeIDs.count <= 8_192, layout.userFolderIDs.count <= 8_192, layout.renamedNodes.count <= 8_192,
+                  layout.collapsedNodeIDs.count <= 8_192,
+                  Set(layout.collapsedNodeIDs).count == layout.collapsedNodeIDs.count,
+                  layout.collapsedNodeIDs.allSatisfy({ folderIDs.contains($0) }),
+                  layout.movedNodeIDs.allSatisfy(validPartID), layout.userFolderIDs.allSatisfy(validPartID),
+                  layout.renamedNodes.allSatisfy({ validPartID($0.key) && validPartName($0.value) }) else {
+                throw invalid("The saved parts layout contains invalid edit metadata.")
             }
-            try validateModel(revision.model)
-            if let preview = revision.preview { try validatePreview(preview) }
-            if let step = revision.stepData { try validateSTEP(step) }
-            let parts = revision.parts ?? revision.preview?.parts
-            let indices = parts?.flatMap(\.allSolidIndices) ?? []
-            guard indices.allSatisfy({ (0..<4_096).contains($0) }) else { throw invalid("The saved parts contain invalid solid indices.") }
-            let solidCount = revision.preview?.solids ?? indices.max().map { $0 + 1 } ?? 0
-            if let parts { try validatePartHierarchy(parts, solidCount: solidCount) }
-            if let layout = revision.partLayout {
-                try validatePartHierarchy(layout.nodes, solidCount: solidCount)
-                let folderIDs = Set(layout.nodes.flatMap(\.flattened).filter(\.isGroup).map(\.id))
-                guard layout.movedNodeIDs.count <= 8_192, layout.userFolderIDs.count <= 8_192, layout.renamedNodes.count <= 8_192,
-                      layout.collapsedNodeIDs.count <= 8_192,
-                      Set(layout.collapsedNodeIDs).count == layout.collapsedNodeIDs.count,
-                      layout.collapsedNodeIDs.allSatisfy({ folderIDs.contains($0) }),
-                      layout.movedNodeIDs.allSatisfy(validPartID), layout.userFolderIDs.allSatisfy(validPartID),
-                      layout.renamedNodes.allSatisfy({ validPartID($0.key) && validPartName($0.value) }) else {
-                    throw invalid("The saved parts layout contains invalid edit metadata.")
-                }
+        }
+        if let hidden = revision.hiddenSolids {
+            guard hidden.count <= solidCount, Set(hidden).count == hidden.count,
+                  hidden.allSatisfy({ $0 >= 0 && $0 < solidCount }) else {
+                throw invalid("The saved part visibility is invalid.")
             }
-            if let hidden = revision.hiddenSolids {
-                guard hidden.count <= solidCount, Set(hidden).count == hidden.count,
-                      hidden.allSatisfy({ $0 >= 0 && $0 < solidCount }) else {
-                    throw invalid("The saved part visibility is invalid.")
-                }
+        }
+        if let colors = revision.partColors {
+            let colorNodes = revision.partLayout?.nodes ?? parts ?? (0..<solidCount).map {
+                PartNode(id: "solid/\($0)", name: "Part \($0 + 1)", solidIndices: [$0])
             }
-            if let colors = revision.partColors {
-                let colorNodes = revision.partLayout?.nodes ?? parts ?? (0..<solidCount).map {
-                    PartNode(id: "solid/\($0)", name: "Part \($0 + 1)", solidIndices: [$0])
-                }
-                // An assembly node may own geometry in addition to children.
-                // Colors address each node's own solids, never an empty folder.
-                let physicalIDs = Set(colorNodes.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map(\.id))
-                guard colors.count <= 4_096, colors.allSatisfy({ physicalIDs.contains($0.key) && $0.value.isValid }) else {
-                    throw invalid("The saved part colors are invalid or refer to missing parts.")
-                }
+            // An assembly node may own geometry in addition to children.
+            // Colors address each node's own solids, never an empty folder.
+            let physicalIDs = Set(colorNodes.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map(\.id))
+            guard colors.count <= 4_096, colors.allSatisfy({ physicalIDs.contains($0.key) && $0.value.isValid }) else {
+                throw invalid("The saved part colors are invalid or refer to missing parts.")
             }
         }
     }
@@ -327,13 +345,15 @@ enum ProjectStore {
         }
     }
 
-    static func validateTaskAudits(_ audits: [ProjectTaskAudit], messages: [ChatMessage]) throws {
+    static func validateTaskAudits(_ audits: [ProjectTaskAudit], messages: [ChatMessage],
+                                   validatedPrevious: [ProjectTaskAudit]? = nil) throws {
         let statuses: Set<String> = ["running", "completed", "failed", "canceled", "interrupted"]
         let categories: Set<String> = ["tool", "command", "file_change", "web_search", "plan", "lifecycle", "validation", "diagnostic", "steering"]
         let userIDs = Set(messages.filter { $0.role == "user" }.map(\.id))
         guard audits.count <= 10_000, Set(audits.map(\.id)).count == audits.count else {
             throw invalid("Tool activity contains too many tasks or duplicate task IDs.")
         }
+        let oldTasks = Dictionary(uniqueKeysWithValues: (validatedPrevious ?? []).map { ($0.id, $0) })
         var totalEvents = 0
         for task in audits {
             guard userIDs.contains(task.userMessageID), statuses.contains(task.status),
@@ -351,7 +371,9 @@ enum ProjectStore {
                     throw invalid("A saved tool task has invalid supplemental message references.")
                 }
             }
-            for event in task.events {
+            if task.events == oldTasks[task.id]?.events { continue }
+            let oldEvents = Dictionary(uniqueKeysWithValues: (oldTasks[task.id]?.events ?? []).map { ($0.id, $0) })
+            for event in task.events where oldEvents[event.id] != event {
                 guard validPartID(event.id), categories.contains(event.category), statuses.contains(event.status),
                       !event.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       event.title.utf8.count <= 16_384, !event.title.contains("\0"),

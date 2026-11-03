@@ -35,6 +35,28 @@ final class ProjectPackageTests: XCTestCase {
         return result
     }
 
+    private struct StoredFile: Equatable {
+        var bytes: Data
+        var inode: UInt64
+        var modified: Date
+    }
+
+    private func storedFiles(_ url: URL) throws -> [String: StoredFile] {
+        try Dictionary(uniqueKeysWithValues: snapshot(url).map { path, bytes in
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.appendingPathComponent(path).path)
+            return (path, StoredFile(bytes: bytes,
+                inode: try XCTUnwrap(attributes[.systemFileNumber] as? NSNumber).uint64Value,
+                modified: try XCTUnwrap(attributes[.modificationDate] as? Date)))
+        })
+    }
+
+    private func assertColdRoundtrip(_ value: LADProject, at url: URL, file: StaticString = #filePath, line: UInt = #line) throws {
+        ProjectPackage.clearSessionCache()
+        let expected = try ProjectArchive.split(value), actual = try ProjectArchive.split(ProjectStore.read(from: url))
+        XCTAssertEqual(actual.metadata, expected.metadata, file: file, line: line)
+        XCTAssertEqual(actual.assets, expected.assets, file: file, line: line)
+    }
+
     private func thumbnailPNG() throws -> Data {
         let image = NSImage(size: NSSize(width: 16, height: 16))
         image.lockFocus(); NSColor.red.setFill(); NSRect(x: 0, y: 0, width: 16, height: 16).fill(); image.unlockFocus()
@@ -190,18 +212,29 @@ final class ProjectPackageTests: XCTestCase {
         struct Interrupted: Error {}
         let url = try temporaryPackage()
         var value = project()
+        value.taskAudits = [ProjectTaskAudit(userMessageID: value.messages[0].id, model: "test", reasoningEffort: "high", events: [
+            ProjectActivityEvent(id: "event", category: "tool", title: "Inspect", status: "completed", output: "Original output")
+        ])]
         try ProjectStore.write(value, to: url)
+        let original = value
         let committed = try ProjectStore.readArchive(from: url)
         value.revisions[0].model.script += "\n# New candidate\n"
         value.messages.append(ChatMessage(role: "assistant", content: "Updated candidate", phase: "commentary"))
+        value.taskAudits![0].events[0].output = "Unpublished output"
         XCTAssertThrowsError(try ProjectPackage.write(value, to: url, beforePublication: { throw Interrupted() }))
+        XCTAssertEqual(committed, try ProjectStore.readArchive(from: url))
+        var metrics = ProjectPackage.WriteMetrics()
+        try ProjectPackage.write(original, to: url, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.rootEncodings, 0, "The failed save must not change any committed in-memory cache")
         XCTAssertEqual(committed, try ProjectStore.readArchive(from: url))
         ProjectPackage.clearSessionCache()
         XCTAssertEqual(try ProjectStore.read(from: url).messages.count, 1)
+        XCTAssertEqual(try ProjectStore.read(from: url).taskAudits?[0].events[0].output, "Original output")
         try ProjectStore.write(value, to: url)
         ProjectPackage.clearSessionCache()
         XCTAssertEqual(try ProjectStore.read(from: url).messages.count, 2)
         XCTAssertEqual(try ProjectStore.read(from: url).revisions[0].model.script, value.revisions[0].model.script)
+        XCTAssertEqual(try ProjectStore.read(from: url).taskAudits, value.taskAudits)
     }
 
     func testDamagedUncommittedHashFileIsNotAdopted() throws {
@@ -238,6 +271,155 @@ final class ProjectPackageTests: XCTestCase {
         let newFiles = try snapshot(url)
         let oldChunks = files.keys.filter { $0.contains("/events-") }
         XCTAssertEqual(oldChunks.filter { newFiles[$0] == files[$0] }.count, 2)
+    }
+
+    func testTranscriptEditsEncodeOnlyChangedMessageAndConversationTail() throws {
+        let url = try temporaryPackage()
+        var value = project()
+        value.messages += (0..<259).map { ChatMessage(role: "assistant", content: "Saved response \($0)") }
+        value.taskAudits = [ProjectTaskAudit(userMessageID: value.messages[0].id, model: "test", reasoningEffort: "high", events:
+            (0..<260).map { ProjectActivityEvent(id: "event-\($0)", category: "tool", title: "Inspect", status: "completed", output: "History \($0)") })]
+        try ProjectStore.write(value, to: url)
+        ProjectPackage.clearSessionCache()
+        value = try ProjectStore.read(from: url)
+        for append in [true, false] {
+            let before = try storedFiles(url)
+            if append { value.messages.append(ChatMessage(role: "assistant", content: "New response")) }
+            else { value.messages[value.messages.count - 1].content += " and more text" }
+            var metrics = ProjectPackage.WriteMetrics()
+            try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+            XCTAssertEqual(metrics.encodedHistoryRecords, 1)
+            XCTAssertEqual(metrics.encodedChunks, 1)
+            XCTAssertEqual(metrics.encodedSectionIndexes, 1)
+            XCTAssertEqual(metrics.encodedRevisionRecipes, 0)
+            XCTAssertEqual(metrics.encodedRevisionParts, 0)
+            XCTAssertEqual(metrics.encodedTaskRecords, 0)
+            XCTAssertEqual(metrics.compressedAssets, 0)
+            let after = try storedFiles(url)
+            for (path, stored) in before where path != "project.json" && !path.hasPrefix("conversation/") {
+                XCTAssertEqual(after[path], stored, path)
+            }
+            let oldChunks = before.keys.filter { $0.hasPrefix("conversation/messages-") }
+            XCTAssertEqual(oldChunks.filter { after[$0] == before[$0] }.count, 2, "Complete old chunks remain untouched")
+            try assertColdRoundtrip(value, at: url)
+        }
+    }
+
+    func testTranscriptSizeChangesReflowChunkBoundariesThenSurviveColdReorderAndRemoval() throws {
+        let url = try temporaryPackage()
+        var value = project()
+        value.messages += (0..<4).map { ChatMessage(role: "assistant", content: String(repeating: "\($0)", count: 240_000)) }
+        try ProjectStore.write(value, to: url)
+        XCTAssertEqual(try snapshot(url).keys.filter { $0.hasPrefix("conversation/messages-") }.count, 2)
+        ProjectPackage.clearSessionCache()
+        value = try ProjectStore.read(from: url)
+        value.messages[1].content += String(repeating: "X", count: 40_000)
+        var metrics = ProjectPackage.WriteMetrics()
+        try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.encodedHistoryRecords, 1)
+        XCTAssertEqual(metrics.encodedChunks, 3, "Only a size change may move the following greedy chunk boundaries")
+        XCTAssertEqual(try snapshot(url).keys.filter { $0.hasPrefix("conversation/messages-") }.count, 3)
+        try assertColdRoundtrip(value, at: url)
+        value.messages.swapAt(1, 4)
+        value.messages.remove(at: 2)
+        try ProjectStore.write(value, to: url)
+        try assertColdRoundtrip(value, at: url)
+    }
+
+    func testActivityAppendReusesOtherTasksSectionsAndCompleteChunks() throws {
+        let url = try temporaryPackage()
+        var value = project()
+        func events(_ prefix: String, _ count: Int) -> [ProjectActivityEvent] {
+            (0..<count).map { ProjectActivityEvent(id: "\(prefix)-\($0)", category: "tool", title: "Inspect", status: "completed", output: "\(prefix) output \($0)") }
+        }
+        value.taskAudits = [
+            ProjectTaskAudit(userMessageID: value.messages[0].id, model: "test", reasoningEffort: "high", events: events("first", 260)),
+            ProjectTaskAudit(userMessageID: value.messages[0].id, model: "test", reasoningEffort: "high", events: events("second", 130))
+        ]
+        try ProjectStore.write(value, to: url)
+        ProjectPackage.clearSessionCache()
+        value = try ProjectStore.read(from: url)
+        let firstID = value.taskAudits![0].id.uuidString, secondID = value.taskAudits![1].id.uuidString
+        let before = try storedFiles(url)
+        value.taskAudits![0].events[259].output = "Extended first output"
+        value.taskAudits![0].events.append(ProjectActivityEvent(id: "first-260", category: "tool", title: "Inspect", status: "completed", output: "New output"))
+        var metrics = ProjectPackage.WriteMetrics()
+        try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.encodedHistoryRecords, 2)
+        XCTAssertEqual(metrics.encodedChunks, 1)
+        XCTAssertEqual(metrics.encodedSectionIndexes, 1)
+        XCTAssertEqual(metrics.encodedTaskRecords, 1)
+        XCTAssertEqual(metrics.encodedRevisionRecipes, 0)
+        let after = try storedFiles(url)
+        for (path, stored) in before where path.hasPrefix("revisions/") || path.hasPrefix("conversation/") || path.hasPrefix("activity/\(secondID)/") {
+            XCTAssertEqual(after[path], stored, path)
+        }
+        for path in before.keys where path.hasPrefix("assets/") && after[path] != nil { XCTAssertEqual(after[path], before[path], path) }
+        let oldChunks = before.keys.filter { $0.hasPrefix("activity/\(firstID)/events-") }
+        XCTAssertEqual(oldChunks.filter { after[$0] == before[$0] }.count, 2)
+        try assertColdRoundtrip(value, at: url)
+    }
+
+    func testVersionNameAndPartsChangesReuseRecipeAndAssets() throws {
+        let url = try temporaryPackage()
+        var value = project()
+        value.revisions[0].model.sourceSTEP = Data("ISO-10303-21;\n\(String(repeating: " ", count: 24_000))\nEND-ISO-10303-21;\n".utf8)
+        try ProjectStore.write(value, to: url)
+        for rename in [true, false] {
+            let before = try storedFiles(url)
+            if rename { value.revisions[0].name = "Named version" }
+            else { value.revisions[0].partColors = ["body": PartColor(red: 1, green: 0, blue: 0)] }
+            var metrics = ProjectPackage.WriteMetrics()
+            try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+            XCTAssertEqual(metrics.encodedChunks, 0)
+            XCTAssertEqual(metrics.encodedSectionIndexes, 1)
+            XCTAssertEqual(metrics.encodedRevisionRecipes, 0)
+            XCTAssertEqual(metrics.encodedRevisionParts, rename ? 0 : 1)
+            XCTAssertEqual(metrics.compressedAssets, 0)
+            let after = try storedFiles(url)
+            for (path, stored) in before where path.contains("/recipe-") || path.hasPrefix("assets/") || path.hasPrefix("conversation/") || path.hasPrefix("activity/") {
+                XCTAssertEqual(after[path], stored, path)
+            }
+            try assertColdRoundtrip(value, at: url)
+        }
+    }
+
+    func testHistoryReorderingAndRemovalPruneOnlyLastSharedAssetReference() throws {
+        let url = try temporaryPackage()
+        var value = project()
+        let source = "# Shared original\n"
+        let bytes = Data(source.utf8), hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let attachment = SourceAttachment(name: "source.py", path: "/missing/source.py", content: source, sha256: hash)
+        value.messages += [ChatMessage(role: "assistant", content: "First"), ChatMessage(role: "assistant", content: "Second")]
+        value.messages[0].attachments = [attachment]
+        value.revisions.append(ProjectRevision(model: value.revisions[0].model, parts: value.revisions[0].parts))
+        value.taskAudits = [ProjectTaskAudit(userMessageID: value.messages[0].id, model: "test", reasoningEffort: "high", events: [
+            ProjectActivityEvent(id: "a", category: "tool", title: "Inspect", status: "completed", output: source),
+            ProjectActivityEvent(id: "b", category: "tool", title: "Inspect", status: "completed", output: "Other")
+        ]), ProjectTaskAudit(userMessageID: value.messages[0].id, model: "test", reasoningEffort: "high", events: [])]
+        try ProjectStore.write(value, to: url)
+        value.messages.swapAt(1, 2)
+        value.revisions.reverse()
+        value.taskAudits!.reverse()
+        value.taskAudits![1].events.reverse()
+        try ProjectStore.write(value, to: url)
+        try assertColdRoundtrip(value, at: url)
+        value.messages[0].attachments = nil
+        value.messages.removeLast()
+        value.revisions.removeLast()
+        value.selectedRevisionID = value.revisions[0].id
+        value.taskAudits!.removeFirst()
+        value.taskAudits![0].events.removeFirst()
+        try ProjectStore.write(value, to: url)
+        XCTAssertNotNil((try root(url)["assets"] as? [String: Any])?[hash], "Activity still refers to the shared source")
+        try assertColdRoundtrip(value, at: url)
+        value.taskAudits![0].events.removeAll()
+        try ProjectStore.write(value, to: url)
+        XCTAssertNil((try root(url)["assets"] as? [String: Any])?[hash], "Last reference removal prunes the payload")
+        try assertColdRoundtrip(value, at: url)
+        value.taskAudits = nil
+        try ProjectStore.write(value, to: url)
+        try assertColdRoundtrip(value, at: url)
     }
 
     func testRejectsOldFilesCorruptReferencesAndSymlinkAssets() throws {

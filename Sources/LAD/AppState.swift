@@ -1873,6 +1873,10 @@ final class AppState: ObservableObject {
     }
     private func autosave() {
         guard canSaveProject else { return }
+        // This snapshot includes the latest draft, divider and audit edits.
+        // Their pending timers would only request the same save again.
+        autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
+        auditSaveTask?.cancel(); auditSaveTask = nil
         hasUnsavedChanges = true
         autosaveSequence += 1
         guard saveConflict == nil else { return }

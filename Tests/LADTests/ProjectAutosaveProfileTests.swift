@@ -6,6 +6,102 @@ import XCTest
 /// Opt-in measurements of real saved history on disposable package copies.
 /// Timing is diagnostic; unchanged dependencies and persisted state are asserted.
 final class ProjectAutosaveProfileTests: XCTestCase {
+    func testProfileIncrementalHistoryAutosave() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let source = environment["LAD_AUTOSAVE_PROFILE_SOURCE"] else {
+            throw XCTSkip("Set LAD_AUTOSAVE_PROFILE_SOURCE to an existing .lad package to profile autosave.")
+        }
+        let sourceURL = URL(fileURLWithPath: source, isDirectory: true).resolvingSymlinksInPath()
+        let sourceBefore = try fingerprints(sourceURL, includingRoot: true)
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-history-profile-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: temporary); ProjectPackage.clearSessionCache() }
+        let samples = min(9, max(3, Int(environment["LAD_AUTOSAVE_PROFILE_SAMPLES"] ?? "5") ?? 5))
+        var operations = [String: Any]()
+        for operation in ["transcript", "activity", "versionName"] {
+            let packageURL = temporary.appendingPathComponent(operation + ".lad", isDirectory: true)
+            try FileManager.default.copyItem(at: sourceURL, to: packageURL)
+            var project = try ProjectAutosaveStore.readProject(from: packageURL)
+            let initialRevisions = project.revisions.map(\.model)
+            let projectID = try XCTUnwrap(project.projectID)
+            guard !project.revisions.isEmpty, !project.messages.isEmpty, project.taskAudits?.isEmpty == false else {
+                throw XCTSkip("Profile a design with revisions, conversation and tool activity.")
+            }
+            var before = try fingerprints(packageURL, includingRoot: true)
+            var changedPerSave = [[String]](), metricsPerSave = [[String: Any]]()
+            var direct = [Double](), coordinated = [Double]()
+            func edit(_ sequence: Int) {
+                switch operation {
+                case "transcript":
+                    project.messages[project.messages.count - 1].content += "\nProfiling transcript update \(sequence)."
+                case "activity":
+                    let index = project.taskAudits!.count - 1
+                    project.taskAudits![index].events.append(ProjectActivityEvent(id: "profile-\(UUID())",
+                        category: "diagnostic", title: "Profiling activity update \(sequence)", status: "completed",
+                        output: "A short tool activity update."))
+                default:
+                    project.revisions[project.revisions.count - 1].name = "Profile \(sequence)"
+                }
+            }
+            func verify() throws {
+                let after = try fingerprints(packageURL, includingRoot: true)
+                let changed = Set(before.keys).union(after.keys).filter { before[$0] != after[$0] }.sorted()
+                let prefix = operation == "transcript" ? "conversation/" : operation == "activity" ? "activity/" : "revisions/index-"
+                XCTAssertTrue(changed.allSatisfy { path in
+                    path == "project.json" || path.hasPrefix(prefix) ||
+                        (path.hasPrefix("assets/") && (before[path] == nil || after[path] == nil))
+                },
+                    "\(operation) changed unrelated dependency content, inode, size or modification time: \(changed)")
+                changedPerSave.append(changed)
+                before = after
+            }
+            for sequence in 0..<samples {
+                edit(sequence)
+                var metrics = ProjectPackage.WriteMetrics()
+                let started = ProcessInfo.processInfo.systemUptime
+                try ProjectPackage.write(project, to: packageURL, thumbnail: project.thumbnailData, didFinish: { metrics = $0 })
+                direct.append(ProcessInfo.processInfo.systemUptime - started)
+                var row: [String: Any] = ["phaseSeconds": metrics.phaseSeconds]
+                for field in Mirror(reflecting: metrics).children {
+                    if let label = field.label, let value = field.value as? Int { row[label] = value }
+                    else if let label = field.label, let value = field.value as? [String: Int] { row[label] = value }
+                }
+                metricsPerSave.append(row)
+                try verify()
+            }
+            project = try ProjectAutosaveStore.readProject(from: packageURL)
+            let actor = ProjectAutosaveStore(rootDirectory: temporary.appendingPathComponent("Managed", isDirectory: true))
+            for sequence in 1...samples {
+                edit(samples + sequence)
+                let started = ProcessInfo.processInfo.systemUptime
+                let url = try await actor.write(project: project, projectID: projectID, title: project.projectName ?? "Profile",
+                    sequence: sequence, preferredURL: packageURL)
+                coordinated.append(ProcessInfo.processInfo.systemUptime - started)
+                XCTAssertEqual(url.resolvingSymlinksInPath().path, packageURL.resolvingSymlinksInPath().path)
+                try verify()
+            }
+            ProjectPackage.clearSessionCache()
+            let reopened = try ProjectStore.read(from: packageURL)
+            XCTAssertEqual(reopened.messages, project.messages)
+            XCTAssertEqual(reopened.taskAudits, project.taskAudits)
+            XCTAssertEqual(reopened.revisions.map(\.model), initialRevisions)
+            XCTAssertEqual(reopened.revisions.map(\.name), project.revisions.map(\.name))
+            operations[operation] = [
+                "directPackageSeconds": direct, "directPackageMedianSeconds": direct.sorted()[direct.count / 2],
+                "coordinatedSeconds": coordinated, "coordinatedMedianSeconds": coordinated.sorted()[coordinated.count / 2],
+                "writeMetrics": metricsPerSave, "changedPathsPerSave": changedPerSave
+            ]
+        }
+        XCTAssertEqual(sourceBefore, try fingerprints(sourceURL, includingRoot: true), "Profiling changed the original design")
+        let report: [String: Any] = ["project": sourceURL.lastPathComponent, "samples": samples, "architecture": "arm64",
+            "sourceUnchanged": sourceBefore == (try fingerprints(sourceURL, includingRoot: true)), "operations": operations,
+            "measurement": "Warm direct package and coordinated actor save completion. Only disposable copies are changed. Hash/content/inode/mtime checks and cold reload occur outside timing."]
+        let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+        let reportURL = URL(fileURLWithPath: environment["LAD_AUTOSAVE_PROFILE_REPORT"] ?? "/tmp/lad-history-autosave-profile.json")
+        try data.write(to: reportURL, options: .atomic)
+        print("LAD_HISTORY_AUTOSAVE_PROFILE_REPORT \(reportURL.path)")
+    }
+
     @MainActor
     func testProfileStateOnlyAutosave() async throws {
         let environment = ProcessInfo.processInfo.environment
