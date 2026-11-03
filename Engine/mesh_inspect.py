@@ -479,7 +479,7 @@ def inspect(context,revision,query,resolve_evidence=None):
             if not isinstance(refs,list) or not 1<=len(refs)<=32:raise EvidenceError("INVALID_QUERY","Combine requires 1..32 evidence selections")
             selection=_selection(refs[0],context,resolve_evidence)
             for item in refs[1:]:selection=_set_operation(selection,_selection(item,context,resolve_evidence),query.get("operation","union"))
-        elif kind in ("partition","section","measure","discrepancies"):
+        elif kind in ("partition","section","measure","discrepancies","recognize"):
             scope=query.get("selection",query.get("scope","all"))
             selection={i:[copy.deepcopy(_FULL)] for i in range(len(analysis["triangles"]))} if scope=="all" else _selection(scope,context,resolve_evidence)
             if kind=="partition":
@@ -561,6 +561,13 @@ def inspect(context,revision,query,resolve_evidence=None):
                  "completeness":{"complete":not omitted and not unknown_scope and not any(d["code"] in {"CAD_UNAVAILABLE","COMPARISON_UNAVAILABLE","COMPARISON_PARTIAL","BUDGET_EXHAUSTED"} for d in diagnostics),
                                  "processed_triangle_count":len(selection),"unprocessed_triangle_ids":sorted(set(omitted)|unknown_scope),"CAD_available":revision.get("_shape") is not None if cad_used else None},
                  "dependencies":dependencies,"units":context.get("units","mm"),"provenance":provenance}
+        if kind=="recognize":
+            from mesh_recognition import recognize
+            recognized=recognize(context,analysis,selection,query.get("families","auto"),triangle_budget=query.get("recognition_triangle_budget",100000))
+            diagnostics.extend(recognized.pop("recognition_diagnostics"))
+            payload.update(recognized)
+            payload["completeness"]["complete"] &= not payload["recognition_unknown_triangle_ids"]
+            payload["completeness"]["unprocessed_triangle_ids"]=sorted(set(payload["completeness"]["unprocessed_triangle_ids"])|set(payload["recognition_unknown_triangle_ids"]))
         if isinstance(query.get("role"),str):payload["role"]=query["role"]
         payload["id"]="evidence-"+_hash(payload)[:24];payload["evidence_id"]=payload["id"]
         return {"status":"partial" if diagnostics or omitted else "ok","payload":payload,"diagnostics":diagnostics,"provenance":provenance}

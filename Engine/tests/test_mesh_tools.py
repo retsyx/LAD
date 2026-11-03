@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -51,11 +52,27 @@ class IterativeMeshToolTests(unittest.TestCase):
 
     def test_discovery_replaces_old_pipeline_and_defines_all_services(self):
         names={item[0] for item in TOOLS}
-        expected={"lad_mesh_"+name for name in ["open_reference","inspect","fit","try_edit","compare","commit","undo","redo","branch","export_step"]}
+        expected={"lad_mesh_"+name for name in ["open_reference","inspect","fit","try_edit","compare","commit","undo","redo","branch","set_delivery","export_step"]}
         self.assertTrue(expected<=names)
         self.assertFalse({"lad_mesh_analyze","lad_mesh_propose","lad_mesh_evaluate","lad_mesh_assemble"}&names)
         self.assertIn("completion obligations",INSTRUCTIONS)
         self.assertIn("meshAPIHelpPath",INSTRUCTIONS)
+
+    def test_geometry_file_admission_keeps_large_ascii_references_and_rejects_oversize_files(self):
+        # Sparse files exercise admission without allocating or reading their
+        # contents. ASCII STL can exceed the old 128 MB cap within the triangle
+        # budget; the worker shares the app's 512 MB geometry-file ceiling.
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"source.stl"
+            with path.open("wb") as stream:stream.truncate(128_000_001)
+            self.assertEqual(read_asset(directory,"source.stl"),path)
+            # Earlier in-process worker calls can already have installed their
+            # hard 512 MB file limit. Exercise oversize admission through stat
+            # metadata without trying to exceed that process-wide limit.
+            info=list(path.lstat());info[6]=512_000_001
+            with mock.patch.object(Path,"lstat",return_value=os.stat_result(info)):
+                with self.assertRaisesRegex(ValueError,"bounded regular private files"):
+                    read_asset(directory,"source.stl")
 
     def test_unit_normalization_preserves_source_and_bounds_rounding(self):
         from fractions import Fraction

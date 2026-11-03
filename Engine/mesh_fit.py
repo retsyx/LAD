@@ -17,6 +17,7 @@ from mesh_inspect import EvidenceError,_analysis,_selection,_hash,_frame,diagnos
 
 VERSION="iterative-fit-1"
 SUPPORTED={"plane","line","circle","cylinder","cone","sphere","profile","extrusion","revolution"}
+RECOGNIZED={"torus","helical_sweep","rounded_rectangle_extrusion","concentric_spherical_shell"}
 
 
 def _unit(vector):
@@ -493,6 +494,63 @@ def _joint_refine(members,data_byid,constraints,scale):
     return unpack(answer.x)
 
 
+def _recognized_candidates(context,records,requested,constraints,limit,tolerance,provenance):
+    """Consume optional recognizer output as alternatives, never a solid union."""
+    choices=[];diagnostics=[]
+    for evidence in records:
+        if evidence.get("context_ref")!=context["id"] or evidence.get("source_hash")!=context["source_hash"]:
+            raise EvidenceError("STALE_REFERENCE","Recognized evidence belongs to another source context")
+        supported=[]
+        for entry in evidence["recognition_records"]:
+            family=entry["family"]
+            if family not in requested:continue
+            report=copy.deepcopy(entry["fit_report"])
+            error=report["source_vertex_maximum"]
+            if error>tolerance and not context.get("fit_policy",{}).get("allow_partial",False):continue
+            report.update(source_vertex_or_fit_sample_maximum=error,recognized_region_ref=entry["id"])
+            supported.append({"id":"member-"+_hash([evidence["id"],entry["id"]])[:20],"evidence_id":evidence["id"],"role":evidence.get("role",entry["id"]),
+                              "family":family,"geometry":copy.deepcopy(entry["geometry"]),"observed_extent":copy.deepcopy(entry["observed_extent"]),
+                              "inferred_extent":{"material_role":"unknown","terminal_faces":"unresolved","unobserved_trims":"unresolved"},
+                              "fit_report":report,"conditioning_report":{"method":"bounded_regional_recognition","unique_original_design":False},
+                              "supporting_triangle_ids":entry["triangle_ids"],"recognition_record_id":entry["id"],"recognition_area":entry["area"]})
+        if not supported:
+            return {"status":"no_result","payload":[],"diagnostics":[diagnostic("NO_ACCEPTABLE_FIT","No recognized region matches the requested families and local fitting policy",evidence_refs=[evidence["id"]])],"provenance":provenance}
+        choices.append(supported)
+    count=math.prod(len(items) for items in choices)
+    if count>64:diagnostics.append(diagnostic("BUDGET_EXHAUSTED",f"Regional joint alternatives evaluate 64 of {count} combinations"))
+    candidates=[]
+    for chosen in itertools.islice(itertools.product(*choices),64):
+        members=copy.deepcopy(list(chosen));compiled=[];hard=[];soft=[]
+        if constraints:
+            # Regional recognition has already fitted finite source support.
+            # Do not move a specialized fit under a constraint without a new
+            # source-residual implementation. Exact existing fixed values are
+            # useful and can be checked independently without changing it.
+            compiled=_compile_constraints(constraints,members,None)
+            if any(c["kind"]!="fixed" for c in compiled):
+                diagnostics.append(diagnostic("UNSUPPORTED_RECOGNITION_CONSTRAINT","Regional recognition alternatives currently support checking existing fixed values only; use a targeted primitive fit for relational refinement"));continue
+            hard,soft=_constraint_reports(members,compiled,_analysis(context)["scale"])
+            if any(not item["satisfied"] for item in hard):
+                diagnostics.append(diagnostic("RECOGNITION_REFIT_UNSUPPORTED","A changed fixed value requires refitting the recognized surface, which is not implemented; use a targeted ordinary primitive fit or an explicit authored construction"))
+                continue
+        support={tid for member in members for tid in member["supporting_triangle_ids"]}
+        observed={tid for record in records for tid in record["source_selection"]["triangle_ids"]}
+        unresolved=[{"triangle_id":tid,"category":"not_supported_by_this_alternative"} for tid in sorted(observed-support)]
+        dependencies={"source_hash":context["source_hash"],"evidence_dependencies":[record.get("dependencies",{}) for record in records]}
+        candidate={"context_revision":context["id"],"context_ref":context["id"],"source_hash":context["source_hash"],"source_revision":context["id"],"based_on_revision":None,
+                   "evidence_ids":[record["id"] for record in records],"family":members[0]["family"] if len(members)==1 else "joint","members":members,
+                   "parameter_values":{m["id"]:m["geometry"] for m in members},"hard_constraint_report":hard,"soft_constraint_report":soft,"shared_parameters":[],
+                   "semantic_bindings":{m["role"]:m["id"] for m in members},"supported_evidence":[m["evidence_id"] for m in members],"unresolved_evidence":unresolved,
+                   "observed_extent":{m["id"]:m["observed_extent"] for m in members},"inferred_extensions":{m["id"]:m["inferred_extent"] for m in members},
+                   "fit_report":{"guarantee":"sampled_local_fit_only","distance_tolerance":tolerance,"public_max_deviation":context.get("max_deviation"),"recognition_does_not_decide_material":True},
+                   "conditioning_report":{m["id"]:m["conditioning_report"] for m in members},"complexity":{"members":len(members),"representation":"analytic_or_compact_line_arc_profile"},
+                   "dependencies":dependencies,"dependency_fingerprint":_hash(dependencies),"units":"mm","provenance":provenance}
+        candidate["id"]="fit-"+_hash(candidate)[:24];candidates.append(candidate)
+    candidates.sort(key=lambda c:(-sum(m["recognition_area"] for m in c["members"]),len(c["unresolved_evidence"]),c["id"]))
+    if not candidates:return {"status":"no_result","payload":[],"diagnostics":diagnostics or [diagnostic("CONSTRAINT_CONFLICT","No recognized alternative satisfies the requested checked constraints")],"provenance":provenance}
+    return {"status":"partial" if diagnostics or any(c["unresolved_evidence"] for c in candidates) else "ok","payload":candidates[:limit],"diagnostics":diagnostics,"provenance":provenance}
+
+
 def fit(context,evidence_records,families="auto",constraints=(),resolve_reference=None):
     provenance={"context_ref":context.get("id") if isinstance(context,dict) else None,"source_hash":context.get("source_hash") if isinstance(context,dict) else None,
                 "dependency_revisions":[],"parameters":{"families":families,"constraints":constraints},"algorithm_versions":{"fit":VERSION},"seed":context.get("seed",0) if isinstance(context,dict) else 0}
@@ -505,13 +563,21 @@ def fit(context,evidence_records,families="auto",constraints=(),resolve_referenc
         if type(maximum) is not int or not 16<=maximum<=10000 or type(limit) is not int or not 1<=limit<=16:raise EvidenceError("INVALID_POLICY","Fit sample budget must be16..10000 and candidate count1..16")
         records=evidence_records if isinstance(evidence_records,list) else [evidence_records]
         if not 1<=len(records)<=16 or not all(isinstance(record,dict) for record in records):raise EvidenceError("INVALID_EVIDENCE","Fit requires1..16 immutable evidence records")
-        requested=set(SUPPORTED) if families=="auto" else {families} if isinstance(families,str) else set(families)
-        diagnostics=[diagnostic("UNSUPPORTED_FAMILY",f"No implemented fitter for {name}") for name in requested-SUPPORTED]
-        requested &= SUPPORTED
+        requested=set(SUPPORTED|RECOGNIZED) if families=="auto" else {families} if isinstance(families,str) else set(families)
+        diagnostics=[diagnostic("UNSUPPORTED_FAMILY",f"No implemented fitter for {name}") for name in requested-(SUPPORTED|RECOGNIZED)]
+        requested &= SUPPORTED|RECOGNIZED
         if not isinstance(constraints,(list,tuple)) or len(constraints)>128:raise EvidenceError("INVALID_CONSTRAINT","Constraints must be a bounded list")
         dependencies=[];options=[];all_data=[]
         tolerance=float(policy.get("distance_tolerance",max(float(context.get("max_deviation",0)),analysis["scale"]*1e-6)))
         if not math.isfinite(tolerance) or tolerance<=0:raise EvidenceError("INVALID_POLICY","Local fitting tolerance must be finite positive")
+        if all("recognition_records" in record for record in records):
+            result=_recognized_candidates(context,records,requested,constraints,limit,tolerance,provenance)
+            result["diagnostics"]=diagnostics+result["diagnostics"]
+            if diagnostics and result["status"]=="ok":result["status"]="partial"
+            return result
+        if any("recognition_records" in record for record in records):
+            return {"status":"no_result","payload":[],"diagnostics":diagnostics+[diagnostic("UNSUPPORTED_MIXED_EVIDENCE","Fit recognized regional evidence separately from ordinary selections or sections. Use the resulting explicit tools in an atomic edit group; mixed joint regional refinement is not implemented.")],"provenance":provenance}
+        if requested&RECOGNIZED and families!="auto":diagnostics.append(diagnostic("RECOGNITION_EVIDENCE_REQUIRED","Specialized regional families require evidence from inspect kind=recognize; ordinary fitting never starts expensive recognition implicitly"))
         for record in records:
             if record.get("context_ref")!=context["id"] or record.get("source_hash")!=context["source_hash"]:raise EvidenceError("STALE_REFERENCE","Fit evidence belongs to a different source context")
             identity=record.get("id",record.get("evidence_id"))

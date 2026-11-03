@@ -215,6 +215,23 @@ def _lad_recon_box(origin, x_direction, z_direction, size):
     return cq.Solid.makeBox(*size).located(plane.location)
 
 
+def _lad_recon_torus(center, axis, major_radius, minor_radius):
+    if (not all(math.isfinite(v) for v in (major_radius, minor_radius)) or
+            not 0 < minor_radius < major_radius):
+        raise ValueError('[INVALID_EDIT] Ring torus requires 0 < minor radius < major radius')
+    return cq.Solid.makeTorus(major_radius, minor_radius, cq.Vector(*center), _lad_recon_axis(axis))
+
+
+def _lad_recon_spherical_shell(center, outer_radius, inner_radius):
+    if (not all(math.isfinite(v) for v in (outer_radius, inner_radius)) or
+            not 0 < inner_radius < outer_radius):
+        raise ValueError('[INVALID_EDIT] Spherical shell requires 0 < inner radius < outer radius')
+    origin = cq.Vector(*center)
+    outer = cq.Solid.makeSphere(outer_radius, origin, angleDegrees1=-90, angleDegrees2=90)
+    inner = cq.Solid.makeSphere(inner_radius, origin, angleDegrees1=-90, angleDegrees2=90)
+    return outer.cut(inner)
+
+
 def _lad_recon_wire(loop, plane):
     def point(values):
         return plane.toWorldCoords(tuple(values))
@@ -251,6 +268,53 @@ def _lad_recon_revolve(profile, origin, axis, x_direction, angle):
     return cq.Solid.revolve(wires[0], wires[1:], angle, start, start+direction)
 
 
+def _lad_recon_helical_sweep(origin, axis, x_direction, pitch, handedness, phase_degrees, profile, extent):
+    if extent.get('mode') not in ('bounded', 'depth'):
+        raise ValueError('[INVALID_EDIT] Helical sweep requires an explicit finite extent')
+    if not math.isfinite(pitch) or pitch <= 0 or not math.isfinite(phase_degrees):
+        raise ValueError('[INVALID_EDIT] Helical pitch must remain positive and phase finite')
+    if handedness not in ('left', 'right'):
+        raise ValueError('[INVALID_EDIT] Helical handedness must be left or right')
+    if (profile['origin'] != [0, 0, 0] or profile['normal'] != [0, 0, 1] or
+            profile['x_direction'] != [1, 0, 0] or len(profile['loops']) != 1 or
+            'points' not in profile['loops'][0] or not profile['loops'][0]['closed']):
+        raise ValueError('[INVALID_PROFILE] Helical profile must be one closed polygon in radius/axial-phase coordinates')
+    points = profile['loops'][0]['points']
+    radial = [p[0] for p in points]
+    axial = [p[1] for p in points]
+    if (not all(math.isfinite(v) for p in points for v in p) or min(radial) <= 0 or
+            max(axial)-min(axial) >= pitch):
+        raise ValueError('[INVALID_PROFILE] Helical profile requires positive radii and axial span below one pitch')
+    low, high = _lad_recon_interval(origin, axis, extent)
+    # Keep the screw phase anchored at the original datum. Translating a
+    # zero-based sweep to a nonintegral low coordinate rotates the flank.
+    first_turn = (low-max(axial)-pitch)/pitch
+    last_turn = (high-min(axial)+pitch)/pitch
+    if (not all(math.isfinite(v) for v in (first_turn, last_turn)) or
+            math.ceil(last_turn)-math.floor(first_turn) > 128):
+        raise ValueError('[RESOURCE_LIMIT] Helical sweep exceeds 128 generated turns including clipping overrun')
+    start, stop = math.floor(first_turn)*pitch, math.ceil(last_turn)*pitch
+    if not all(math.isfinite(v) for v in (start, stop)) or stop <= start:
+        raise ValueError('[INVALID_EDIT] Helical sweep interval is unresolved at the working precision')
+    radius = (min(radial)+max(radial))/2
+    path = cq.Wire.makeHelix(pitch, stop-start, radius, center=(0, 0, start), lefthand=handedness == 'left')
+    plane = cq.Plane(origin=(0, 0, start), xDir=(1, 0, 0), normal=(0, -1, 0))
+    wire = cq.Wire.makePolygon([plane.toWorldCoords(tuple(p)) for p in points], close=True)
+    swept = cq.Solid.sweep(wire, [], path, makeSolid=True, isFrenet=True)
+    bound = max(radial)+pitch+high-low
+    slab = cq.Solid.makeBox(2*bound, 2*bound, high-low, (-bound, -bound, low))
+    result = swept.intersect(slab)
+    if phase_degrees:
+        result = result.rotate((0, 0, 0), (0, 0, 1), phase_degrees)
+    frame = cq.Plane(origin=tuple(origin), xDir=tuple(x_direction), normal=_lad_recon_axis(axis).toTuple())
+    result = result.located(frame.location)
+    # Rebuild coherent curve/pcurve parameterizations after the native pipe
+    # and trim operations. No edge tolerance is manually enlarged.
+    from OCP.BRepLib import BRepLib
+    BRepLib.SameParameter_s(result.wrapped, 1e-7, True)
+    return result
+
+
 def _lad_recon_fillet(shape, radius, anchors, body_id):
     solid = _lad_recon_one(shape, body_id)
     edges, chosen = solid.Edges(), []
@@ -282,8 +346,9 @@ def _lad_recon_result(bodies):
 
 
 _HELPERS = (_lad_recon_shape, _lad_recon_one, _lad_recon_axis, _lad_recon_interval,
-            _lad_recon_cylinder, _lad_recon_cone, _lad_recon_box, _lad_recon_wire,
-            _lad_recon_extrude, _lad_recon_revolve, _lad_recon_fillet, _lad_recon_result)
+            _lad_recon_cylinder, _lad_recon_cone, _lad_recon_box, _lad_recon_torus,
+            _lad_recon_spherical_shell, _lad_recon_wire, _lad_recon_extrude,
+            _lad_recon_revolve, _lad_recon_helical_sweep, _lad_recon_fillet, _lad_recon_result)
 
 
 def _header(state):
@@ -494,7 +559,59 @@ def _operand(tool, state, resolve_fit, target, operation):
         expression = f'_lad_recon_{family}(' + ', '.join(_py(v) for v in args) + ', ' + target_expr + ')'
     elif family == 'sphere':
         expression = f'cq.Solid.makeSphere({_py(num("radius"))}, cq.Vector(*{_py(vec("center"))}), angleDegrees1=-90, angleDegrees2=90)'
-    elif family in ('profile', 'extrusion'):
+    elif family == 'torus':
+        if tool.get('extent') != {'mode': 'full'}:
+            _fail('INSUFFICIENT_EVIDENCE', 'Choose extent mode full explicitly; observed torus support does not establish a complete ring')
+        center, axis = vec('center'), vec('axis', direction=True)
+        major, minor = num('major_radius'), num('minor_radius')
+        if _resolved(minor, state) >= _resolved(major, state):
+            _fail('INVALID_EDIT', 'Ring torus requires minor radius below major radius')
+        extent = {'mode': 'full'}
+        expression = f'_lad_recon_torus({_py(center)}, {_py(axis)}, {_py(major)}, {_py(minor)})'
+    elif family == 'concentric_spherical_shell':
+        if tool.get('material') != 'between_surfaces':
+            _fail('INSUFFICIENT_EVIDENCE', 'Choose material between_surfaces explicitly before constructing the spherical shell')
+        center = vec('center')
+        outer, inner = num('outer_radius'), num('inner_radius')
+        if _resolved(inner, state) >= _resolved(outer, state):
+            _fail('INVALID_EDIT', 'Spherical shell requires inner radius below outer radius')
+        expression = f'_lad_recon_spherical_shell({_py(center)}, {_py(outer)}, {_py(inner)})'
+    elif family == 'helical_sweep':
+        if 'extent' not in tool:
+            _fail('INSUFFICIENT_EVIDENCE', 'Choose an explicit finite helical sweep extent')
+        extent = _extent(tool, geometry, observed, state, through_allowed=False)
+        origin, axis = vec('origin'), vec('axis', direction=True)
+        x_direction = vec('x_direction', [1, 0, 0], True)
+        _frame_check(x_direction, axis, state)
+        pitch = num('pitch')
+        handedness = geometry.get('handedness')
+        if handedness not in ('left', 'right'):
+            _fail('INVALID_EDIT', 'Helical handedness must be left or right')
+        phase = _number(geometry.get('phase_degrees', 0), 'helical phase', state)
+        profile = _profile(geometry.get('profile'), state, radial=True)
+        if ([_resolved(v, state) for v in profile['origin']] != [0, 0, 0] or
+                [_resolved(v, state) for v in profile['normal']] != [0, 0, 1] or
+                [_resolved(v, state) for v in profile['x_direction']] != [1, 0, 0] or
+                len(profile['loops']) != 1 or 'points' not in profile['loops'][0]):
+            _fail('INVALID_PROFILE', 'Helical profile must be one closed polygon in radius/axial-phase coordinates')
+        points = [[_resolved(v, state) for v in p] for p in profile['loops'][0]['points']]
+        radial, axial = [p[0] for p in points], [p[1] for p in points]
+        resolved_pitch = _resolved(pitch, state)
+        if min(radial) <= 0 or max(axial)-min(axial) >= resolved_pitch:
+            _fail('INVALID_PROFILE', 'Helical profile requires positive radii and axial span below one pitch')
+        if extent['mode'] == 'bounded':
+            low, high = [_resolved(v, state) for v in extent['interval']]
+        else:
+            low = _resolved(extent['start'], state)
+            high = low+_resolved(extent['depth'], state)
+        first, last = (low-max(axial)-resolved_pitch)/resolved_pitch, (high-min(axial)+resolved_pitch)/resolved_pitch
+        if (not all(math.isfinite(v) for v in (first, last)) or math.ceil(last)-math.floor(first) > 128):
+            _fail('RESOURCE_LIMIT', 'Helical sweep exceeds 128 generated turns including clipping overrun')
+        expression = ('_lad_recon_helical_sweep(' + ', '.join(_py(v) for v in
+                      (origin, axis, x_direction, pitch, handedness, phase, profile, extent)) + ')')
+    elif family in ('profile', 'extrusion', 'rounded_rectangle_extrusion'):
+        if family == 'rounded_rectangle_extrusion' and 'extent' not in tool:
+            _fail('INSUFFICIENT_EVIDENCE', 'Choose an explicit rounded-profile construction extent')
         profile = _profile(geometry.get('profile', geometry), state)
         direction = _vector(geometry.get('direction', profile['normal']), 'extrusion direction', state, direction=True)
         extent = _extent(tool, geometry, observed, state, through_allowed=through)
@@ -518,9 +635,12 @@ def _operand(tool, state, resolve_fit, target, operation):
         if isinstance(value, list):
             return [bindings_only(item) for item in value]
         return value
-    return expression, {'family': family, 'geometry': bindings_only(geometry), 'extent': extent,
-                        'fit': provenance, 'observed_extent': observed,
-                        'construction_extent_is_evidence': False}
+    realization = {'family': family, 'geometry': bindings_only(geometry), 'extent': extent,
+                   'fit': provenance, 'observed_extent': observed,
+                   'construction_extent_is_evidence': False}
+    if family == 'concentric_spherical_shell':
+        realization['material'] = 'between_surfaces'
+    return expression, realization
 
 
 def _merge_requirements(state, edit):

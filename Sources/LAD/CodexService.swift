@@ -193,6 +193,10 @@ final class CodexService {
             // Construction reuse skips the worker. Validate the complete final
             // metadata here so every accepted revision can be saved.
             try ProjectStore.validateModel(specification)
+            // Retain any explicit intermediate classification and complete
+            // limitation in the saved design, including native preview reuse.
+            specification = try bridge.tools.resolvingFinalDelivery(in: specification)
+            try ProjectStore.validateModel(specification)
             validatedModel = specification
             validatedMesh = bridge.tools.validatedPreview(for: specification)
             partColorChanges = bridge.tools.partColorChanges(for: specification)

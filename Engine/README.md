@@ -133,6 +133,21 @@ are `lad_runtime`, `lad_request_permission`, `lad_versions`, `lad_version`, `lad
 `lad_get_part_colors`, `lad_set_part_colors`, `lad_measure`, `lad_validate`,
 `lad_render`, `lad_screenshot`, `lad_export_step` and `lad_import`.
 
+The iterative `lad_mesh_*` tools keep immutable reference evidence and private
+reconstruction revisions. Optional `lad_mesh_inspect` recognition finds supported
+surface regions, toroidal blends, measured helical profiles, rounded ports and
+concentric spherical surfaces. `lad_mesh_fit` returns alternatives; explicit
+`lad_mesh_try_edit` operations compile complete replayable Python programs.
+Commits, undo/redo and branches retain useful intermediate bodies without
+changing the design window. See [mesh-api.md](mesh-api.md) for schemas and limits.
+
+Normal completed reconstruction delivery checks a full final comparison of the
+exact committed recipe. When the agent cannot complete reconstruction, it may
+choose `lad_mesh_set_delivery(..., mode="intermediate", reason=..., unresolved=[...])`
+for an existing committed revision. The saved summary identifies that result and
+its limitations. This choice never establishes source agreement or bypasses the
+accepted-comparison and source-checked STEP-readback export gates.
+
 Builds use this worker and the configured CAD runtime. Inspection/measurement
 use session topology and native BRep; PNG images use LAD's native Metal renderer
 and are returned as MCP image blocks for visual review. Build/export/import

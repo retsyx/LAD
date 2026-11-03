@@ -13,8 +13,18 @@ final class CADMeshSession {
     }
     private struct Record { var contextID: String; var data: Data }
     private struct Branch { var contextID: String; var history: [String]; var index: Int }
+    private struct IntermediateDelivery {
+        var contextID: String
+        var reason: String
+        var unresolved: [String]
+
+        var disclosure: String {
+            "Intermediate reconstruction. Stopped because: \(reason) Unresolved: \(unresolved.joined(separator: "; ")). Full reconstruction acceptance has not passed."
+        }
+    }
     private let workspace: CADAgentWorkspace
     private var contexts: [String: Data] = [:]
+    private var contextSourceHashes: [String: String] = [:]
     private var revisions: [String: Record] = [:]
     private var previews: [String: Record] = [:]
     private var evidence: [String: Record] = [:]
@@ -29,6 +39,9 @@ final class CADMeshSession {
     private var nativeBytes = 0
     private var fileBytes = 0
     private var files = Set<String>()
+    private var hasAuthoredBodies = false
+    private var intermediateDeliveries: [String: IntermediateDelivery] = [:]
+    private var acceptedRevisions = Set<String>()
     private let maximumBytes = 256 * 1024 * 1024
 
     init(workspace: CADAgentWorkspace) { self.workspace = workspace }
@@ -38,9 +51,49 @@ final class CADMeshSession {
         return try object(value.data)["script"] as? String
     }
 
+    /// A normal CAD build proves body validity, not agreement with a mesh. Once
+    /// reconstruction produces a body, final delivery requires an exact accepted
+    /// committed recipe or an explicit intermediate choice for that recipe.
+    /// Evidence-only use remains neutral.
+    func validateFinalDelivery(program: String) throws -> String? {
+        guard hasAuthoredBodies else { return nil }
+        var intermediate: IntermediateDelivery?
+        for (id, record) in revisions {
+            let revision = try object(record.data)
+            guard revision["script"] as? String == program else { continue }
+            if acceptedRevisions.contains(id) { return nil }
+            if let choice = intermediateDeliveries[id], choice.contextID == record.contextID { intermediate = choice }
+        }
+        if let intermediate { return intermediate.disclosure }
+        throw LADError.message("This reconstruction has no passing full final comparison for its exact committed CAD program. Commit the completed revision and run lad_mesh_compare with scope=all and quality=final. Resolve failed or inconclusive checks, or explicitly keep that exact committed revision with lad_mesh_set_delivery(mode=intermediate), providing why work stopped and what remains unresolved. Return the unchanged committed programPath.")
+    }
+
+    private func acceptsFinal(_ report: [String: Any], revisionID: String,
+                              revision: [String: Any], contextID: String, sourceHash: String) -> Bool {
+        guard let geometryHash = revision["geometry_hash"] as? String,
+              let nativeDigest = report["native_geometry_digest"] as? String, !nativeDigest.isEmpty,
+              revision["context_ref"] as? String == contextID,
+              revision["source_hash"] as? String == sourceHash,
+              report["context_revision"] as? String == contextID,
+              report["source_hash"] as? String == sourceHash,
+              report["model_ref"] as? String == revisionID,
+              report["geometry_hash"] as? String == geometryHash,
+              report["quality_requested"] as? String == "final",
+              report["scope_requested"] as? String == "all",
+              report["acceptance"] as? String == "pass",
+              report["units"] as? String == "mm",
+              (report["scope_completed"] as? [String: Any])?["whole_continuous_cover"] as? Bool == true,
+              let dependencies = report["dependencies"] as? [String: Any],
+              dependencies["context_revision"] as? String == contextID,
+              dependencies["source_hash"] as? String == sourceHash,
+              dependencies["geometry_hash"] as? String == geometryHash,
+              dependencies["native_geometry_digest"] as? String == nativeDigest else { return false }
+        return native[geometryHash] != nil
+    }
+
     func handle(name: String, arguments: [String: Any], engine: EngineService,
                 python: String, threads: Int, solidColors: [Int: PartColor] = [:]) async throws -> Output {
-        if ["lad_mesh_commit", "lad_mesh_undo", "lad_mesh_redo", "lad_mesh_branch"].contains(name) {
+        if ["lad_mesh_commit", "lad_mesh_undo", "lad_mesh_redo", "lad_mesh_branch", "lad_mesh_set_delivery"].contains(name) {
             return try transaction(name, arguments)
         }
         var assets: [String: Data] = [:]
@@ -59,7 +112,7 @@ final class CADMeshSession {
             }
             let access = workspace
             assets["source." + suffix] = try await Task.detached(priority: .userInitiated) {
-                try access.read(path, maximumBytes: 128_000_000)
+                try access.read(path, maximumBytes: ProjectStore.maximumSTEPBytes)
             }.value
             request["sourceAsset"] = "source." + suffix
             options = ["units": try text("units", arguments), "max_deviation": number.doubleValue,
@@ -147,6 +200,7 @@ final class CADMeshSession {
             let contextBytes = try await encoded(context)
             try Task.checkCancellation()
             try retainContext(identity, data: contextBytes)
+            contextSourceHashes[identity] = try text("source_hash", context)
             try retain(revisionID, data: json(revision), context: identity, pool: &revisions)
             let branch = "branch-" + UUID().uuidString
             branches[branch] = Branch(contextID: identity, history: [revisionID], index: 0)
@@ -180,6 +234,14 @@ final class CADMeshSession {
                     try retain(id, data: json(payload), context: contextID, pool: &previews)
                     returnedPreview = output.preview ?? targetID.flatMap { display[$0] }
                     if let returnedPreview { cacheDisplay(returnedPreview, id: id) }
+                    // Native validity and final eligibility are separate. A
+                    // body rejected by an invariant or representation gate
+                    // must not escape final source checks through lad_build.
+                    if let script = payload["script"] as? String, !script.isEmpty,
+                       !(payload["body_ids"] as? [String] ?? []).isEmpty,
+                       let hash = payload["geometry_hash"] as? String, native[hash] != nil {
+                        hasAuthoredBodies = true
+                    }
                     if payload["commit_eligible"] as? Bool == true, let script = payload["script"] as? String {
                         program = script
                         values["programPath"] = try workspace.write(Data(script.utf8), path: "mesh/programs/\(id).py").path
@@ -191,6 +253,11 @@ final class CADMeshSession {
                     let id = (payload["comparison_id"] as? String) ?? (payload["id"] as? String) ?? "comparison-\(UUID().uuidString)"
                     payload["comparison_id"] = id
                     try retain(id, data: json(payload), context: contextID, pool: &comparisons)
+                    if let targetID, let revision = revisions[targetID], revision.contextID == contextID,
+                       let sourceHash = contextSourceHashes[contextID],
+                       acceptsFinal(payload, revisionID: targetID, revision: try object(revision.data), contextID: contextID, sourceHash: sourceHash) {
+                        acceptedRevisions.insert(targetID)
+                    }
                     values["comparisonID"] = id
                 }
             case "lad_mesh_export_step":
@@ -212,6 +279,40 @@ final class CADMeshSession {
         var payload: [String: Any]
         var preparedProgramPath: String?
         switch name {
+        case "lad_mesh_set_delivery":
+            try allowed(arguments, ["contextID", "revisionID", "mode", "reason", "unresolved"])
+            let id = try text("revisionID", arguments)
+            let revision = try record(id, pool: revisions, context: context)
+            guard let script = revision["script"] as? String, !script.isEmpty,
+                  revision["geometry_hash"] is String,
+                  !(revision["body_ids"] as? [String] ?? []).isEmpty else {
+                throw LADError.message("Choose a committed reconstruction containing valid solid bodies for delivery.")
+            }
+            let mode = try text("mode", arguments)
+            let choice: IntermediateDelivery?
+            switch mode {
+            case "intermediate":
+                let reason = try text("reason", arguments).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !reason.isEmpty, reason.utf8.count <= 512,
+                      let unresolved = arguments["unresolved"] as? [String], (1...8).contains(unresolved.count),
+                      unresolved.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.utf8.count <= 256 && !$0.contains("\0") }) else {
+                    throw LADError.message("Keeping an intermediate reconstruction requires a reason of at most 512 UTF-8 bytes and 1–8 nonempty unresolved items of at most 256 UTF-8 bytes each.")
+                }
+                let intermediate = IntermediateDelivery(contextID: context, reason: reason, unresolved: unresolved)
+                choice = intermediate
+                payload = ["revisionID": id, "delivery": mode, "reason": reason, "unresolved": unresolved,
+                           "disclosure": intermediate.disclosure, "scope": "this exact committed reconstruction recipe only"]
+            case "verified":
+                guard arguments["reason"] == nil, arguments["unresolved"] == nil else {
+                    throw LADError.message("Use reason and unresolved only when explicitly keeping an intermediate reconstruction.")
+                }
+                choice = nil
+                payload = ["revisionID": id, "delivery": mode, "scope": "final delivery requires this exact revision's passing full final comparison"]
+            default:
+                throw LADError.message("Choose verified or intermediate reconstruction delivery.")
+            }
+            preparedProgramPath = try workspace.write(Data(script.utf8), path: "mesh/programs/\(id).py").path
+            intermediateDeliveries[id] = choice
         case "lad_mesh_commit":
             try allowed(arguments, ["contextID", "previewID", "expectedRevisionID"])
             let expected = try text("expectedRevisionID", arguments)
@@ -272,8 +373,11 @@ final class CADMeshSession {
         let id = payload["revisionID"] as! String
         let revision = try record(id, pool: revisions, context: context)
         if let preparedProgramPath { payload["programPath"] = preparedProgramPath }
-        return Output(values: ["status": "ok", "payload": payload, "contextID": context, "revisionID": id,
-                               "diagnostics": [], "provenance": ["context_ref": context, "dependency_revisions": [id]]],
+        var values: [String: Any] = ["status": "ok", "payload": payload, "contextID": context, "revisionID": id,
+                                    "diagnostics": [], "provenance": ["context_ref": context, "dependency_revisions": [id]]]
+        if let delivery = payload["delivery"] { values["delivery"] = delivery }
+        if let disclosure = payload["disclosure"] { values["disclosure"] = disclosure }
+        return Output(values: values,
                       program: revision["script"] as? String, preview: display[id])
     }
 

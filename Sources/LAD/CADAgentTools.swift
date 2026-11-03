@@ -156,6 +156,19 @@ final class CADAgentTools {
         return nil
     }
 
+    func finalDeliveryDisclosure(for model: ModelSpec) throws -> String? {
+        try checkCancellation()
+        return try meshSession.validateFinalDelivery(program: model.script)
+    }
+
+    func resolvingFinalDelivery(in model: ModelSpec) throws -> ModelSpec {
+        guard let disclosure = try finalDeliveryDisclosure(for: model) else { return model }
+        var result = model
+        let combined = disclosure + "\n\n" + model.summary
+        result.summary = combined.utf8.count <= 6_000 ? combined : disclosure
+        return result
+    }
+
     /// These exact reviewed programs are self-contained. An inherited external
     /// input from the prior design must not change their replay identity.
     func resolvingReconstructionInputs(in model: ModelSpec) -> ModelSpec {
@@ -267,7 +280,7 @@ final class CADAgentTools {
             }
             return try await stageVersion(matches[0])
         case "lad_mesh_open_reference", "lad_mesh_inspect", "lad_mesh_fit", "lad_mesh_try_edit", "lad_mesh_compare",
-             "lad_mesh_commit", "lad_mesh_undo", "lad_mesh_redo", "lad_mesh_branch", "lad_mesh_export_step":
+             "lad_mesh_commit", "lad_mesh_undo", "lad_mesh_redo", "lad_mesh_branch", "lad_mesh_set_delivery", "lad_mesh_export_step":
             var meshColors: [Int: PartColor] = [:]
             if name == "lad_mesh_export_step", let contextID = arguments["contextID"] as? String,
                let revisionID = arguments["revisionID"] as? String,

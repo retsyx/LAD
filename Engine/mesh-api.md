@@ -33,6 +33,16 @@ physical allowance. Source normals are recomputed from triangle coordinates.
 creates and selects another private branch. Exact historical revisions remain
 addressable; a stale preview cannot commit against a different branch tip.
 
+Completed reconstruction delivery requires a full accepted comparison of the
+exact committed program. If further reconstruction is infeasible, the agent
+can keep a valid intermediate result with
+`lad_mesh_set_delivery(contextID, revisionID, mode="intermediate", reason, unresolved)`.
+`reason` explains why work stopped and `unresolved` is a nonempty list of remaining
+features or checks. This choice applies only to that exact committed revision;
+the saved design summary discloses the intermediate result. It does not establish
+source agreement or authorize checked STEP export. `mode="verified"` removes
+the intermediate choice and restores the accepted-comparison requirement.
+
 The four algorithms return a common `status` (`ok`, `partial`, `no_result`,
 `error`), `payload`, diagnostics and provenance. Full records are in `recordPath`;
 large arrays and source/program contents are omitted from tool text. Read those
@@ -63,6 +73,25 @@ Write the typed query to a workspace JSON file. Examples:
 {"kind":"discrepancies","scope":"all","freshness":"refresh_or_partial"}
 ```
 
+```json
+{"kind":"recognize","scope":"all","families":["torus","helical_sweep","rounded_rectangle_extrusion","concentric_spherical_shell"]}
+```
+
+Recognition is optional. It searches the selected source for bounded regional
+explanations rather than constructing or unioning a proposed solid. Each result
+retains its supporting original triangle IDs, observed support, sampled residuals
+and unresolved material decisions. Feed this evidence to `lad_mesh_fit`, then
+choose one returned candidate/member explicitly. A recognized thread or rounded
+port can become an additive or subtractive tool only through an explicit edit.
+Unprocessed, clipped or unexplained triangles remain reported as unknown; a
+recognized patch never certifies the complete reference.
+`recognition_triangle_budget` defaults to 100,000 and may be raised to 1,000,000;
+it bounds the inspected original triangles without decimating them. Full records
+are under `recognition_records`, provisional partitions under `recognized_regions`,
+and unknown IDs under `recognition_unknown_triangle_ids`. Unsupported recognition
+families return diagnostics. Ordinary selection and fitting do not start regional
+recognition implicitly.
+
 Selections retain original triangle IDs and barycentric clipping provenance.
 `grow`/`shrink` use physical distances and explicit barriers. `partition` and
 `combine` preserve connectivity and evidence references. Sections retain open
@@ -87,12 +116,13 @@ explicitly. Hard constraints must be satisfied, never implemented by merely
 assigning a large optimization penalty. Sampled local residuals do not certify
 the final maximum deviation or explain hidden Boolean operands.
 
-The initial fit registry supports `plane`, `line`, `circle`, `cylinder`, `cone`,
-`sphere`, line/arc `profile`, `extrusion` and `revolution`. Tori, general sweeps,
-lofts and freeform-network recognition currently return capability diagnostics;
-complete authored programs can still construct them when their native validity
-and comparison methods are supported. A small patch can legitimately return
-several families and weakly determined parameters.
+The fit registry supports `plane`, `line`, `circle`, `cylinder`, `cone`,
+`sphere`, line/arc `profile`, `extrusion` and `revolution`. Optional recognition
+adds `torus`, measured `helical_sweep`, `rounded_rectangle_extrusion`, and
+`concentric_spherical_shell` alternatives. General sweep, loft and freeform-network
+recognition remain unsupported; complete authored programs can still construct
+them when their native validity and comparison methods are supported. A small
+patch can legitimately return several families and weakly determined parameters.
 
 Constraints JSON is an array. A fixed constraint uses `kind:"fixed"`,
 `parameter`, `value`, and `member` or `evidence_ref` (the target is optional for
@@ -102,6 +132,13 @@ one-member fits). Relationships use `kind:"coaxial" | "parallel" |
 candidate member IDs or the corresponding evidence IDs. Unsupported datum
 references and general tangency are diagnosed explicitly. Fixed/equality
 relationships use shared or eliminated parameters and independent checks.
+Recognized regional alternatives currently support checking existing fixed
+parameter values only. Constraints that would move/refit specialized geometry,
+or introduce relationships between those alternatives, return explicit
+diagnostics; they never silently change a measured thread or profile.
+Fit recognized records separately from ordinary selections or sections. Mixed
+joint regional refinement is diagnosed as unsupported; the separate fitted tools
+can still be combined in an atomic edit group.
 
 ## Typed edits and complete programs
 
@@ -122,6 +159,21 @@ Body operations include `create`, `fuse`, `cut`, `intersect`, `fillet`, explicit
 `update_parameters`, and `program_replace`. A `group` with `edits[]` executes
 atomically. Construction `add` keeps datums/profiles separately and can commit
 with no body. Construction objects never leak into the delivered solid.
+
+Specialized fitted tools use these explicit construction decisions:
+
+- `torus`: choose `extent:{"mode":"full"}` to extend the observed toroidal
+  surface to a complete ring torus. Only positive embedded ring radii are supported.
+- `rounded_rectangle_extrusion`: use the fitted exact line/arc `profile` and
+  choose `observed`, `bounded`, `depth`, or `through_all` extent as for an extrusion.
+- `helical_sweep`: choose a finite `observed`, `bounded`, or `depth` extent.
+  Profile coordinates are radius and axial phase in millimeters. Pitch,
+  handedness and phase remain tied to the fitted origin even when clipping to a
+  nonintegral or negative axial interval. Through-all and more than 128 generated
+  turns are unsupported.
+- `concentric_spherical_shell`: choose `material:"between_surfaces"` to construct
+  the material between the fitted inner and outer spheres. Recognition alone
+  does not establish that this is the intended material.
 
 `program_replace` references a **complete** self-contained workspace Python
 program through the tool's `programPath`. Its edit JSON can declare `body_ids`
@@ -197,6 +249,7 @@ checks. Unsupported enclosures, stale dependencies or exhausted budgets yield
 matching full accepted report. It validates solid STEP readback and compares the
 readback against the original source under the same allowance. An unaccepted
 reconstruction artifact cannot bypass this gate through `lad_export_step`.
+An explicit intermediate-delivery choice leaves this checked-export gate intact.
 
 There is no triangle-per-face, disguised spline-facet, or generated-geometry
 import fallback. Keep iterating from localized evidence while useful changes

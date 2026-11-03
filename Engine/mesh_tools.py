@@ -19,7 +19,7 @@ import struct
 import uuid
 
 VERSION = "iterative-mesh-1"
-MAX_FILE = 128 * 1024 * 1024
+MAX_FILE = 512_000_000  # Match the app's geometry-file admission limit.
 MAX_SOURCE_TRIANGLES = 1_000_000
 UNIT_RATIOS = {"mm":(1,1), "cm":(10,1), "m":(1000,1), "um":(1,1000),
                "µm":(1,1000), "in":(127,5), "inch":(127,5), "ft":(1524,5)}
@@ -199,7 +199,8 @@ def _has_program_replacement(edit):
 
 
 def _compact(value,depth=0):
-    large={"vertices","original_vertices","triangles","triangle_ids","source_members","samples","source_samples","residuals","points","segments","loops"}
+    large={"vertices","original_vertices","triangles","triangle_ids","source_members","samples","source_samples","residuals","points","segments","loops",
+           "recognition_unknown_triangle_ids","supporting_triangle_ids"}
     if isinstance(value,dict):
         return {key:({"count":len(item),"available_in":"recordPath"} if key in large and isinstance(item,(list,dict)) else _compact(item,depth+1))
                 for key,item in value.items() if key not in {"script","program","_shape","shape"}}
