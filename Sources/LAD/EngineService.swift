@@ -9,6 +9,37 @@ enum EngineExportError: LocalizedError {
     }
 }
 
+/// Worker failures remain bounded data from the private build directory.
+/// A separate report keeps native validation details clear of stderr noise.
+enum EngineFailureDiagnostic {
+    private struct Report: Decodable {
+        var formatVersion: Int
+        var message: String
+    }
+
+    static func message(in folder: URL, stderr: String) -> String {
+        if let data = try? EngineArtifact.read(folder.appendingPathComponent("error.json"), in: folder,
+                                               maximumBytes: 65_536),
+           let report = try? JSONDecoder().decode(Report.self, from: data),
+           report.formatVersion == 1, report.message.utf8.count <= 48_000,
+           !report.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "LAD CAD engine: \(report.message)"
+        }
+        return String(stderr.suffix(3_000))
+    }
+
+    static func repairText(for failure: Error) -> String {
+        let description = failure.localizedDescription
+        let diagnostic: String
+        if let marker = description.range(of: "LAD CAD engine:", options: .backwards) {
+            diagnostic = String(description[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            diagnostic = description
+        }
+        return String(diagnostic.prefix(16_000))
+    }
+}
+
 /// A separate process keeps the UI responsive and contains native-kernel failures.
 /// Generated CAD programs run under a restricted macOS sandbox.
 @MainActor
@@ -321,13 +352,14 @@ final class EngineService {
         guard status == 0 else {
             let logData = try? EngineArtifact.tail(folder.appendingPathComponent("stderr.log"), in: folder, maximumBytes: 65_536)
             let log = logData.map { String(decoding: $0, as: UTF8.self) } ?? ""
-            if log.contains("No module named") {
-                throw LADError.message("LAD’s CAD runtime is incomplete. Reinstall LAD and try again.\n\n\(log.suffix(1_200))")
+            let diagnostic = EngineFailureDiagnostic.message(in: folder, stderr: log)
+            if diagnostic.contains("No module named") {
+                throw LADError.message("LAD’s CAD runtime is incomplete. Reinstall LAD and try again.\n\n\(diagnostic.suffix(1_200))")
             }
-            if scriptMode, log.contains("sandbox_apply") || log.contains("sandbox-exec:") {
-                throw LADError.message("The macOS sandbox could not start this design. Restart LAD outside an enclosing sandbox and try again.\n\n\(log.suffix(1_200))")
+            if scriptMode, diagnostic.contains("sandbox_apply") || diagnostic.contains("sandbox-exec:") {
+                throw LADError.message("The macOS sandbox could not start this design. Restart LAD outside an enclosing sandbox and try again.\n\n\(diagnostic.suffix(1_200))")
             }
-            throw LADError.message("The CAD engine could not \(action).\n\n\(log.suffix(3_000))")
+            throw LADError.message("The CAD engine could not \(action).\n\n\(diagnostic)")
         }
         return RunResult(artifacts: artifacts, token: token)
     }

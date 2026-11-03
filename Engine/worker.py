@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from contextvars import ContextVar
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -23,14 +24,32 @@ MAX_VERTICES = 1_000_000
 MAX_EDGE_SEGMENTS = 250_000
 MAX_SCRIPT_BYTES = 200_000
 MAX_GEOMETRY_BYTES = 512_000_000
+MAX_VALIDATION_FAILURES = 24
 LIMIT = 100_000.0
 _validated_replay = ContextVar("validated_replay", default=False)
+_validation_scope = ContextVar("validation_scope", default="native_candidate")
+_validation_input = ContextVar("validation_input", default=None)
 
 ROOT_KEYS = {"title", "summary", "units", "script"}
 
 
 class ModelError(ValueError):
     """An actionable, user-visible modeling error."""
+
+    def __init__(self, message, *, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+@contextmanager
+def validation_scope(scope, input_asset=None):
+    scope_token = _validation_scope.set(scope)
+    input_token = _validation_input.set(input_asset)
+    try:
+        yield
+    finally:
+        _validation_input.reset(input_token)
+        _validation_scope.reset(scope_token)
 
 
 def validate_spec(spec):
@@ -105,6 +124,205 @@ def _shape_entities(shape, kind):
     return result
 
 
+def geometry_validation_error(shape, analyzer):
+    """Keep OCCT's actual statuses and pointers scoped to this exact shape.
+
+    These are zero-based native topology indices, not STEP entity numbers or
+    selections in a previous preview. In particular STEP readback can reorder
+    and split topology. Never silently remap its indices to the live design.
+    """
+    import cadquery as cq
+    from OCP.BRepCheck import BRepCheck_NoError
+    from OCP.TopAbs import (TopAbs_VERTEX, TopAbs_EDGE, TopAbs_WIRE, TopAbs_FACE,
+                           TopAbs_SHELL, TopAbs_SOLID, TopAbs_COMPSOLID, TopAbs_COMPOUND)
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    scope = _validation_scope.get()
+    failures, seen = [], set()
+    omitted = 0
+    stage = {"step_readback": "step_readback_validation", "input_asset": "input_validation",
+             "source_step": "input_validation", "saved_step": "input_validation"}.get(scope, "native_validation")
+    diagnostic = {"stage": stage,
+                  "geometryScope": scope, "failures": failures, "omittedFailures": 0}
+    input_asset = _validation_input.get()
+    if input_asset:
+        diagnostic["inputAsset"] = input_asset
+    try:
+        maps, owners = {}, {}
+        kinds = [("Vertex", TopAbs_VERTEX), ("Edge", TopAbs_EDGE), ("Wire", TopAbs_WIRE),
+                 ("Face", TopAbs_FACE), ("Shell", TopAbs_SHELL), ("Solid", TopAbs_SOLID),
+                 ("CompSolid", TopAbs_COMPSOLID), ("Compound", TopAbs_COMPOUND)]
+        for kind, native_kind in kinds:
+            native_map = TopTools_IndexedMapOfShape()
+            TopExp.MapShapes_s(shape.wrapped, native_kind, native_map)
+            maps[kind] = native_map
+        # Match the existing feature order, including its degenerate-edge
+        # filtering, while also retaining pointers to other invalid subshapes.
+        for solid_index, solid in enumerate(_shape_entities(shape, "Solid")):
+            for kind, _ in kinds:
+                for local_index, entity in enumerate(_shape_entities(solid, kind)):
+                    index = maps[kind].FindIndex(entity.wrapped)
+                    owners.setdefault((kind, index), []).append(
+                        {"solidIndex": solid_index, "localIndex": local_index})
+
+        def reference(native):
+            wrapped = cq.Shape.cast(native)
+            kind = wrapped.ShapeType()
+            index = maps[kind].FindIndex(native) if kind in maps else 0
+            result = {"kind": kind.lower(), "index": index - 1}
+            references = owners.get((kind, index), [])
+            if references:
+                result["owners"] = references[:4]
+                if len(references) > 4:
+                    result["omittedOwners"] = len(references) - 4
+            return result
+
+        measurements = {}
+
+        def measures(native, context, entity, parent):
+            key = (entity["kind"], entity["index"],
+                   parent["kind"] if parent else None, parent["index"] if parent else None)
+            if key in measurements:
+                return measurements[key]
+            values = {}
+            try:
+                bounds = exact_bounds(cq.Shape.cast(native))
+                if all(math.isfinite(value) for value in bounds):
+                    values["bounds"] = bounds
+            except Exception:
+                pass
+            if entity["kind"] == "edge":
+                from OCP.BRep import BRep_Tool
+                from OCP.TopoDS import TopoDS
+                edge = TopoDS.Edge(native)
+                tolerance = BRep_Tool.Tolerance_s(edge)
+                if math.isfinite(tolerance) and tolerance >= 0:
+                    values["tolerance"] = tolerance
+                if parent and parent["kind"] == "face" and not BRep_Tool.Degenerated_s(edge):
+                    try:
+                        from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Curve2d, BRepAdaptor_Surface
+                        from OCP.Adaptor3d import Adaptor3d_CurveOnSurface
+                        from OCP.GeomLib import GeomLib_CheckCurveOnSurface
+                        face = TopoDS.Face(context)
+                        curve = BRepAdaptor_Curve(edge)
+                        surface_curve = Adaptor3d_CurveOnSurface(
+                            BRepAdaptor_Curve2d(edge, face), BRepAdaptor_Surface(face))
+                        check = GeomLib_CheckCurveOnSurface(curve)
+                        check.Perform(surface_curve)
+                        if check.IsDone():
+                            distance, parameter = check.MaxDistance(), check.MaxParameter()
+                            point = list(curve.Value(parameter).Coord())
+                            if (math.isfinite(distance) and distance >= 0 and math.isfinite(parameter)
+                                    and all(math.isfinite(value) for value in point)):
+                                values.update(maxDeviation=distance, maxDeviationPoint=point)
+                    except Exception:
+                        # Missing or malformed representations may prevent an
+                        # independent distance calculation. Preserve OCCT's
+                        # actual status without guessing a discrepancy.
+                        pass
+            measurements[key] = values
+            return values
+
+        def add(statuses, native, context=None):
+            nonlocal omitted
+            entity = reference(native)
+            parent = reference(context) if context is not None else None
+            for status in statuses:
+                if status == BRepCheck_NoError:
+                    continue
+                name = getattr(status, "name", str(status).rsplit(".", 1)[-1])
+                key = (entity["kind"], entity["index"], name,
+                       parent["kind"] if parent else None, parent["index"] if parent else None)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if len(failures) >= MAX_VALIDATION_FAILURES:
+                    omitted += 1
+                    continue
+                item = {"status": name, "entity": entity}
+                if parent is not None:
+                    item["context"] = parent
+                item.update(measures(native, context, entity, parent))
+                failures.append(item)
+
+        for kind, _ in kinds:
+            native_map = maps[kind]
+            for index in range(1, native_map.Extent() + 1):
+                native = native_map.FindKey(index)
+                result = analyzer.Result(native)
+                if result is None:
+                    continue
+                add(result.Status(), native)
+                result.InitContextIterator()
+                while result.MoreShapeInContext():
+                    add(result.StatusOnShape(), native, result.ContextualShape())
+                    result.NextShapeInContext()
+    except Exception as error:
+        diagnostic["collectionError"] = f"Could not collect all OpenCascade statuses: {type(error).__name__}: {error}"[:1000]
+    diagnostic["omittedFailures"] = omitted
+
+    def label(entity):
+        text = f"{entity['kind']}[{entity['index']}]"
+        if entity.get("owners"):
+            text += " (" + ", ".join(f"solid[{owner['solidIndex']}]/{entity['kind']}[{owner['localIndex']}]"
+                                     for owner in entity["owners"]) + ")"
+        return text
+
+    lines = ["OpenCascade geometry validation failed.",
+             f"Geometry scope: {scope}; all topology indices are zero-based and refer only to this geometry."]
+    if input_asset:
+        lines.append("Input geometry: " + json.dumps(input_asset, ensure_ascii=False, sort_keys=True))
+    if scope == "step_readback":
+        lines.append("STEP readback indices must not be used as selections in the original design.")
+    for failure in failures:
+        line = f"{failure['status']}: {label(failure['entity'])}"
+        if failure.get("context"):
+            line += f" in {label(failure['context'])}"
+        if failure.get("bounds"):
+            line += "; bounds (mm): [" + ", ".join(f"{value:.9g}" for value in failure["bounds"]) + "]"
+        if "tolerance" in failure:
+            line += f"; edge tolerance: {failure['tolerance']:.9g} mm"
+        if "maxDeviation" in failure:
+            line += f"; max curve-on-surface discrepancy: {failure['maxDeviation']:.9g} mm"
+            line += " at [" + ", ".join(f"{value:.9g}" for value in failure["maxDeviationPoint"]) + "] mm"
+        lines.append(line)
+    if omitted:
+        lines.append(f"{omitted} additional failure statuses omitted.")
+    if not failures:
+        lines.append("OpenCascade returned an invalid result without an available per-entity failure status.")
+    if diagnostic.get("collectionError"):
+        lines.append(diagnostic["collectionError"])
+    return ModelError("\n".join(lines), diagnostic=diagnostic)
+
+
+def write_error_report(error, output):
+    """Publish bounded failure details independently of diagnostic log tails."""
+    import tempfile
+    report = {"formatVersion": 1, "stage": "worker", **(getattr(error, "diagnostic", None) or {}),
+              "message": str(error).encode("utf-8")[:32_000].decode("utf-8", errors="ignore")}
+    data = json.dumps(report, separators=(",", ":"), allow_nan=False, ensure_ascii=False).encode("utf-8")
+    if len(data) > 65_536:
+        report.pop("failures", None)
+        report["detailsOmitted"] = True
+        data = json.dumps(report, separators=(",", ":"), allow_nan=False, ensure_ascii=False).encode("utf-8")
+    while len(data) > 65_536 and report["message"]:
+        # Control characters need escaping even without ASCII-only encoding.
+        # Bound the serialized bytes, not just the source string's length.
+        report["message"] = report["message"][:len(report["message"]) // 2]
+        report["messageTruncated"] = True
+        data = json.dumps(report, separators=(",", ":"), allow_nan=False, ensure_ascii=False).encode("utf-8")
+    output.mkdir(parents=True, exist_ok=True)
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".error-", dir=output, delete=False) as stream:
+            path = Path(stream.name)
+            stream.write(data)
+        path.replace(output / "error.json")
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
 def validate_shape(shape, preview_stats=None):
     """Validate exact, closed geometry before meshing or accepting a build."""
     from OCP.BRepCheck import BRepCheck_Analyzer, BRepCheck_Shell, BRepCheck_NoError
@@ -123,8 +341,9 @@ def validate_shape(shape, preview_stats=None):
     if not _validated_replay.get():
         # CadQuery's isValid() uses finitely sampled curve/surface checks. Exact
         # checking catches parameterization defects that those samples can miss.
-        if not BRepCheck_Analyzer(shape.wrapped, True, False, True).IsValid():
-            raise ModelError("operation produced invalid geometry; exact curve-on-surface validation failed")
+        analyzer = BRepCheck_Analyzer(shape.wrapped, True, False, True)
+        if not analyzer.IsValid():
+            raise geometry_validation_error(shape, analyzer)
         for shell in _shape_entities(shape, "Shell"):
             check = BRepCheck_Shell(shell.wrapped)
             if check.Closed() != BRepCheck_NoError or check.Orientation() != BRepCheck_NoError:
@@ -179,12 +398,17 @@ def validate_step_roundtrip(shape, cq, step_path, preview_stats=None):
     try:
         if not 0 < Path(step_path).stat().st_size <= MAX_GEOMETRY_BYTES:
             raise ModelError("The STEP design is empty or exceeds 512 MB.")
-        import_step(step_path, cq, preview_stats=actual)
+        with validation_scope("step_readback"):
+            import_step(step_path, cq, preview_stats=actual)
     except Exception as error:
-        raise ModelError(f"Design failed STEP verification before acceptance: {error}") from error
+        raise ModelError(f"Design failed STEP verification before acceptance: {error}",
+                         diagnostic=getattr(error, "diagnostic", None) or {
+                             "stage": "step_readback", "geometryScope": "step_readback"}) from error
     before, after = expected["solidProperties"], actual["solidProperties"]
     if len(before) != len(after):
-        raise ModelError(f"Design failed STEP verification: expected {len(before)} closed solids, received {len(after)}.")
+        raise ModelError(f"Design failed STEP verification: expected {len(before)} closed solids, received {len(after)}.",
+                         diagnostic={"stage": "step_geometry_comparison", "geometryScope": "step_readback",
+                                     "expectedSolids": len(before), "receivedSolids": len(after)})
     # Bounds and centroids use a linear tolerance relative to each part's own
     # size, independent of world-space translation. Measures use a small
     # relative allowance for analytic surface conversion and integration.
@@ -232,7 +456,13 @@ def validate_step_roundtrip(shape, cq, step_path, preview_stats=None):
                     visited.add(previous)
                     pending.append(previous)
         if available is None:
-            raise ModelError("Design failed STEP verification: conversion changed a part's volume, surface area, dimensions or position.")
+            part = after[source_index]
+            raise ModelError("Design failed STEP verification: conversion changed a part's volume, surface area, dimensions or position. "
+                             f"No original part matches STEP readback solid[{source_index}]: "
+                             f"volume={part['volume']:.12g} mm³, area={part['area']:.12g} mm², "
+                             f"bounds={part['bounds']}, centroid={part['centroid']}.",
+                             diagnostic={"stage": "step_geometry_comparison", "geometryScope": "step_readback",
+                                         "unmatchedReadbackSolid": source_index, "readbackProperties": part})
         while available is not None:
             current = parents[available]
             previous = assigned.get(current)
@@ -464,17 +694,18 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
     resource.setrlimit(resource.RLIMIT_FSIZE, (ceiling, ceiling))
     import numpy as np
     namespace = {"cq": cq, "math": math, "np": np, "__name__": "__lad_model__"}
-    namespace["imported_assets"] = {
-        asset["id"]: import_input_asset(path, asset["format"], cq)
-        for asset, path in input_assets or []
-    }
+    namespace["imported_assets"] = {}
+    for asset, path in input_assets or []:
+        with validation_scope("input_asset", {"id": asset["id"], "name": asset["name"], "format": asset["format"]}):
+            namespace["imported_assets"][asset["id"]] = import_input_asset(path, asset["format"], cq)
     if source_asset is not None:
         import stat
         try:
             info = source_asset.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
                 raise ModelError("The imported STEP asset must be a regular private file of at most 512 MB.")
-            imported = import_step(source_asset, cq)
+            with validation_scope("source_step", {"name": source_asset.name, "format": "step"}):
+                imported = import_step(source_asset, cq)
             namespace["imported_model"] = imported
         except ModelError:
             raise
@@ -940,6 +1171,21 @@ def import_step(path, cq, preview_stats=None):
 
 def import_input_asset(path, format, cq):
     """Read an app-staged recipe input, never an arbitrary program path."""
+    input_asset = _validation_input.get() or {"name": path.name, "format": format}
+    with validation_scope("input_asset", input_asset):
+        try:
+            return _read_input_asset(path, format, cq)
+        except ModelError as error:
+            if error.diagnostic is None:
+                error.diagnostic = {"stage": "input_import", "geometryScope": "input_asset", "inputAsset": input_asset}
+            raise
+        except Exception as error:
+            raise ModelError(f"Input geometry import failed: {type(error).__name__}: {error}",
+                             diagnostic={"stage": "input_import", "geometryScope": "input_asset",
+                                         "inputAsset": input_asset}) from error
+
+
+def _read_input_asset(path, format, cq):
     import stat
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
@@ -1101,7 +1347,8 @@ def preview_step(spec, asset_directory, output, cq, threads):
         raise ModelError("The saved STEP asset is incomplete.")
     configure_threads(threads)
     preview_stats = {}
-    shape = import_step(source, cq, preview_stats=preview_stats)
+    with validation_scope("saved_step", {"name": source.name, "format": "step"}):
+        shape = import_step(source, cq, preview_stats=preview_stats)
     if spec.get("parts") is not None:
         shape._lad_parts = validate_parts(spec["parts"], len(shape.Solids()))
     preview = make_preview(shape, preview_stats=preview_stats)
@@ -1143,7 +1390,8 @@ def read_brep(spec, asset_directory, cq, threads):
     wrapped = TopoDS_Shape()
     if not BRepTools.Read_s(wrapped, str(source), BRep_Builder()) or wrapped.IsNull():
         raise ModelError("The native solid asset could not be read.")
-    return validate_shape(cq.Shape.cast(wrapped))
+    with validation_scope("native_artifact", {"name": source.name, "format": "brep"}):
+        return validate_shape(cq.Shape.cast(wrapped))
 
 
 def selected_solids(spec, solids, required=False):
@@ -1182,8 +1430,15 @@ def write_step(solids, path, cq, colors=None, indices=None):
         rgb = (colors or {}).get(index)
         color = cq.Color(rgb["red"], rgb["green"], rgb["blue"], 1) if rgb is not None else None
         assembly.add(solids[index], name=f"Part {index + 1}", color=color)
-    if not exportAssembly(assembly, str(path), mode="default"):
-        raise ModelError("STEP export could not write the design parts.")
+    try:
+        if not exportAssembly(assembly, str(path), mode="default"):
+            raise ModelError("STEP export could not write the design parts; the CAD exporter reported failure.",
+                             diagnostic={"stage": "step_export"})
+    except ModelError:
+        raise
+    except Exception as error:
+        raise ModelError(f"STEP export failed: {type(error).__name__}: {error}",
+                         diagnostic={"stage": "step_export"}) from error
 
 
 def export_brep(spec, asset_directory, output, cq, threads):
@@ -1422,6 +1677,11 @@ def main():
         result = run(arguments.request, arguments.output, arguments.threads, arguments.defer_step, arguments.validated_hash)
         print(json.dumps({"status": "complete", "solids": result.get("solids"), "faces": result.get("faces")}))
     except Exception as error:
+        try:
+            write_error_report(error, arguments.output)
+        except Exception:
+            # Report publication must not replace the original CAD failure.
+            pass
         print(f"LAD CAD engine: {error}", file=sys.stderr)
         return 1
     return 0
