@@ -1345,13 +1345,19 @@ def _preview_mesh(shape, solids, tolerance):
     from OCP.TopLoc import TopLoc_Location
     faces = [[(face, _shape_entities(face, "Edge")) for face in _shape_entities(solid, "Face")] for solid in solids]
     # Retain healthy native meshes; retry only a failed display candidate.
-    attempts = [(IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Watson, 0.15)] + [
-        (IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella, angle) for angle in (0.16, 0.14, 0.18, 0.20)]
-    for attempt, (algorithm, angle) in enumerate(attempts):
+    attempts = [(IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Watson, 0.15, tolerance)] + [
+        (IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella, angle, tolerance)
+        for angle in (0.16, 0.14, 0.18, 0.20)]
+    # Pole-adjacent trims can still fold an analytic sphere's native mesh at
+    # every ordinary angle. Refine its boundary and surface sampling together
+    # before giving up; do not flip those facets or alter the exact geometry.
+    attempts += [(IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella, 0.20, tolerance * factor)
+                 for factor in (0.25, 0.125)]
+    for attempt, (algorithm, angle, linear_deflection) in enumerate(attempts):
         if attempt:
             BRepTools.Clean_s(shape.wrapped)
         parameters = IMeshTools_Parameters()
-        parameters.Deflection, parameters.Angle = tolerance, angle
+        parameters.Deflection, parameters.Angle = linear_deflection, angle
         parameters.Relative, parameters.InParallel = False, True
         # Watson can report success with folded facets and large missing areas
         # on trimmed analytic spheres. Try an independent native triangulator.
@@ -1376,7 +1382,7 @@ def _preview_mesh(shape, solids, tolerance):
                     transform = location.Transformation()
                     points = [list(poly.Node(index).Transformed(transform).Coord()) for index in range(1, poly.NbNodes() + 1)]
                     normals = _preview_face_normals(face, poly, location)
-                    triangles = _preview_face_triangles(face, poly, location, points, normals, edges, tolerance)
+                    triangles = _preview_face_triangles(face, poly, location, points, normals, edges, linear_deflection)
                     total_nodes += len(points)
                     total_triangles += len(triangles)
                     if total_nodes > MAX_VERTICES or total_triangles > MAX_TRIANGLES:
@@ -1389,7 +1395,7 @@ def _preview_mesh(shape, solids, tolerance):
             failure_feature = feature_id("face", solid_index, local_index)
     diagnostic = {"stage": "preview_meshing", "geometryScope": "native_candidate",
                   "openCascadeMeshingStatus": mesher.GetStatusFlags(),
-                  "linearDeflectionMM": tolerance, "angularDeflectionRadians": angle,
+                  "linearDeflectionMM": linear_deflection, "angularDeflectionRadians": angle,
                   "meshingAlgorithm": "Watson" if algorithm == attempts[0][0] else "Delabella"}
     if failure_feature is not None:
         diagnostic["feature"] = failure_feature
