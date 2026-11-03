@@ -22,8 +22,8 @@ import test_candidate_validation as candidate_validation
 
 def slot_program(radius):
     # A minimal version of the reported center-plane rear-cutout request. The
-    # nominally simple 3 mm corners fail STEP readback in the pinned runtime;
-    # 1 mm corners pass. Keep exact validation enabled for both paths.
+    # nominally simple 3 mm corners must pass just like the 1 mm corners under
+    # the application's numeric tolerance. Keep exact validation enabled.
     return f"""import cadquery as cq
 sphere = cq.Solid.makeSphere(50, angleDegrees1=-90, angleDegrees2=90)
 sphere = sphere.rotate((0, 0, 0), (1, 0, 0), -55)
@@ -94,9 +94,8 @@ class ValidationDiagnosticTests(unittest.TestCase):
                 self.assertTrue(all(failure['bounds'][axis] <= failure['bounds'][axis + 3]
                                     for axis in range(3)))
 
-    def test_native_error_identifies_unorientable_faces_without_guessing_curve_failure(self):
-        shape = candidate_validation.CandidateNativeValidationTests.offset_curve_solid()
-        self.assertTrue(shape.isValid(), 'This fixture passes CadQuery sampled checks.')
+    def test_native_error_identifies_actual_edge_and_face_failures(self):
+        shape = candidate_validation.displaced_pcurve_box(1e-3)
         with self.assertRaises(worker.ModelError) as caught:
             worker.validate_shape(shape)
         error = caught.exception
@@ -105,14 +104,15 @@ class ValidationDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic['geometryScope'], 'native_candidate')
         self.assertNotIn('collectionError', diagnostic)
         self.assertTrue(diagnostic['failures'])
-        self.assertTrue(all(failure['entity']['kind'] == 'face' for failure in diagnostic['failures']))
-        self.assertEqual({failure['status'] for failure in diagnostic['failures']},
-                         {'BRepCheck_UnorientableShape'})
+        self.assertTrue({'BRepCheck_InvalidCurveOnSurface', 'BRepCheck_InvalidSameParameterFlag',
+                         'BRepCheck_UnorientableShape'} <=
+                        {failure['status'] for failure in diagnostic['failures']})
+        self.assertEqual({failure['entity']['kind'] for failure in diagnostic['failures']}, {'edge', 'face'})
         self.assertIn('BRepCheck_UnorientableShape', str(error))
         self.assertNotIn('exact curve-on-surface validation failed', str(error))
         self.assert_references_match_native_statuses(shape, diagnostic)
 
-    def test_slot_radius_pair_reports_step_edge_face_context_and_resets_scope(self):
+    def test_actual_slot_radius_pair_passes_full_build_and_step_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             for radius in (1, 3):
@@ -121,40 +121,59 @@ class ValidationDiagnosticTests(unittest.TestCase):
                     worker.validate_shape(shape)
                     step = folder / f'radius-{radius}.step'
                     worker.write_step(worker._shape_entities(shape, 'Solid'), step, cq)
-                    if radius == 1:
-                        worker.validate_step_roundtrip(shape, cq, step)
-                    else:
-                        with self.assertRaises(worker.ModelError) as caught:
-                            worker.validate_step_roundtrip(shape, cq, step)
-                        diagnostic = caught.exception.diagnostic
-                        self.assertEqual(diagnostic['stage'], 'step_readback_validation')
-                        self.assertEqual(diagnostic['geometryScope'], 'step_readback')
-                        self.assertNotIn('collectionError', diagnostic)
-                        edge_failures = [failure for failure in diagnostic['failures']
-                                         if failure['entity']['kind'] == 'edge']
-                        self.assertTrue(edge_failures)
-                        self.assertTrue({'BRepCheck_InvalidCurveOnSurface', 'BRepCheck_InvalidSameParameterFlag'}
-                                        <= {failure['status'] for failure in edge_failures})
-                        self.assertTrue(all(failure['context']['kind'] == 'face' for failure in edge_failures))
-                        for failure in edge_failures:
-                            self.assertGreater(failure['tolerance'], 0)
-                            self.assertTrue(math.isfinite(failure['maxDeviation']))
-                            self.assertGreaterEqual(failure['maxDeviation'], 0)
-                            self.assertEqual(len(failure['maxDeviationPoint']), 3)
-                            self.assertTrue(all(math.isfinite(value) for value in failure['maxDeviationPoint']))
-                        self.assertTrue(any(failure['maxDeviation'] > failure['tolerance']
-                                            for failure in edge_failures))
-                        self.assertIn('STEP readback indices must not be used as selections', str(caught.exception))
-                        readback = cq.importers.importStep(str(step)).val()
-                        self.assert_references_match_native_statuses(readback, diagnostic)
+                    worker.validate_step_roundtrip(shape, cq, step)
+                    request = folder / f'radius-{radius}.json'
+                    request.write_text(json.dumps({'title': 'Rear cutout', 'summary': 'Center-plane extrusion',
+                                                   'units': 'mm', 'script': slot_program(radius)}))
+                    output = folder / f'output-{radius}'
+                    preview = worker.run(request, output, 2, defer_step=True)
+                    self.assertEqual(preview['solids'], 1)
+                    self.assertEqual(preview['faces'], len(shape.Faces()))
+                    self.assertGreater(preview['volume'], 0)
+                    self.assertAlmostEqual(preview['volume'], shape.Volume(), places=5)
+                    self.assertTrue(Path(preview['brepPath']).is_file())
+                    self.assertTrue((output / 'result.json').is_file())
+                    self.assertFalse((output / 'error.json').exists())
                     self.assertEqual(worker._validation_scope.get(), 'native_candidate')
+
+    def test_above_tolerance_step_error_retains_edge_face_context_and_resets_scope(self):
+        # Scaling this representation-sensitive case makes its STEP discrepancy
+        # genuinely exceed 1e-4 mm, preserving a real readback failure fixture.
+        shape = slot_shape(3).scale(1000)
+        worker.validate_shape(shape)
+        with tempfile.TemporaryDirectory() as directory:
+            step = Path(directory) / 'above-tolerance.step'
+            worker.write_step(worker._shape_entities(shape, 'Solid'), step, cq)
+            with self.assertRaises(worker.ModelError) as caught:
+                worker.validate_step_roundtrip(shape, cq, step)
+            diagnostic = caught.exception.diagnostic
+            self.assertEqual(diagnostic['stage'], 'step_readback_validation')
+            self.assertEqual(diagnostic['geometryScope'], 'step_readback')
+            self.assertNotIn('collectionError', diagnostic)
+            edge_failures = [failure for failure in diagnostic['failures'] if failure['entity']['kind'] == 'edge']
+            self.assertTrue(edge_failures)
+            self.assertTrue({'BRepCheck_InvalidCurveOnSurface', 'BRepCheck_InvalidSameParameterFlag'}
+                            <= {failure['status'] for failure in edge_failures})
+            self.assertTrue(all(failure['context']['kind'] == 'face' for failure in edge_failures))
+            for failure in edge_failures:
+                self.assertGreaterEqual(failure['tolerance'], 1e-4)
+                self.assertTrue(math.isfinite(failure['maxDeviation']))
+                self.assertGreaterEqual(failure['maxDeviation'], 0)
+                self.assertEqual(len(failure['maxDeviationPoint']), 3)
+                self.assertTrue(all(math.isfinite(value) for value in failure['maxDeviationPoint']))
+            self.assertTrue(any(failure['maxDeviation'] > max(1e-4, failure['tolerance'])
+                                for failure in edge_failures))
+            self.assertIn('STEP readback indices must not be used as selections', str(caught.exception))
+            readback = cq.importers.importStep(str(step)).val()
+            self.assert_references_match_native_statuses(readback, diagnostic)
+            self.assertEqual(worker._validation_scope.get(), 'native_candidate')
             # A subsequent unrelated failure must not inherit STEP identity.
             with self.assertRaises(worker.ModelError) as caught:
-                worker.validate_shape(candidate_validation.CandidateNativeValidationTests.offset_curve_solid())
+                worker.validate_shape(candidate_validation.displaced_pcurve_box(1e-3))
             self.assertEqual(caught.exception.diagnostic['geometryScope'], 'native_candidate')
 
     def test_invalid_reference_input_identifies_its_asset_without_leaking_scope(self):
-        invalid = candidate_validation.CandidateNativeValidationTests.offset_curve_solid()
+        invalid = candidate_validation.displaced_pcurve_box(1e-3)
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             path = folder / 'input-000.brep'
@@ -191,7 +210,7 @@ class ValidationDiagnosticTests(unittest.TestCase):
                 worker.validate_shape(invalid)
             self.assertEqual(native.exception.diagnostic['geometryScope'], 'native_candidate')
             self.assertNotIn('inputAsset', native.exception.diagnostic)
-            shape = slot_shape(3)
+            shape = slot_shape(3).scale(1000)
             step = folder / 'candidate.step'
             worker.write_step(worker._shape_entities(shape, 'Solid'), step, cq)
             with self.assertRaises(worker.ModelError) as transferred:
@@ -202,8 +221,10 @@ class ValidationDiagnosticTests(unittest.TestCase):
             self.assertIsNone(worker._validation_input.get())
 
     def test_many_real_native_failures_are_bounded_and_count_omitted_statuses(self):
-        invalid = candidate_validation.CandidateNativeValidationTests.offset_curve_solid()
-        compound = cq.Compound.makeCompound([invalid.translate((index * 100, 0, 0)) for index in range(16)])
+        # Place each box before corrupting its pcurve; a later native shape
+        # transform can rebuild the representation and repair the fixture.
+        compound = cq.Compound.makeCompound([
+            candidate_validation.displaced_pcurve_box(1e-3, (index * 100, 0, 0)) for index in range(16)])
         with self.assertRaises(worker.ModelError) as caught:
             worker.validate_shape(compound)
         diagnostic = caught.exception.diagnostic
@@ -238,7 +259,7 @@ class ValidationDiagnosticTests(unittest.TestCase):
             folder = Path(directory)
             request = folder / 'request.json'
             request.write_text(json.dumps({'title': 'Rear cutout', 'summary': 'Center-plane extrusion',
-                                           'units': 'mm', 'script': slot_program(3)}))
+                                           'units': 'mm', 'script': slot_program(3) + '\nresult = result.scale(1000)\n'}))
             output = folder / 'output'
             process = subprocess.run([sys.executable, str(ENGINE / 'worker.py'), '--request', str(request),
                                       '--output', str(output), '--threads', '2', '--defer-step'],

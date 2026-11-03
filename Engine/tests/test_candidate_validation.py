@@ -15,11 +15,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import worker
 
 
+def displaced_pcurve_program(delta, origin=(0, 0, 0)):
+    """Keep box geometry fixed while offsetting one face's edge representation."""
+    return f"""from OCP.BRep import BRep_Builder, BRep_Tool
+from OCP.gp import gp_Vec2d
+result = cq.Solid.makeBox(2, 3, 4, cq.Vector({origin[0]!r}, {origin[1]!r}, {origin[2]!r}))
+face = result.Faces()[0]
+edge = face.Edges()[0]
+curve = BRep_Tool.CurveOnSurface_s(edge.wrapped, face.wrapped, 0., 0.)
+BRep_Builder().UpdateEdge(edge.wrapped, curve.Translated(gp_Vec2d({delta!r}, 0)), face.wrapped, 1e-7)
+"""
+
+
+def displaced_pcurve_box(delta, origin=(0, 0, 0)):
+    namespace = {'cq': cq}
+    exec(displaced_pcurve_program(delta, origin), namespace, namespace)
+    return namespace['result']
+
+
 class CandidateNativeValidationTests(unittest.TestCase):
     @staticmethod
     def offset_curve_solid():
-        # One closed cubic trace is enough to reproduce the sampled check's
-        # false acceptance of the offset geometry used by the stamp design.
+        # One closed cubic trace reproduces a tiny representation discrepancy
+        # in the stamp design, below the application's numeric tolerance.
         points = [cq.Vector(x * 0.06, y * 0.06, 0)
                   for x, y in [(404, 330), (295, 386), (201, 418), (211, 500)]]
         curve = cq.Edge.makeBezier(points)
@@ -29,12 +47,30 @@ class CandidateNativeValidationTests(unittest.TestCase):
         offsets.sort(key=lambda wire: cq.Face.makeFromWires(wire).Area(), reverse=True)
         return cq.Solid.extrudeLinear(offsets[0], offsets[1:], cq.Vector(0, 0, 2))
 
-    def test_rejects_offset_geometry_that_passes_cadquery_sampled_validation(self):
+    def test_accepts_small_offset_discrepancy_within_geometry_tolerance(self):
         shape = self.offset_curve_solid()
-        self.assertTrue(shape.isValid(), "The fixture must pass the old sampled check.")
+        self.assertTrue(shape.isValid(), "The fixture passes sampled checks at its original tolerances.")
         self.assertFalse(BRepCheck_Analyzer(shape.wrapped, True, False, True).IsValid())
-        with self.assertRaises(worker.ModelError):
+        worker.validate_shape(shape)
+        self.assertTrue(BRepCheck_Analyzer(shape.wrapped, True, False, True).IsValid())
+
+    def test_accepts_controlled_curve_discrepancy_below_tolerance_without_moving_geometry(self):
+        shape = displaced_pcurve_box(1e-5)
+        positions = [vertex.toTuple() for vertex in shape.Vertices()]
+        self.assertFalse(BRepCheck_Analyzer(shape.wrapped, True, False, True).IsValid())
+        worker.validate_shape(shape)
+        self.assertTrue(BRepCheck_Analyzer(shape.wrapped, True, False, True).IsValid())
+        self.assertEqual([vertex.toTuple() for vertex in shape.Vertices()], positions)
+
+    def test_rejects_controlled_curve_discrepancy_above_geometry_tolerance(self):
+        shape = displaced_pcurve_box(1e-3)
+        with self.assertRaises(worker.ModelError) as caught:
             worker.validate_shape(shape)
+        failures = caught.exception.diagnostic['failures']
+        edge_failures = [failure for failure in failures if failure['entity']['kind'] == 'edge']
+        self.assertTrue(edge_failures)
+        self.assertTrue(any(failure['maxDeviation'] > 1e-4 for failure in edge_failures))
+        self.assertTrue(all(failure['tolerance'] >= 1e-4 for failure in edge_failures))
 
     def test_rejects_construction_geometry_beside_a_valid_solid(self):
         shape = cq.Compound.makeCompound([
@@ -136,16 +172,45 @@ class CandidateSTEPRoundtripTests(unittest.TestCase):
             step = self.write_step(cq.Compound.makeCompound(parts[::-1]), Path(directory))
             worker.validate_step_roundtrip(source, cq, step)
 
+    def test_step_precision_settings_are_restored_after_success_and_read_failure(self):
+        from OCP.Interface import Interface_Static
+        from OCP.STEPControl import STEPControl_Controller
+        STEPControl_Controller.Init_s()
+        settings = {}
+        for direction in ('read', 'write'):
+            settings[direction] = (Interface_Static.IVal_s(f'{direction}.precision.mode'),
+                                   Interface_Static.RVal_s(f'{direction}.precision.val'))
+        try:
+            # Distinct caller values make an unscoped assignment observable.
+            for direction in settings:
+                Interface_Static.SetIVal_s(f'{direction}.precision.mode', 0)
+                Interface_Static.SetRVal_s(f'{direction}.precision.val', 3e-6)
+            shape = cq.Solid.makeBox(2, 3, 4)
+            with tempfile.TemporaryDirectory() as directory:
+                step = Path(directory) / 'candidate.step'
+                worker.write_step([shape], step, cq)
+                worker.validate_step_roundtrip(shape, cq, step)
+                step.write_text('ISO-10303-21;\nNot a STEP entity.\nEND-ISO-10303-21;\n')
+                with self.assertRaises(worker.ModelError):
+                    worker.validate_step_roundtrip(shape, cq, step)
+            for direction in settings:
+                self.assertEqual(Interface_Static.IVal_s(f'{direction}.precision.mode'), 0)
+                self.assertEqual(Interface_Static.RVal_s(f'{direction}.precision.val'), 3e-6)
+        finally:
+            for direction, (mode, value) in settings.items():
+                Interface_Static.SetIVal_s(f'{direction}.precision.mode', mode)
+                Interface_Static.SetRVal_s(f'{direction}.precision.val', value)
+
     def test_near_coincident_part_matching_is_independent_of_import_order(self):
         source = cq.Compound.makeCompound([
             cq.Solid.makeBox(1, 1, 1),
-            cq.Solid.makeBox(1, 1, 1).translate((1e-6, 0, 0)),
+            cq.Solid.makeBox(1, 1, 1).translate((1e-4, 0, 0)),
         ])
-        # The +0.5e-6 mm part can match either original within the allowed
-        # tolerance; the -0.5e-6 mm part can match only the first original.
+        # The +0.5e-4 mm part can match either original within the allowed
+        # tolerance; the -0.5e-4 mm part can match only the first original.
         # Matching the first available body greedily rejects one STEP order.
         with tempfile.TemporaryDirectory() as directory:
-            for offsets in ((0.5e-6, -0.5e-6), (-0.5e-6, 0.5e-6)):
+            for offsets in ((0.5e-4, -0.5e-4), (-0.5e-4, 0.5e-4)):
                 with self.subTest(offsets=offsets):
                     transferred = cq.Compound.makeCompound([
                         cq.Solid.makeBox(1, 1, 1).translate((offset, 0, 0))
