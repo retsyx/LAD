@@ -14,7 +14,7 @@ struct ProjectWindowRequest: Hashable, Codable {
     static func initialSource(request: Self?, storedPath: String, storedProjectID: String) -> (url: URL?, projectID: UUID?) {
         let stored = storedPath.isEmpty ? nil : URL(fileURLWithPath: storedPath)
         let source = request?.fileURL ?? stored
-        let sameFile = source?.standardizedFileURL.resolvingSymlinksInPath() == stored?.standardizedFileURL.resolvingSymlinksInPath()
+        let sameFile = source.map(ProjectFileOrigin.canonicalURL)?.path == stored.map(ProjectFileOrigin.canonicalURL)?.path
         return (source, sameFile ? UUID(uuidString: storedProjectID) : nil)
     }
 }
@@ -81,7 +81,7 @@ final class ProjectWindowCoordinator: ObservableObject {
 
     private enum ReplacementTarget {
         case open(AppState, URL)
-        case archive(LADProject, URL)
+        case package(LADProject, URL)
     }
 
     private var entries: [UUID: Entry] = [:]
@@ -286,7 +286,7 @@ final class ProjectWindowCoordinator: ObservableObject {
     }
 
     /// Open a dropped design in its receiving window. Keep the old document
-    /// intact until the incoming archive validates and the outgoing save succeeds.
+    /// intact until the incoming package validates and the outgoing save succeeds.
     func replaceProject(at url: URL, in id: UUID) {
         replaceProject(at: url, in: id, sharingInitialRead: false)
     }
@@ -340,11 +340,11 @@ final class ProjectWindowCoordinator: ObservableObject {
                     guard replacementIsCurrent(token, in: id, session: session) else { return }
                     incoming = state
                     source = hasWindow(for: state) ? url : Self.canonicalURL(state.projectURL ?? url)
-                case .archive(let project, let url):
+                case .package(let project, let url):
                     source = url
                     // Two simultaneous drops must converge on a single writer.
                     if let existing = entryID(matching: url), let state = entries[existing]?.state {
-                        // Another window may still be reading this archive. Use
+                        // Another window may still be reading this package. Use
                         // our validated snapshot to finish that same document,
                         // canceling its stale read instead of sharing empty state.
                         if !hasLoadedProject(state) { loadExistingProject(state, project, url) }
@@ -528,14 +528,14 @@ final class ProjectWindowCoordinator: ObservableObject {
             if hasLoadedProject(closing.state) { return .open(closing.state, destination) }
             // A closing window may have canceled its very first read. It has
             // no validated document to reuse, so validate before saving the receiver.
-            return .archive(try await readProject(destination), destination)
+            return .package(try await readProject(destination), destination)
         }
         if let existing = entryID(matching: url), let state = entries[existing]?.state {
             // Registration precedes the initial asynchronous read. Its source
-            // alias alone does not establish that the archive is a valid design.
+            // alias alone does not establish that the package is a valid design.
             if hasLoadedProject(state) { return .open(state, url) }
         }
-        return .archive(try await readProject(url), url)
+        return .package(try await readProject(url), url)
     }
 
     private func replacementIsCurrent(_ token: UUID, in id: UUID, session: ProjectWindowSession) -> Bool {
@@ -621,7 +621,7 @@ final class ProjectWindowCoordinator: ObservableObject {
     }
 
     private static func canonicalURL(_ url: URL) -> URL {
-        url.standardizedFileURL.resolvingSymlinksInPath()
+        ProjectFileOrigin.canonicalURL(url)
     }
 }
 

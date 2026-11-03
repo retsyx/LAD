@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>LAD Design Thumbnails</string>
+    <key>CFBundleDisplayName</key><string>LAD Design Thumbnails</string>
+    <key>CFBundleIdentifier</key><string>studio.lad.cad.thumbnail</string>
+    <key>CFBundleExecutable</key><string>LADThumbnailExtension</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+    <key>CFBundleShortVersionString</key><string>0.3.0</string>
+    <key>CFBundleVersion</key><string>99</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSArchitecturePriority</key><array><string>arm64</string></array>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionPointIdentifier</key><string>com.apple.quicklook.thumbnail</string>
+        <key>NSExtensionPrincipalClass</key><string>ThumbnailProvider</string>
+        <key>NSExtensionAttributes</key>
+        <dict>
+            <key>QLSupportedContentTypes</key><array><string>studio.lad.project</string></array>
+            <key>QLThumbnailMinimumDimension</key><integer>0</integer>
+        </dict>
+    </dict>
+</dict>
+</plist>

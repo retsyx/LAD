@@ -34,7 +34,7 @@ final class ProjectWindowTests: XCTestCase {
         coordinator.openProject(at: alias) { requests.append($0) }
         XCTAssertEqual(requests.count, 1)
         let request = requests[0]
-        XCTAssertEqual(request.fileURL, source.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(request.fileURL, ProjectFileOrigin.canonicalURL(source))
 
         let state = AppState()
         state.isWorking = true
@@ -136,7 +136,7 @@ final class ProjectWindowTests: XCTestCase {
         await fulfillment(of: [opened], timeout: 2)
         XCTAssertEqual(requests.count, 1)
         XCTAssertNotEqual(requests[0].id, id)
-        XCTAssertEqual(requests[0].fileURL, source.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(requests[0].fileURL, ProjectFileOrigin.canonicalURL(source))
         XCTAssertEqual(original.messages.first?.content, "Latest unsaved change")
     }
 
@@ -167,7 +167,7 @@ final class ProjectWindowTests: XCTestCase {
         gate.continuation.finish()
         await fulfillment(of: [opened], timeout: 2)
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests[0].fileURL, renamed.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(requests[0].fileURL, ProjectFileOrigin.canonicalURL(renamed))
     }
 
     @MainActor
@@ -252,7 +252,7 @@ final class ProjectWindowTests: XCTestCase {
         coordinator.replaceProject(at: source, in: receiverID)
         await fulfillment(of: [readStarted], timeout: 2)
         XCTAssertTrue(session.state === original)
-        XCTAssertEqual(session.sourceURL, originalSource.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(session.sourceURL, ProjectFileOrigin.canonicalURL(originalSource))
         XCTAssertEqual(flushes, 0)
         readGate.continuation.yield(())
         readGate.continuation.finish()
@@ -263,7 +263,7 @@ final class ProjectWindowTests: XCTestCase {
         flushGate.continuation.finish()
         await fulfillment(of: [replaced], timeout: 2)
         XCTAssertTrue(session.state === incoming)
-        XCTAssertEqual(session.sourceURL, source.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(session.sourceURL, ProjectFileOrigin.canonicalURL(source))
         XCTAssertEqual(loads, 1)
         XCTAssertEqual(flushes, 1)
         XCTAssertEqual(original.messages.first?.content, "Preserve outgoing history")
@@ -296,7 +296,7 @@ final class ProjectWindowTests: XCTestCase {
         coordinator.replaceProject(at: source, in: id)
         await fulfillment(of: [failed], timeout: 2)
         XCTAssertTrue(session.state === original)
-        XCTAssertEqual(session.sourceURL, originalSource.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(session.sourceURL, ProjectFileOrigin.canonicalURL(originalSource))
         XCTAssertEqual(original.messages.first?.content, "Original validated design")
         XCTAssertTrue(original.error?.contains("Invalid ZIP archive") == true)
         XCTAssertEqual(flushes, 0)
@@ -712,7 +712,7 @@ final class ProjectWindowTests: XCTestCase {
         gate.continuation.finish()
         await fulfillment(of: [replaced], timeout: 2)
         XCTAssertTrue(session.state === target)
-        XCTAssertEqual(session.sourceURL, renamed.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(session.sourceURL, ProjectFileOrigin.canonicalURL(renamed))
         XCTAssertEqual(session.state.messages.first?.content, "Latest target edits")
         withExtendedLifetime(observation) {}
     }

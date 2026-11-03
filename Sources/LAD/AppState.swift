@@ -8,14 +8,19 @@ final class AppState: ObservableObject {
     @Published private(set) var taskAudits: [ProjectTaskAudit] = []
     let activityImages = ProjectActivityImages()
     weak var viewportView: CADSceneView?
-    @Published var revisions: [ProjectRevision] = []
-    @Published var selectedRevisionID: UUID?
+    @Published var revisions: [ProjectRevision] = [] {
+        didSet { scheduleProjectThumbnail() }
+    }
+    @Published var selectedRevisionID: UUID? {
+        didSet { if selectedRevisionID != oldValue { scheduleProjectThumbnail() } }
+    }
     @Published var mesh: PreviewMesh? {
         didSet {
             // Feature IDs belong to one native topology. Even a replacement
             // at the same artifact path must not keep old feature selections.
             selectedFeatures = []
             refreshMeasurements()
+            scheduleProjectThumbnail()
         }
     }
     @Published var prompt = "" {
@@ -43,12 +48,12 @@ final class AppState: ObservableObject {
     @Published var error: String?
     @Published var displayMode: ViewportDisplayMode = .edges {
         didSet {
-            if displayMode != oldValue { autosave() }
+            if displayMode != oldValue { scheduleProjectThumbnail(); autosave() }
         }
     }
     @Published var projectionMode: ViewportProjectionMode = .perspective {
         didSet {
-            if projectionMode != oldValue { autosave() }
+            if projectionMode != oldValue { scheduleProjectThumbnail(); autosave() }
         }
     }
     @Published var showGrid = true {
@@ -72,7 +77,9 @@ final class AppState: ObservableObject {
     @Published private(set) var measurementError: String?
     @Published private(set) var isMeasuring = false
     @Published var selectedPartNodeIDs: Set<String> = []
-    @Published var hiddenSolids: Set<Int> = []
+    @Published var hiddenSolids: Set<Int> = [] {
+        didSet { if hiddenSolids != oldValue { scheduleProjectThumbnail() } }
+    }
     @Published var pendingAttachments: [SourceAttachment] = [] {
         didSet { if pendingAttachments != oldValue { scheduleDebouncedAutosave() } }
     }
@@ -117,6 +124,10 @@ final class AppState: ObservableObject {
     private var projectID = UUID()
     private var autosavedProjectURL: URL?
     private var projectFileOrigin: ProjectFileOrigin?
+    private var projectThumbnailTask: Task<Void, Never>?
+    private var projectThumbnailToken = UUID()
+    private var projectThumbnailInput: ProjectThumbnail.Input?
+    private var projectThumbnailData: Data?
     private var saveConflictPromptTask: Task<Void, Never>?
     private var presentedSaveConflict: ProjectSaveConflict?
     private var autosaveSequence = 0
@@ -347,6 +358,7 @@ final class AppState: ObservableObject {
 
     func prepareToQuit() async {
         cancel()
+        cancelProjectThumbnail(clearImage: false)
         auditSaveTask?.cancel(); auditSaveTask = nil
         autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         await waitForPromptAttachments()
@@ -358,6 +370,7 @@ final class AppState: ObservableObject {
     func flushForReplacement() async throws {
         let wasGenerating = generationFeedback != nil
         cancel()
+        cancelProjectThumbnail(clearImage: false)
         autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         await waitForPromptAttachments()
         await waitForQueuedSources()
@@ -428,6 +441,7 @@ final class AppState: ObservableObject {
 
     func newProject() {
         cancel()
+        cancelProjectThumbnail()
         activityImages.reset()
         projectReady = false
         projectSavingEnabled = false
@@ -1592,7 +1606,7 @@ final class AppState: ObservableObject {
         panel.identifier = NSUserInterfaceItemIdentifier("LAD.SaveNewProject")
         panel.title = "Save New"
         panel.prompt = "Save New"
-        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .data]
+        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .package]
         panel.directoryURL = projectURL?.deletingLastPathComponent() ?? ProjectAutosaveStore.defaultDirectory
         panel.nameFieldStringValue = "\(safeName(title)) copy.lad"
         guard SavePanelPresentation.runModal(panel) == .OK, let target = panel.url,
@@ -1626,7 +1640,7 @@ final class AppState: ObservableObject {
         let panel = NSSavePanel()
         panel.identifier = NSUserInterfaceItemIdentifier("LAD.SaveProject")
         panel.title = "Save LAD design"
-        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .data]
+        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .package]
         panel.nameFieldStringValue = "\(safeName(title)).lad"
         guard SavePanelPresentation.runModal(panel) == .OK, let target = panel.url else { return }
         let snapshot = projectSnapshot(), sessionID = projectSessionID
@@ -1648,7 +1662,7 @@ final class AppState: ObservableObject {
 
     func openProject() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .data]
+        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .package]
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         if let onOpenProject { onOpenProject(url) }
@@ -1784,7 +1798,7 @@ final class AppState: ObservableObject {
 
     private func rememberAutosavedProject(_ url: URL) {
         guard projectReady else { return }
-        let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+        let canonical = ProjectFileOrigin.canonicalURL(url)
         if canonical != lastNotedRecentURL { noteRecentProject(at: canonical) }
         guard isActiveProject else { return }
         UserDefaults.standard.set(url.path, forKey: Self.recentProjectPathKey)
@@ -1799,7 +1813,7 @@ final class AppState: ObservableObject {
 
     private func noteRecentProject(at url: URL) {
         guard let onRecentProjectChanged else { return }
-        let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+        let canonical = ProjectFileOrigin.canonicalURL(url)
         let previous = lastNotedRecentURL.flatMap { $0 == canonical ? nil : $0 }
         onRecentProjectChanged(canonical, previous)
         lastNotedRecentURL = canonical
@@ -1811,6 +1825,7 @@ final class AppState: ObservableObject {
     }
 
     private func restore(_ project: LADProject) {
+        cancelProjectThumbnail()
         projectReady = false
         // Existing files retain normal autosaving, including empty archives.
         projectSavingEnabled = true
@@ -2077,7 +2092,51 @@ final class AppState: ObservableObject {
                    draftPrompt: draftPrompt.isEmpty ? nil : draftPrompt,
                    draftAttachments: draftAttachments.isEmpty ? nil : draftAttachments,
                    queuePaused: queuedRequests.isEmpty ? nil : queuePaused,
-                   partsPaneFraction: partsPaneFraction, fileOrigin: projectFileOrigin)
+                   partsPaneFraction: partsPaneFraction, fileOrigin: projectFileOrigin,
+                   thumbnailData: currentProjectThumbnailInput() == projectThumbnailInput ? projectThumbnailData : nil)
+    }
+
+    private func currentProjectThumbnailInput() -> ProjectThumbnail.Input? {
+        guard let mesh, let selectedRevisionID, builtRevisionID == selectedRevisionID else { return nil }
+        return ProjectThumbnail.Input(revisionID: selectedRevisionID, geometryPath: mesh.stepPath,
+            nativePath: mesh.brepPath, validationHash: mesh.validatedHash,
+            projection: projectionMode, display: displayMode, hiddenSolids: hiddenSolids, solidColors: solidColors)
+    }
+
+    private func cancelProjectThumbnail(clearImage: Bool = true) {
+        projectThumbnailToken = UUID()
+        projectThumbnailTask?.cancel(); projectThumbnailTask = nil
+        if clearImage { projectThumbnailInput = nil; projectThumbnailData = nil }
+    }
+
+    /// Coalesce presentation edits without delaying typing, geometry acceptance,
+    /// or normal saves. Stale captures cannot attach to a replacement design.
+    private func scheduleProjectThumbnail() {
+        projectThumbnailTask?.cancel()
+        let token = UUID(), session = projectSessionID
+        projectThumbnailToken = token
+        guard projectReady else { projectThumbnailTask = nil; return }
+        projectThumbnailTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(350))
+                guard let self, self.projectSessionID == session, self.projectThumbnailToken == token,
+                      let input = self.currentProjectThumbnailInput(), let preview = self.mesh else { return }
+                if input == self.projectThumbnailInput, self.projectThumbnailData != nil { return }
+                let data = try await ProjectThumbnail.render(preview: preview, projection: input.projection,
+                    display: input.display, hiddenSolids: input.hiddenSolids, solidColors: input.solidColors)
+                guard !Task.isCancelled, self.projectSessionID == session, self.projectThumbnailToken == token,
+                      self.currentProjectThumbnailInput() == input else { return }
+                self.projectThumbnailInput = input
+                self.projectThumbnailData = data
+                self.projectThumbnailTask = nil
+                self.autosave()
+            } catch {
+                // Finder can fall back to the registered LAD icon. Thumbnail
+                // failure must never fail a required save or interrupt CAD work.
+                guard let self, self.projectSessionID == session, self.projectThumbnailToken == token else { return }
+                self.projectThumbnailTask = nil
+            }
+        }
     }
 }
 

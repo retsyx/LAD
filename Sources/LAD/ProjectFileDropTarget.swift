@@ -134,8 +134,8 @@ enum ProjectFileDrop {
               let objects = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]),
               objects.count == 1, let url = objects[0] as? URL,
               url.isFileURL, url.pathExtension.lowercased() == "lad",
-              let metadata = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey]),
-              metadata.isRegularFile == true, metadata.isDirectory != true else { return nil }
+              let metadata = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              metadata.isDirectory == true, metadata.isSymbolicLink != true else { return nil }
         return url
     }
 }

@@ -179,7 +179,7 @@ private struct ProjectCommands: Commands {
 
     private func openProject() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .data]
+        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .package]
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         coordinator.openProject(at: url) { openWindow(id: "project", value: $0) }

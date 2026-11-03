@@ -120,12 +120,12 @@ final class AppStateActivityImageTests: XCTestCase {
         state.cancel()
         await state.prepareToQuit()
         let url = try XCTUnwrap(state.projectURL)
-        let bytes = try Data(contentsOf: url)
-        let manifest = try ProjectZIP.decode(bytes)
+        let saved = try ProjectStore.read(from: url)
+        let snapshot = try ProjectArchive.split(saved)
+        let manifest = snapshot.metadata
         let manifestText = String(decoding: manifest, as: UTF8.self)
         XCTAssertFalse(manifestText.contains("imageData"))
-        XCTAssertFalse(manifestText.contains(png.base64EncodedString()), "Derived screenshots must never become archive assets.")
-        let saved = try ProjectStore.read(from: url)
+        XCTAssertFalse(snapshot.assets.values.contains(png), "Derived screenshots must never become package assets.")
         XCTAssertEqual(saved.taskAudits, state.taskAudits)
         XCTAssertTrue(saved.taskAudits?.flatMap(\.events).allSatisfy { $0.imageData == nil } == true)
 

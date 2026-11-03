@@ -21,6 +21,10 @@ swift build --disable-sandbox --arch arm64 -c "$CONFIG"
 BIN="$(swift build --disable-sandbox --arch arm64 -c "$CONFIG" --show-bin-path)"
 mkdir -p "$ASSEMBLED/Contents/MacOS" "$ASSEMBLED/Contents/Resources"
 cp "$BIN/LAD" "$ASSEMBLED/Contents/MacOS/LAD"
+THUMBNAIL_EXTENSION="$ASSEMBLED/Contents/PlugIns/LADThumbnailExtension.appex"
+mkdir -p "$THUMBNAIL_EXTENSION/Contents/MacOS"
+cp "$BIN/LADThumbnailExtension" "$THUMBNAIL_EXTENSION/Contents/MacOS/LADThumbnailExtension"
+cp "$ROOT/Scripts/ThumbnailExtension-Info.plist" "$THUMBNAIL_EXTENSION/Contents/Info.plist"
 # Bundle.module searches Contents/Resources in a packaged macOS app.
 [[ -d "$BIN/LAD_LAD.bundle" ]] || { echo "The Swift resource bundle is missing." >&2; exit 1; }
 ditto "$BIN/LAD_LAD.bundle" "$ASSEMBLED/Contents/Resources/LAD_LAD.bundle"
@@ -42,12 +46,17 @@ fi
 if [[ -n "${LAD_BUILD_NUMBER:-}" ]]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $LAD_BUILD_NUMBER" "$ASSEMBLED/Contents/Info.plist"
 fi
+for KEY in CFBundleShortVersionString CFBundleVersion; do
+    VALUE="$(/usr/libexec/PlistBuddy -c "Print :$KEY" "$ASSEMBLED/Contents/Info.plist")"
+    /usr/libexec/PlistBuddy -c "Set :$KEY $VALUE" "$THUMBNAIL_EXTENSION/Contents/Info.plist"
+done
 mkdir -p "$STAGING/icons"
 xcrun swift "$ROOT/Scripts/make-icon.swift" "$STAGING/icons"
 for ICON in LAD LADDocument LADFolder; do
     cp "$STAGING/icons/$ICON.icns" "$ASSEMBLED/Contents/Resources/"
 done
 if [[ "${LAD_APP_SIGNING:-adhoc}" != none ]]; then
+    codesign --force --sign - --entitlements "$ROOT/Scripts/ThumbnailExtension.entitlements" "$THUMBNAIL_EXTENSION"
     codesign --force --sign - "$ASSEMBLED"
 fi
 # A fresh assembly never retains deleted resources or old runtime payloads.

@@ -76,14 +76,14 @@ final class AppStateInitialSaveTests: XCTestCase {
         await state.prepareToQuit()
         XCTAssertEqual(try ProjectStore.read(from: url).draftPrompt, state.prompt)
         XCTAssertEqual(try ProjectStore.read(from: url).displayMode, .translucent)
-        let previousBytes = try Data(contentsOf: url)
+        let previousBytes = try ProjectStore.readArchive(from: url)
         state.newProject()
         state.prompt = "Another unsent first request"
         await state.prepareToQuit()
         XCTAssertFalse(state.canSaveProject)
         XCTAssertFalse(state.hasUnsavedChanges)
         XCTAssertNil(state.projectURL)
-        XCTAssertEqual(try Data(contentsOf: url), previousBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: url), previousBytes)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: fixture.saveDirectory.path).filter { $0.hasSuffix(".lad") }.count, 1)
     }
 

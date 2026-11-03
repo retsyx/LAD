@@ -48,7 +48,7 @@ final class ProjectSaveLocationTests: XCTestCase {
 
         try state.renameProject(to: "Renamed here")
         await state.prepareToQuit()
-        let renamed = directory.appendingPathComponent("Renamed here.lad")
+        let renamed = directory.appendingPathComponent("Renamed here.lad", isDirectory: false)
         XCTAssertEqual(state.projectURL, renamed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
         XCTAssertEqual(try ProjectStore.read(from: renamed).projectID, identity)
@@ -74,14 +74,14 @@ final class ProjectSaveLocationTests: XCTestCase {
         var remote = original
         remote.draftPrompt = "Other writer"
         try ProjectStore.write(remote, to: source)
-        let remoteBytes = try Data(contentsOf: source)
+        let remoteBytes = try ProjectStore.readArchive(from: source)
         opened.draftPrompt = "My edits"
         let store = ProjectAutosaveStore(rootDirectory: directory.appendingPathComponent("unused"))
         do {
             _ = try await store.write(project: opened, projectID: id, title: "Different title", sequence: 1, preferredURL: source)
             XCTFail("An external file needs the same conflict protection as a default-folder file")
         } catch { XCTAssertTrue(error is ProjectSaveConflict) }
-        XCTAssertEqual(try Data(contentsOf: source), remoteBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: source), remoteBytes)
     }
 
     func testRestorationFindsRenamedExternalIdentityBeforeConsultingUnavailableDefault() async throws {
@@ -95,7 +95,7 @@ final class ProjectSaveLocationTests: XCTestCase {
         try ProjectStore.write(LADProject(messages: [], revisions: [], selectedRevisionID: nil, projectID: UUID()), to: source)
         let store = ProjectAutosaveStore(rootDirectory: directory.appendingPathComponent("missing-parent/LAD"))
         let restored = try await store.restoreRecent(preferredURL: source, projectID: id)
-        XCTAssertEqual(restored?.url.resolvingSymlinksInPath(), renamed.resolvingSymlinksInPath())
+        XCTAssertEqual(restored.map { ProjectFileOrigin.canonicalURL($0.url) }, ProjectFileOrigin.canonicalURL(renamed))
         XCTAssertEqual(restored?.project.projectID, id)
     }
 }

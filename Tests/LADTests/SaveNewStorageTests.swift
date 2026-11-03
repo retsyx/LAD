@@ -10,7 +10,7 @@ final class SaveNewStorageTests: XCTestCase {
         let original = project()
         let id = try XCTUnwrap(original.projectID)
         let source = try await store.write(project: original, projectID: id, title: "Original", sequence: 1)
-        let originalBytes = try Data(contentsOf: source)
+        let originalBytes = try ProjectStore.readArchive(from: source)
         var new = try SaveNewProject.snapshot(from: original)
         new.projectName = "New design"
         let destination = directory.appendingPathComponent("New design.lad")
@@ -22,7 +22,7 @@ final class SaveNewStorageTests: XCTestCase {
         XCTAssertEqual(saved.revisions.map(\.id), [try XCTUnwrap(original.revisions.last?.id)])
         XCTAssertTrue(saved.messages.isEmpty)
         XCTAssertEqual(saved.projectName, "New design")
-        XCTAssertEqual(try Data(contentsOf: source), originalBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: source), originalBytes)
         let autosaved = try await store.write(project: original, projectID: id, title: "Original", sequence: 2, preferredURL: source)
         XCTAssertEqual(autosaved, source)
         XCTAssertEqual(try ProjectStore.read(from: source).revisions.count, 2)
@@ -38,7 +38,7 @@ final class SaveNewStorageTests: XCTestCase {
         original.selectedRevisionID = original.revisions.last?.id
         let id = try XCTUnwrap(original.projectID)
         let source = try await store.write(project: original, projectID: id, title: "Original", sequence: 1)
-        let originalBytes = try Data(contentsOf: source)
+        let originalBytes = try ProjectStore.readArchive(from: source)
         var copy = try SaveNewProject.snapshot(from: original, revisionID: requested.id)
         copy.projectName = "First version copy"
         let target = directory.appendingPathComponent("First version copy.lad")
@@ -51,7 +51,7 @@ final class SaveNewStorageTests: XCTestCase {
         XCTAssertEqual(saved.revisions[0].model, requested.model)
         XCTAssertTrue(saved.messages.isEmpty)
         XCTAssertNil(saved.taskAudits)
-        XCTAssertEqual(try Data(contentsOf: source), originalBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: source), originalBytes)
         let unchanged = try ProjectStore.read(from: source)
         XCTAssertEqual(unchanged.revisions.map(\.id), original.revisions.map(\.id))
         XCTAssertEqual(unchanged.messages, original.messages)
@@ -65,12 +65,12 @@ final class SaveNewStorageTests: XCTestCase {
         let original = project()
         let id = try XCTUnwrap(original.projectID)
         let source = try await store.write(project: original, projectID: id, title: "Original", sequence: 1)
-        let bytes = try Data(contentsOf: source)
+        let bytes = try ProjectStore.readArchive(from: source)
         let new = try SaveNewProject.snapshot(from: original)
         let alias = directory.appendingPathComponent("Alias.lad")
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: source)
         let sameIdentity = directory.appendingPathComponent("Original copy.lad")
-        try bytes.write(to: sameIdentity)
+        try FileManager.default.copyItem(at: source, to: sameIdentity)
 
         for destination in [source, alias, sameIdentity] {
             do {
@@ -79,8 +79,8 @@ final class SaveNewStorageTests: XCTestCase {
             } catch {
                 XCTAssertTrue(error.localizedDescription.contains("different filename"))
             }
-            XCTAssertEqual(try Data(contentsOf: source), bytes)
-            XCTAssertEqual(try Data(contentsOf: sameIdentity), bytes)
+            XCTAssertEqual(try ProjectStore.readArchive(from: source), bytes)
+            XCTAssertEqual(try ProjectStore.readArchive(from: sameIdentity), bytes)
         }
     }
 

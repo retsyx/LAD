@@ -97,13 +97,13 @@ final class AppStateSaveConflictTests: XCTestCase {
         var remote = try ProjectStore.read(from: url)
         remote.draftPrompt = "Remote draft"
         try ProjectStore.write(remote, to: url)
-        let remoteBytes = try Data(contentsOf: url)
+        let remoteBytes = try ProjectStore.readArchive(from: url)
         state.prompt = "Local draft"
         await state.prepareToQuit()
         XCTAssertNotNil(state.saveConflict)
         XCTAssertTrue(state.hasUnsavedChanges)
         try await state.resolveSaveConflict(.cancel)
-        XCTAssertEqual(try Data(contentsOf: url), remoteBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: url), remoteBytes)
         XCTAssertEqual(state.prompt, "Local draft")
         XCTAssertTrue(state.hasUnsavedChanges)
 
@@ -132,7 +132,7 @@ final class AppStateSaveConflictTests: XCTestCase {
         var remote = try ProjectStore.read(from: original)
         remote.draftPrompt = "Remote changes"
         try ProjectStore.write(remote, to: original)
-        let remoteBytes = try Data(contentsOf: original)
+        let remoteBytes = try ProjectStore.readArchive(from: original)
         state.prompt = "My local changes"
         await state.prepareToQuit()
         let destination = fixture.directory.appendingPathComponent("Local copy.lad")
@@ -140,7 +140,7 @@ final class AppStateSaveConflictTests: XCTestCase {
         XCTAssertNil(state.saveConflict)
         XCTAssertNotEqual(state.projectDocumentID, identity)
         XCTAssertEqual(state.projectURL, destination)
-        XCTAssertEqual(try Data(contentsOf: original), remoteBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: original), remoteBytes)
         let copy = try ProjectStore.read(from: destination)
         XCTAssertEqual(copy.messages, state.messages)
         XCTAssertEqual(copy.draftPrompt, state.prompt)
@@ -150,7 +150,7 @@ final class AppStateSaveConflictTests: XCTestCase {
         await state.prepareToQuit()
         XCTAssertEqual(state.projectURL, destination)
         XCTAssertEqual(try ProjectStore.read(from: destination).draftPrompt, state.prompt)
-        XCTAssertEqual(try Data(contentsOf: original), remoteBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: original), remoteBytes)
         XCTAssertNil(state.saveConflict)
     }
 
@@ -170,13 +170,13 @@ final class AppStateSaveConflictTests: XCTestCase {
         let first = try XCTUnwrap(state.saveConflict)
         remote.draftPrompt = "Second remote edit while the dialog is open"
         try ProjectStore.write(remote, to: url)
-        let secondBytes = try Data(contentsOf: url)
+        let secondBytes = try ProjectStore.readArchive(from: url)
         do {
             try await state.resolveSaveConflict(.overwrite)
             XCTFail("An overwrite decision must apply only to the observed file")
         } catch is ProjectSaveConflict {}
         XCTAssertNotEqual(state.saveConflict?.file.sha256, first.file.sha256)
-        XCTAssertEqual(try Data(contentsOf: url), secondBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: url), secondBytes)
         XCTAssertTrue(state.hasUnsavedChanges)
         state.newProject()
         XCTAssertNil(state.saveConflict)

@@ -1,0 +1,15 @@
+# Complete CadQuery construction.
+part_0 = cq.Workplane('XY').box(*[100, 50, 6], centered=(True, True, False)).val()
+part_1 = cq.Workplane('XY').box(*[100, 6, 40], centered=(True, True, False)).val()
+part_2 = part_1.translate([0, 22, 0])
+part_3 = part_0.fuse(part_2).clean()
+part_4 = cq.Solid.makeCylinder(*[3, 10])
+part_5 = part_4.translate([-38, -14, -2])
+part_6 = part_4.translate([38, -14, -2])
+part_7 = part_4.translate([-38, 8, -2])
+part_8 = part_4.translate([38, 8, -2])
+part_9 = cq.Solid.makeCylinder(*[8, 12])
+part_10 = part_9.rotate((0, 0, 0), [1, 0, 0], 90)
+part_11 = part_10.translate([0, 28, 25])
+part_12 = part_3.cut(part_5, part_6, part_7, part_8, part_11).clean()
+result = part_12

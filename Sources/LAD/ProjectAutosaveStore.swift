@@ -1,8 +1,8 @@
 import Foundation
 import Darwin
 
-/// Serializes complete projects in place, or into the default folder for new files.
-/// All coordination and potentially large archive work stays off the main actor.
+/// Serializes incremental project packages in place, or into the default folder.
+/// All file coordination and package work stays off the main actor.
 actor ProjectAutosaveStore {
     nonisolated static var defaultDirectory: URL {
         ProjectSaveLocation.directory()
@@ -16,6 +16,7 @@ actor ProjectAutosaveStore {
         var size: UInt64
         var modified: Date
         var inode: UInt64
+        var manifestInode: UInt64
     }
 
     private struct SavedFile {
@@ -46,7 +47,6 @@ actor ProjectAutosaveStore {
         }
         var portable = project
         portable.projectID = projectID
-        let data = try ProjectStore.encode(portable)
         let base: String
         if let name = portable.projectName {
             try ProjectNaming.validateSavedName(name)
@@ -54,14 +54,14 @@ actor ProjectAutosaveStore {
         } else { base = Self.filenameStem(title) }
         let previous = saved[projectID]
         let preferred = preferredURL.flatMap { url -> URL? in
-            guard Self.isProjectFile(url), isManaged(url) || portable.fileOrigin?.matches(url) == true || previous?.url == url.standardizedFileURL else { return nil }
-            return url.standardizedFileURL
+            guard Self.isProjectFile(url), isManaged(url) || portable.fileOrigin?.matches(url) == true || previous?.url.path == url.standardizedFileURL.path else { return nil }
+            return ProjectFileOrigin.documentURL(url)
         }
         let reopened = portable.fileOrigin != previous?.sourceOrigin && portable.fileOrigin?.matches(preferred ?? managedDirectory) == true
         let candidates = reopened ? [preferred, previous?.url] : [previous?.url, preferred]
         var source = candidates.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
         if let proposed = source,
-           previous?.url.standardizedFileURL != proposed.standardizedFileURL || (try? Self.fingerprint(proposed)) != previous?.fingerprint {
+           previous?.url.standardizedFileURL.path != proposed.standardizedFileURL.path || (try? Self.fingerprint(proposed)) != previous?.fingerprint {
             source = try ownedSource(proposed, project: portable, projectID: projectID, previous: previous, resolving: conflict)
         }
         if source == nil, previous != nil || portable.fileOrigin?.matches(preferred ?? managedDirectory) == true {
@@ -70,14 +70,14 @@ actor ProjectAutosaveStore {
         let directory = source?.deletingLastPathComponent() ?? managedDirectory
         try prepareDirectory(directory, creating: source == nil)
         defer {
-            if rootDirectory == nil, directory.standardizedFileURL == ProjectSaveLocation.cloudDirectory().standardizedFileURL {
+            if rootDirectory == nil, directory.standardizedFileURL.path == ProjectSaveLocation.cloudDirectory().standardizedFileURL.path {
                 ProjectFolderIcon.apply(to: directory)
             }
         }
         // An opened file outside the default folder keeps its exact filename.
         // Explicit header renaming still operates within that file's folder.
         if let source, !isManaged(source), !preferExactName {
-            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source,
+            if let result = try writeCandidate(project: portable, projectID: projectID, source: source,
                                                destination: source, previous: previous, resolving: conflict) {
                 remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
@@ -89,7 +89,7 @@ actor ProjectAutosaveStore {
         // collision disappears. Ordinary autosaves retain a stable suffix.
         if preferExactName, let source {
             let destination = directory.appendingPathComponent(base).appendingPathExtension("lad")
-            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
+            if let result = try writeCandidate(project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
                 remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
             }
@@ -99,7 +99,7 @@ actor ProjectAutosaveStore {
         // every time another similarly titled project disappears.
         if let source, let matchingName = Self.matchingStem(source, stem: base) {
             let destination = directory.appendingPathComponent(matchingName).appendingPathExtension("lad")
-            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
+            if let result = try writeCandidate(project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
                 remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
             }
@@ -107,7 +107,7 @@ actor ProjectAutosaveStore {
         for index in 1...10_000 {
             let name = index == 1 ? base : "\(base) (\(index))"
             let destination = directory.appendingPathComponent(name).appendingPathExtension("lad")
-            if let result = try writeCandidate(data, project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
+            if let result = try writeCandidate(project: portable, projectID: projectID, source: source, destination: destination, previous: previous, resolving: conflict) {
                 remember(result, projectID: projectID, sequence: sequence, sourceOrigin: portable.fileOrigin)
                 return result.url
             }
@@ -118,6 +118,7 @@ actor ProjectAutosaveStore {
     /// Restore the exact last project, including a renamed file after a crash.
     /// Without a prior identity, the newest project in the default folder is the initial choice.
     func restoreRecent(preferredURL: URL?, projectID: UUID?) throws -> (project: LADProject, url: URL)? {
+        let preferredURL = preferredURL.map(ProjectFileOrigin.documentURL)
         if let preferredURL, Self.isProjectFile(preferredURL), FileManager.default.fileExists(atPath: preferredURL.path) {
             let snapshot = try Self.readSnapshot(from: preferredURL)
             if projectID == nil || snapshot.project.projectID == projectID {
@@ -125,11 +126,11 @@ actor ProjectAutosaveStore {
                 return (snapshot.project, preferredURL)
             }
         }
-        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey]
         var directories = [managedDirectory]
         if projectID != nil, let preferredURL {
             let parent = preferredURL.deletingLastPathComponent().standardizedFileURL
-            if parent != managedDirectory.standardizedFileURL,
+            if parent.path != managedDirectory.standardizedFileURL.path,
                FileManager.default.fileExists(atPath: parent.path) { directories.insert(parent, at: 0) }
         }
         for directory in directories {
@@ -142,13 +143,14 @@ actor ProjectAutosaveStore {
                     return first > second
                 }
             for url in candidates {
-                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-                guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+                let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
                 do {
                     let snapshot = try Self.readSnapshot(from: url)
                     guard projectID == nil || snapshot.project.projectID == projectID else { continue }
-                    if let id = snapshot.project.projectID { saved[id] = SavedFile(url: url, sequence: -1, fingerprint: snapshot.fingerprint, origin: snapshot.project.fileOrigin!, sourceOrigin: snapshot.project.fileOrigin) }
-                    return (snapshot.project, url)
+                    let documentURL = ProjectFileOrigin.documentURL(url)
+                    if let id = snapshot.project.projectID { saved[id] = SavedFile(url: documentURL, sequence: -1, fingerprint: snapshot.fingerprint, origin: snapshot.project.fileOrigin!, sourceOrigin: snapshot.project.fileOrigin) }
+                    return (snapshot.project, documentURL)
                 } catch {
                     // A known identity must never be replaced by an unrelated
                     // project merely because its own file cannot be read.
@@ -172,7 +174,7 @@ actor ProjectAutosaveStore {
     func writeCopy(_ project: LADProject, to url: URL, preserving sourceURL: URL? = nil, projectID sourceID: UUID? = nil) throws -> ProjectFileOrigin {
         func protectSource(at destination: URL) throws {
             let matchesPath = sourceURL.map {
-                $0.standardizedFileURL.resolvingSymlinksInPath() == destination.standardizedFileURL.resolvingSymlinksInPath()
+                ProjectFileOrigin.canonicalURL($0).path == ProjectFileOrigin.canonicalURL(destination).path
             } ?? false
             let matchesIdentity = sourceID.map { id in
                 (try? ProjectStore.read(from: destination).projectID) == id
@@ -182,20 +184,30 @@ actor ProjectAutosaveStore {
             }
         }
         try protectSource(at: url)
-        let data = try ProjectStore.encode(project)
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordinationError: NSError?
         var outcome: Result<WriteReceipt, Error>?
         coordinator.coordinate(writingItemAt: url, options: .forReplacing, error: &coordinationError) { writable in
             outcome = Result {
                 try protectSource(at: writable)
-                try data.write(to: writable, options: .atomic)
-                return WriteReceipt(url: writable, fingerprint: try Self.fingerprint(writable), origin: ProjectFileOrigin(url: writable, data: data))
+                // Explicit replacement publishes a fully prepared package, including
+                // when the destination contains a different project's identity.
+                let staging = writable.deletingLastPathComponent()
+                    .appendingPathComponent(".LAD-copy-\(UUID().uuidString).lad", isDirectory: true)
+                defer { try? FileManager.default.removeItem(at: staging) }
+                try ProjectStore.write(project, to: staging, thumbnail: project.thumbnailData)
+                if FileManager.default.fileExists(atPath: writable.path) {
+                    _ = try FileManager.default.replaceItemAt(writable, withItemAt: staging,
+                                                              options: .usingNewMetadataOnly)
+                } else {
+                    try FileManager.default.moveItem(at: staging, to: writable)
+                }
+                return try Self.receipt(at: writable)
             }
         }
         guard let outcome else { throw coordinationError ?? NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError) }
         let written = try outcome.get()
-        for id in Array(saved.keys) where saved[id]?.url.standardizedFileURL == written.url.standardizedFileURL {
+        for id in Array(saved.keys) where saved[id]?.url.standardizedFileURL.path == written.url.standardizedFileURL.path {
             if id == project.projectID, let sequence = saved[id]?.sequence {
                 remember(written, projectID: id, sequence: sequence, sourceOrigin: project.fileOrigin)
             }
@@ -224,11 +236,11 @@ actor ProjectAutosaveStore {
         }
     }
 
-    private func writeCandidate(_ data: Data, project: LADProject, projectID: UUID, source: URL?, destination: URL, previous: SavedFile?, resolving conflict: ProjectSaveConflict?) throws -> WriteReceipt? {
+    private func writeCandidate(project: LADProject, projectID: UUID, source: URL?, destination: URL, previous: SavedFile?, resolving conflict: ProjectSaveConflict?) throws -> WriteReceipt? {
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordinationError: NSError?
         var outcome: Result<WriteReceipt?, Error>?
-        let moving = source.map { $0.standardizedFileURL != destination.standardizedFileURL } ?? false
+        let moving = source.map { $0.standardizedFileURL.path != destination.standardizedFileURL.path } ?? false
         let accessor: (URL?, URL) -> Void = { old, target in
             outcome = Result {
                 let expected = destination.deletingLastPathComponent().resolvingSymlinksInPath()
@@ -238,7 +250,7 @@ actor ProjectAutosaveStore {
                     throw LADError.message("The design location changed while saving. Open the design again.")
                 }
                 let manager = FileManager.default
-                if manager.fileExists(atPath: target.path), target.standardizedFileURL != old?.standardizedFileURL {
+                if manager.fileExists(atPath: target.path), target.standardizedFileURL.path != old?.standardizedFileURL.path {
                     // Existing files at a new title are collisions, even when
                     // they happen to contain a copy of the same project ID.
                     if moving {
@@ -252,7 +264,7 @@ actor ProjectAutosaveStore {
                 }
                 if let old, manager.fileExists(atPath: old.path) {
                     guard try self.canUpdate(old, project: project, projectID: projectID, previous: previous, resolving: conflict) else { return nil }
-                    try data.write(to: old, options: .atomic)
+                    try ProjectStore.write(project, to: old, thumbnail: project.thumbnailData)
                     if moving {
                         coordinator.item(at: old, willMoveTo: target)
                         // RENAME_EXCL changes filename case on APFS and makes
@@ -261,12 +273,12 @@ actor ProjectAutosaveStore {
                             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: target.path])
                         }
                         coordinator.item(at: old, didMoveTo: target)
-                        return WriteReceipt(url: target, fingerprint: try Self.fingerprint(target), origin: ProjectFileOrigin(url: target, data: data))
+                        return try Self.receipt(at: target)
                     }
-                    return WriteReceipt(url: old, fingerprint: try Self.fingerprint(old), origin: ProjectFileOrigin(url: old, data: data))
+                    return try Self.receipt(at: old)
                 }
-                try data.write(to: target, options: .atomic)
-                return WriteReceipt(url: target, fingerprint: try Self.fingerprint(target), origin: ProjectFileOrigin(url: target, data: data))
+                try ProjectStore.write(project, to: target, thumbnail: project.thumbnailData)
+                return try Self.receipt(at: target)
             }
         }
         if moving, let source {
@@ -300,8 +312,11 @@ actor ProjectAutosaveStore {
         }
         // A caller without an opening baseline may adopt an identical complete
         // document, but may never infer ownership from matching geometry alone.
-        guard let existing = try? ProjectStore.decode(bytes), existing.projectID == projectID else { return false }
-        guard try ProjectArchive.encode(existing) == ProjectArchive.encode(project) else {
+        guard let existing = try? ProjectStore.read(from: url), existing.projectID == projectID else { return false }
+        let existingSnapshot = try ProjectArchive.split(existing)
+        let proposedSnapshot = try ProjectArchive.split(project)
+        guard existingSnapshot.metadata == proposedSnapshot.metadata,
+              existingSnapshot.assets == proposedSnapshot.assets else {
             throw ProjectSaveConflict(file: observed)
         }
         return true
@@ -327,7 +342,7 @@ actor ProjectAutosaveStore {
 
     private func isManaged(_ url: URL) -> Bool {
         Self.isProjectFile(url) &&
-            url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath() == managedDirectory.resolvingSymlinksInPath()
+            url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath().path == managedDirectory.resolvingSymlinksInPath().path
     }
 
     private nonisolated static func isProjectFile(_ url: URL) -> Bool {
@@ -344,9 +359,7 @@ actor ProjectAutosaveStore {
         var outcome: Result<(project: LADProject, fingerprint: Fingerprint), Error>?
         coordinator.coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
             outcome = Result {
-                let data = try ProjectStore.readArchive(from: readable)
-                var project = try ProjectStore.decode(data)
-                project.fileOrigin = ProjectFileOrigin(url: readable, data: data)
+                let project = try ProjectStore.read(from: readable)
                 return (project, try fingerprint(readable))
             }
         }
@@ -354,14 +367,27 @@ actor ProjectAutosaveStore {
         throw coordinationError ?? NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError)
     }
 
+    private nonisolated static func receipt(at url: URL) throws -> WriteReceipt {
+        let data = try ProjectStore.readArchive(from: url)
+        return WriteReceipt(url: ProjectFileOrigin.documentURL(url), fingerprint: try fingerprint(url), origin: ProjectFileOrigin(url: url, data: data))
+    }
+
     private nonisolated static func fingerprint(_ url: URL) throws -> Fingerprint {
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard attributes[.type] as? FileAttributeType == .typeRegular else {
-            throw LADError.message("The design save location is not a regular file.")
+        let manager = FileManager.default
+        let package = try manager.attributesOfItem(atPath: url.path)
+        guard package[.type] as? FileAttributeType == .typeDirectory else {
+            throw LADError.message("The design save location is not a LAD package.")
         }
-        return Fingerprint(size: (attributes[.size] as? NSNumber)?.uint64Value ?? 0,
-                           modified: attributes[.modificationDate] as? Date ?? .distantPast,
-                           inode: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0)
+        let manifest = try manager.attributesOfItem(atPath: url.appendingPathComponent("project.json").path)
+        guard manifest[.type] as? FileAttributeType == .typeRegular else {
+            throw LADError.message("The design manifest is not a regular file.")
+        }
+        // Directory timestamps also change for disposable/uncommitted files.
+        // Bind ownership to the authoritative manifest and package identity.
+        return Fingerprint(size: (manifest[.size] as? NSNumber)?.uint64Value ?? 0,
+                           modified: manifest[.modificationDate] as? Date ?? .distantPast,
+                           inode: (package[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0,
+                           manifestInode: (manifest[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0)
     }
 
     nonisolated static func filenameStem(_ title: String) -> String {

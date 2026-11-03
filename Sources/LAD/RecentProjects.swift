@@ -51,7 +51,7 @@ final class RecentProjects: ObservableObject {
               url.pathExtension.lowercased() == "lad" else { return nil }
         // Resolve path aliases without opening or inspecting design contents.
         // Reconstructing a file URL also drops irrelevant query/fragment text.
-        let canonical = URL(fileURLWithPath: url.path).standardizedFileURL.resolvingSymlinksInPath()
+        let canonical = ProjectFileOrigin.canonicalURL(url)
         guard canonical.pathExtension.lowercased() == "lad" else { return nil }
         return canonical
     }

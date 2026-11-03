@@ -24,7 +24,7 @@ final class ProjectSaveConflictTests: XCTestCase {
                           _ write: () async throws -> URL) async throws -> ProjectSaveConflict {
         do { _ = try await write() }
         catch let conflict as ProjectSaveConflict { return conflict }
-        XCTFail("A changed archive must require an explicit conflict decision", file: file, line: line)
+        XCTFail("A changed package must require an explicit conflict decision", file: file, line: line)
         throw ExpectedConflict.missing
     }
 
@@ -52,14 +52,14 @@ final class ProjectSaveConflictTests: XCTestCase {
             var remote = try ProjectStore.read(from: url)
             try change(&remote)
             try ProjectStore.write(remote, to: url)
-            let remoteBytes = try Data(contentsOf: url)
+            let remoteBytes = try ProjectStore.readArchive(from: url)
 
             let detected = try await conflict {
                 try await store.write(project: local, projectID: id, title: "Case", sequence: 2)
             }
             XCTAssertTrue(detected.file.matches(url), name)
             XCTAssertEqual(detected.file.sha256, ProjectFileOrigin(url: url, data: remoteBytes).sha256, name)
-            XCTAssertEqual(try Data(contentsOf: url), remoteBytes, name)
+            XCTAssertEqual(try ProjectStore.readArchive(from: url), remoteBytes, name)
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["Case.lad"], name)
         }
     }
@@ -101,22 +101,22 @@ final class ProjectSaveConflictTests: XCTestCase {
         var remote = original
         remote.queuedRequests = [ProjectQueuedRequest(content: "Remote request after our opening read")]
         try ProjectStore.write(remote, to: url)
-        let remoteBytes = try Data(contentsOf: url)
+        let remoteBytes = try ProjectStore.readArchive(from: url)
         let store = ProjectAutosaveStore(rootDirectory: root)
 
         _ = try await conflict {
             try await store.write(project: local, projectID: id, title: "Case", sequence: 1, preferredURL: url)
         }
-        XCTAssertEqual(try Data(contentsOf: url), remoteBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: url), remoteBytes)
     }
 
-    func testRewritingUnchangedArchiveBytesDoesNotCauseAConflict() async throws {
+    func testRewritingUnchangedManifestBytesDoesNotCauseAConflict() async throws {
         let root = try folder(), original = project()
         let id = try XCTUnwrap(original.projectID)
         let store = ProjectAutosaveStore(rootDirectory: root)
         let url = try await store.write(project: original, projectID: id, title: "Case", sequence: 1)
-        let bytes = try Data(contentsOf: url)
-        try bytes.write(to: url, options: .atomic)
+        let bytes = try ProjectStore.readArchive(from: url)
+        try bytes.write(to: url.appendingPathComponent("project.json"), options: .atomic)
         var local = original
         local.draftPrompt = "Still safe to save after an unchanged-byte rewrite"
 
@@ -162,7 +162,7 @@ final class ProjectSaveConflictTests: XCTestCase {
         remote.draftPrompt = "Second remote edit while the overwrite decision was pending"
         remote.queuedRequests = [ProjectQueuedRequest(content: "Another remote request")]
         try ProjectStore.write(remote, to: url)
-        let latestBytes = try Data(contentsOf: url)
+        let latestBytes = try ProjectStore.readArchive(from: url)
 
         let second = try await conflict {
             try await store.write(project: original, projectID: id, title: "Case", sequence: 3,
@@ -170,7 +170,7 @@ final class ProjectSaveConflictTests: XCTestCase {
         }
         XCTAssertNotEqual(second.file.sha256, first.file.sha256)
         XCTAssertEqual(second.file.sha256, ProjectFileOrigin(url: url, data: latestBytes).sha256)
-        XCTAssertEqual(try Data(contentsOf: url), latestBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: url), latestBytes)
         _ = try await store.write(project: original, projectID: id, title: "Case", sequence: 4,
                                   preferredURL: url, resolving: second)
         XCTAssertEqual(try ProjectArchive.encode(ProjectStore.read(from: url)), try ProjectArchive.encode(original))
@@ -194,9 +194,9 @@ final class ProjectSaveConflictTests: XCTestCase {
         _ = try await store.write(project: reopened, projectID: id, title: "Case", sequence: 3, preferredURL: url)
         reopened.revisions[0].name = "A second edit after reopening"
         _ = try await store.write(project: reopened, projectID: id, title: "Case", sequence: 4, preferredURL: url)
-        let latestBytes = try Data(contentsOf: url)
+        let latestBytes = try ProjectStore.readArchive(from: url)
         _ = try await store.write(project: firstSession, projectID: id, title: "Old name", sequence: 2, preferredURL: url)
-        XCTAssertEqual(try Data(contentsOf: url), latestBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: url), latestBytes)
         XCTAssertEqual(try ProjectStore.read(from: url).queuedRequests, remote.queuedRequests)
         XCTAssertEqual(try ProjectStore.read(from: url).revisions[0].name, reopened.revisions[0].name)
     }
@@ -206,19 +206,19 @@ final class ProjectSaveConflictTests: XCTestCase {
         let id = try XCTUnwrap(original.projectID)
         let store = ProjectAutosaveStore(rootDirectory: root)
         let originalURL = try await store.write(project: original, projectID: id, title: "Case", sequence: 1)
-        let originalBytes = try Data(contentsOf: originalURL)
+        let originalBytes = try ProjectStore.readArchive(from: originalURL)
         var copy = original
         copy.projectName = "Portable copy"
         let copyURL = root.appendingPathComponent("Portable copy.lad")
         let copiedOrigin = try await store.writeCopy(copy, to: copyURL)
         XCTAssertTrue(copiedOrigin.matches(copyURL))
-        XCTAssertEqual(copiedOrigin.sha256, ProjectFileOrigin(url: copyURL, data: try Data(contentsOf: copyURL)).sha256)
+        XCTAssertEqual(copiedOrigin.sha256, ProjectFileOrigin(url: copyURL, data: try ProjectStore.readArchive(from: copyURL)).sha256)
         var reopened = try ProjectAutosaveStore.readProject(from: copyURL)
         reopened.draftPrompt = "Edit only the newly opened copy"
 
         let saved = try await store.write(project: reopened, projectID: id, title: "Portable copy", sequence: 2, preferredURL: copyURL)
         XCTAssertEqual(saved, copyURL)
-        XCTAssertEqual(try Data(contentsOf: originalURL), originalBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: originalURL), originalBytes)
         XCTAssertEqual(try ProjectStore.read(from: copyURL).draftPrompt, reopened.draftPrompt)
     }
 

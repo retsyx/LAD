@@ -124,7 +124,8 @@ final class ProjectStoreTests: XCTestCase {
         let original = project()
         try ProjectStore.write(original, to: file)
         XCTAssertEqual(file.pathExtension, "lad")
-        XCTAssertEqual(try Data(contentsOf: file).prefix(4), Data([0x50, 0x4B, 0x03, 0x04]))
+        XCTAssertTrue(try file.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: ProjectStore.readArchive(from: file)) as? [String: Any] != nil, true)
         let restored = try ProjectStore.read(from: file)
         XCTAssertNil(restored.revisions.last?.stepData)
         var withoutGeometry = original

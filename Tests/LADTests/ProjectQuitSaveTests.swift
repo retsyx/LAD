@@ -157,11 +157,11 @@ final class ProjectQuitSaveTests: XCTestCase {
         let originalURL = try XCTUnwrap(state.projectURL)
 
         // Simulate another writer so the local final autosave must preserve
-        // the existing archive and leave this window's later changes unsaved.
+        // the existing package and leave this window's later changes unsaved.
         var remote = try ProjectStore.read(from: originalURL)
         remote.messages.append(ChatMessage(role: "user", content: "A change from another Mac"))
         try ProjectStore.write(remote, to: originalURL)
-        let originalBytes = try Data(contentsOf: originalURL)
+        let originalBytes = try ProjectStore.readArchive(from: originalURL)
         state.prompt = "My local unsaved draft"
         await state.prepareToQuit()
         XCTAssertTrue(state.hasUnsavedChanges)
@@ -177,7 +177,7 @@ final class ProjectQuitSaveTests: XCTestCase {
         XCTAssertEqual(prompts, 1)
         XCTAssertTrue(state.hasUnsavedChanges, "Cancel preserves the unsaved design and prevents quitting")
         XCTAssertEqual(state.prompt, "My local unsaved draft")
-        XCTAssertEqual(try Data(contentsOf: originalURL), originalBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: originalURL), originalBytes)
     }
 
     @MainActor

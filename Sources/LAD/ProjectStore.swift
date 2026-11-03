@@ -24,36 +24,28 @@ enum ProjectStore {
         return project
     }
 
+    /// Disk documents are directory packages only. The Data codec above is an
+    /// internal snapshot codec and is never an opening compatibility fallback.
     static func read(from url: URL) throws -> LADProject {
-        let data = try readArchive(from: url)
-        var project = try decode(data)
-        project.fileOrigin = ProjectFileOrigin(url: url, data: data)
-        return project
+        try ProjectPackage.read(from: url)
     }
 
+    /// The root is the authoritative conflict baseline, independent of caches
+    /// and of dependency files staged by an interrupted save.
     static func readArchive(from url: URL) throws -> Data {
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        if let size = attributes[.size] as? NSNumber, size.uint64Value > UInt64(maximumFileBytes) {
-            throw invalid("File exceeds the 1,024 MB design limit.")
-        }
-        let file = try FileHandle(forReadingFrom: url)
-        defer { try? file.close() }
-        var data = Data()
-        // Bound actual reads as well as the file-size preflight, including if a
-        // file grows between the two operations.
-        while let chunk = try file.read(upToCount: min(1_048_576, maximumFileBytes + 1 - data.count)), !chunk.isEmpty {
-            data.append(chunk)
-            guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 1,024 MB design limit.") }
-        }
-        return data
+        try ProjectPackage.rootData(from: url)
     }
 
-    static func write(_ project: LADProject, to url: URL) throws {
-        try encode(project).write(to: url, options: .atomic)
+    static func write(_ project: LADProject, to url: URL, thumbnail: Data? = nil) throws {
+        try ProjectPackage.write(project, to: url, thumbnail: thumbnail)
     }
 
     static func validate(_ project: LADProject) throws {
-        var verifiedAttachmentPayloads: [String: Data] = [:]
+        var verified: [String: Data] = [:]
+        try validate(project, verifiedAttachmentPayloads: &verified)
+    }
+
+    static func validate(_ project: LADProject, verifiedAttachmentPayloads: inout [String: Data]) throws {
         guard project.formatVersion == 1 else { throw invalid("Unsupported format version \(project.formatVersion).") }
         guard project.partsPaneFraction.isFinite, (0...1).contains(project.partsPaneFraction) else {
             throw invalid("The saved sidebar layout is invalid.")

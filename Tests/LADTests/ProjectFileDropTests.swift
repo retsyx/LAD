@@ -148,22 +148,22 @@ final class ProjectFileDropTests: XCTestCase {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("PCB enclosure – מסך.LAD")
-        // An empty file is intentional: drag validation must inspect metadata,
-        // leaving archive validation to opening rather than reading its bytes.
-        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        // An empty directory is intentional: drag validation inspects metadata,
+        // leaving package validation to opening rather than reading its files.
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
         let pasteboard = makePasteboard([url])
         defer { pasteboard.releaseGlobally() }
         XCTAssertEqual(ProjectFileDrop.fileURL(from: pasteboard), url)
     }
 
-    func testRejectsDirectoriesMissingFilesNonProjectsAndRemoteURLs() throws {
+    func testRejectsRegularFilesMissingPackagesNonProjectsAndRemoteURLs() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let directory = root.appendingPathComponent("Folder.lad", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let regularFile = root.appendingPathComponent("Archive.lad")
+        XCTAssertTrue(FileManager.default.createFile(atPath: regularFile.path, contents: nil))
         let other = root.appendingPathComponent("board.kicad_pcb")
         XCTAssertTrue(FileManager.default.createFile(atPath: other.path, contents: nil))
-        for url in [directory, root.appendingPathComponent("Missing.lad"), other,
+        for url in [regularFile, root.appendingPathComponent("Missing.lad"), other,
                     try XCTUnwrap(URL(string: "https://example.com/Design.lad"))] {
             let pasteboard = makePasteboard([url])
             XCTAssertNil(ProjectFileDrop.fileURL(from: pasteboard), url.absoluteString)
@@ -177,9 +177,10 @@ final class ProjectFileDropTests: XCTestCase {
         let first = root.appendingPathComponent("First.lad")
         let second = root.appendingPathComponent("Second.lad")
         let other = root.appendingPathComponent("PCB.kicad_pcb")
-        for url in [first, second, other] {
-            XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        for url in [first, second] {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
         }
+        XCTAssertTrue(FileManager.default.createFile(atPath: other.path, contents: nil))
         for urls in [[first, second], [first, other]] {
             let pasteboard = makePasteboard(urls)
             XCTAssertNil(ProjectFileDrop.fileURL(from: pasteboard))
@@ -202,7 +203,7 @@ final class ProjectFileDropTests: XCTestCase {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("Design.lad")
-        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
         let pasteboard = makePasteboard([url])
         defer { pasteboard.releaseGlobally() }
         XCTAssertNotEqual(pasteboard.name, NSPasteboard.Name.drag,
@@ -234,7 +235,7 @@ final class ProjectFileDropTests: XCTestCase {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("Design.lad")
-        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
         let pasteboard = makePasteboard([url])
         defer { pasteboard.releaseGlobally() }
         let sender = FileDropDraggingInfo(pasteboard: pasteboard)
@@ -265,7 +266,8 @@ final class ProjectFileDropTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let attachment = root.appendingPathComponent("PCB.kicad_pcb")
         let project = root.appendingPathComponent("Design.lad")
-        for url in [attachment, project] { XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil)) }
+        XCTAssertTrue(FileManager.default.createFile(atPath: attachment.path, contents: nil))
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: false)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -318,7 +320,8 @@ final class ProjectFileDropTests: XCTestCase {
         let binary = root.appendingPathComponent("部品.bin")
         let directory = root.appendingPathComponent("CAD assets", isDirectory: true)
         let secret = "FILE-CONTENTS-MUST-NEVER-BECOME-THE-PROMPT"
-        try Data(secret.utf8).write(to: project)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: false)
+        try Data(secret.utf8).write(to: project.appendingPathComponent("project.json"))
         try Data([0xff, 0x00, 0xfe]).write(to: binary)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         let urls = [project, binary, directory]
@@ -361,7 +364,8 @@ final class ProjectFileDropTests: XCTestCase {
         let binary = root.appendingPathComponent("board.bin")
         let directory = root.appendingPathComponent("Parts", isDirectory: true)
         let secret = "NOT-INLINE-SOURCE-CONTENTS"
-        try Data(secret.utf8).write(to: project)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: false)
+        try Data(secret.utf8).write(to: project.appendingPathComponent("project.json"))
         try Data([0xff, 0x00]).write(to: binary)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),

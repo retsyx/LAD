@@ -48,7 +48,7 @@ enum ProjectQuitSave {
         let panel = NSSavePanel()
         panel.identifier = NSUserInterfaceItemIdentifier("LAD.SaveUnsavedProject")
         panel.title = "Save Unsaved Design"
-        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .data]
+        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .package]
         panel.nameFieldStringValue = "\(ProjectAutosaveStore.filenameStem(state.title)).lad"
         panel.directoryURL = state.projectURL?.deletingLastPathComponent()
         return SavePanelPresentation.runModal(panel) == .OK ? panel.url : nil

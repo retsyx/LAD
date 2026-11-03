@@ -22,7 +22,7 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         var project = makeProject()
         let first = try await store.write(project: project, projectID: id, title: "Bracket / with: slots", sequence: 1)
         XCTAssertEqual(first.lastPathComponent, "Bracket with slots.lad")
-        XCTAssertEqual(try Data(contentsOf: first).prefix(4), Data([0x50, 0x4B, 0x03, 0x04]))
+        XCTAssertEqual(try first.resourceValues(forKeys: [.isDirectoryKey]).isDirectory, true)
         XCTAssertEqual(try ProjectStore.read(from: first).projectID, id)
 
         project.messages.append(ChatMessage(role: "assistant", content: "I’ll add the slots and check their spacing.", phase: "commentary"))
@@ -37,7 +37,7 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         let renamed = try await store.write(project: project, projectID: id, title: "Slotted bracket", sequence: 2, preferredURL: first)
         XCTAssertEqual(renamed.lastPathComponent, "Slotted bracket.lad")
         XCTAssertFalse(FileManager.default.fileExists(atPath: first.path))
-        XCTAssertEqual(try Data(contentsOf: renamed).prefix(4), Data([0x50, 0x4B, 0x03, 0x04]))
+        XCTAssertEqual(try renamed.resourceValues(forKeys: [.isDirectoryKey]).isDirectory, true)
         let restored = try ProjectStore.read(from: renamed)
         XCTAssertEqual(restored.messages, project.messages)
         XCTAssertEqual(restored.revisions.map(\.id), project.revisions.map(\.id))
@@ -52,15 +52,15 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         let store = ProjectAutosaveStore(rootDirectory: root)
         let firstID = UUID(), secondID = UUID()
         let first = try await store.write(project: makeProject(), projectID: firstID, title: "Case", sequence: 1)
-        let firstBytes = try Data(contentsOf: first)
+        let firstBytes = try ProjectStore.readArchive(from: first)
         let second = try await store.write(project: makeProject(), projectID: secondID, title: "Case", sequence: 2, preferredURL: first)
         XCTAssertEqual(second.lastPathComponent, "Case (2).lad")
-        XCTAssertEqual(try Data(contentsOf: first), firstBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: first), firstBytes)
         XCTAssertEqual(try ProjectStore.read(from: second).projectID, secondID)
         let freshStore = ProjectAutosaveStore(rootDirectory: root)
         let updated = try await freshStore.write(project: try ProjectStore.read(from: second), projectID: secondID, title: "Case", sequence: 3, preferredURL: second)
         XCTAssertEqual(updated, second)
-        XCTAssertEqual(try Data(contentsOf: first), firstBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: first), firstBytes)
     }
 
     func testUnknownFilesAndOutsidePreferredLocationsArePreserved() async throws {
@@ -87,10 +87,10 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         var newer = older
         newer.messages.append(ChatMessage(role: "user", content: "Make it wider"))
         let saved = try await store.write(project: newer, projectID: id, title: "Wide bracket", sequence: 10)
-        let bytes = try Data(contentsOf: saved)
+        let bytes = try ProjectStore.readArchive(from: saved)
         let stale = try await store.write(project: older, projectID: id, title: "Old title", sequence: 9)
         XCTAssertEqual(stale, saved)
-        XCTAssertEqual(try Data(contentsOf: saved), bytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: saved), bytes)
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Old title.lad").path))
     }
 
@@ -137,12 +137,12 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         var remote = try ProjectStore.read(from: url)
         remote.messages.append(ChatMessage(role: "user", content: "A change from another Mac"))
         try ProjectStore.write(remote, to: url)
-        let remoteBytes = try Data(contentsOf: url)
+        let remoteBytes = try ProjectStore.readArchive(from: url)
         do {
             _ = try await store.write(project: initial, projectID: id, title: "Case", sequence: 2)
             XCTFail("An unmerged remote edit must not be overwritten")
         } catch { XCTAssertTrue(error.localizedDescription.contains("changed outside LAD")) }
-        XCTAssertEqual(try Data(contentsOf: url), remoteBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: url), remoteBytes)
     }
 
     func testRestoreFindsRenamedProjectByIdentityAndDoesNotSelectAnotherProject() async throws {
@@ -155,7 +155,7 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         _ = try await store.write(project: makeProject(), projectID: UUID(), title: "Other design", sequence: 2)
         let reopened = ProjectAutosaveStore(rootDirectory: root)
         let restored = try await reopened.restoreRecent(preferredURL: original, projectID: id)
-        XCTAssertEqual(restored?.url.resolvingSymlinksInPath(), moved.resolvingSymlinksInPath())
+        XCTAssertEqual(restored.map { ProjectFileOrigin.canonicalURL($0.url) }, ProjectFileOrigin.canonicalURL(moved))
         XCTAssertEqual(restored?.project.projectID, id)
         do {
             _ = try await reopened.restoreRecent(preferredURL: nil, projectID: UUID())
@@ -172,7 +172,7 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: older.path)
         let fresh = ProjectAutosaveStore(rootDirectory: root)
         let restored = try await fresh.restoreRecent(preferredURL: nil, projectID: nil)
-        XCTAssertEqual(restored?.url.resolvingSymlinksInPath(), latest.resolvingSymlinksInPath())
+        XCTAssertEqual(restored.map { ProjectFileOrigin.canonicalURL($0.url) }, ProjectFileOrigin.canonicalURL(latest))
         XCTAssertEqual(restored?.project.projectID, latestID)
         XCTAssertEqual(try ProjectAutosaveStore.readProject(from: latest).projectID, latestID)
     }
@@ -190,8 +190,8 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         let copy = parent.appendingPathComponent("Portable copy.lad")
         try await store.writeCopy(project, to: copy)
         XCTAssertEqual(copy.pathExtension, "lad")
-        XCTAssertEqual(try Data(contentsOf: copy).prefix(4), Data([0x50, 0x4B, 0x03, 0x04]))
-        XCTAssertEqual(try Data(contentsOf: url).prefix(4), Data([0x50, 0x4B, 0x03, 0x04]))
+        XCTAssertEqual(try copy.resourceValues(forKeys: [.isDirectoryKey]).isDirectory, true)
+        XCTAssertEqual(try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory, true)
         XCTAssertEqual(try ProjectStore.read(from: copy).messages, project.messages)
         XCTAssertEqual(try ProjectStore.read(from: url).messages, project.messages)
     }
@@ -220,11 +220,11 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         XCTAssertEqual(reopened.revisions.map(\.partLayout), project.revisions.map(\.partLayout))
         XCTAssertEqual(reopened.revisions.map(\.hiddenSolids), project.revisions.map(\.hiddenSolids))
         XCTAssertEqual(reopened.codexSettings, project.codexSettings)
-        XCTAssertEqual(try Data(contentsOf: renamed).prefix(4), Data([0x50, 0x4b, 0x03, 0x04]))
+        XCTAssertEqual(try renamed.resourceValues(forKeys: [.isDirectoryKey]).isDirectory, true)
 
         let freshStore = ProjectAutosaveStore(rootDirectory: root)
         let restored = try await freshStore.restoreRecent(preferredURL: original, projectID: id)
-        XCTAssertEqual(restored?.url.resolvingSymlinksInPath(), renamed.resolvingSymlinksInPath())
+        XCTAssertEqual(restored.map { ProjectFileOrigin.canonicalURL($0.url) }, ProjectFileOrigin.canonicalURL(renamed))
         var refined = try XCTUnwrap(restored?.project)
         var newModel = ModelSpec.bracket
         newModel.title = "A later Codex design title"
@@ -232,7 +232,7 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         refined.revisions.append(newRevision)
         refined.selectedRevisionID = newRevision.id
         let next = try await freshStore.write(project: refined, projectID: id, title: newModel.title, sequence: 3, preferredURL: renamed)
-        XCTAssertEqual(next.resolvingSymlinksInPath(), renamed.resolvingSymlinksInPath(), "A later generated title must not undo a manual project name")
+        XCTAssertEqual(ProjectFileOrigin.canonicalURL(next), ProjectFileOrigin.canonicalURL(renamed), "A later generated title must not undo a manual project name")
         XCTAssertEqual(try ProjectStore.read(from: next).revisions.count, 2)
     }
 
@@ -242,14 +242,14 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         var first = makeProject()
         first.projectName = "Case v2.1"
         let firstURL = try await store.write(project: first, projectID: UUID(), title: "ignored", sequence: 1)
-        let firstBytes = try Data(contentsOf: firstURL)
+        let firstBytes = try ProjectStore.readArchive(from: firstURL)
         let id = UUID()
         var second = makeProject()
         let old = try await store.write(project: second, projectID: id, title: "Other project", sequence: 1)
         second.projectName = first.projectName
         let renamed = try await store.write(project: second, projectID: id, title: "ignored", sequence: 2, preferredURL: old)
         XCTAssertEqual(renamed.lastPathComponent, "Case v2.1 (2).lad")
-        XCTAssertEqual(try Data(contentsOf: firstURL), firstBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: firstURL), firstBytes)
         XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
         try FileManager.default.removeItem(at: firstURL)
         let next = try await store.write(project: second, projectID: id, title: "ignored", sequence: 3, preferredURL: renamed)
@@ -296,18 +296,18 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         var renamedProject = older
         renamedProject.projectName = "Chosen name"
         let renamed = try await store.write(project: renamedProject, projectID: id, title: "ignored", sequence: 3, preferredURL: original)
-        let renamedBytes = try Data(contentsOf: renamed)
+        let renamedBytes = try ProjectStore.readArchive(from: renamed)
         let stale = try await store.write(project: older, projectID: id, title: "Automatic name", sequence: 2, preferredURL: original)
         XCTAssertEqual(stale, renamed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: original.path))
-        XCTAssertEqual(try Data(contentsOf: renamed), renamedBytes)
+        XCTAssertEqual(try ProjectStore.readArchive(from: renamed), renamedBytes)
     }
 
     func testExplicitRenameCanReclaimFreeBaseWhileOrdinaryAutosaveRetainsSuffix() async throws {
         let root = try folder().appendingPathComponent("LAD", isDirectory: true)
         let store = ProjectAutosaveStore(rootDirectory: root)
         let occupied = try await store.write(project: makeProject(), projectID: UUID(), title: "Case", sequence: 1)
-        let occupiedBytes = try Data(contentsOf: occupied)
+        let occupiedBytes = try ProjectStore.readArchive(from: occupied)
         let id = UUID()
         var project = makeProject()
         project.projectName = "Case"
@@ -316,7 +316,7 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         let blocked = try await store.write(project: project, projectID: id, title: "ignored", sequence: 2,
                                             preferredURL: suffixed, preferExactName: true)
         XCTAssertEqual(blocked, suffixed)
-        XCTAssertEqual(try Data(contentsOf: occupied), occupiedBytes, "Explicit rename must not overwrite an occupied exact name")
+        XCTAssertEqual(try ProjectStore.readArchive(from: occupied), occupiedBytes, "Explicit rename must not overwrite an occupied exact name")
 
         try FileManager.default.removeItem(at: occupied)
         let autosaved = try await store.write(project: project, projectID: id, title: "ignored", sequence: 3, preferredURL: suffixed)
@@ -328,5 +328,83 @@ final class ProjectAutosaveStoreTests: XCTestCase {
         XCTAssertEqual(try ProjectStore.read(from: renamed).projectID, id)
         XCTAssertEqual(try ProjectStore.read(from: renamed).projectName, "Case")
         XCTAssertEqual(try ProjectStore.read(from: renamed).messages, project.messages)
+    }
+
+    func testUnpublishedPackageFilesDoNotChangeTheAutosaveBaseline() async throws {
+        let root = try folder().appendingPathComponent("LAD", isDirectory: true)
+        let store = ProjectAutosaveStore(rootDirectory: root)
+        let id = UUID()
+        var project = makeProject()
+        let url = try await store.write(project: project, projectID: id, title: "Case", sequence: 1)
+        let manifest = try ProjectStore.readArchive(from: url)
+        // A failed preparation can leave files without publishing a new root.
+        // That must not masquerade as another writer's committed design.
+        try Data("uncommitted".utf8).write(to: url.appendingPathComponent("unpublished.tmp"))
+        XCTAssertEqual(try ProjectStore.readArchive(from: url), manifest)
+        project.draftPrompt = "A local edit after an unpublished file appeared"
+
+        let saved = try await store.write(project: project, projectID: id, title: "Case", sequence: 2)
+        XCTAssertEqual(saved, url)
+        XCTAssertEqual(try ProjectStore.read(from: url).draftPrompt, project.draftPrompt)
+    }
+
+    func testExplicitCopyReplacesADifferentPackageAsOneCompleteDesign() async throws {
+        let root = try folder()
+        let store = ProjectAutosaveStore(rootDirectory: root)
+        var first = makeProject()
+        first.projectID = UUID()
+        first.draftPrompt = "Old destination state"
+        let destination = root.appendingPathComponent("Copy.lad")
+        try ProjectStore.write(first, to: destination)
+        var replacement = makeProject()
+        replacement.projectID = UUID()
+        replacement.messages.append(ChatMessage(role: "user", content: "Replacement history"))
+
+        let origin = try await store.writeCopy(replacement, to: destination)
+        let restored = try ProjectStore.read(from: destination)
+        XCTAssertEqual(restored.projectID, replacement.projectID)
+        XCTAssertEqual(restored.messages, replacement.messages)
+        XCTAssertNil(restored.draftPrompt)
+        XCTAssertEqual(origin.sha256, ProjectFileOrigin(url: destination, data: try ProjectStore.readArchive(from: destination)).sha256)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["Copy.lad"])
+    }
+
+    func testDeletedManifestCannotBeSilentlyRecreatedByAnExistingWriter() async throws {
+        let root = try folder()
+        let store = ProjectAutosaveStore(rootDirectory: root)
+        let project = makeProject(), id = UUID()
+        let url = try await store.write(project: project, projectID: id, title: "Case", sequence: 1)
+        try FileManager.default.removeItem(at: url.appendingPathComponent("project.json"))
+
+        do {
+            _ = try await store.write(project: project, projectID: id, title: "Case", sequence: 2)
+            XCTFail("A missing authoritative manifest must require reopening or an explicit copy")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("changed outside LAD")) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.appendingPathComponent("project.json").path))
+    }
+
+    func testPackageDirectoryURLsKeepOneStableDocumentIdentity() async throws {
+        let root = try folder()
+        let id = UUID()
+        let store = ProjectAutosaveStore(rootDirectory: root)
+        let url = try await store.write(project: makeProject(), projectID: id, title: "Case", sequence: 1)
+        XCTAssertFalse(url.hasDirectoryPath)
+        let directoryForm = URL(fileURLWithPath: url.path, isDirectory: true)
+        XCTAssertTrue(directoryForm.hasDirectoryPath)
+        var loaded = try ProjectAutosaveStore.readProject(from: directoryForm)
+        XCTAssertFalse(try XCTUnwrap(loaded.fileOrigin).url.hasDirectoryPath)
+        XCTAssertTrue(try XCTUnwrap(loaded.fileOrigin).matches(url))
+        XCTAssertTrue(try XCTUnwrap(loaded.fileOrigin).matches(directoryForm))
+        loaded.draftPrompt = "Opened through a directory URL"
+
+        let saved = try await store.write(project: loaded, projectID: id, title: "Case", sequence: 2,
+                                          preferredURL: directoryForm)
+        XCTAssertEqual(saved, url)
+        XCTAssertFalse(saved.hasDirectoryPath)
+        let reopened = ProjectAutosaveStore(rootDirectory: root)
+        let restored = try await reopened.restoreRecent(preferredURL: directoryForm, projectID: id)
+        XCTAssertEqual(restored?.url, url)
+        let discovered = try await ProjectAutosaveStore(rootDirectory: root).restoreRecent(preferredURL: nil, projectID: id)
+        XCTAssertEqual(discovered?.url, url)
     }
 }

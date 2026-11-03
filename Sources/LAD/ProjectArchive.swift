@@ -9,7 +9,40 @@ enum ProjectArchive {
     private static let maximumAssetCount = 32_768
     private static let maximumAssetBytes = ProjectStore.maximumFileBytes
 
+    struct Snapshot {
+        var metadata: Data
+        var assets: [String: Data]
+    }
+
+    /// Separate metadata from exact asset bytes without ever base64-encoding them.
+    static func split(_ project: LADProject) throws -> Snapshot {
+        var archive = try document(project)
+        let assets = archive.assets
+        archive.assets = [:]
+        return Snapshot(metadata: try encoder().encode(archive), assets: assets)
+    }
+
+    static func restore(metadata: Data, assets: [String: Data]) throws -> LADProject {
+        var archive = try JSONDecoder().decode(Document.self, from: metadata)
+        archive.assets = assets
+        return try restored(archive)
+    }
+
     static func encode(_ project: LADProject) throws -> Data {
+        let data = try encoder().encode(document(project))
+        guard data.count <= ProjectStore.maximumFileBytes else {
+            throw invalid("File exceeds the 1,024 MB design limit.")
+        }
+        return data
+    }
+
+    private static func encoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }
+
+    private static func document(_ project: LADProject) throws -> Document {
         var writer = AssetWriter()
         let messages = try project.messages.map { try ArchivedMessage($0, writer: &writer) }
         let revisions = try project.revisions.map { try ArchivedRevision($0, writer: &writer) }
@@ -25,13 +58,7 @@ enum ProjectArchive {
                                recentPartColors: project.recentPartColors, taskAudits: taskAudits,
                                queuedRequests: queuedRequests, draftPrompt: project.draftPrompt,
                                draftAttachments: draftAttachments, queuePaused: project.queuePaused, assets: writer.assets)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(archive)
-        guard data.count <= ProjectStore.maximumFileBytes else {
-            throw invalid("File exceeds the 1,024 MB design limit.")
-        }
-        return data
+        return archive
     }
 
     static func decode(_ data: Data) throws -> LADProject {
@@ -39,6 +66,10 @@ enum ProjectArchive {
             throw invalid("File exceeds the 1,024 MB design limit.")
         }
         let archive = try JSONDecoder().decode(Document.self, from: data)
+        return try restored(archive)
+    }
+
+    private static func restored(_ archive: Document) throws -> LADProject {
         guard archive.formatVersion == formatVersion else {
             throw invalid("Unsupported format version \(archive.formatVersion).")
         }

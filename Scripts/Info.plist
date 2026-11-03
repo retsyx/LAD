@@ -20,6 +20,7 @@
         <key>CFBundleTypeName</key><string>LAD Design</string>
         <key>CFBundleTypeIconFile</key><string>LADDocument.icns</string>
         <key>CFBundleTypeRole</key><string>Editor</string>
+        <key>LSTypeIsPackage</key><true/>
         <key>LSHandlerRank</key><string>Owner</string>
         <key>LSItemContentTypes</key><array><string>studio.lad.project</string></array>
     </dict></array>
@@ -28,7 +29,7 @@
         <key>UTTypeIdentifier</key><string>studio.lad.project</string>
         <key>UTTypeDescription</key><string>LAD Design</string>
         <key>UTTypeIconFile</key><string>LADDocument.icns</string>
-        <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+        <key>UTTypeConformsTo</key><array><string>com.apple.package</string></array>
         <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>lad</string></array></dict>
     </dict></array>
 </dict>

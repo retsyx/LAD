@@ -3,19 +3,30 @@ import CryptoKit
 import Foundation
 import UniformTypeIdentifiers
 
-/// A coordinated read/write baseline. Never stored in the portable archive.
+/// A coordinated read/write baseline. Never stored in the portable package.
 struct ProjectFileOrigin: Sendable, Equatable {
     let readID = UUID()
     var url: URL
     var sha256: String
 
     init(url: URL, data: Data) {
-        self.url = url.standardizedFileURL.resolvingSymlinksInPath()
+        self.url = Self.canonicalURL(url)
         sha256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     func matches(_ other: URL) -> Bool {
-        url == other.standardizedFileURL.resolvingSymlinksInPath()
+        other.isFileURL && url.path == Self.canonicalURL(other).path
+    }
+
+    /// A package is presented as a document. Keep a stable URL spelling when
+    /// Foundation discovers that its on-disk representation is a directory.
+    static func documentURL(_ url: URL) -> URL {
+        guard url.isFileURL else { return url }
+        return URL(fileURLWithPath: url.standardizedFileURL.path, isDirectory: false)
+    }
+
+    static func canonicalURL(_ url: URL) -> URL {
+        documentURL(url.standardizedFileURL.resolvingSymlinksInPath())
     }
 }
 
@@ -43,7 +54,7 @@ enum ProjectSaveConflictPrompt {
         guard response == .alertSecondButtonReturn else { return .cancel }
         let panel = NSSavePanel()
         panel.title = "Save Design with Different Name"
-        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .data]
+        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .package]
         panel.directoryURL = conflict.file.url.deletingLastPathComponent()
         panel.nameFieldStringValue = conflict.file.url.deletingPathExtension().lastPathComponent + " copy.lad"
         let result = await panel.beginSheetModal(for: window)

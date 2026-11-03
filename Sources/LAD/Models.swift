@@ -237,6 +237,9 @@ struct LADProject: Codable, Sendable {
     var partsPaneFraction: Double = 0.75
     /// Session-only file baseline for conflict detection, including first save.
     var fileOrigin: ProjectFileOrigin? = nil
+    /// Optional Finder presentation image. Package storage saves it separately;
+    /// it is never part of conversation, task activity, or CAD replay inputs.
+    var thumbnailData: Data? = nil
 
     private enum CodingKeys: String, CodingKey {
         case formatVersion, messages, revisions, selectedRevisionID, projectID, codexSettings, projectName

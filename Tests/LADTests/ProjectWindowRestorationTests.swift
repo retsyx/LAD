@@ -16,7 +16,7 @@ final class ProjectWindowRestorationTests: XCTestCase {
         XCTAssertTrue(coordinator.register(first, id: firstID, sourceURL: source))
         XCTAssertFalse(coordinator.register(second, id: secondID, sourceURL: alias))
         XCTAssertTrue(first.state === second.state)
-        XCTAssertEqual(second.sourceURL, source.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(second.sourceURL, ProjectFileOrigin.canonicalURL(source))
 
         first.state.prompt = "Keep the same unsent request in both restored views"
         XCTAssertEqual(second.state.prompt, first.state.prompt)

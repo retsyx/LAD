@@ -161,8 +161,29 @@ def verify_app(app, version, build_number, production):
             raise ReleaseError("The LAD app lacks a timestamped Developer ID Application signature.")
         run(["/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=2", app], capture=True)
         run(["/usr/bin/xcrun", "stapler", "validate", app], capture=True)
-    if len(native_images(app)) != 1:
+    thumbnail = app / "Contents/PlugIns/LADThumbnailExtension.appex"
+    thumbnail_executable = thumbnail / "Contents/MacOS/LADThumbnailExtension"
+    expected_images = {executable.resolve(), thumbnail_executable.resolve()}
+    if {path.resolve() for path in native_images(app)} != expected_images:
         raise ReleaseError("Unexpected unpacked native code in the app; add explicit inside-out signing before shipping it.")
+    with (thumbnail / "Contents/Info.plist").open("rb") as stream:
+        thumbnail_info = plistlib.load(stream)
+    extension = thumbnail_info.get("NSExtension", {})
+    if (thumbnail_info.get("CFBundleIdentifier") != "studio.lad.cad.thumbnail"
+            or thumbnail_info.get("CFBundleVersion") != build_number
+            or thumbnail_info.get("CFBundleShortVersionString") != version
+            or extension.get("NSExtensionPointIdentifier") != "com.apple.quicklook.thumbnail"
+            or extension.get("NSExtensionAttributes", {}).get("QLSupportedContentTypes") != ["studio.lad.project"]):
+        raise ReleaseError("The Finder thumbnail extension has incorrect metadata.")
+    if run(["/usr/bin/lipo", "-archs", thumbnail_executable], capture=True).stdout.split() != ["arm64"]:
+        raise ReleaseError("The Finder thumbnail extension must contain only arm64 code.")
+    run(["/usr/bin/codesign", "--verify", "--strict", thumbnail], capture=True)
+    thumbnail_details = run(["/usr/bin/codesign", "--display", "--verbose=4", thumbnail], capture=True).stderr
+    thumbnail_flags = re.search(r"\bflags=0x([0-9a-fA-F]+)", thumbnail_details)
+    if not thumbnail_flags or not int(thumbnail_flags.group(1), 16) & 0x10000:
+        raise ReleaseError("The Finder thumbnail extension must have hardened runtime enabled.")
+    if production and ("Authority=Developer ID Application:" not in thumbnail_details or "Timestamp=" not in thumbnail_details):
+        raise ReleaseError("The Finder thumbnail extension lacks a timestamped Developer ID Application signature.")
 
 
 def verify_installed_payload(app, work, production):
@@ -314,6 +335,10 @@ def release(args):
         # SwiftPM can retain an unused Xcode-toolchain rpath. Remove build-only
         # searches before signing, while rejecting actual external dependencies.
         app_audit = audit_runtime(app / "Contents", "arm64", repair_build_rpaths=True)
+        thumbnail = app / "Contents/PlugIns/LADThumbnailExtension.appex"
+        run(["/usr/bin/codesign", "--force", "--sign", identity, "--options", "runtime",
+             "--timestamp" if production else "--timestamp=none", "--entitlements",
+             source_root / "Scripts/ThumbnailExtension.entitlements", thumbnail])
         run(["/usr/bin/codesign", "--force", "--sign", identity, "--options", "runtime",
              "--timestamp" if production else "--timestamp=none", app])
         if production:
