@@ -45,6 +45,9 @@ final class CADAgentTools {
     private var runtime: CADRuntime?
     private var permissionRequest: (id: UUID, task: Task<AgentPermissionDecision, Error>)?
     private var cancelled = false
+    private lazy var meshSession = CADMeshSession(workspace: workspace)
+    private var reconstructionPrograms = Set<String>()
+    private var reconstructionArtifacts = Set<String>()
 
     init(directory: URL, python: String, threads: Int, current: ModelSpec?, currentPreview: PreviewMesh?,
          engine: EngineService, viewport: CADSceneView? = nil, hiddenSolids: Set<Int> = [],
@@ -153,6 +156,28 @@ final class CADAgentTools {
         return nil
     }
 
+    func finalDeliveryDisclosure(for model: ModelSpec) throws -> String? {
+        try checkCancellation()
+        return try meshSession.validateFinalDelivery(program: model.script)
+    }
+
+    func resolvingFinalDelivery(in model: ModelSpec) throws -> ModelSpec {
+        guard let disclosure = try finalDeliveryDisclosure(for: model) else { return model }
+        var result = model
+        let combined = disclosure + "\n\n" + model.summary
+        result.summary = combined.utf8.count <= 6_000 ? combined : disclosure
+        return result
+    }
+
+    /// These exact reviewed programs are self-contained. An inherited external
+    /// input from the prior design must not change their replay identity.
+    func resolvingReconstructionInputs(in model: ModelSpec) -> ModelSpec {
+        guard model.units == "mm", reconstructionPrograms.contains(model.script) else { return model }
+        var result = model
+        result.sourceSTEP = nil; result.sourceName = nil; result.inputAssets = nil
+        return result
+    }
+
     /// Only the chosen construction's speculative color patch crosses the
     /// successful task boundary. Other candidates and history remain isolated.
     func partColorChanges(for model: ModelSpec?) -> [CADPartColorChange] {
@@ -193,8 +218,10 @@ final class CADAgentTools {
         case "lad_runtime":
             try allowed(arguments, [])
             if runtime == nil { runtime = try await engine.runtimeInfo(python: python, threads: threads) }
+            let meshHelp = try workspace.write(Data(contentsOf: ResourcePaths.root.appendingPathComponent("Engine/mesh-api.md")), path: "context/mesh-api.md")
             return try result(["pythonExecutable": python, "runtime": try json(runtime!), "threads": threads,
                                "workspace": workspace.root.path,
+                               "meshAPIHelpPath": meshHelp.path,
                                "programInterface": "Full installed CadQuery and OCP Python APIs; assign result. cq, math, np and imported_assets are preloaded. imported_model is available when the current design has an original STEP input.",
                                "capabilities": ["sketches", "lofts", "sweeps", "splines", "surfaces", "shells", "offsets", "booleans", "assemblies", "direct OCP", "exact measurements", "PNG rendering", "STEP export"],
                                "externalTools": "External tools are user-managed. Before each new optional download or dependency installation, call lad_request_permission with the proposed operation and reason, even after a previous always-allow/always-deny result; Settings can change at any time. Proceed only when the current result has allowed true. That tool returns a decision only; you execute any approved operation in an isolated environment inside this task workspace, using LAD's Python as the base for a helper environment if needed. Never change LAD's shared runtime, global settings, original sources or files outside the task workspace. Final authored geometry must replay using only LAD's bundled CAD dependencies and registered reference inputs. lad_import is only for pre-existing external/reference inputs and faithful format conversions of user-provided inputs; never export/import or reimport geometry generated as part of this design by LAD or external tools.",
@@ -252,6 +279,32 @@ final class CADAgentTools {
                                    "nextStep": "Choose a candidate's stable versionID; no version was opened or rebuilt."])
             }
             return try await stageVersion(matches[0])
+        case "lad_mesh_open_reference", "lad_mesh_inspect", "lad_mesh_fit", "lad_mesh_try_edit", "lad_mesh_compare",
+             "lad_mesh_commit", "lad_mesh_undo", "lad_mesh_redo", "lad_mesh_branch", "lad_mesh_set_delivery", "lad_mesh_export_step":
+            var meshColors: [Int: PartColor] = [:]
+            if name == "lad_mesh_export_step", let contextID = arguments["contextID"] as? String,
+               let revisionID = arguments["revisionID"] as? String,
+               let program = try meshSession.program(contextID: contextID, revisionID: revisionID),
+               let artifact = artifactOrder.reversed().compactMap({ artifacts[$0] }).first(where: { $0.model.script == program }) {
+                meshColors = renderColors(for: artifact)
+            }
+            let output = try await meshSession.handle(name: name, arguments: arguments, engine: engine, python: python, threads: threads, solidColors: meshColors)
+            try checkCancellation()
+            var values = output.values
+            if let program = output.program, let preview = output.preview {
+                let model = ModelSpec(title: "Mesh reconstruction", summary: "Valid intermediate reconstruction; final source agreement is checked separately.", units: "mm", script: program)
+                let existing = artifactOrder.reversed().compactMap { artifacts[$0] }.first { $0.model.script == program && reconstructionArtifacts.contains($0.id) }
+                let artifact: Artifact
+                if let existing { artifact = existing }
+                else { artifact = try await build(model, preparedPreview: preview) }
+                reconstructionPrograms.insert(program)
+                reconstructionArtifacts.insert(artifact.id)
+                values["artifactID"] = artifact.id
+                values["programPath"] = artifact.programURL.path
+            }
+            var response = try result(values)
+            if values["status"] as? String == "error" { response["isError"] = true }
+            return response
         case "lad_build":
             try allowed(arguments, ["programPath", "title", "summary", "assetIDs", "versionID"])
             let version = try string("versionID", arguments).map { try versions.version(id: $0) }
@@ -424,6 +477,10 @@ final class CADAgentTools {
         case "lad_export_step":
             try allowed(arguments, ["artifactID", "path", "solidIndices"])
             let requestedID = try string("artifactID", arguments) ?? "current"
+            guard !reconstructionArtifacts.contains(requestedID),
+                  artifacts[requestedID].map({ !reconstructionPrograms.contains($0.model.script) }) ?? true else {
+                throw LADError.message("Use lad_mesh_export_step with this reconstruction's committed revision and accepted comparison for source verification and STEP readback.")
+            }
             let previous = artifacts[requestedID]
             let artifact = try await artifact(arguments)
             let preview = artifact.preview!
@@ -475,10 +532,11 @@ final class CADAgentTools {
         return try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
     }
 
-    private func build(_ model: ModelSpec, id: String? = nil, versionID: UUID? = nil) async throws -> Artifact {
+    private func build(_ model: ModelSpec, id: String? = nil, versionID: UUID? = nil, preparedPreview: PreviewMesh? = nil) async throws -> Artifact {
         let id = id ?? UUID().uuidString
         let preview: PreviewMesh
-        if let cached = validatedPreview(for: model) { preview = cached }
+        if let preparedPreview { preview = preparedPreview }
+        else if let cached = validatedPreview(for: model) { preview = cached }
         else { preview = try await engine.buildPreview(model, python: python, threads: threads) }
         try checkCancellation()
         runtime = preview.runtime

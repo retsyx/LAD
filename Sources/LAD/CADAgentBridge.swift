@@ -147,6 +147,13 @@ final class CADAgentBridge {
             onActivity(ProjectActivityEvent(id: "tool:\(requestID)", date: started, category: "tool",
                 title: name, status: "running", input: Self.json(arguments), files: snapshots.isEmpty ? nil : snapshots))
             let result = try await tools.handle(name: name, arguments: arguments)
+            if name.hasPrefix("lad_mesh_"), let content = result["content"] as? [[String: Any]],
+               let text = content.first?["text"] as? String,
+               let bytes = text.data(using: .utf8),
+               let values = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+               let path = values["programPath"] as? String {
+                snapshots += try auditSnapshots(name: "lad_build", arguments: ["programPath": path])
+            }
             try Task.checkCancellation()
             guard !stopped else { return }
             try writeResponse(result, id: requestID)
@@ -170,6 +177,17 @@ final class CADAgentBridge {
         let paths: [String]
         if name == "lad_build", let program = arguments["programPath"] as? String { paths = [program] }
         else if name == "lad_import" { paths = arguments["producerPaths"] as? [String] ?? [] }
+        else if name.hasPrefix("lad_mesh_") {
+            var referenced = ["queryPath", "constraintsPath", "editPath", "programPath", "policyPath"].compactMap { arguments[$0] as? String }
+            if let editPath = arguments["editPath"] as? String {
+                let access = try CADAgentWorkspace(directory: workspace)
+                let bytes = try access.read(editPath, maximumBytes: 2_000_000)
+                if let edit = try JSONSerialization.jsonObject(with: bytes) as? [String: Any], let path = edit["programPath"] as? String {
+                    referenced.append(path)
+                }
+            }
+            paths = referenced
+        }
         else { return [] }
         guard paths.count <= 64 else { throw LADError.message("Choose at most 64 source files for the tool activity record.") }
         let access = try CADAgentWorkspace(directory: workspace)

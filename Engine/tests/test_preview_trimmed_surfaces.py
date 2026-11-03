@@ -185,6 +185,29 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
         self.assertEqual(preview['parts'], shape._lad_parts)
         self.assert_complete_native_coverage(shape, preview)
 
+    def test_small_relief_in_spherical_shell_retains_complete_outward_coverage(self):
+        snapshot = geometry_tolerance.GeometryToleranceTests().snapshot
+        for label, scale, located in [('original', 1, False), ('half', .5, False),
+                                      ('double', 2, False), ('located', 1, True)]:
+            with self.subTest(label=label):
+                shape = trimmed_shell(reduced=True)
+                parts = copy.deepcopy(shape._lad_parts)
+                direction = cq.Vector(0, np.cos(np.radians(15)), -np.sin(np.radians(15)))
+                plane = cq.Plane(origin=direction.multiply(8), xDir=(1, 0, 0), normal=direction.multiply(-1))
+                relief = cq.Workplane(plane).center(0, 41.1).rect(5, 14.2).extrude(18).val()
+                shape = shape.cut(relief)
+                if scale != 1:
+                    shape = shape.scale(scale)
+                if located:
+                    shape = shape.moved(cq.Location((13, -8, 21), (1, 2, 3), 37))
+                shape._lad_parts = parts
+                worker.validate_shape(shape)
+                before = snapshot(shape)
+                preview = worker.make_preview(shape)
+                self.assertEqual(snapshot(shape), before, 'A preview retry must not alter exact geometry or identities.')
+                self.assertEqual(preview['parts'], parts)
+                self.assert_complete_native_coverage(shape, preview)
+
     def test_inward_native_candidates_fail_with_a_scoped_face_diagnostic(self):
         shape = cq.Solid.makeBox(2, 3, 4)
         audit = worker._preview_face_triangles

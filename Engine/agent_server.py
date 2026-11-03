@@ -37,6 +37,18 @@ INSTRUCTIONS = (
     "lad_import is only for pre-existing external/reference geometry and faithful format conversions of user-provided inputs. "
     "NEVER export/import, reimport or use lad_import for geometry generated as part of the current design, whether authored with LAD or external tools such as SDF software. "
     "Keep all authored geometry in the replayable CAD program; external tools may support analysis and prototyping. Mesh reference inputs remain faceted. "
+    "For analytic reconstruction from a mesh, use LAD's iterative lad_mesh toolbox described by lad_runtime.meshAPIHelpPath. "
+    "Open the immutable reference with lad_mesh_open_reference, inspect evidence, fit alternatives, try an explicit edit, and inspect/compare the exposed result. "
+    "lad_mesh_commit keeps a valid intermediate body in a private reconstruction branch; it never changes the user's design. "
+    "Unfinished completion obligations do not block intermediate commits. Active invariants protect established features. "
+    "Continue revising from discrepancy evidence; a failed fit or edit is feedback, not proof the reference cannot be reconstructed. "
+    "Preview metrics are estimates, not final maximum bounds. Only full final lad_mesh_compare acceptance=pass establishes reconstruction acceptance. "
+    "For verified final reconstruction delivery, commit the final recipe and compare that exact committed revision with scope=all and quality=final. "
+    "Verified final delivery requires its unchanged program's passing full final comparison; lad_build, local/preview reports and another revision/context's acceptance cannot grant verification. "
+    "If you decide completion is not achievable and keeping useful interim results is appropriate, explicitly call lad_mesh_set_delivery for that exact committed revision with mode=intermediate, a reason and unresolved items. No user approval is required for that decision. "
+    "LAD then permits that exact intermediate program and saves a clear limitation disclosure; this choice does not authorize another recipe or verified STEP export. Otherwise continue editing or return message/unsupported while preserving the current design. "
+    "Use lad_mesh_export_step with the exact committed revision and accepted comparison for checked STEP readback. "
+    "Render successful preview artifactIDs and use their complete self-contained programPath for final CAD; never import generated geometry. "
     "Use lad_get_part_colors for effective sRGB colors and stable part IDs, and lad_set_part_colors to stage color assignments or null resets without rebuilding geometry. "
     "Colors on candidate artifacts remain speculative; only the current patch or the final program's matching artifact patch is committed on success. "
     "Part colors have one current RGB value; the last successful color assignment applies. CadQuery Assembly color=cq.Color(r,g,b) seeds colors for new parts. "
@@ -102,6 +114,30 @@ TOOLS = [
      schema({**ARTIFACT, "path": prop("string"), "solidIndices": INDICES}), False),
     ("lad_import", "Import pre-existing external/reference STEP/BREP or closed STL/OBJ geometry from the task workspace, including faithful format conversions of user-provided inputs. Never import geometry generated as part of the current design by LAD or external tools. Binary and ASCII STL are supported directly without extra dependencies; meshes must be watertight and use millimeter coordinates. Existing file-size and preview resource limits apply. Returns an input asset ID, validated artifact and fidelity notes. Access the reference shape using imported_assets[assetID].",
      schema({"path": prop("string"), "name": prop("string"), "producerPaths": prop("array", items=prop("string"), description="Optional source-conversion code and dependency file references for a pre-existing external/reference input's task audit.")}, ["path"]), False),
+]
+TOOLS += [
+    ("lad_mesh_open_reference", "Open immutable original STL/indexed triangle JSON with explicit source units and final maximum deviation. Returns contextID, empty revisionID and private branchID. Working coordinates are explicitly normalized to millimeters; source bytes and triangle identities stay unchanged. No solid conversion or design-window edit.",
+     schema({"path":prop("string"),"units":prop("string"),"maxDeviation":prop("number",minimum=0),"sourceKind":prop("string",enum=["unknown","cad_tessellation","scan"]),"policyPath":prop("string",description="Optional workspace JSON reference interpretation, obligations, invariants and bounded algorithm policies.")},["path","units","maxDeviation"]),False),
+    ("lad_mesh_inspect", "Obtain immutable selectable evidence on the reference/current revision: select, grow, shrink, partition, combine, section, measure, or refresh discrepancies. Empty CAD is supported. Optional source-only query kind=recognize with scope/selection and families finds regional torus, helical_sweep, rounded_rectangle_extrusion and concentric_spherical_shell alternatives for fit; material decisions remain explicit edits. Complete selections and provenance stay in recordPath; queryPath is a workspace JSON object. See meshAPIHelpPath for exact schemas.",
+     schema({"contextID":prop("string"),"revisionID":prop("string"),"queryPath":prop("string")},["contextID","revisionID","queryPath"]),False),
+    ("lad_mesh_fit", "Fit permitted geometric explanations to evidence. Every returned FitCandidate.id is one alternative; joint members inside a candidate share its constraints. Fit success does not construct a body, discharge obligations, or prove final agreement. Returns immutable candidates with support, inferred extents, residuals and ambiguity.",
+     schema({"contextID":prop("string"),"revisionID":prop("string"),"evidenceIDs":prop("array",items=prop("string"),minItems=1,maxItems=32),"families":{"oneOf":[prop("string"),prop("array",items=prop("string"),maxItems=16)]},"constraintsPath":prop("string")},["contextID","revisionID","evidenceIDs"]),False),
+    ("lad_mesh_try_edit", "Stage a reversible typed CAD decision or complete program replacement against an exact revision. editPath is workspace JSON; programPath references complete CadQuery/OCP Python when replacing a program. Returns previewID, commit eligibility, native validity, invariant checks and automatic before/after preview comparisons. Valid incomplete solids may be committed. Failure preserves the base. No faceted fallback.",
+     schema({"contextID":prop("string"),"revisionID":prop("string"),"editPath":prop("string"),"programPath":prop("string")},["contextID","revisionID","editPath"]),False),
+    ("lad_mesh_compare", "Compare the original mesh with an exact reconstruction revision or preview. Preview/local results never grant final pass. Final checks return pass, fail or inconclusive with explicit continuous bounds, native validity, representation, obligations and coverage. Does not fit, heal or alter geometry.",
+     schema({"contextID":prop("string"),"targetID":prop("string"),"scope":{"oneOf":[prop("string",enum=["all"]),prop("object",additionalProperties=True)]},"quality":prop("string",enum=["preview","final"])},["contextID","targetID"]),False),
+    ("lad_mesh_commit", "Atomically keep an eligible preview in the current private reconstruction branch if expectedRevisionID still matches its base. Does not replace the user's design and does not imply final reconstruction acceptance. Returns a new immutable revisionID.",
+     schema({"contextID":prop("string"),"previewID":prop("string"),"expectedRevisionID":prop("string")},["contextID","previewID","expectedRevisionID"]),False),
+    ("lad_mesh_set_delivery", "Choose final delivery for one exact committed reconstruction revision. Default verified mode requires its passing full final comparison. If completing reconstruction is not achievable, the agent may explicitly choose intermediate with a reason and unresolved items to keep useful valid interim solids without requesting user approval. LAD saves the limitation disclosure; this never grants verified status, applies to another recipe, or bypasses checked STEP export. Does not move the branch or change the design window.",
+     schema({"contextID":prop("string"),"revisionID":prop("string"),"mode":prop("string",enum=["verified","intermediate"]),"reason":prop("string",minLength=1,maxLength=512),"unresolved":prop("array",items=prop("string",minLength=1,maxLength=256),minItems=1,maxItems=8)},["contextID","revisionID","mode"]),False),
+    ("lad_mesh_undo", "Move the private reconstruction branch to its previous retained revision. Leaves the design window unchanged and preserves exact provenance; stale comparisons cannot certify another revision.",
+     schema({"contextID":prop("string"),"expectedRevisionID":prop("string")},["contextID"]),False),
+    ("lad_mesh_redo", "Move the private reconstruction branch to its next retained revision after undo. Does not modify the design window.",
+     schema({"contextID":prop("string"),"expectedRevisionID":prop("string")},["contextID"]),False),
+    ("lad_mesh_branch", "Start and select a new private reconstruction branch from an exact retained revision, keeping existing history intact. Returns branchID and revisionID; design window unchanged.",
+     schema({"contextID":prop("string"),"revisionID":prop("string")},["contextID","revisionID"]),False),
+    ("lad_mesh_export_step", "Export a committed reconstruction only with its matching full accepted comparison. Validate solid STEP readback and compare that readback against the original reference under the same allowance. Returns a workspace path only on success.",
+     schema({"contextID":prop("string"),"revisionID":prop("string"),"comparisonID":prop("string"),"path":prop("string")},["contextID","revisionID","comparisonID"]),False),
 ]
 TOOL_NAMES = {tool[0] for tool in TOOLS}
 

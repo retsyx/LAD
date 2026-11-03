@@ -49,6 +49,7 @@ struct ProjectRevisionPickerList: View {
     @State private var editingProjectID: UUID?
     @State private var nameDraft = ""
     @State private var renameError: String?
+    @State private var contentHeight: CGFloat = 360
     @FocusState private var nameFieldFocused: Bool
 
     var body: some View {
@@ -61,8 +62,15 @@ struct ProjectRevisionPickerList: View {
                     }
                 }
                 .padding(6)
+                .onGeometryChange(for: CGFloat.self) { geometry in
+                    geometry.size.height
+                } action: { height in
+                    if height.isFinite, height > 0, abs(contentHeight - height) >= 0.5 {
+                        contentHeight = height
+                    }
+                }
             }
-            .frame(width: 300, height: listHeight)
+            .frame(width: 300, height: min(360, contentHeight))
             .background(Palette.panel)
             .onAppear {
                 if let id = state.selectedRevisionID { scroll.scrollTo(id, anchor: .center) }
@@ -82,12 +90,6 @@ struct ProjectRevisionPickerList: View {
             if let id = editingRevisionID, !ids.contains(id) { cancelRename() }
         }
         .onDisappear { cancelRename() }
-    }
-
-    private var listHeight: CGFloat {
-        // Leave room for wrapped names and an inline validation message, while
-        // keeping long histories scrollable within the current screen.
-        min(360, max(48, CGFloat(state.revisions.count) * 42 + (renameError == nil ? 12 : 42)))
     }
 
     private func revisionRow(_ id: UUID) -> some View {

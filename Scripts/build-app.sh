@@ -28,6 +28,7 @@ PACKAGED_ENGINE="$ASSEMBLED/Contents/Resources/Engine"
 mkdir -p "$PACKAGED_ENGINE"
 cp "$ROOT/Engine/worker.py" "$ROOT/Engine/agent_server.py" \
    "$ROOT/Engine/script.sb" "$ROOT/Engine/requirements-lock.txt" "$PACKAGED_ENGINE/"
+cp "$ROOT"/Engine/mesh_*.py "$ROOT/Engine/mesh-api.md" "$PACKAGED_ENGINE/"
 ditto "$ROOT/Examples" "$ASSEMBLED/Contents/Resources/Examples"
 # Ship a verified offline payload. First use prepares a versioned private
 # interpreter/venv in Application Support without changing the signed app.

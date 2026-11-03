@@ -178,6 +178,7 @@ final class CodexService {
             specification.sourceName = current?.sourceName
             let assets = try bridge.tools.resolveAssets(ids: response.assetIDs ?? current?.inputAssets?.map(\.id) ?? [])
             specification.inputAssets = assets.isEmpty ? nil : assets
+            specification = bridge.tools.resolvingReconstructionInputs(in: specification)
             guard specification.units == "mm" else {
                 throw CodexError.invalidModel("The response uses unsupported units.")
             }
@@ -191,6 +192,10 @@ final class CodexService {
             }
             // Construction reuse skips the worker. Validate the complete final
             // metadata here so every accepted revision can be saved.
+            try ProjectStore.validateModel(specification)
+            // Retain any explicit intermediate classification and complete
+            // limitation in the saved design, including native preview reuse.
+            specification = try bridge.tools.resolvingFinalDelivery(in: specification)
             try ProjectStore.validateModel(specification)
             validatedModel = specification
             validatedMesh = bridge.tools.validatedPreview(for: specification)

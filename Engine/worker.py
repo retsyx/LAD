@@ -25,6 +25,11 @@ MAX_EDGE_SEGMENTS = 250_000
 MAX_SCRIPT_BYTES = 200_000
 MAX_GEOMETRY_BYTES = 512_000_000
 MAX_VALIDATION_FAILURES = 24
+MAX_PREVIEW_EXACT_ORIENTATION_CELLS = 4_096
+MAX_PREVIEW_REFINEMENT_NODES = 20_000
+MAX_PREVIEW_REFINEMENT_PASSES = 16
+MAX_PREVIEW_REFINEMENT_PROJECTIONS = 16_384
+MAX_PREVIEW_REFINEMENT_CELLS = 100_000
 GEOMETRY_TOLERANCE_MM = 1e-4
 LIMIT = 100_000.0
 _validated_replay = ContextVar("validated_replay", default=False)
@@ -1035,7 +1040,9 @@ def _preview_face_normals(face, poly, location):
 
 
 class _PreviewMeshError(ValueError):
-    pass
+    def __init__(self, message, *, refine_surface=False):
+        super().__init__(message)
+        self.refine_surface = refine_surface
 
 
 def _preview_patch_triangles(loop, points, normals, face, tolerance):
@@ -1114,7 +1121,126 @@ def _preview_patch_triangles(loop, points, normals, face, tolerance):
     return result
 
 
-def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary):
+def _preview_triangle_matches_surface(face, corners, uv, tolerance, distance_limit):
+    """Check suspect cells against their own surface and parameter chart."""
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.gp import gp_Pnt
+    try:
+        surface = BRep_Tool.Surface_s(face.wrapped)
+        # Sample both the boundary and interior. The parameter check also
+        # guards against a projection onto an unrelated nearby surface branch.
+        for first in range(5):
+            for second in range(5 - first):
+                weights = [first / 4, second / 4, (4 - first - second) / 4]
+                point = [sum(weights[index] * corners[index][axis] for index in range(3)) for axis in range(3)]
+                u, v = [sum(weights[index] * uv[index][axis] for index in range(3)) for axis in range(2)]
+                expected = surface.Value(u, v).Coord()
+                if (not all(math.isfinite(value) for value in [*point, *expected])
+                        or math.dist(point, expected) > tolerance):
+                    return False
+                if distance_limit >= tolerance:
+                    continue  # The corresponding surface point already proves this bound.
+                projection = GeomAPI_ProjectPointOnSurf(gp_Pnt(*point), surface)
+                if not projection.NbPoints() or not projection.LowerDistance() <= distance_limit:
+                    return False
+    except Exception:
+        return False
+    return True
+
+
+def _preview_metric_triangles(points, normals, uv, triangles, boundary, sign):
+    """Repair interior diagonals in batches without changing any node."""
+    import numpy as np
+    xyz, exact, uv = np.asarray(points), np.asarray(normals), np.asarray(uv)
+    indices = np.array(triangles, dtype=np.int64, copy=True)
+    threshold = -1e-8 / 3
+
+    def raw_audit(cells):
+        corners = xyz[cells]
+        planes = np.cross(corners[..., 1, :] - corners[..., 0, :], corners[..., 2, :] - corners[..., 0, :])
+        lengths = np.linalg.norm(planes, axis=-1)
+        dots = np.divide((planes * exact[cells].mean(axis=-2)).sum(axis=-1), lengths,
+                         out=np.zeros_like(lengths), where=lengths > 1e-20)
+        return dots, lengths
+
+    def signed(cells):
+        corners = uv[cells]
+        ab, ac = corners[..., 1, :] - corners[..., 0, :], corners[..., 2, :] - corners[..., 0, :]
+        return sign * (ab[..., 0] * ac[..., 1] - ab[..., 1] * ac[..., 0])
+
+    _, lengths = raw_audit(indices)
+    if np.any((lengths > 1e-12) & (signed(indices) <= 0)):
+        raise _PreviewMeshError("the triangulation contains inward surface triangles with reversed UV winding")
+    # An encoded pair is exact for native node IDs; no coincident seam/pole
+    # positions are merged. The preview node limit keeps these within int64.
+    base = len(xyz)
+    native_boundary = np.asarray(list(boundary), dtype=np.int64).reshape(-1, 2)
+    boundary_keys = native_boundary.min(axis=1) * base + native_boundary.max(axis=1)
+    for iteration in range(20):
+        dots, lengths = raw_audit(indices)
+        if not np.any((lengths > 1e-12) & (dots < threshold)):
+            break
+        # Build all ownership and proposal data in native array operations.
+        # Calling a two-cell NumPy/native audit for every edge made large
+        # sheared surfaces spend minutes in otherwise bounded repair passes.
+        edges = np.stack((indices, np.roll(indices, -1, axis=1)), axis=-1).reshape(-1, 2)
+        opposite = np.roll(indices, 1, axis=1).reshape(-1)
+        keys = edges.min(axis=1) * base + edges.max(axis=1)
+        order = np.argsort(keys, kind="stable")
+        ordered = keys[order]
+        starts = np.r_[0, np.flatnonzero(ordered[1:] != ordered[:-1]) + 1]
+        counts = np.diff(np.r_[starts, len(ordered)])
+        if np.any(counts > 2):
+            raise _PreviewMeshError("the triangulation contains nonmanifold surface edges")
+        paired = starts[counts == 2]
+        first_edge, second_edge = order[paired], order[paired + 1]
+        keep = ((first_edge // 3 != second_edge // 3)
+                & ~np.isin(keys[first_edge], boundary_keys))
+        first_edge, second_edge = first_edge[keep], second_edge[keep]
+        first, second = first_edge // 3, second_edge // 3
+        a, b = edges[first_edge].T
+        if np.any(a != edges[second_edge, 1]) or np.any(b != edges[second_edge, 0]):
+            raise _PreviewMeshError("the triangulation has inconsistent shared-edge directions")
+        c, d = opposite[first_edge], opposite[second_edge]
+        proposed_keys = np.minimum(c, d) * base + np.maximum(c, d)
+        old_squared = ((xyz[a] - xyz[b]) ** 2).sum(axis=1)
+        new_squared = ((xyz[c] - xyz[d]) ** 2).sum(axis=1)
+        keep = ((c != d) & ~np.isin(proposed_keys, ordered[starts])
+                & (np.sqrt(new_squared) < np.sqrt(old_squared) - 1e-10))
+        a, b, c, d = a[keep], b[keep], c[keep], d[keep]
+        first, second = first[keep], second[keep]
+        proposed_keys, old_squared = proposed_keys[keep], old_squared[keep]
+        proposed = np.stack((np.stack((c, a, d), axis=1), np.stack((c, d, b), axis=1)), axis=1)
+        keep = np.all(signed(proposed) > 1e-16, axis=1)
+        proposed, first, second = proposed[keep], first[keep], second[keep]
+        proposed_keys, old_squared = proposed_keys[keep], old_squared[keep]
+        new_dots, new_lengths = raw_audit(proposed)
+        old_bad = (dots[first] < threshold).astype(np.int8) + (dots[second] < threshold)
+        keep = (np.all(new_lengths > 1e-12, axis=1)
+                & (np.count_nonzero(new_dots < threshold, axis=1) <= old_bad)
+                & (new_dots.min(axis=1) > np.minimum(dots[first], dots[second]) + 1e-6))
+        eligible = np.flatnonzero(keep)
+        eligible = eligible[np.argsort(-old_squared[eligible], kind="stable")]
+        # Match the sequential pass's non-overlapping owners, and prohibit two
+        # independent flips from introducing the same new diagonal together.
+        touched = np.zeros(len(indices), dtype=bool)
+        diagonals, chosen = set(), []
+        for index in eligible:
+            left, right, diagonal = int(first[index]), int(second[index]), int(proposed_keys[index])
+            if touched[left] or touched[right] or diagonal in diagonals:
+                continue
+            touched[left] = touched[right] = True
+            diagonals.add(diagonal)
+            chosen.append(index)
+        if not chosen:
+            break
+        chosen = np.asarray(chosen, dtype=np.int64)
+        indices[first[chosen]], indices[second[chosen]] = proposed[chosen, 0], proposed[chosen, 1]
+    return indices
+
+
+def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary, tolerance, uv_nodes=None):
     """Improve folded native cells without moving or adding mesh nodes.
 
     A sheared surface chart can give Delaunay-in-UV a physically long diagonal.
@@ -1123,90 +1249,419 @@ def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary
     shortens the physical diagonal, and improves the worst surface orientation.
     """
     import numpy as np
-    from collections import defaultdict
     from OCP.TopAbs import TopAbs_Orientation
     xyz, exact = np.asarray(points), np.asarray(normals)
-    indices = np.asarray(triangles, dtype=np.int64)
+    indices = np.array(triangles, dtype=np.int64, copy=True)
     threshold = -1e-8 / 3
+    sign = -1 if face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED else 1
+    uv = None if uv_nodes is None else np.asarray(uv_nodes)
+    if uv is not None and (uv.shape != (len(points), 2) or not np.all(np.isfinite(uv))):
+        raise _PreviewMeshError("surface orientation requires finite native UV coordinates")
+    surface = None
+    orientation_cache = {}
 
-    def audit(cells):
+    def raw_audit(cells):
         corners = xyz[cells]
-        planes = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
-        lengths = np.linalg.norm(planes, axis=1)
-        unit = np.divide(planes, lengths[:, None], out=np.zeros_like(planes), where=lengths[:, None] > 1e-20)
-        dots = (unit * exact[cells].mean(axis=1)).sum(axis=1)
+        planes = np.cross(corners[..., 1, :] - corners[..., 0, :], corners[..., 2, :] - corners[..., 0, :])
+        lengths = np.linalg.norm(planes, axis=-1)
+        dots = np.divide((planes * exact[cells].mean(axis=-2)).sum(axis=-1), lengths,
+                         out=np.zeros_like(lengths), where=lengths > 1e-20)
         return dots, lengths
 
-    dots, lengths = audit(indices)
-    if not np.any((lengths > 1e-12) & (dots < threshold)):
+    def audit(cells):
+        nonlocal uv, surface
+        dots, lengths = raw_audit(cells)
+        corners = xyz[cells]
+        planes = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        unit = np.divide(planes, lengths[:, None], out=np.zeros_like(planes), where=lengths[:, None] > 1e-20)
+        suspects = np.flatnonzero((lengths > 1e-12) & (dots < threshold))
+        if len(suspects) > MAX_PREVIEW_EXACT_ORIENTATION_CELLS:
+            raise _PreviewMeshError("inward surface triangles exceed the bounded orientation repair budget",
+                                    refine_surface=True)
+        if len(suspects) and (poly.HasUVNodes() or uv is not None):
+            from OCP.BRepGProp import BRepGProp_Face
+            from OCP.gp import gp_Pnt, gp_Vec
+            if uv is None:
+                uv = np.asarray([poly.UVNode(index).Coord() for index in range(1, poly.NbNodes() + 1)])
+            if surface is None:
+                surface = BRepGProp_Face(face.wrapped)
+            for index in suspects:
+                cell_uv = uv[cells[index]]
+                ab, ac = cell_uv[1] - cell_uv[0], cell_uv[2] - cell_uv[0]
+                if sign * (ab[0] * ac[1] - ab[1] * ac[0]) <= 0:
+                    continue  # Never excuse reversed native parameter winding.
+                cache_key = tuple(sorted(int(node) for node in cells[index]))
+                if cache_key in orientation_cache:
+                    dots[index] = orientation_cache[cache_key]
+                    continue
+                # Corner normals can cancel or reverse around a surface cusp.
+                # Judge the facet against the exact normal inside its UV cell;
+                # keep the original exact lighting normals at every vertex.
+                u, v = cell_uv.mean(axis=0)
+                point, normal = gp_Pnt(), gp_Vec()
+                try:
+                    surface.Normal(float(u), float(v), point, normal)
+                except Exception:
+                    continue
+                if normal.SquareMagnitude() > 1e-24:
+                    center_dot = float(np.dot(unit[index], normal.Normalized().Coord()))
+                    if math.isfinite(center_dot):
+                        if (center_dot < threshold
+                                or _preview_triangle_matches_surface(face, corners[index], cell_uv, tolerance, tolerance)):
+                            dots[index] = center_dot
+                if dots[index] >= threshold:
+                    if len(orientation_cache) < len(triangles) * 4:
+                        orientation_cache[cache_key] = dots[index]
+                    continue
+                longest = max(np.linalg.norm(corners[index][right] - corners[index][left])
+                              for left, right in ((0, 1), (1, 2), (2, 0)))
+                # Native trims can contain wrinkles below the kernel's own
+                # positional precision. Retain their coverage and node identity
+                # only when the physical width and surface error are both
+                # unresolved at that precision. Meaningful folds still fail.
+                if (lengths[index] / longest <= GEOMETRY_TOLERANCE_MM
+                        and _preview_triangle_matches_surface(face, corners[index], cell_uv, tolerance,
+                                                              GEOMETRY_TOLERANCE_MM)):
+                    dots[index] = 0
+                if len(orientation_cache) < len(triangles) * 4:
+                    orientation_cache[cache_key] = dots[index]
+        return dots, lengths
+
+    dots, lengths = raw_audit(indices)
+    suspects = (lengths > 1e-12) & (dots < threshold)
+    if not np.any(suspects):
         return triangles
+    # Rare corner-normal ambiguities are cheap to resolve before changing a
+    # healthy mesh. A grossly folded candidate must not trigger thousands of
+    # per-cell native surface projections before its bounded metric repair.
+    if np.count_nonzero(suspects) <= MAX_PREVIEW_EXACT_ORIENTATION_CELLS:
+        precise_dots, precise_lengths = audit(indices)
+        if not np.any((precise_lengths > 1e-12) & (precise_dots < threshold)):
+            return triangles
     if face.geomType() not in {"BSPLINE", "BEZIER"}:
         raise _PreviewMeshError("the triangulation contains inward surface triangles")
-    if not poly.HasUVNodes():
+    if not poly.HasUVNodes() and uv is None:
         raise _PreviewMeshError("inward surface triangles have no native UV coordinates")
-    boundary = boundary()
-    uv = np.asarray([poly.UVNode(index).Coord() for index in range(1, poly.NbNodes() + 1)])
-    sign = -1 if face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED else 1
+    if uv is None:
+        uv = np.asarray([poly.UVNode(index).Coord() for index in range(1, poly.NbNodes() + 1)])
 
-    def key(a, b):
-        return (min(a, b), max(a, b))
+    def signed(cells):
+        corners = uv[cells]
+        ab, ac = corners[..., 1, :] - corners[..., 0, :], corners[..., 2, :] - corners[..., 0, :]
+        return sign * (ab[..., 0] * ac[..., 1] - ab[..., 1] * ac[..., 0])
 
-    def signed(a, b, c):
-        ab, ac = uv[b] - uv[a], uv[c] - uv[a]
-        return float(ab[0] * ac[1] - ab[1] * ac[0])
-
-    if any(sign * signed(*cell) <= 0 for cell, length in zip(indices, lengths) if length > 1e-12):
+    if np.any((lengths > 1e-12) & (signed(indices) <= 0)):
         raise _PreviewMeshError("the triangulation contains inward surface triangles with reversed UV winding")
-    for iteration in range(20):
-        dots, lengths = audit(indices)
-        adjacent = defaultdict(list)
-        for index, (a, b, c) in enumerate(indices.tolist()):
-            for left, right in ((a, b), (b, c), (c, a)):
-                adjacent[key(left, right)].append(index)
-        if any(len(owners) > 2 for owners in adjacent.values()):
-            raise _PreviewMeshError("the triangulation contains nonmanifold surface edges")
-        candidates = [edge for edge, owners in adjacent.items() if len(owners) == 2 and edge not in boundary]
-        candidates.sort(key=lambda edge: -float(np.linalg.norm(xyz[edge[0]] - xyz[edge[1]])))
-        touched, changed = set(), False
-        for edge in candidates:
-            first, second = adjacent[edge]
-            if first == second or first in touched or second in touched:
-                continue
-            cell, other = indices[first].tolist(), indices[second].tolist()
-            position = next(index for index in range(3) if key(cell[index], cell[(index + 1) % 3]) == edge)
-            a, b, c = [cell[(position + index) % 3] for index in range(3)]
-            if not any(other[index] == b and other[(index + 1) % 3] == a for index in range(3)):
-                raise _PreviewMeshError("the triangulation has inconsistent shared-edge directions")
-            d = next(node for node in other if node not in edge)
-            if len({a, b, c, d}) != 4:
-                continue
-            if key(c, d) in adjacent:
-                continue  # A new diagonal must not create a nonmanifold edge.
-            proposed = np.asarray([[c, a, d], [c, d, b]], dtype=np.int64)
-            if any(sign * signed(*triangle) <= 1e-16 for triangle in proposed):
-                continue
-            new_dots, new_lengths = audit(proposed)
-            if np.any(new_lengths <= 1e-12):
-                continue
-            old_bad = int(dots[first] < threshold) + int(dots[second] < threshold)
-            if np.count_nonzero(new_dots < threshold) > old_bad:
-                continue
-            if new_dots.min() <= min(dots[first], dots[second]) + 1e-6:
-                continue
-            if np.linalg.norm(xyz[c] - xyz[d]) >= np.linalg.norm(xyz[a] - xyz[b]) - 1e-10:
-                continue
-            indices[first], indices[second] = proposed
-            touched.update((first, second))
-            changed = True
-        if not changed:
-            break
+    indices = _preview_metric_triangles(xyz, exact, uv, indices, boundary(), sign)
     dots, lengths = audit(indices)
     if np.any((lengths > 1e-12) & (dots < threshold)):
         raise _PreviewMeshError("inward surface triangles remain after bounded metric triangulation")
     return indices.tolist()
 
 
-def _preview_face_triangles(face, poly, location, points, normals, edges, tolerance):
+def _preview_refine_face(face, poly, location, points, normals, triangles, boundary, tolerance):
+    """Refine a coarse native mesh on its exact surface, preserving trim nodes.
+
+    Surface-control meshing can oversample a severely sheared parameter chart.
+    A coarse candidate is usable only after every nondegenerate cell passes an
+    independent surface check. Split shared interior edges conformingly; never
+    move an existing node or change a native boundary segment. All work stays
+    private until both orientation and surface fidelity have been established.
+    """
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepGProp import BRepGProp_Face
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.Poly import Poly_Triangle
+    from OCP.TopAbs import TopAbs_Orientation
+    from OCP.gp import gp_Pnt, gp_Pnt2d, gp_Vec
+
+    original_count = len(points)
+    if (not isinstance(points, list) or not isinstance(normals, list)
+            or not poly.HasUVNodes() or poly.NbNodes() != original_count
+            or len(normals) != original_count or not math.isfinite(tolerance) or tolerance <= 0):
+        raise _PreviewMeshError("surface refinement requires complete native UV nodes and normals")
+    candidate_points = [list(point) for point in points]
+    candidate_normals = [list(normal) for normal in normals]
+    candidate_uv = [list(poly.UVNode(index).Coord()) for index in range(1, original_count + 1)]
+    xyz, exact, uv = np.asarray(candidate_points), np.asarray(candidate_normals), np.asarray(candidate_uv)
+    indices = np.array(triangles, dtype=np.int64, copy=True)
+    if original_count > MAX_VERTICES or len(indices) > MAX_TRIANGLES:
+        raise _PreviewMeshError("surface refinement exceeds the mesh size budget")
+    if (xyz.shape != (original_count, 3) or exact.shape != xyz.shape
+            or uv.shape != (original_count, 2) or indices.ndim != 2 or indices.shape[1] != 3
+            or not len(indices) or np.any(indices < 0) or np.any(indices >= original_count)
+            or not np.all(np.isfinite(xyz)) or not np.all(np.isfinite(exact))
+            or not np.all(np.isfinite(uv)) or np.any(np.abs((exact * exact).sum(axis=1) - 1) > 1e-6)):
+        raise _PreviewMeshError("surface refinement received invalid native mesh data")
+    native_boundary = {tuple(sorted((int(a), int(b)))) for a, b in boundary}
+    if any(a < 0 or b >= original_count for a, b in native_boundary):
+        raise _PreviewMeshError("surface refinement received invalid native boundary indices")
+    reverse = face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
+    sign = -1 if reverse else 1
+    threshold = -1e-8 / 3
+    surface = BRep_Tool.Surface_s(face.wrapped)
+    oriented_surface = BRepGProp_Face(face.wrapped)
+    surface_bounds = surface.Bounds()
+    quality_cache = {}
+    projection_count = 0
+    # Leave room for curvature between the finite lattice samples. The denser
+    # independent regression checks use the full requested display deflection.
+    fidelity_limit = tolerance * 0.9
+    weights = np.asarray([[first / 4, second / 4, (4 - first - second) / 4]
+                          for first in range(5) for second in range(5 - first)])
+    if face.geomType() == "PLANE":
+        # Both the plane and its UV map are affine. The corner error bounds
+        # every barycentric point without repeating identical native queries.
+        weights = np.eye(3)
+
+    # Existing nodes cannot be moved by refinement. Reject an inaccurate
+    # native corner before spending work around it, including collapsed XYZ
+    # cells whose UV coordinates still cover a real surface patch.
+    for index in np.unique(indices):
+        u, v = uv[index]
+        try:
+            expected = surface.Value(float(u), float(v)).Coord()
+        except Exception as error:
+            raise _PreviewMeshError("the exact surface could not be sampled during refinement") from error
+        if (not all(math.isfinite(value) for value in expected)
+                or math.dist(xyz[index], expected) > fidelity_limit):
+            raise _PreviewMeshError("a native refinement node exceeds the display surface deflection")
+
+    def raw_audit(cells):
+        corners = xyz[cells]
+        planes = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        lengths = np.linalg.norm(planes, axis=1)
+        dots = (planes * exact[cells].mean(axis=1)).sum(axis=1)
+        bad = (lengths > 1e-12) & (dots < lengths * threshold)
+        return bad, lengths
+
+    def signed(cells):
+        corners = uv[cells]
+        ab, ac = corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]
+        return sign * (ab[:, 0] * ac[:, 1] - ab[:, 1] * ac[:, 0])
+
+    def check_coverage():
+        directed = np.stack((indices, np.roll(indices, -1, axis=1)), axis=-1).reshape(-1, 2)
+        edges = np.sort(directed, axis=1)
+        unique, inverse, counts = np.unique(edges, axis=0, return_inverse=True, return_counts=True)
+        meaningful = np.linalg.norm(xyz[unique[:, 0]] - xyz[unique[:, 1]], axis=1) > 1e-12
+        balance = np.bincount(inverse, weights=np.where(directed[:, 0] < directed[:, 1], 1, -1),
+                              minlength=len(unique))
+        if np.any(meaningful & ((counts > 2) | ((counts == 2) & (balance != 0)))):
+            raise _PreviewMeshError("surface refinement contains overlapping or nonmanifold edges")
+        present = {tuple(pair) for pair in unique[meaningful]}
+        single = {tuple(pair) for pair in unique[meaningful & (counts == 1)]}
+        required = {pair for pair in native_boundary if math.dist(candidate_points[pair[0]],
+                                                                 candidate_points[pair[1]]) > 1e-12}
+        if single - required or required - present:
+            raise _PreviewMeshError("surface refinement does not preserve complete native trim coverage")
+
+    def matches_surface(cell, length):
+        nonlocal projection_count
+        if length <= 1e-12:
+            parameters = uv[cell]
+            scale = np.max(np.abs(parameters), axis=0)
+            parameters = parameters / np.where(scale > 0, scale, 1)
+            ab, ac = parameters[1] - parameters[0], parameters[2] - parameters[0]
+            epsilon = np.finfo(float).eps
+            uncertainty = epsilon * (np.abs(parameters[1:]) + np.abs(parameters[0])
+                                      + np.abs(np.asarray([ab, ac])))
+            area = ab[0] * ac[1] - ab[1] * ac[0]
+            roundoff = 8 * (uncertainty[0, 0] * abs(ac[1]) + uncertainty[0, 1] * abs(ac[0])
+                           + uncertainty[1, 0] * abs(ab[1]) + uncertainty[1, 1] * abs(ab[0])
+                           + epsilon * (abs(ab[0] * ac[1]) + abs(ab[1] * ac[0])))
+            if abs(area) <= roundoff:
+                return True  # A native stitch has no resolved UV surface area.
+        key = tuple(sorted(int(node) for node in cell))
+        if key in quality_cache:
+            return quality_cache[key]
+        if len(quality_cache) >= MAX_PREVIEW_REFINEMENT_CELLS:
+            raise _PreviewMeshError("surface refinement exceeds the bounded cell validation budget")
+        corners, parameters = xyz[cell], uv[cell]
+        samples, sample_uv = weights @ corners, weights @ parameters
+        low, high = parameters.min(axis=0), parameters.max(axis=0)
+        padding = np.maximum(1e-12, (high - low) * 1e-9)
+        low, high = low - padding, high + padding
+        for axis, (minimum, maximum) in enumerate(((surface_bounds[0], surface_bounds[1]),
+                                                   (surface_bounds[2], surface_bounds[3]))):
+            if math.isfinite(minimum):
+                low[axis] = max(low[axis], minimum)
+            if math.isfinite(maximum):
+                high[axis] = min(high[axis], maximum)
+        valid = True
+        try:
+            for point, (u, v) in zip(samples, sample_uv):
+                expected = surface.Value(float(u), float(v)).Coord()
+                if not all(math.isfinite(value) for value in expected):
+                    valid = False
+                    break
+                if math.dist(point, expected) <= fidelity_limit:
+                    continue
+                if projection_count >= MAX_PREVIEW_REFINEMENT_PROJECTIONS:
+                    raise _PreviewMeshError("surface refinement exceeds the bounded projection budget")
+                projection_count += 1
+                # Stay on this cell's surface patch rather than projecting to
+                # an unrelated nearby portion of a long, folded surface chart.
+                projection = GeomAPI_ProjectPointOnSurf(
+                    gp_Pnt(*point), surface, float(low[0]), float(high[0]),
+                    float(low[1]), float(high[1]), 1e-7)
+                if not projection.NbPoints() or not projection.LowerDistance() <= fidelity_limit:
+                    valid = False
+                    break
+        except _PreviewMeshError:
+            raise
+        except Exception as error:
+            raise _PreviewMeshError("the exact surface could not be sampled during refinement") from error
+        quality_cache[key] = valid
+        return valid
+
+    def midpoint(a, b):
+        center = (uv[a] + uv[b]) / 2
+        point, normal = gp_Pnt(), gp_Vec()
+        try:
+            oriented_surface.Normal(float(center[0]), float(center[1]), point, normal)
+            if not normal.SquareMagnitude() > 1e-24:
+                raise _PreviewMeshError("the exact surface normal is undefined during refinement")
+            coordinates = list(point.Coord())
+            direction = list(normal.Normalized().Coord())
+        except _PreviewMeshError:
+            raise
+        except Exception as error:
+            raise _PreviewMeshError("the exact surface could not be evaluated during refinement") from error
+        if (not all(math.isfinite(value) and abs(value) <= LIMIT * 10 for value in coordinates)
+                or not all(math.isfinite(value) for value in direction)
+                or abs(sum(value * value for value in direction) - 1) > 1e-6):
+            raise _PreviewMeshError("surface refinement produced an invalid point or normal")
+        error = float(np.linalg.norm(np.asarray(coordinates) - (xyz[a] + xyz[b]) / 2))
+        return error, center, coordinates, direction
+
+    check_coverage()
+    complete = False
+    for iteration in range(MAX_PREVIEW_REFINEMENT_PASSES + 1):
+        indices = _preview_metric_triangles(xyz, exact, uv, indices, native_boundary, sign)
+        bad, lengths = raw_audit(indices)
+        orientation = signed(indices)
+        if np.any((lengths > 1e-12) & (orientation <= 0)):
+            raise _PreviewMeshError("surface refinement contains reversed native UV winding")
+        quality_bad = np.asarray([not matches_surface(cell, length) for cell, length in zip(indices, lengths)])
+        targets = np.flatnonzero(bad | quality_bad)
+        if not len(targets):
+            complete = True
+            break
+        if not np.any(quality_bad) and np.count_nonzero(bad) <= MAX_PREVIEW_EXACT_ORIENTATION_CELLS:
+            # Reuse the ordinary centroid-normal/kernel-precision policy for
+            # microscopic native ambiguities; do not refine those forever.
+            # The extra UV nodes are still private and have not reached poly.
+            try:
+                checked = _preview_retriangulate_face(
+                    face, poly, candidate_points, candidate_normals, indices.tolist(),
+                    lambda: native_boundary, tolerance, uv_nodes=uv)
+            except _PreviewMeshError:
+                pass
+            else:
+                indices = np.asarray(checked, dtype=np.int64)
+                _, lengths = raw_audit(indices)
+                quality_bad = np.asarray([not matches_surface(cell, length) for cell, length in zip(indices, lengths)])
+                if not np.any(quality_bad):
+                    complete = True
+                    break
+                # The shared policy accepted orientation, but any newly
+                # changed diagonal must still meet this fallback's fidelity.
+                targets = np.flatnonzero(quality_bad)
+                orientation = signed(indices)
+        if iteration == MAX_PREVIEW_REFINEMENT_PASSES:
+            break
+        owners = {}
+        for index, cell in enumerate(indices.tolist()):
+            for a, b in zip(cell, cell[1:] + cell[:1]):
+                owners.setdefault(tuple(sorted((a, b))), []).append(index)
+        selected, midpoint_cache = {}, {}
+        for index in targets:
+            cell = indices[index].tolist()
+            candidates = []
+            for a, b in zip(cell, cell[1:] + cell[:1]):
+                key = tuple(sorted((a, b)))
+                adjacent = owners[key]
+                if key in native_boundary or len(adjacent) != 2:
+                    continue
+                # A native zero-UV stitch must not acquire new physical area.
+                # Refining an edge beside such an owner can duplicate its
+                # existing opposite UV node and create a nonmanifold junction.
+                if any(orientation[owner] <= 1e-16 for owner in adjacent):
+                    continue
+                if key not in midpoint_cache:
+                    midpoint_cache[key] = midpoint(a, b)
+                candidates.append((key, midpoint_cache[key]))
+            if candidates:
+                key, sample = max(candidates, key=lambda item: item[1][0])
+                selected[key] = sample
+        if not selected:
+            break
+        added = len(candidate_points) - original_count
+        if (added + len(selected) > MAX_PREVIEW_REFINEMENT_NODES
+                or len(candidate_points) + len(selected) > MAX_VERTICES
+                or len(indices) + 2 * len(selected) > MAX_TRIANGLES):
+            raise _PreviewMeshError("surface refinement exceeds the bounded mesh growth budget")
+        midpoints = {}
+        for key, (_, center, coordinates, direction) in selected.items():
+            midpoints[key] = len(candidate_points)
+            candidate_points.append(coordinates)
+            candidate_normals.append(direction)
+            candidate_uv.append(center.tolist())
+        refined = []
+        for cell in indices.tolist():
+            middle = [midpoints.get(tuple(sorted((cell[index], cell[(index + 1) % 3])))) for index in range(3)]
+            count = sum(node is not None for node in middle)
+            if count == 0:
+                refined.append(cell)
+            elif count == 1:
+                offset = next(index for index, node in enumerate(middle) if node is not None)
+                a, b, c = [cell[(offset + index) % 3] for index in range(3)]
+                m = middle[offset]
+                refined.extend(((a, m, c), (m, b, c)))
+            elif count == 2:
+                missing = next(index for index, node in enumerate(middle) if node is None)
+                offset = (missing + 1) % 3
+                a, b, c = [cell[(offset + index) % 3] for index in range(3)]
+                m, n = middle[offset], middle[(offset + 1) % 3]
+                refined.extend(((b, n, m), (a, m, c), (m, n, c)))
+            else:
+                a, b, c = cell
+                m, n, p = middle
+                refined.extend(((a, m, p), (m, b, n), (p, n, c), (m, n, p)))
+        xyz = np.asarray(candidate_points)
+        exact = np.asarray(candidate_normals)
+        uv = np.asarray(candidate_uv)
+        indices = np.asarray(refined, dtype=np.int64)
+    if not complete:
+        raise _PreviewMeshError("the surface could not be refined within its bounded fidelity budget")
+    check_coverage()
+
+    # Publish derived display data only after the whole candidate has passed.
+    # Existing nodes, UVs, and Python lighting normals retain their exact bits.
+    result = indices.tolist()
+    if len(candidate_points) != original_count or not np.array_equal(indices, np.asarray(triangles)):
+        inverse = location.Transformation().Inverted()
+        additions = [(gp_Pnt(*point).Transformed(inverse), gp_Pnt2d(*parameters))
+                     for point, parameters in zip(candidate_points[original_count:], candidate_uv[original_count:])]
+        native_triangles = [Poly_Triangle(a + 1, c + 1, b + 1) if reverse else Poly_Triangle(a + 1, b + 1, c + 1)
+                            for a, b, c in result]
+        poly.RemoveNormals()
+        if additions:
+            poly.ResizeNodes(len(candidate_points), True)
+            for index, (point, parameters) in enumerate(additions, original_count + 1):
+                poly.SetNode(index, point)
+                poly.SetUVNode(index, parameters)
+        poly.ResizeTriangles(len(result), True)
+        for index, triangle in enumerate(native_triangles, 1):
+            poly.SetTriangle(index, triangle)
+        points.extend(candidate_points[original_count:])
+        normals.extend(candidate_normals[original_count:])
+    return result
+
+
+def _preview_face_triangles(face, poly, location, points, normals, edges, tolerance, refine_surface=False):
     """Audit native coverage and complete small gaps at curved trim corners."""
     from collections import Counter, defaultdict
     from OCP.BRep import BRep_Tool
@@ -1227,7 +1682,10 @@ def _preview_face_triangles(face, poly, location, points, normals, edges, tolera
                     sequence = [nodes.Value(index) - 1 for index in range(nodes.Lower(), nodes.Upper() + 1)]
                     result.update(tuple(sorted(pair)) for pair in zip(sequence, sequence[1:]))
         return result
-    triangles = _preview_retriangulate_face(face, poly, points, normals, triangles, boundary)
+    if refine_surface:
+        triangles = _preview_refine_face(face, poly, location, points, normals, triangles, boundary(), tolerance)
+    else:
+        triangles = _preview_retriangulate_face(face, poly, points, normals, triangles, boundary, tolerance)
     if len(points) == 3 and len(triangles) == 1:
         return triangles  # Common faceted imports need no boundary graph.
 
@@ -1345,14 +1803,25 @@ def _preview_mesh(shape, solids, tolerance):
     from OCP.TopLoc import TopLoc_Location
     faces = [[(face, _shape_entities(face, "Edge")) for face in _shape_entities(solid, "Face")] for solid in solids]
     # Retain healthy native meshes; retry only a failed display candidate.
-    attempts = [(IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Watson, 0.15)] + [
-        (IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella, angle) for angle in (0.16, 0.14, 0.18, 0.20)]
-    for attempt, (algorithm, angle) in enumerate(attempts):
+    # Small connector blends can need finer boundary angles even when the
+    # assembly-wide linear deflection is already adequate.
+    attempts = [(IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Watson, angle, tolerance, False)
+                for angle in (0.15, 0.07)] + [
+        (IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella, angle, tolerance, False)
+        for angle in (0.16, 0.14, 0.18, 0.20)]
+    # Pole-adjacent trims can still fold an analytic sphere's native mesh at
+    # every ordinary angle. Refine its boundary and surface sampling together
+    # before giving up; do not flip those facets or alter the exact geometry.
+    attempts += [(IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella, 0.20, tolerance * factor, False)
+                 for factor in (0.25, 0.125)]
+    refinement_queued = False
+    for attempt, (algorithm, angle, linear_deflection, refine_surface) in enumerate(attempts):
         if attempt:
             BRepTools.Clean_s(shape.wrapped)
         parameters = IMeshTools_Parameters()
-        parameters.Deflection, parameters.Angle = tolerance, angle
+        parameters.Deflection, parameters.Angle = linear_deflection, angle
         parameters.Relative, parameters.InParallel = False, True
+        parameters.ControlSurfaceDeflection = not refine_surface
         # Watson can report success with folded facets and large missing areas
         # on trimmed analytic spheres. Try an independent native triangulator.
         parameters.MeshAlgo = algorithm
@@ -1376,7 +1845,8 @@ def _preview_mesh(shape, solids, tolerance):
                     transform = location.Transformation()
                     points = [list(poly.Node(index).Transformed(transform).Coord()) for index in range(1, poly.NbNodes() + 1)]
                     normals = _preview_face_normals(face, poly, location)
-                    triangles = _preview_face_triangles(face, poly, location, points, normals, edges, tolerance)
+                    triangles = _preview_face_triangles(face, poly, location, points, normals, edges,
+                                                        linear_deflection, refine_surface)
                     total_nodes += len(points)
                     total_triangles += len(triangles)
                     if total_nodes > MAX_VERTICES or total_triangles > MAX_TRIANGLES:
@@ -1387,9 +1857,17 @@ def _preview_mesh(shape, solids, tolerance):
         except _PreviewMeshError as error:
             failure = f"part {solid_index + 1}, face {local_index + 1}: {error}"
             failure_feature = feature_id("face", solid_index, local_index)
+            if error.refine_surface and not refinement_queued:
+                # A highly sheared chart can make native surface refinement
+                # manufacture hundreds of thousands of folded cells. Try one
+                # coarse seed instead, with LAD's independent, bounded exact-
+                # surface refinement and complete trim audit on every face.
+                attempts.insert(attempt + 1, (algorithm, angle, linear_deflection, True))
+                refinement_queued = True
     diagnostic = {"stage": "preview_meshing", "geometryScope": "native_candidate",
                   "openCascadeMeshingStatus": mesher.GetStatusFlags(),
-                  "linearDeflectionMM": tolerance, "angularDeflectionRadians": angle,
+                  "linearDeflectionMM": linear_deflection, "angularDeflectionRadians": angle,
+                  "independentSurfaceRefinement": refine_surface,
                   "meshingAlgorithm": "Watson" if algorithm == attempts[0][0] else "Delabella"}
     if failure_feature is not None:
         diagnostic["feature"] = failure_feature
@@ -1987,6 +2465,18 @@ def run(request, output, threads, defer_step=False, validated_hash=None):
     if size > 16 * 1024 * 1024:
         raise ModelError("CAD request exceeds the 16 MiB size limit.")
     spec = json.loads(request.read_text())
+    if isinstance(spec, dict) and str(spec.get("operation", "")).startswith("mesh_"):
+        from mesh_tools import execute, envelope, diagnostic, canonical
+        try:
+            return execute(spec, request.parent.resolve(), output, threads)
+        except Exception as error:
+            # Domain failures remain inspectable tool results. The native host
+            # never receives a candidate artifact from an unsuccessful call.
+            result = envelope({}, None, "error", [diagnostic(getattr(error, "code", "INVALID_REQUEST"), str(error))])
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "mesh-result.json").write_bytes(canonical(result))
+            (output / "mesh-record.json").write_bytes(canonical(result))
+            return result
     is_preview = isinstance(spec, dict) and spec.get("operation") == "preview"
     is_export = isinstance(spec, dict) and spec.get("operation") == "export"
     is_measurement = isinstance(spec, dict) and spec.get("operation") == "measure"
