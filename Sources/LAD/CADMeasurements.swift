@@ -147,7 +147,9 @@ enum CADMeasurements {
             }
             return true
         }
-        guard topology.vertices.count <= 1_000_000, topology.edges.count <= 250_000, topology.faces.count <= 80_000,
+        // A faceted input can have one native face per display triangle.
+        // Keep its metadata within the same budget as the preview mesh.
+        guard topology.vertices.count <= 1_000_000, topology.edges.count <= 250_000, topology.faces.count <= 1_000_000,
               identities(topology.vertices.map(\.id), kind: .vertex), identities(topology.edges.map(\.id), kind: .edge),
               identities(topology.faces.map(\.id), kind: .face),
               topology.vertices.allSatisfy({ point($0.position) }),

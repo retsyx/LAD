@@ -96,6 +96,50 @@ final class CADMeasurementTests: XCTestCase {
         XCTAssertNil(try ProjectStore.decode(compressed).revisions[0].preview)
     }
 
+    func testDenseFacetedInputRetainsEveryNativeFaceAndMeasurement() throws {
+        // A dense STL produces one separately addressable native face per
+        // triangle. Reuse display vertices while exercising the full mapping.
+        let count = 152_164
+        var mesh = preview()
+        let prototype = try XCTUnwrap(mesh.topology?.faces.first)
+        mesh.faces = count
+        mesh.triangles = Array(repeating: [0, 1, 2], count: count)
+        mesh.triangleFaces = Array(0..<count)
+        mesh.triangleSolids = Array(repeating: 0, count: count)
+        mesh.topology?.faces = (0..<count).map { index in
+            var face = prototype
+            face.id = id(.face, index)
+            return face
+        }
+        XCTAssertNoThrow(try ProjectStore.validatePreview(mesh))
+        XCTAssertNoThrow(try CADMeasurements.validateTopology(mesh))
+        let last = id(.face, count - 1)
+        let report = try CADMeasurements.report(mesh, features: [last], solids: [])
+        XCTAssertEqual(report.features, [last])
+        XCTAssertEqual(try values(report, last.id + ":area"), [prototype.area])
+
+        var invalid = mesh
+        invalid.topology?.faces[count - 1].id.localIndex = count
+        XCTAssertThrowsError(try CADMeasurements.validateTopology(invalid), "Native identities must remain contiguous.")
+        invalid = mesh
+        invalid.triangleFaces?[count - 1] = count
+        XCTAssertThrowsError(try CADMeasurements.validateTopology(invalid), "Every triangle must reference a native face.")
+        invalid = mesh
+        invalid.triangleSolids?[count - 1] = 1
+        XCTAssertThrowsError(try CADMeasurements.validateTopology(invalid), "Face mappings must retain their original part ownership.")
+    }
+
+    func testNativeFaceMetadataRemainsBoundedByPreviewTriangleBudget() throws {
+        var mesh = preview()
+        let prototype = try XCTUnwrap(mesh.topology?.faces.first)
+        mesh.topology?.faces = (0...1_000_000).map { index in
+            var face = prototype
+            face.id = id(.face, index)
+            return face
+        }
+        XCTAssertThrowsError(try CADMeasurements.validateTopology(mesh))
+    }
+
     func testMeshedCurvesCanExceedOldPerEdgeSamplingLimitWithinTotalBudget() throws {
         var mesh = preview()
         mesh.topology?.edges[0].polyline = (0...512).map { index in
