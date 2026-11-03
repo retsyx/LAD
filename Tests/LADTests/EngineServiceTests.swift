@@ -186,8 +186,53 @@ final class EngineServiceTests: XCTestCase {
             _ = try await EngineService().buildPreview(spec, python: EngineService.defaultPython, threads: 2)
             XCTFail("The candidate must fail before a preview can be accepted or saved.")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("exact curve-on-surface validation failed"), error.localizedDescription)
+            let diagnostic = error.localizedDescription
+            XCTAssertTrue(diagnostic.contains("OpenCascade geometry validation failed"), diagnostic)
+            XCTAssertTrue(diagnostic.contains("BRepCheck_UnorientableShape"), diagnostic)
+            XCTAssertTrue(diagnostic.contains("Geometry scope: native_candidate"), diagnostic)
+            XCTAssertTrue(diagnostic.contains("bounds (mm):"), diagnostic)
+            XCTAssertFalse(diagnostic.contains("Geometry scope: step_readback"), diagnostic)
         }
+    }
+
+    @MainActor
+    func testSTEPReadbackDiagnosticsPreserveTransferredGeometryAndValidAlternative() async throws {
+        try requireRuntime()
+        func slotProgram(radius: Int) -> String {
+            """
+            sphere = cq.Solid.makeSphere(50, angleDegrees1=-90, angleDegrees2=90).rotate((0,0,0),(1,0,0),-55)
+            cutter = (cq.Workplane('XZ').center(0,-19.75).sketch().rect(15,8.5)
+                      .vertices().fillet(\(radius)).finalize().extrude(200).val())
+            result = sphere.cut(cutter).clean()
+            assert result.isValid()
+            """
+        }
+        let engine = EngineService()
+        let rejected = ModelSpec(title: "Transferred rounded slot", summary: "Native geometry passes but STEP readback has invalid edges.",
+                                 units: "mm", script: slotProgram(radius: 3))
+        do {
+            _ = try await engine.buildPreview(rejected, python: EngineService.defaultPython, threads: 2)
+            XCTFail("An invalid STEP readback must fail before a preview is accepted.")
+        } catch {
+            let diagnostic = error.localizedDescription
+            for required in ["Design failed STEP verification before acceptance", "Geometry scope: step_readback",
+                             "BRepCheck_InvalidCurveOnSurface", "BRepCheck_InvalidSameParameterFlag", "bounds (mm):",
+                             "edge tolerance:", "max curve-on-surface discrepancy:", " at [",
+                             "STEP readback indices must not be used as selections in the original design."] {
+                XCTAssertTrue(diagnostic.contains(required), diagnostic)
+            }
+            XCTAssertFalse(diagnostic.contains("Geometry scope: native_candidate"), diagnostic)
+            let repair = EngineFailureDiagnostic.repairText(for: error)
+            XCTAssertTrue(repair.contains("Geometry scope: step_readback"), repair)
+            XCTAssertTrue(repair.contains("max curve-on-surface discrepancy:"), repair)
+        }
+        let accepted = ModelSpec(title: "Valid rounded slot", summary: "A one-millimeter corner radius survives STEP readback.",
+                                 units: "mm", script: slotProgram(radius: 1))
+        let preview = try await engine.buildPreview(accepted, python: EngineService.defaultPython, threads: 2)
+        XCTAssertEqual(preview.solids, 1)
+        XCTAssertGreaterThan(preview.volume, 0)
+        XCTAssertFalse(preview.triangles.isEmpty)
+        XCTAssertNotNil(preview.validatedHash)
     }
 
     @MainActor

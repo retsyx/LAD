@@ -141,6 +141,15 @@ and releases waiting MCP calls. No listening port or global MCP configuration
 is installed. Source files, audit snapshots and geometry input references remain
 separate from the bounded initial prompt.
 
+Failed worker calls publish a bounded `error.json` alongside stderr. Native
+validation reports OpenCascade's actual per-entity status codes, the validation
+stage, zero-based topology references and available bounds. Edge/face failures
+also report their edge tolerance and independently calculated curve-on-surface
+discrepancy and witness point when available. References are explicitly scoped
+to the candidate or STEP readback; STEP topology must not be treated as feature
+IDs in the live design. The app preserves these details in tool errors and the
+current request's repair context, with bounded stderr as a fallback.
+
 External tools are user-managed. The bundled CAD baseline needs no extra install.
 Before an optional download or installation, Codex calls `lad_request_permission`
 with a specific operation and reason. The tool returns a decision only; it never

@@ -910,12 +910,7 @@ final class AppState: ObservableObject {
                 Task { @MainActor in self?.drainGenerationFeedback(feedback, token: token) }
             }
             func briefDiagnostic(_ failure: Error) -> String {
-                let description = failure.localizedDescription
-                if let line = description.components(separatedBy: .newlines).last(where: { $0.contains("LAD CAD engine:") }),
-                   let marker = line.range(of: "LAD CAD engine:") {
-                    return String(line[marker.upperBound...].trimmingCharacters(in: .whitespaces).prefix(800))
-                }
-                return String(description.prefix(1_200))
+                EngineFailureDiagnostic.repairText(for: failure)
             }
             do {
                 activity = "Reading referenced source files…"

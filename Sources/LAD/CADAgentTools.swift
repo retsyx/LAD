@@ -414,7 +414,7 @@ final class CADAgentTools {
             let artifact = try await artifact(arguments)
             var info = summary(artifact)
             info["valid"] = true
-            info["checks"] = ["Exact OpenCascade curve-on-surface validity", "closed oriented final solids", "positive finite part volumes and surface area", "STEP roundtrip preserves closed solids and per-part geometry", "finite dimensions", "native topology ownership", "preview integrity"]
+            info["checks"] = ["Exact OpenCascade geometry and topology validity", "closed oriented final solids", "positive finite part volumes and surface area", "STEP roundtrip preserves closed solids and per-part geometry", "finite dimensions", "native topology ownership", "preview integrity"]
             return try result(info)
         case "lad_render":
             try allowed(arguments, ["artifactID", "view", "projection", "display", "width", "height", "solidIndices",
