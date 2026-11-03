@@ -21,7 +21,7 @@ import worker
 import test_geometry_tolerance as geometry_tolerance
 
 
-def trimmed_shell(radius=3, reduced=False):
+def trimmed_shell(radius=3, reduced=False, twisted_bore=False):
     """The pole-adjacent rear opening that exposed incomplete OCCT meshes."""
     worker.configure_threads(2)
     axis = cq.Vector(0, np.sin(np.radians(55)), np.cos(np.radians(55)))
@@ -37,7 +37,14 @@ def trimmed_shell(radius=3, reduced=False):
     if not reduced:
         ring = cq.Solid.makeCylinder(34, 2, cq.Vector(0, 0, -40)).cut(
             cq.Solid.makeCylinder(30, 4, cq.Vector(0, 0, -41)))
-        body = body.fuse(ring).cut(cq.Solid.makeCylinder(22.5, 12, axis.multiply(28), axis))
+        body = body.fuse(ring)
+    if twisted_bore:
+        body = body.fuse(cq.Solid.makeCylinder(35, 16, cq.Vector(0, 0, -40)))
+        body = body.fuse(cq.Solid.makeCylinder(43, 1.2, cq.Vector(0, 0, -25.2)))
+        profile = cq.Workplane('XY', origin=(0, 0, -40)).moveTo(-1.146108, 0).ellipse(30.069444, 29.742879)
+        body = body.cut(profile.twistExtrude(16, 1440, combine=False).val())
+    if not reduced:
+        body = body.cut(cq.Solid.makeCylinder(22.5, 12, axis.multiply(28), axis))
     slot = cq.Workplane('XY').box(15, 200, 8.5).edges('|Y').fillet(radius).val()
     body = body.cut(slot.translate((0, -100, -19.75))).clean()
     worker.validate_shape(body)
@@ -63,9 +70,12 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
                 native = np.asarray([poly.Node(i).Transformed(location.Transformation()).Coord()
                                      for i in range(1, count + 1)])
                 np.testing.assert_array_equal(points[offset:offset + count], native)
-                local = triangles[face_ids == face_index] - offset
+                owned = triangles[face_ids == face_index]
+                self.assertGreater(len(owned), 0)
+                local = owned - offset
                 self.assertGreater(len(local), 0)
                 self.assertTrue(np.all((local >= 0) & (local < count)))
+                displayed = points[offset:offset + count]
 
                 # Independently compare lighting and winding to exact surface
                 # derivatives, rather than accepting the supplied normals.
@@ -82,11 +92,13 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
                         expected = normals[offset + node - 1]
                     exact.append(expected)
                 exact = np.asarray(exact)
-                corners = native[local]
+                corners = displayed[local]
                 planes = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
                 length = np.linalg.norm(planes, axis=1)
                 direction = (planes * exact[local].sum(axis=1)).sum(axis=1)
                 self.assertTrue(np.all(direction[length > 1e-12] >= -length[length > 1e-12] * 1e-8))
+                self.assertLessEqual(abs(length.sum() / 2 - face.Area()), max(face.Area() * .01, 1e-7),
+                                     'Display coverage must retain each analytic face area within tessellation accuracy.')
 
                 # Coincident poles/seams have separate UV nodes. Compare their
                 # physical boundaries without rounding or moving coordinates.
@@ -98,7 +110,7 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
                         index = parent[index]
                     return index
 
-                for a, b in cKDTree(native).query_pairs(1e-12):
+                for a, b in cKDTree(displayed).query_pairs(1e-12):
                     parent[root(b)] = root(a)
 
                 def edge_key(a, b):
@@ -162,6 +174,16 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
             with self.subTest(radius=radius, reduced=reduced):
                 shape = trimmed_shell(radius, reduced)
                 self.assert_complete_native_coverage(shape, worker.make_preview(shape))
+
+    def test_twisted_weight_chamber_bore_has_complete_outward_surface_coverage(self):
+        shape = trimmed_shell(twisted_bore=True)
+        self.assertTrue(any(face.geomType() == 'BSPLINE' for face in worker._shape_entities(shape, 'Face')))
+        snapshot = geometry_tolerance.GeometryToleranceTests().snapshot
+        before = snapshot(shape)
+        preview = worker.make_preview(shape)
+        self.assertEqual(snapshot(shape), before)
+        self.assertEqual(preview['parts'], shape._lad_parts)
+        self.assert_complete_native_coverage(shape, preview)
 
     def test_inward_native_candidates_fail_with_a_scoped_face_diagnostic(self):
         shape = cq.Solid.makeBox(2, 3, 4)
