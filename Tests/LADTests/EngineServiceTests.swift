@@ -169,50 +169,86 @@ final class EngineServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testPreviewRejectsSampledValidOffsetGeometryDuringGeneration() async throws {
+    func testPreviewRejectsCurveDefectAboveNumericalTolerance() async throws {
         try requireRuntime()
         let program = """
-        points = [cq.Vector(x*0.06, y*0.06, 0)
-                  for x,y in [(404,330),(295,386),(201,418),(211,500)]]
-        curve = cq.Edge.makeBezier(points)
-        trace = cq.Wire.assembleEdges([curve, cq.Edge.makeLine(points[-1], points[0])])
-        offsets = trace.offset2D(0.75, 'arc') + trace.offset2D(-0.75, 'arc')
-        offsets.sort(key=lambda wire: cq.Face.makeFromWires(wire).Area(), reverse=True)
-        result = cq.Solid.extrudeLinear(offsets[0], offsets[1:], cq.Vector(0,0,2))
-        assert result.isValid()
+        from OCP.BRep import BRep_Builder, BRep_Tool
+        from OCP.gp import gp_Vec2d
+        result = cq.Solid.makeBox(2,3,4)
+        face = result.Faces()[0]
+        edge = face.Edges()[0]
+        curve = BRep_Tool.CurveOnSurface_s(edge.wrapped, face.wrapped, 0., 0.)
+        BRep_Builder().UpdateEdge(edge.wrapped, curve.Translated(gp_Vec2d(0.001,0)), face.wrapped, 1e-7)
         """
-        let spec = ModelSpec(title: "Invalid curved ridge", summary: "Regression for sampled native validation.", units: "mm", script: program)
+        let spec = ModelSpec(title: "Invalid edge curve", summary: "A 0.001 mm curve defect exceeds the 0.0001 mm numerical tolerance.",
+                             units: "mm", script: program)
         do {
             _ = try await EngineService().buildPreview(spec, python: EngineService.defaultPython, threads: 2)
             XCTFail("The candidate must fail before a preview can be accepted or saved.")
         } catch {
             let diagnostic = error.localizedDescription
             XCTAssertTrue(diagnostic.contains("OpenCascade geometry validation failed"), diagnostic)
-            XCTAssertTrue(diagnostic.contains("BRepCheck_UnorientableShape"), diagnostic)
+            XCTAssertTrue(diagnostic.contains("BRepCheck_InvalidCurveOnSurface"), diagnostic)
+            XCTAssertTrue(diagnostic.contains("BRepCheck_InvalidSameParameterFlag"), diagnostic)
             XCTAssertTrue(diagnostic.contains("Geometry scope: native_candidate"), diagnostic)
             XCTAssertTrue(diagnostic.contains("bounds (mm):"), diagnostic)
+            XCTAssertTrue(diagnostic.contains("edge tolerance:"), diagnostic)
+            XCTAssertTrue(diagnostic.contains("max curve-on-surface discrepancy:"), diagnostic)
             XCTAssertFalse(diagnostic.contains("Geometry scope: step_readback"), diagnostic)
         }
     }
 
     @MainActor
-    func testSTEPReadbackDiagnosticsPreserveTransferredGeometryAndValidAlternative() async throws {
+    func testRoundedSlotsSurvivePreviewExportSTEPReadbackAndPortableReplay() async throws {
         try requireRuntime()
-        func slotProgram(radius: Int) -> String {
-            """
-            sphere = cq.Solid.makeSphere(50, angleDegrees1=-90, angleDegrees2=90).rotate((0,0,0),(1,0,0),-55)
-            cutter = (cq.Workplane('XZ').center(0,-19.75).sketch().rect(15,8.5)
-                      .vertices().fillet(\(radius)).finalize().extrude(200).val())
-            result = sphere.cut(cutter).clean()
-            assert result.isValid()
-            """
-        }
         let engine = EngineService()
-        let rejected = ModelSpec(title: "Transferred rounded slot", summary: "Native geometry passes but STEP readback has invalid edges.",
-                                 units: "mm", script: slotProgram(radius: 3))
+        for radius in [1, 3] {
+            let spec = ModelSpec(title: "Rounded slot with \(radius) mm corners",
+                                 summary: "Exact rounded-slot construction accepted within the numerical tolerance.",
+                                 units: "mm", script: roundedSlotProgram(radius: radius))
+            let preview = try await engine.buildPreview(spec, python: EngineService.defaultPython, threads: 2)
+            XCTAssertEqual(preview.solids, 1)
+            XCTAssertGreaterThan(preview.volume, 0)
+            XCTAssertFalse(preview.triangles.isEmpty)
+            XCTAssertTrue(preview.topology?.faces.contains {
+                $0.type == "CYLINDER" && abs(($0.radius ?? -1) - Double(radius)) <= 1e-6
+            } == true, "The requested \(radius) mm analytic corner radius must remain in the accepted geometry.")
+            let receipt = try XCTUnwrap(preview.validatedHash)
+
+            let step = try await engine.exportSTEP(preview, python: EngineService.defaultPython, threads: 2)
+            XCTAssertTrue(step.starts(with: Data("ISO-10303-21;".utf8)))
+            let transferred = try await engine.previewSTEP(step, parts: preview.parts, python: EngineService.defaultPython, threads: 2)
+            XCTAssertEqual(transferred.solids, preview.solids)
+            XCTAssertEqual(transferred.volume, preview.volume, accuracy: max(1e-6, preview.volume * 1e-6))
+            for (actual, expected) in zip(transferred.bounds, preview.bounds) {
+                XCTAssertEqual(actual, expected, accuracy: 1e-4)
+            }
+
+            let revision = ProjectRevision(model: spec, validatedHash: receipt)
+            let project = LADProject(messages: [], revisions: [revision], selectedRevisionID: revision.id)
+            let saved = try XCTUnwrap(ProjectStore.decode(ProjectStore.encode(project)).revisions.first)
+            XCTAssertEqual(saved.model.script, spec.script)
+            XCTAssertNil(saved.preview)
+            XCTAssertNil(saved.stepData)
+            let replay = try await engine.buildPreview(saved.model, python: EngineService.defaultPython, threads: 2,
+                                                      validatedHash: saved.validatedHash)
+            XCTAssertEqual(replay.validatedHash, receipt)
+            XCTAssertEqual(replay.solids, preview.solids)
+            XCTAssertEqual(replay.volume, preview.volume, accuracy: 1e-7)
+            XCTAssertEqual(replay.bounds, preview.bounds)
+        }
+    }
+
+    @MainActor
+    func testSTEPReadbackRejectsDiscrepancyAboveNumericalTolerance() async throws {
+        try requireRuntime()
+        // Scaling is confined to this regression fixture. The actual-size
+        // radius-three construction above must pass without changing shape.
+        let spec = ModelSpec(title: "Oversized STEP discrepancy", summary: "A transferred curve defect above the numerical tolerance must remain rejected.",
+                             units: "mm", script: roundedSlotProgram(radius: 3, scale: 1_000))
         do {
-            _ = try await engine.buildPreview(rejected, python: EngineService.defaultPython, threads: 2)
-            XCTFail("An invalid STEP readback must fail before a preview is accepted.")
+            _ = try await EngineService().buildPreview(spec, python: EngineService.defaultPython, threads: 2)
+            XCTFail("STEP readback with a genuine above-tolerance curve discrepancy must not be accepted.")
         } catch {
             let diagnostic = error.localizedDescription
             for required in ["Design failed STEP verification before acceptance", "Geometry scope: step_readback",
@@ -226,13 +262,17 @@ final class EngineServiceTests: XCTestCase {
             XCTAssertTrue(repair.contains("Geometry scope: step_readback"), repair)
             XCTAssertTrue(repair.contains("max curve-on-surface discrepancy:"), repair)
         }
-        let accepted = ModelSpec(title: "Valid rounded slot", summary: "A one-millimeter corner radius survives STEP readback.",
-                                 units: "mm", script: slotProgram(radius: 1))
-        let preview = try await engine.buildPreview(accepted, python: EngineService.defaultPython, threads: 2)
-        XCTAssertEqual(preview.solids, 1)
-        XCTAssertGreaterThan(preview.volume, 0)
-        XCTAssertFalse(preview.triangles.isEmpty)
-        XCTAssertNotNil(preview.validatedHash)
+    }
+
+    private func roundedSlotProgram(radius: Int, scale: Int = 1) -> String {
+        let program = """
+        sphere = cq.Solid.makeSphere(50, angleDegrees1=-90, angleDegrees2=90).rotate((0,0,0),(1,0,0),-55)
+        cutter = (cq.Workplane('XZ').center(0,-19.75).sketch().rect(15,8.5)
+                  .vertices().fillet(\(radius)).finalize().extrude(200).val())
+        result = sphere.cut(cutter).clean()
+        assert result.isValid()
+        """
+        return scale == 1 ? program : program + "\nresult = result.scale(\(scale))\n"
     }
 
     @MainActor

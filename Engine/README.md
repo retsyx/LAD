@@ -150,6 +150,15 @@ to the candidate or STEP readback; STEP topology must not be treated as feature
 IDs in the live design. The app preserves these details in tool errors and the
 current request's repair context, with bounded stderr as a fallback.
 
+Native and STEP-readback validation apply a 0.0001 mm (10e-5 mm) minimum
+tolerance to edges and vertices. Face tolerances, coordinates, topology,
+locations and analytic surfaces remain unchanged; larger existing tolerances
+are preserved. STEP import requests this precision; export declares the greatest
+native tolerance, at least this floor. Translation settings are scoped to each
+operation and restored afterwards. Exact BRep, shell and part-integrity checks
+remain enabled. Linear STEP bounds/centroid comparisons use at least this
+tolerance; surface-area and volume checks retain their relative criteria.
+
 External tools are user-managed. The bundled CAD baseline needs no extra install.
 Before an optional download or installation, Codex calls `lad_request_permission`
 with a specific operation and reason. The tool returns a decision only; it never

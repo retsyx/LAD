@@ -25,6 +25,7 @@ MAX_EDGE_SEGMENTS = 250_000
 MAX_SCRIPT_BYTES = 200_000
 MAX_GEOMETRY_BYTES = 512_000_000
 MAX_VALIDATION_FAILURES = 24
+GEOMETRY_TOLERANCE_MM = 1e-4
 LIMIT = 100_000.0
 _validated_replay = ContextVar("validated_replay", default=False)
 _validation_scope = ContextVar("validation_scope", default="native_candidate")
@@ -50,6 +51,43 @@ def validation_scope(scope, input_asset=None):
     finally:
         _validation_input.reset(input_token)
         _validation_scope.reset(scope_token)
+
+
+def apply_geometry_tolerance(shape):
+    """Allow sub-micron boundary discrepancies without moving any geometry.
+
+    WIRE applies to edges and vertices. A zero upper limit means minimum-only:
+    never reduce a larger existing tolerance or change face surfaces, topology,
+    orientation or locations. Exact BRep validation still runs afterwards.
+    """
+    from OCP.ShapeFix import ShapeFix_ShapeTolerance
+    from OCP.TopAbs import TopAbs_WIRE
+    ShapeFix_ShapeTolerance().LimitTolerance(shape.wrapped, GEOMETRY_TOLERANCE_MM, 0.0, TopAbs_WIRE)
+    return shape
+
+
+@contextmanager
+def step_precision(direction):
+    """Scope OCCT precision to this operation without understating accuracy.
+
+    Read mode 1 uses our requested precision. Write mode 1 uses the greatest
+    native tolerance, which is at least our boundary floor and may be larger
+    for existing geometry. Both settings are restored before returning.
+    """
+    from OCP.Interface import Interface_Static
+    from OCP.STEPControl import STEPControl_Controller
+    STEPControl_Controller.Init_s()
+    mode, value = f"{direction}.precision.mode", f"{direction}.precision.val"
+    previous = Interface_Static.IVal_s(mode), Interface_Static.RVal_s(value)
+    try:
+        if (not Interface_Static.SetIVal_s(mode, 1)
+                or not Interface_Static.SetRVal_s(value, GEOMETRY_TOLERANCE_MM)):
+            raise ModelError(f"Could not configure STEP {direction} precision.",
+                             diagnostic={"stage": "step_precision"})
+        yield
+    finally:
+        Interface_Static.SetIVal_s(mode, previous[0])
+        Interface_Static.SetRVal_s(value, previous[1])
 
 
 def validate_spec(spec):
@@ -337,6 +375,7 @@ def validate_shape(shape, preview_stats=None):
         raise ModelError("operation produced no solid; check dimensions and overlapping inputs")
     if len(solids) > 4_096:
         raise ModelError("geometry exceeds the 4,096 solid limit; simplify the design")
+    apply_geometry_tolerance(shape)
     face_count = len(_shape_entities(shape, "Face"))
     if not _validated_replay.get():
         # CadQuery's isValid() uses finitely sampled curve/surface checks. Exact
@@ -414,7 +453,8 @@ def validate_step_roundtrip(shape, cq, step_path, preview_stats=None):
     # relative allowance for analytic surface conversion and integration.
     def tolerance(part):
         bounds = part["bounds"]
-        return 1e-6 + math.hypot(*(bounds[i + 3] - bounds[i] for i in range(3))) * 1e-7
+        return max(GEOMETRY_TOLERANCE_MM,
+                   1e-6 + math.hypot(*(bounds[i + 3] - bounds[i] for i in range(3))) * 1e-7)
 
     ordered = sorted(before, key=lambda part: part["bounds"][0])
     starts = [part["bounds"][0] for part in ordered]
@@ -1162,7 +1202,8 @@ def validate_parts(parts, solid_count):
 def import_step(path, cq, preview_stats=None):
     # A STEP can have multiple transfer roots. Workplane.val() silently keeps
     # only the first one; combine every imported root in its stored order.
-    values = cq.importers.importStep(str(path)).vals()
+    with step_precision("read"):
+        values = cq.importers.importStep(str(path)).vals()
     if not values or any(not isinstance(value, cq.Shape) for value in values):
         raise ModelError("The saved STEP contains no solid geometry.")
     shape = values[0] if len(values) == 1 else cq.Compound.makeCompound(values)
@@ -1427,13 +1468,15 @@ def write_step(solids, path, cq, colors=None, indices=None):
     from cadquery.occ_impl.exporters.assembly import exportAssembly
     assembly = cq.Assembly(name="Parts")
     for index in range(len(solids)) if indices is None else indices:
+        apply_geometry_tolerance(solids[index])
         rgb = (colors or {}).get(index)
         color = cq.Color(rgb["red"], rgb["green"], rgb["blue"], 1) if rgb is not None else None
         assembly.add(solids[index], name=f"Part {index + 1}", color=color)
     try:
-        if not exportAssembly(assembly, str(path), mode="default"):
-            raise ModelError("STEP export could not write the design parts; the CAD exporter reported failure.",
-                             diagnostic={"stage": "step_export"})
+        with step_precision("write"):
+            if not exportAssembly(assembly, str(path), mode="default", precision_mode=1):
+                raise ModelError("STEP export could not write the design parts; the CAD exporter reported failure.",
+                                 diagnostic={"stage": "step_export"})
     except ModelError:
         raise
     except Exception as error:
