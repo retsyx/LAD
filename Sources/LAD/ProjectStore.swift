@@ -36,7 +36,8 @@ enum ProjectStore {
         try ProjectPackage.rootData(from: url)
     }
 
-    static func write(_ project: LADProject, to url: URL, thumbnail: Data? = nil) throws {
+    @discardableResult
+    static func write(_ project: LADProject, to url: URL, thumbnail: Data? = nil) throws -> Data {
         try ProjectPackage.write(project, to: url, thumbnail: thumbnail)
     }
 

@@ -23,12 +23,21 @@ enum ProjectPackage {
         var sha256: String
     }
 
+    struct WriteMetrics {
+        var historySnapshots = 0
+        var rootEncodings = 0
+        var thumbnailValidations = 0
+        var phaseSeconds: [String: TimeInterval] = [:]
+    }
+
     private struct Session {
         var project: LADProject
-        var snapshot: ProjectArchive.Snapshot
+        var assets: [String: Data]
         var metadata: [String: Any]
         var root: [String: Any]
         var rootData: Data
+        var inlineData: Data
+        var sectionData: Data
         var files: Set<String>
         var verifiedAttachments: [String: Data]
     }
@@ -46,9 +55,14 @@ enum ProjectPackage {
 
     /// beforePublication is a fault-injection point: throwing must leave the
     /// previously committed root and all its dependencies readable.
+    @discardableResult
     static func write(_ project: LADProject, to url: URL, thumbnail: Data? = nil,
-                      beforePublication: (() throws -> Void)? = nil) throws {
+                      beforePublication: (() throws -> Void)? = nil,
+                      didFinish: ((WriteMetrics) -> Void)? = nil) throws -> Data {
         lock.lock(); defer { lock.unlock() }
+        var metrics = WriteMetrics()
+        var phaseStart = ProcessInfo.processInfo.systemUptime
+        defer { didFinish?(metrics) }
         let key = url.standardizedFileURL.resolvingSymlinksInPath().path
         let manager = FileManager.default
         let exists = manager.fileExists(atPath: url.path)
@@ -68,10 +82,16 @@ enum ProjectPackage {
                 throw invalid("The destination is not an empty design package.")
             }
         }
+        metrics.phaseSeconds["previous"] = ProcessInfo.processInfo.systemUptime - phaseStart
+        phaseStart = ProcessInfo.processInfo.systemUptime
 
         let portable = try normalized(project)
         var verified = previous?.verifiedAttachments ?? [:]
         let historyChanged = previous.map { !sameHistory(portable, $0.project) } ?? true
+        let reuseDependencies = previous.map {
+            !historyChanged && sameQueuedAttachments(portable.queuedRequests, $0.project.queuedRequests) &&
+                portable.draftAttachments == $0.project.draftAttachments
+        } ?? false
         guard portable.selectedRevisionID.map({ id in portable.revisions.contains { $0.id == id } }) ?? true else {
             throw invalid("The selected revision does not exist.")
         }
@@ -81,8 +101,21 @@ enum ProjectPackage {
             state.messages = []; state.revisions = []; state.taskAudits = nil; state.selectedRevisionID = nil
             try ProjectStore.validate(state, verifiedAttachmentPayloads: &verified)
         }
-        let snapshot = try makeSnapshot(portable, previous: previous)
-        let metadata = try object(snapshot.metadata)
+        metrics.phaseSeconds["validation"] = ProcessInfo.processInfo.systemUptime - phaseStart
+        phaseStart = ProcessInfo.processInfo.systemUptime
+        let metadata: [String: Any]
+        let assets: [String: Data]
+        if reuseDependencies, let previous {
+            metadata = try stateMetadata(portable, previous: previous)
+            assets = previous.assets
+        } else {
+            metrics.historySnapshots += 1
+            let snapshot = try makeSnapshot(portable, previous: previous)
+            metadata = try object(snapshot.metadata)
+            assets = snapshot.assets
+        }
+        metrics.phaseSeconds["snapshot"] = ProcessInfo.processInfo.systemUptime - phaseStart
+        phaseStart = ProcessInfo.processInfo.systemUptime
         var root = metadata
         root.removeValue(forKey: "messages")
         root.removeValue(forKey: "revisions")
@@ -128,10 +161,6 @@ enum ProjectPackage {
             return result
         }
 
-        let reuseDependencies = previous.map {
-            !historyChanged && portable.queuedRequests == $0.project.queuedRequests &&
-                portable.draftAttachments == $0.project.draftAttachments
-        } ?? false
         if reuseDependencies, let previous {
             for field in ["revisions", "conversation", "activity", "assets"] { root[field] = previous.root[field] }
             files = previous.files
@@ -167,7 +196,7 @@ enum ProjectPackage {
 
         var assetEntries = [String: Any]()
         let previousAssets = previous?.root["assets"] as? [String: Any] ?? [:]
-        for (hash, bytes) in snapshot.assets {
+        for (hash, bytes) in assets {
             let path = assetPath(hash)
             if let old = previousAssets[hash] as? [String: Any],
                old["byteCount"] as? Int == bytes.count, old["path"] as? String == path {
@@ -183,35 +212,63 @@ enum ProjectPackage {
         }
         root["assets"] = assetEntries
         }
+        metrics.phaseSeconds["dependencies"] = ProcessInfo.processInfo.systemUptime - phaseStart
+        phaseStart = ProcessInfo.processInfo.systemUptime
         let thumbnailKey = try thumbnailIdentity(metadata)
         if let old = previous?.root["thumbnail"] as? [String: Any], let path = old["path"] as? String,
-           !(root["assets"] as? [String: Any] ?? [:]).values.contains(where: { ($0 as? [String: Any])?["path"] as? String == path }) {
+           let hash = old["sha256"] as? String, (root["assets"] as? [String: Any])?[hash] == nil {
             files.remove(path)
         }
-        if let thumbnail, validThumbnail(thumbnail) {
-            let hash = digest(thumbnail), path = assetPath(hash)
-            // Presentation images are optional: unavailable thumbnail storage
-            // must not prevent publishing the authoritative design.
-            if (try? writeImmutable(thumbnail, path: path, in: url, verified: previous?.files ?? [], directories: &directories)) != nil {
-                files.insert(path)
-                root["thumbnail"] = ["path": path, "sha256": hash, "byteCount": thumbnail.count]
-                root["thumbnailIdentity"] = thumbnailKey
+        var savedThumbnail: Data?
+        func keepThumbnail(_ bytes: Data, reference: [String: Any]) {
+            guard let path = reference["path"] as? String else { return }
+            if (try? requireRegularFile(path, in: url)) == nil {
+                // Presentation images are optional: unavailable thumbnail
+                // storage must not prevent saving the authoritative design.
+                guard (try? writeImmutable(bytes, path: path, in: url, verified: previous?.files ?? [], directories: &directories)) != nil else { return }
             }
-        } else if previous?.root["thumbnailIdentity"] as? String == thumbnailKey,
-                  let prior = previous?.root["thumbnail"] as? [String: Any], let path = prior["path"] as? String,
-                  let hash = prior["sha256"] as? String,
-                  let bytes = try? readFile(path, in: url, limit: 8_000_000), validThumbnail(bytes), digest(bytes) == hash {
-            root["thumbnail"] = prior; root["thumbnailIdentity"] = thumbnailKey; files.insert(path)
+            files.insert(path)
+            root["thumbnail"] = reference; root["thumbnailIdentity"] = thumbnailKey
+            savedThumbnail = bytes
         }
+        if let thumbnail {
+            if thumbnail == previous?.project.thumbnailData,
+               let prior = previous?.root["thumbnail"] as? [String: Any] {
+                keepThumbnail(thumbnail, reference: prior)
+            } else {
+                metrics.thumbnailValidations += 1
+                if validThumbnail(thumbnail) {
+                    let hash = digest(thumbnail), path = assetPath(hash)
+                    if (try? writeImmutable(thumbnail, path: path, in: url, verified: previous?.files ?? [], directories: &directories)) != nil {
+                        keepThumbnail(thumbnail, reference: ["path": path, "sha256": hash, "byteCount": thumbnail.count])
+                    }
+                }
+            }
+        }
+        if savedThumbnail == nil, previous?.root["thumbnailIdentity"] as? String == thumbnailKey,
+           let prior = previous?.root["thumbnail"] as? [String: Any], let bytes = previous?.project.thumbnailData {
+            keepThumbnail(bytes, reference: prior)
+        }
+        metrics.phaseSeconds["thumbnail"] = ProcessInfo.processInfo.systemUptime - phaseStart
+        phaseStart = ProcessInfo.processInfo.systemUptime
         // Do not create a new commit for a byte-identical authoritative state.
-        var comparable = root, oldComparable = previous?.root ?? [:]
-        comparable.removeValue(forKey: "commitID"); comparable.removeValue(forKey: "parentCommitID")
-        oldComparable.removeValue(forKey: "commitID"); oldComparable.removeValue(forKey: "parentCommitID")
-        if previous != nil, try json(comparable) == json(oldComparable) { return }
+        // The immutable asset catalog need not be encoded to compare a state edit.
+        let inlineData = try json(inlineMetadata(root))
+        let sectionData: Data
+        if reuseDependencies, let previous { sectionData = previous.sectionData }
+        else { sectionData = try json(sectionReferences(root)) }
+        if let previous, inlineData == previous.inlineData, sectionData == previous.sectionData,
+           reuseDependencies || assets == previous.assets {
+            metrics.phaseSeconds["manifest"] = ProcessInfo.processInfo.systemUptime - phaseStart
+            return previous.rootData
+        }
         root["commitID"] = UUID().uuidString
         root["parentCommitID"] = previous?.root["commitID"]
+        metrics.rootEncodings += 1
         let data = try json(root)
         guard data.count <= maximumRootBytes else { throw invalid("The design manifest exceeds its size limit.") }
+        metrics.phaseSeconds["manifest"] = ProcessInfo.processInfo.systemUptime - phaseStart
+        phaseStart = ProcessInfo.processInfo.systemUptime
         for directory in directories.sorted(by: { $0.count > $1.count }) { try synchronizeDirectory(url.appendingPathComponent(directory)) }
         try beforePublication?()
         try writeAtomic(data, path: "project.json", in: url, directories: &directories)
@@ -219,8 +276,10 @@ enum ProjectPackage {
 
         var committed = portable
         committed.fileOrigin = ProjectFileOrigin(url: url, data: data)
-        let session = Session(project: committed, snapshot: snapshot, metadata: metadata, root: root,
-                              rootData: data, files: files, verifiedAttachments: verified)
+        committed.thumbnailData = savedThumbnail
+        let session = Session(project: committed, assets: assets, metadata: metadata, root: root,
+                              rootData: data, inlineData: inlineData, sectionData: sectionData,
+                              files: files, verifiedAttachments: verified)
         remember(session, key: key)
         // Cleanup follows publication and cannot invalidate an unsuccessful save.
         // The inactive index slot is retained for the next alternating write.
@@ -229,6 +288,8 @@ enum ProjectPackage {
                 if let target = try? safeURL(path, in: url) { try? manager.removeItem(at: target) }
             }
         }
+        metrics.phaseSeconds["publication"] = ProcessInfo.processInfo.systemUptime - phaseStart
+        return data
     }
 
     /// Tests and one-time development conversion can discard process caches.
@@ -341,10 +402,66 @@ enum ProjectPackage {
             project.thumbnailData = bytes
             files.insert(assetPath(hash))
         }
-        let session = Session(project: project, snapshot: snapshot, metadata: metadata, root: root,
-                              rootData: data, files: files, verifiedAttachments: verified)
+        let session = Session(project: project, assets: assets, metadata: metadata, root: root,
+                              rootData: data, inlineData: try json(inlineMetadata(root)),
+                              sectionData: try json(sectionReferences(root)),
+                              files: files, verifiedAttachments: verified)
         remember(session, key: url.standardizedFileURL.resolvingSymlinksInPath().path)
         return session
+    }
+
+    /// Serialize only inline state. History and exact payload references are
+    /// already validated in the cached session and remain shared with it.
+    private static func stateMetadata(_ project: LADProject, previous: Session) throws -> [String: Any] {
+        var state = project
+        state.messages = []; state.revisions = []; state.taskAudits = nil; state.selectedRevisionID = nil
+        state.draftAttachments = nil
+        for index in state.queuedRequests?.indices ?? 0..<0 where state.queuedRequests![index].attachments != nil {
+            state.queuedRequests![index].attachments = nil
+        }
+        var metadata = try object(ProjectArchive.split(state).metadata)
+        metadata["messages"] = previous.metadata["messages"]
+        metadata["revisions"] = previous.metadata["revisions"]
+        metadata["taskAudits"] = previous.metadata["taskAudits"]
+        metadata["draftAttachments"] = previous.metadata["draftAttachments"]
+        metadata["selectedRevisionID"] = project.selectedRevisionID?.uuidString
+        if var queue = metadata["queuedRequests"] as? [[String: Any]] {
+            let old = Dictionary((previous.metadata["queuedRequests"] as? [[String: Any]] ?? []).compactMap { row in
+                (row["id"] as? String).map { ($0, row) }
+            }, uniquingKeysWith: { _, new in new })
+            for index in queue.indices {
+                guard let attachments = project.queuedRequests?[index].attachments else { continue }
+                if attachments.isEmpty { queue[index]["attachments"] = [[String: Any]]() }
+                else if let id = queue[index]["id"] as? String, let archived = old[id]?["attachments"] {
+                    queue[index]["attachments"] = archived
+                } else { throw invalid("A queued request asset reference is missing.") }
+            }
+            metadata["queuedRequests"] = queue
+        }
+        return metadata
+    }
+
+    private static func sameQueuedAttachments(_ lhs: [ProjectQueuedRequest]?, _ rhs: [ProjectQueuedRequest]?) -> Bool {
+        if lhs == rhs { return true }
+        let old = Dictionary(uniqueKeysWithValues: (rhs ?? []).compactMap { request in
+            request.attachments?.isEmpty == false ? (request.id, request.attachments!) : nil
+        })
+        let current = (lhs ?? []).filter { $0.attachments?.isEmpty == false }
+        return old.count == current.count && current.allSatisfy { old[$0.id] == $0.attachments }
+    }
+
+    private static func inlineMetadata(_ root: [String: Any]) -> [String: Any] {
+        var inline = root
+        for field in ["assets", "revisions", "conversation", "activity", "commitID", "parentCommitID"] {
+            inline.removeValue(forKey: field)
+        }
+        return inline
+    }
+
+    private static func sectionReferences(_ root: [String: Any]) -> [String: Any] {
+        var references = [String: Any]()
+        for field in ["revisions", "conversation", "activity"] { references[field] = root[field] }
+        return references
     }
 
     private static func makeSnapshot(_ project: LADProject, previous: Session?) throws -> ProjectArchive.Snapshot {
@@ -393,7 +510,7 @@ enum ProjectPackage {
         if sameQueue { metadata["queuedRequests"] = previous.metadata["queuedRequests"] }
         if sameDraftAttachments { metadata["draftAttachments"] = previous.metadata["draftAttachments"] }
         metadata["selectedRevisionID"] = project.selectedRevisionID?.uuidString
-        let candidates = previous.snapshot.assets.merging(delta.assets) { _, new in new }
+        let candidates = previous.assets.merging(delta.assets) { _, new in new }
         let required = assetReferences(metadata)
         let assets = candidates.filter { required.contains($0.key) }
         guard assets.count == required.count else { throw invalid("A saved asset reference is missing.") }
@@ -409,11 +526,13 @@ enum ProjectPackage {
                     PartNode(id: "solid/\($0)", name: "Part \($0 + 1)", solidIndices: [$0])
                 }
             }
-            result.revisions[index].preview = nil
-            result.revisions[index].stepData = nil
+            if result.revisions[index].preview != nil { result.revisions[index].preview = nil }
+            if result.revisions[index].stepData != nil { result.revisions[index].stepData = nil }
         }
         for task in result.taskAudits?.indices ?? 0..<0 {
-            for event in result.taskAudits![task].events.indices { result.taskAudits![task].events[event].imageData = nil }
+            for event in result.taskAudits![task].events.indices where result.taskAudits![task].events[event].imageData != nil {
+                result.taskAudits![task].events[event].imageData = nil
+            }
         }
         return result
     }

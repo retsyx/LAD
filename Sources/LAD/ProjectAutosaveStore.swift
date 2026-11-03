@@ -195,14 +195,14 @@ actor ProjectAutosaveStore {
                 let staging = writable.deletingLastPathComponent()
                     .appendingPathComponent(".LAD-copy-\(UUID().uuidString).lad", isDirectory: true)
                 defer { try? FileManager.default.removeItem(at: staging) }
-                try ProjectStore.write(project, to: staging, thumbnail: project.thumbnailData)
+                let manifest = try ProjectStore.write(project, to: staging, thumbnail: project.thumbnailData)
                 if FileManager.default.fileExists(atPath: writable.path) {
                     _ = try FileManager.default.replaceItemAt(writable, withItemAt: staging,
                                                               options: .usingNewMetadataOnly)
                 } else {
                     try FileManager.default.moveItem(at: staging, to: writable)
                 }
-                return try Self.receipt(at: writable)
+                return try Self.receipt(at: writable, manifest: manifest)
             }
         }
         guard let outcome else { throw coordinationError ?? NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError) }
@@ -264,7 +264,7 @@ actor ProjectAutosaveStore {
                 }
                 if let old, manager.fileExists(atPath: old.path) {
                     guard try self.canUpdate(old, project: project, projectID: projectID, previous: previous, resolving: conflict) else { return nil }
-                    try ProjectStore.write(project, to: old, thumbnail: project.thumbnailData)
+                    let manifest = try ProjectStore.write(project, to: old, thumbnail: project.thumbnailData)
                     if moving {
                         coordinator.item(at: old, willMoveTo: target)
                         // RENAME_EXCL changes filename case on APFS and makes
@@ -273,12 +273,12 @@ actor ProjectAutosaveStore {
                             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: target.path])
                         }
                         coordinator.item(at: old, didMoveTo: target)
-                        return try Self.receipt(at: target)
+                        return try Self.receipt(at: target, manifest: manifest)
                     }
-                    return try Self.receipt(at: old)
+                    return try Self.receipt(at: old, manifest: manifest)
                 }
-                try ProjectStore.write(project, to: target, thumbnail: project.thumbnailData)
-                return try Self.receipt(at: target)
+                let manifest = try ProjectStore.write(project, to: target, thumbnail: project.thumbnailData)
+                return try Self.receipt(at: target, manifest: manifest)
             }
         }
         if moving, let source {
@@ -367,9 +367,10 @@ actor ProjectAutosaveStore {
         throw coordinationError ?? NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError)
     }
 
-    private nonisolated static func receipt(at url: URL) throws -> WriteReceipt {
-        let data = try ProjectStore.readArchive(from: url)
-        return WriteReceipt(url: ProjectFileOrigin.documentURL(url), fingerprint: try fingerprint(url), origin: ProjectFileOrigin(url: url, data: data))
+    private nonisolated static func receipt(at url: URL, manifest: Data) throws -> WriteReceipt {
+        // The coordinated writer already owns the exact published bytes. Reuse
+        // them for the conflict baseline instead of reopening the same manifest.
+        WriteReceipt(url: ProjectFileOrigin.documentURL(url), fingerprint: try fingerprint(url), origin: ProjectFileOrigin(url: url, data: manifest))
     }
 
     private nonisolated static func fingerprint(_ url: URL) throws -> Fingerprint {

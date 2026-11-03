@@ -35,6 +35,13 @@ final class ProjectPackageTests: XCTestCase {
         return result
     }
 
+    private func thumbnailPNG() throws -> Data {
+        let image = NSImage(size: NSSize(width: 16, height: 16))
+        image.lockFocus(); NSColor.red.setFill(); NSRect(x: 0, y: 0, width: 16, height: 16).fill(); image.unlockFocus()
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+        return try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+    }
+
     func testPackageRoundtripStoresOnlyRecipesAndExactSharedInputs() throws {
         let url = try temporaryPackage()
         var value = project()
@@ -82,6 +89,82 @@ final class ProjectPackageTests: XCTestCase {
         let unchanged = try ProjectStore.readArchive(from: url)
         try ProjectStore.write(value, to: url)
         XCTAssertEqual(unchanged, try ProjectStore.readArchive(from: url), "A no-op save does not create another commit")
+    }
+
+    func testStateEditsSkipHistorySerializationAndRemainCurrentForTheNextHistoryEdit() throws {
+        let url = try temporaryPackage()
+        var value = project()
+        let bytes = Data("# Exact shared source\n".utf8)
+        let hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let attachment = SourceAttachment(name: "source.py", path: "/missing/source.py", content: String(decoding: bytes, as: UTF8.self), sha256: hash)
+        value.messages[0].attachments = [attachment]
+        value.draftAttachments = [attachment]
+        value.queuedRequests = [ProjectQueuedRequest(content: "Refine the bracket", attachments: [attachment])]
+        value.taskAudits = [ProjectTaskAudit(userMessageID: value.messages[0].id, model: "test", reasoningEffort: "high", events: [
+            ProjectActivityEvent(id: "event-1", category: "tool", title: "Inspect", status: "completed", output: "Original output")
+        ])]
+        try ProjectStore.write(value, to: url)
+        let files = try snapshot(url)
+        let dependencyAttributes = try Dictionary(uniqueKeysWithValues: files.keys.filter { $0 != "project.json" }.map { path in
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.appendingPathComponent(path).path)
+            return (path, (inode: attributes[.systemFileNumber] as? NSNumber, modified: attributes[.modificationDate] as? Date))
+        })
+
+        value.showGrid = false
+        value.partsPaneFraction = 0.61
+        value.projectName = "Shared source bracket"
+        value.codexSettings = CodexProjectSettings(model: "test-model", reasoningEffort: "high", reasoningByModel: ["test-model": "high"])
+        value.displayMode = .shaded
+        value.projectionMode = .isometric
+        value.draftPrompt = "Continue after the queued refinements"
+        value.queuePaused = true
+        value.queuedRequests![0].content = "Refine the same bracket again"
+        value.queuedRequests!.append(ProjectQueuedRequest(content: "An attachment-free follow-up", attachments: []))
+        value.queuedRequests!.reverse()
+        var metrics = ProjectPackage.WriteMetrics()
+        let committed = try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.historySnapshots, 0)
+        XCTAssertEqual(metrics.rootEncodings, 1)
+        XCTAssertEqual(committed, try ProjectStore.readArchive(from: url))
+        let after = try snapshot(url)
+        XCTAssertEqual(Set(files.keys), Set(after.keys))
+        for path in dependencyAttributes.keys {
+            XCTAssertEqual(files[path], after[path], path)
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.appendingPathComponent(path).path)
+            XCTAssertEqual(dependencyAttributes[path]?.inode, attributes[.systemFileNumber] as? NSNumber, path)
+            XCTAssertEqual(dependencyAttributes[path]?.modified, attributes[.modificationDate] as? Date, path)
+        }
+
+        let noOp = try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+        XCTAssertEqual(noOp, committed)
+        XCTAssertEqual(metrics.historySnapshots, 0)
+        XCTAssertEqual(metrics.rootEncodings, 0)
+
+        value.messages.append(ChatMessage(role: "assistant", content: "Refined"))
+        value.revisions[0].name = "Refined bracket"
+        value.taskAudits![0].events[0].output = "Updated output"
+        try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.historySnapshots, 1)
+        XCTAssertEqual(metrics.rootEncodings, 1)
+        ProjectPackage.clearSessionCache()
+        let restored = try ProjectStore.read(from: url)
+        let expected = try ProjectArchive.split(value), actual = try ProjectArchive.split(restored)
+        XCTAssertEqual(actual.metadata, expected.metadata)
+        XCTAssertEqual(actual.assets, expected.assets)
+    }
+
+    func testStateOnlySaveStillValidatesInlineFields() throws {
+        let url = try temporaryPackage()
+        var value = project()
+        try ProjectStore.write(value, to: url)
+        let committed = try ProjectStore.readArchive(from: url)
+        value.partsPaneFraction = .nan
+        XCTAssertThrowsError(try ProjectStore.write(value, to: url))
+        XCTAssertEqual(committed, try ProjectStore.readArchive(from: url))
+        value.partsPaneFraction = 0.75
+        value.queuedRequests = [ProjectQueuedRequest(content: "")]
+        XCTAssertThrowsError(try ProjectStore.write(value, to: url))
+        XCTAssertEqual(committed, try ProjectStore.readArchive(from: url))
     }
 
     func testIndexesAlternateAndSupersededRecordsAreRemovedAfterPublication() throws {
@@ -182,10 +265,7 @@ final class ProjectPackageTests: XCTestCase {
     func testThumbnailsAreOptionalAndCopiesCanRetainValidImage() throws {
         let url = try temporaryPackage()
         let value = project()
-        let image = NSImage(size: NSSize(width: 16, height: 16))
-        image.lockFocus(); NSColor.red.setFill(); NSRect(x: 0, y: 0, width: 16, height: 16).fill(); image.unlockFocus()
-        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
-        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        let png = try thumbnailPNG()
         try ProjectStore.write(value, to: url, thumbnail: png)
         ProjectPackage.clearSessionCache()
         XCTAssertEqual(try ProjectStore.read(from: url).thumbnailData, png)
@@ -197,6 +277,46 @@ final class ProjectPackageTests: XCTestCase {
         var changed = value; changed.showGrid = false
         XCTAssertNoThrow(try ProjectStore.write(changed, to: url, thumbnail: Data("invalid".utf8)))
         XCTAssertNil(try root(url)["thumbnail"])
+    }
+
+    func testStateSavesReuseValidatedThumbnailAndDropItWhenPresentationChanges() throws {
+        let url = try temporaryPackage()
+        var value = project()
+        var alternate = value.revisions[0]
+        alternate.id = UUID()
+        value.revisions.append(alternate)
+        let png = try thumbnailPNG()
+        var metrics = ProjectPackage.WriteMetrics()
+        try ProjectPackage.write(value, to: url, thumbnail: png, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.thumbnailValidations, 1)
+        let original = try root(url)
+        value.showGrid = false
+        try ProjectPackage.write(value, to: url, thumbnail: png, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.historySnapshots, 0)
+        XCTAssertEqual(metrics.thumbnailValidations, 0)
+        XCTAssertEqual(try reference(root(url), "thumbnail")["sha256"] as? String, try reference(original, "thumbnail")["sha256"] as? String)
+        value.draftPrompt = "A saved draft"
+        try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.thumbnailValidations, 0)
+        ProjectPackage.clearSessionCache()
+        value = try ProjectStore.read(from: url)
+        XCTAssertEqual(value.thumbnailData, png)
+
+        value.projectionMode = .isometric
+        try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.historySnapshots, 0)
+        XCTAssertNil(try root(url)["thumbnail"])
+        try ProjectPackage.write(value, to: url, thumbnail: png)
+        value.selectedRevisionID = alternate.id
+        try ProjectPackage.write(value, to: url, didFinish: { metrics = $0 })
+        XCTAssertEqual(metrics.historySnapshots, 0)
+        XCTAssertNil(try root(url)["thumbnail"])
+        try ProjectPackage.write(value, to: url, thumbnail: png)
+        value.revisions[1].partColors = ["body": PartColor(red: 1, green: 0, blue: 0)]
+        try ProjectPackage.write(value, to: url)
+        XCTAssertNil(try root(url)["thumbnail"])
+        ProjectPackage.clearSessionCache()
+        XCTAssertNil(try ProjectStore.read(from: url).thumbnailData)
     }
 
     func testSignedZeroSelectionAnchorsSurviveWarmAndColdJSONRecordsExactly() throws {
