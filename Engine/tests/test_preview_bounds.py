@@ -30,9 +30,9 @@ class PreviewBoundsTests(unittest.TestCase):
         original = BRepMesh.BRepMesh_IncrementalMesh
         calls = []
 
-        def capture(native, deflection, relative, angular, parallel):
-            calls.append((deflection, relative, angular, parallel))
-            return original(native, deflection, relative, angular, parallel)
+        def capture(native, parameters):
+            calls.append((parameters.Deflection, parameters.Relative, parameters.Angle, parameters.InParallel))
+            return original(native, parameters)
 
         with patch.object(BRepMesh, "BRepMesh_IncrementalMesh", side_effect=capture):
             preview = worker.make_preview(shape)

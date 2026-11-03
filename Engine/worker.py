@@ -1034,11 +1034,274 @@ def _preview_face_normals(face, poly, location):
     return normals
 
 
-def make_preview(shape, preview_stats=None):
-    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+class _PreviewMeshError(ValueError):
+    pass
+
+
+def _preview_patch_triangles(loop, points, normals, face, tolerance):
+    """Close a small trim gap in physical space using its existing nodes.
+
+    Straight chords of a curved boundary can cross in a distorted surface UV
+    chart, even though their 3D polygon is simple. Never triangulate that gap
+    in UV space, move its boundary, or flip an inward facet to hide it.
+    """
+    import numpy as np
+    xyz = np.asarray([points[index] for index in loop], dtype=float)
+    exact = np.asarray([normals[index] for index in loop], dtype=float)
+    normal = exact.sum(axis=0)
+    length = np.linalg.norm(normal)
+    if not math.isfinite(length) or length <= 1e-12:
+        raise _PreviewMeshError("a missing surface patch has ambiguous surface normals")
+    normal /= length
+    if not np.all(exact @ normal > 0.95):
+        raise _PreviewMeshError("a missing surface patch is too curved for local triangulation")
+    direction = xyz[1] - xyz[0]
+    direction -= normal * np.dot(direction, normal)
+    length = np.linalg.norm(direction)
+    if not length > 1e-12:
+        raise _PreviewMeshError("a missing surface patch has a degenerate boundary")
+    direction /= length
+    xy = np.stack([(xyz - xyz[0]) @ direction, (xyz - xyz[0]) @ np.cross(normal, direction)], axis=1)
+
+    def cross(a, b, c):
+        ab, ac = xy[b] - xy[a], xy[c] - xy[a]
+        return float(ab[0] * ac[1] - ab[1] * ac[0])
+
+    # The loop follows missing native boundary segments and closes opposite an
+    # existing mesh edge. It must bound an outward patch, not overlapping ink.
+    area = sum(xy[index, 0] * xy[(index + 1) % len(loop), 1] -
+               xy[index, 1] * xy[(index + 1) % len(loop), 0] for index in range(len(loop)))
+    if not area > 1e-16:
+        raise _PreviewMeshError("a missing surface patch has inconsistent boundary orientation")
+    # Reject self intersections before ear clipping. This is a local graph over
+    # the exact mean normal; unrelated trim loops must never be bridged.
+    for a in range(len(loop)):
+        b = (a + 1) % len(loop)
+        for c in range(a + 1, len(loop)):
+            d = (c + 1) % len(loop)
+            if len({a, b, c, d}) == 4 and cross(a, b, c) * cross(a, b, d) < 0 and cross(c, d, a) * cross(c, d, b) < 0:
+                raise _PreviewMeshError("a missing surface patch has a crossing boundary")
+    polygon, result = list(range(len(loop))), []
+    while len(polygon) > 3:
+        for position, b in enumerate(polygon):
+            a, c = polygon[position - 1], polygon[(position + 1) % len(polygon)]
+            if cross(a, b, c) <= 1e-16:
+                continue
+            if any(min(cross(a, b, q), cross(b, c, q), cross(c, a, q)) >= -1e-16
+                   for q in polygon if q not in (a, b, c)):
+                continue
+            result.append([loop[a], loop[b], loop[c]])
+            polygon.pop(position)
+            break
+        else:
+            raise _PreviewMeshError("a missing surface patch could not be triangulated")
+    result.append([loop[index] for index in polygon])
+    for a, b, c in result:
+        plane = np.cross(np.asarray(points[b]) - points[a], np.asarray(points[c]) - points[a])
+        if np.dot(plane, np.asarray([normals[a], normals[b], normals[c]]).sum(axis=0)) <= 0:
+            raise _PreviewMeshError("a repaired surface patch contains an inward triangle")
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.gp import gp_Pnt
+    surface = BRep_Tool.Surface_s(face.wrapped)
+    for triangle in result:
+        corners = np.asarray([points[index] for index in triangle])
+        samples = [corners.mean(axis=0)] + [(corners[index] + corners[(index + 1) % 3]) / 2 for index in range(3)]
+        for sample in samples:
+            projection = GeomAPI_ProjectPointOnSurf(gp_Pnt(*sample), surface)
+            if not projection.NbPoints() or not projection.LowerDistance() <= tolerance:
+                raise _PreviewMeshError("a repaired surface patch exceeds the display surface deflection")
+    return result
+
+
+def _preview_face_triangles(face, poly, location, points, normals, edges, tolerance):
+    """Audit native coverage and complete small gaps at curved trim corners."""
+    from collections import Counter, defaultdict
     from OCP.BRep import BRep_Tool
     from OCP.TopAbs import TopAbs_Orientation
+    from OCP.TopoDS import TopoDS
+    import numpy as np
+    reverse = face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
+    triangles = [[a - 1, (c if reverse else b) - 1, (b if reverse else c) - 1]
+                 for a, b, c in (poly.Triangle(index).Get() for index in range(1, poly.NbTriangles() + 1))]
+    xyz, exact = np.asarray(points), np.asarray(normals)
+    corners = xyz[np.asarray(triangles)]
+    planes = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    lengths = np.linalg.norm(planes, axis=1)
+    dots = (planes * exact[np.asarray(triangles)].sum(axis=1)).sum(axis=1)
+    if np.any((lengths > 1e-12) & (dots < -lengths * 1e-8)):
+        raise _PreviewMeshError("the triangulation contains inward surface triangles")
+    if len(points) == 3 and len(triangles) == 1:
+        return triangles  # Common faceted imports need no boundary graph.
+
+    # Collapse only endpoints of native zero-length mesh/pole edges for the
+    # audit. Nearby nodes on unrelated trim curves retain distinct identities.
+    parents = list(range(len(points)))
+    def root(index):
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+    def join_if_collapsed(a, b):
+        if math.dist(points[a], points[b]) <= 1e-12:
+            parents[root(b)] = root(a)
+    for triangle in triangles:
+        for a, b in zip(triangle, triangle[1:] + triangle[:1]):
+            join_if_collapsed(a, b)
+    boundary_pairs, seam_pairs = [], []
+    for edge in edges:
+        seam = BRep_Tool.IsClosed_s(edge.wrapped, poly, location)
+        for wrapped in (edge.wrapped, TopoDS.Edge(edge.wrapped.Reversed())):
+            polygon = BRep_Tool.PolygonOnTriangulation_s(wrapped, poly, location)
+            if polygon is None:
+                continue
+            nodes = polygon.Nodes()
+            indices = [nodes.Value(index) - 1 for index in range(nodes.Lower(), nodes.Upper() + 1)]
+            for a, b in zip(indices, indices[1:]):
+                join_if_collapsed(a, b)
+                boundary_pairs.append((a, b))
+                if seam:
+                    seam_pairs.append((a, b))
+    keys = [root(index) for index in range(len(points))]
+    def key(a, b):
+        return tuple(sorted((keys[a], keys[b])))
+    native = {key(a, b): (a, b) for a, b in boundary_pairs if keys[a] != keys[b]}
+    seams = {key(a, b) for a, b in seam_pairs if keys[a] != keys[b]}
+    incidence, directed, balance = Counter(), {}, Counter()
+    for triangle in triangles:
+        if len({keys[index] for index in triangle}) < 3:
+            continue  # Collapsed pole facets contribute no surface boundary.
+        for a, b in zip(triangle, triangle[1:] + triangle[:1]):
+            if keys[a] != keys[b]:
+                edge_key = key(a, b)
+                incidence[edge_key] += 1
+                balance[edge_key] += 1 if keys[a] < keys[b] else -1
+                directed[edge_key] = (a, b)
+    if any(count > 2 or (count == 2 and balance[edge_key] != 0) or
+           (edge_key in native and count != 1 and edge_key not in seams) for edge_key, count in incidence.items()):
+        raise _PreviewMeshError("the triangulation contains overlapping or nonmanifold surface edges")
+    missing = {edge_key: pair for edge_key, pair in native.items() if edge_key not in incidence}
+    extra = {edge_key: directed[edge_key] for edge_key, count in incidence.items()
+             if count == 1 and edge_key not in native}
+    if not missing and not extra:
+        return triangles
+    graph = defaultdict(list)
+    pairs = {**missing, **extra}
+    for a, b in pairs:
+        graph[a].append(b)
+        graph[b].append(a)
+    if any(len(neighbors) != 2 for neighbors in graph.values()):
+        raise _PreviewMeshError("the triangulation has an open or branched surface gap")
+    while extra:
+        edge_key, (a, b) = next(iter(extra.items()))
+        # Start opposite the existing oriented mesh edge. The remaining path
+        # must close through this same connected difference boundary.
+        first, current, previous = keys[b], keys[a], keys[b]
+        loop_keys = [first, current]
+        while True:
+            following = next(node for node in graph[current] if node != previous)
+            if following == first:
+                break
+            if following in loop_keys:
+                raise _PreviewMeshError("the triangulation has a repeated surface-gap boundary")
+            loop_keys.append(following)
+            previous, current = current, following
+        node_indices = {keys[index]: index for pair in pairs.values() for index in pair}
+        loop = [node_indices[node] for node in loop_keys]
+        # Every extra mesh edge in this component must be cancelled by the
+        # added patch, never doubled in the same direction.
+        for left, right in zip(loop_keys, loop_keys[1:] + loop_keys[:1]):
+            boundary_key = tuple(sorted((left, right)))
+            if boundary_key in extra:
+                x, y = extra[boundary_key]
+                if (left, right) != (keys[y], keys[x]):
+                    raise _PreviewMeshError("a surface gap has inconsistent edge directions")
+                del extra[boundary_key]
+            missing.pop(boundary_key, None)
+        triangles.extend(_preview_patch_triangles(loop, points, normals, face, tolerance))
+        if len(triangles) > MAX_TRIANGLES:
+            raise ModelError("Preview exceeds the mesh size limit; simplify the design.")
+    if missing:
+        raise _PreviewMeshError("the triangulation omits native trim boundaries")
+    # Check the completed mesh, rather than trusting the mesher's success flag.
+    completed, balance = Counter(), Counter()
+    for triangle in triangles:
+        if len({keys[index] for index in triangle}) < 3:
+            continue
+        for a, b in zip(triangle, triangle[1:] + triangle[:1]):
+            edge_key = key(a, b)
+            completed[edge_key] += 1
+            balance[edge_key] += 1 if keys[a] < keys[b] else -1
+    if any(count > 2 or (count == 2 and balance[edge_key] != 0) or
+           (count == 1 and edge_key not in native) or
+           (edge_key in native and count != 1 and edge_key not in seams)
+           for edge_key, count in completed.items()) or any(edge_key not in completed for edge_key in native):
+        raise _PreviewMeshError("surface triangulation remains incomplete after trim repair")
+    return triangles
+
+
+def _preview_mesh(shape, solids, tolerance):
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.BRepTools import BRepTools
+    from OCP.IMeshTools import IMeshTools_Parameters, IMeshTools_MeshAlgoType
     from OCP.TopLoc import TopLoc_Location
+    faces = [[(face, _shape_entities(face, "Edge")) for face in _shape_entities(solid, "Face")] for solid in solids]
+    # Retain healthy native meshes; retry only a failed display candidate.
+    attempts = [(IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Watson, 0.15)] + [
+        (IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella, angle) for angle in (0.16, 0.14, 0.18, 0.20)]
+    for attempt, (algorithm, angle) in enumerate(attempts):
+        if attempt:
+            BRepTools.Clean_s(shape.wrapped)
+        parameters = IMeshTools_Parameters()
+        parameters.Deflection, parameters.Angle = tolerance, angle
+        parameters.Relative, parameters.InParallel = False, True
+        # Watson can report success with folded facets and large missing areas
+        # on trimmed analytic spheres. Try an independent native triangulator.
+        parameters.MeshAlgo = algorithm
+        mesher = BRepMesh_IncrementalMesh(shape.wrapped, parameters)
+        failure_feature = None
+        if not mesher.IsDone():
+            failure = "OpenCascade did not complete triangulation"
+            continue
+        result = []
+        total_nodes, total_triangles = 0, 0
+        try:
+            for solid_index, solid_faces in enumerate(faces):
+                chunks = []
+                for local_index, (face, edges) in enumerate(solid_faces):
+                    location = TopLoc_Location()
+                    poly = BRep_Tool.Triangulation_s(face.wrapped, location)
+                    if poly is None or not poly.NbTriangles():
+                        raise _PreviewMeshError("OpenCascade returned no surface triangles")
+                    if total_nodes + poly.NbNodes() > MAX_VERTICES or total_triangles + poly.NbTriangles() > MAX_TRIANGLES:
+                        raise ModelError("Preview exceeds the mesh size limit; simplify the design.")
+                    transform = location.Transformation()
+                    points = [list(poly.Node(index).Transformed(transform).Coord()) for index in range(1, poly.NbNodes() + 1)]
+                    normals = _preview_face_normals(face, poly, location)
+                    triangles = _preview_face_triangles(face, poly, location, points, normals, edges, tolerance)
+                    total_nodes += len(points)
+                    total_triangles += len(triangles)
+                    if total_triangles > MAX_TRIANGLES:
+                        raise ModelError("Preview exceeds the mesh size limit; simplify the design.")
+                    chunks.append((face, edges, poly, location, points, normals, triangles))
+                result.append(chunks)
+            return result
+        except _PreviewMeshError as error:
+            failure = f"part {solid_index + 1}, face {local_index + 1}: {error}"
+            failure_feature = feature_id("face", solid_index, local_index)
+    diagnostic = {"stage": "preview_meshing", "geometryScope": "native_candidate",
+                  "openCascadeMeshingStatus": mesher.GetStatusFlags(),
+                  "linearDeflectionMM": tolerance, "angularDeflectionRadians": angle,
+                  "meshingAlgorithm": "Watson" if algorithm == attempts[0][0] else "Delabella"}
+    if failure_feature is not None:
+        diagnostic["feature"] = failure_feature
+    raise ModelError(f"OpenCascade could not produce a complete design preview ({failure}).",
+                     diagnostic=diagnostic)
+
+
+def make_preview(shape, preview_stats=None):
+    from OCP.BRep import BRep_Tool
     prepared = None
     if preview_stats is not None:
         prepared = dict(preview_stats)
@@ -1056,10 +1319,7 @@ def make_preview(shape, preview_stats=None):
                             else _preview_bounds(solids))
     diagonal = math.sqrt(sum((bounds[axis + 3] - bounds[axis]) ** 2 for axis in range(3)))
     tolerance = max(0.005, min(0.25, diagonal / 1000))
-    # Absolute deflection, angular deflection in radians, and parallel meshing.
-    mesher = BRepMesh_IncrementalMesh(shape.wrapped, tolerance, False, 0.15, True)
-    if not mesher.IsDone():
-        raise ModelError("OpenCascade could not tessellate this design.")
+    mesh = _preview_mesh(shape, solids, tolerance)
     # Keep an explicit triangle-to-solid mapping for native part picking. A
     # fused body is one selectable solid; a disconnected union/pattern has
     # multiple selectable solids. Tessellating each solid retains CadQuery's
@@ -1074,30 +1334,19 @@ def make_preview(shape, preview_stats=None):
         topology["vertices"].extend({"id": feature_id("vertex", solid_index, local_index),
                                       "position": list(vertex.toTuple())}
                                      for local_index, vertex in enumerate(_shape_entities(solid, "Vertex")))
-        # Extract the existing parallel triangulation directly. Iterating the
-        # bound Poly_Array1OfTriangle through Python's sequence protocol is
-        # exceptionally expensive; indexed Triangle(i).Get() avoids that path
-        # and extra CadQuery Vector allocations without changing tessellation.
-        for local_index, face in enumerate(_shape_entities(solid, "Face")):
+        # Keep the native face order and node positions, including separate
+        # boundaries for hard lighting normals and the original stroke nodes.
+        for local_index, (face, face_edges, poly, location, points, face_normals, face_triangles) in enumerate(mesh[solid_index]):
             face_index = len(topology["faces"])
             topology["faces"].append(face_metadata(face, solid_index, local_index))
-            location = TopLoc_Location()
-            poly = BRep_Tool.Triangulation_s(face.wrapped, location)
-            if poly is None:
-                continue
             offset = len(vertices)
-            node_count, triangle_count = poly.NbNodes(), poly.NbTriangles()
+            node_count, triangle_count = len(points), len(face_triangles)
             if offset + node_count > MAX_VERTICES or len(triangles) + triangle_count > MAX_TRIANGLES:
                 raise ModelError("Preview exceeds the mesh size limit; simplify the design.")
             transform = location.Transformation()
-            vertices.extend(list(poly.Node(index).Transformed(transform).Coord())
-                            for index in range(1, node_count + 1))
-            normals.extend(_preview_face_normals(face, poly, location))
-            reverse = face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
-            for index in range(1, triangle_count + 1):
-                a, b, c = poly.Triangle(index).Get()
-                triangles.append([a + offset - 1, (c if reverse else b) + offset - 1,
-                                  (b if reverse else c) + offset - 1])
+            vertices.extend(points)
+            normals.extend(face_normals)
+            triangles.extend([index + offset for index in triangle] for triangle in face_triangles)
             triangle_solids.extend([solid_index] * triangle_count)
             triangle_faces.extend([face_index] * triangle_count)
             # Independent curve sampling can place a coarse chord inside its
@@ -1107,7 +1356,7 @@ def make_preview(shape, preview_stats=None):
             # Native hashes ignore orientation; IsSame resolves collisions and
             # keeps repeated/located instances separate within each owner.
             polylines = mesh_polylines[solid_index]
-            for edge in _shape_entities(face, "Edge"):
+            for edge in face_edges:
                 bucket = polylines.setdefault(hash(edge.wrapped), [])
                 if any(native.IsSame(edge.wrapped) for native, _ in bucket):
                     continue
