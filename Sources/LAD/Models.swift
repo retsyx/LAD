@@ -262,11 +262,6 @@ enum ResourcePaths {
         let packaged = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources")
         if Bundle.main.bundleURL.pathExtension == "app" { return packaged }
         if FileManager.default.fileExists(atPath: packaged.appendingPathComponent("Engine/worker.py").path) { return packaged }
-        var candidate = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        for _ in 0..<5 {
-            if FileManager.default.fileExists(atPath: candidate.appendingPathComponent("Engine/worker.py").path) { return candidate }
-            candidate.deleteLastPathComponent()
-        }
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     }
 

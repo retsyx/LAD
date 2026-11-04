@@ -21,6 +21,7 @@ import tarfile
 import tempfile
 
 from audit_runtime import audit_runtime, load_commands, validate_commands
+from prepare_app_binaries import verify_app_binaries, verify_app_symbols
 from prepare_runtime import payload_fingerprint
 from release_runtime import file_hash, native_images, pack_runtime, sign_runtime
 
@@ -140,6 +141,10 @@ def staple(path):
 
 
 def verify_app(app, version, build_number, production):
+    # Audit both signed executables again, including the copy from the DMG.
+    # Signing, notarization and the archive round trip must not bypass the
+    # stripping and private-path checks performed before signing.
+    verify_app_binaries(app)
     with (app / "Contents/Info.plist").open("rb") as stream:
         info = plistlib.load(stream)
     if (info.get("CFBundleShortVersionString"), info.get("CFBundleVersion")) != (version, build_number):
@@ -310,6 +315,7 @@ def release(args):
     print("Local validation only; this artifact is not notarized." if args.local else "Building a Developer ID release.", flush=True)
     logs = work / "logs"
     logs.mkdir()
+    symbols = work / "symbols"
     try:
         frozen_notes = work / "release-notes.md"
         frozen_notes.write_bytes(notes_data)
@@ -330,8 +336,13 @@ def release(args):
         app = work / "application/LAD.app"
         environment = dict(os.environ, LAD_BUILD_CONFIGURATION="release", LAD_APP_OUTPUT=str(app),
                            LAD_RUNTIME_PAYLOAD=str(final_payload), LAD_APP_SIGNING="none", LAD_REGISTER_APP="0",
-                           LAD_VERSION=args.version, LAD_BUILD_NUMBER=args.build_number)
+                           LAD_VERSION=args.version, LAD_BUILD_NUMBER=args.build_number,
+                           LAD_APP_SYMBOLS_OUTPUT=str(symbols), LAD_BUILD_PYTHON=sys.executable)
         run([source_root / "Scripts/build-app.sh"], env=environment)
+        # Enforce preparation independently of build-app.sh before any release
+        # signatures, retaining the complete matching symbols outside the app.
+        verify_app_binaries(app, build_roots=(root, source_root))
+        verify_app_symbols(app, symbols)
         # SwiftPM can retain an unused Xcode-toolchain rpath. Remove build-only
         # searches before signing, while rejecting actual external dependencies.
         app_audit = audit_runtime(app / "Contents", "arm64", repair_build_rpaths=True)
@@ -393,12 +404,14 @@ def release(args):
             if publication.exists():
                 shutil.rmtree(publication)
         print(f"Verified {'release' if production else 'local validation'} artifacts: {output}", flush=True)
+        print(f"Private debugging symbols retained separately: {symbols}", flush=True)
     except BaseException:
         print(f"Release failed. No release output was published. Diagnostic workspace: {work}", file=sys.stderr)
         raise
-    # Keep the small notarization logs for diagnostics; remove multi-GB staging.
+    # Keep notarization logs and UUID-matched symbols privately for diagnostics.
+    # Symbols contain build paths and must never enter the published artifacts.
     for child in work.iterdir():
-        if child != logs:
+        if child not in {logs, symbols}:
             if child.is_dir(): shutil.rmtree(child)
             else: child.unlink()
     return output

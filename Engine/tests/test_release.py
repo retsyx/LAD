@@ -17,6 +17,15 @@ SPEC.loader.exec_module(release)
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_app_privacy_failure_stops_before_native_signature_checks(self):
+        app = Path("LAD.app")
+        with patch.object(release, "verify_app_binaries", side_effect=RuntimeError("private build path")) as privacy, \
+                patch.object(release, "run") as native:
+            with self.assertRaisesRegex(RuntimeError, "private build path"):
+                release.verify_app(app, "0.3.0", "99", True)
+        privacy.assert_called_once_with(app)
+        native.assert_not_called()
+
     def test_production_credentials_and_valid_version_are_required(self):
         for version, build, local, identity, profile in [
             ("0.3.0", "99", False, "", ""),

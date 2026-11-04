@@ -25,6 +25,16 @@ THUMBNAIL_EXTENSION="$ASSEMBLED/Contents/PlugIns/LADThumbnailExtension.appex"
 mkdir -p "$THUMBNAIL_EXTENSION/Contents/MacOS"
 cp "$BIN/LADThumbnailExtension" "$THUMBNAIL_EXTENSION/Contents/MacOS/LADThumbnailExtension"
 cp "$ROOT/Scripts/ThumbnailExtension-Info.plist" "$THUMBNAIL_EXTENSION/Contents/Info.plist"
+if [[ "$CONFIG" == release ]]; then
+    SYMBOLS="${LAD_APP_SYMBOLS_OUTPUT:-}"
+    if [[ -z "$SYMBOLS" ]]; then
+        mkdir -p "$ROOT/.build/app-symbols"
+        SYMBOLS="$(mktemp -d "$ROOT/.build/app-symbols/release.XXXXXX")"
+    fi
+    BUILD_PYTHON="${LAD_BUILD_PYTHON:-$RUNTIME_PAYLOAD/expanded/python/bin/python3}"
+    "$BUILD_PYTHON" "$ROOT/Scripts/prepare_app_binaries.py" \
+        --app "$ASSEMBLED" --symbols "$SYMBOLS" --build-root "$ROOT"
+fi
 # Bundle.module searches Contents/Resources in a packaged macOS app.
 [[ -d "$BIN/LAD_LAD.bundle" ]] || { echo "The Swift resource bundle is missing." >&2; exit 1; }
 ditto "$BIN/LAD_LAD.bundle" "$ASSEMBLED/Contents/Resources/LAD_LAD.bundle"
