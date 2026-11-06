@@ -243,6 +243,46 @@ Source formats, including `.kicad_pcb`, are passed to Codex as ordinary source r
 
 Onshape FeatureScript and OpenSCAD are **translated into CadQuery/OCP**, rather than executed by their original CAD systems. Codex must use source dimensions and describe the translation. If it cannot faithfully express the design, it reports the unsupported features and preserves the current design; it cannot substitute the existing design as a successful import. Approximations require an explicit user request. Source comments are treated as data, and source files are never modified by the import path.
 
+## External agents
+
+LAD can serve external agents running on the same Mac through MCP Streamable HTTP. In **Settings → External Agents**, enable the server, choose a port, and create a client credential. The default endpoint is `http://127.0.0.1:47512/mcp`. LAD must remain running. The listener binds only to IPv4 loopback; it does not make LAD available on the LAN or internet. A cloud-hosted agent's `127.0.0.1` refers to its own host and cannot reach this endpoint directly.
+
+Each client receives its own revocable credential and grants for reading, building, committing, exporting, capturing the live viewport, or managing designs. Grants can be restricted to selected designs. Copy the client configuration from Settings into an MCP client that supports Streamable HTTP and authorization headers. A typical configuration has this form; use the actual endpoint and credential supplied by LAD:
+
+```json
+{
+  "mcpServers": {
+    "lad": {
+      "url": "http://127.0.0.1:47512/mcp",
+      "headers": {
+        "Authorization": "Bearer <client-token>"
+      }
+    }
+  }
+}
+```
+
+The external agent writes a complete CadQuery/OCP program and uses LAD's native CAD tools directly. LAD does not launch its internal Codex agent for these calls. Client configuration and bearer credentials remain on the Mac and are never saved into `.lad` files or tool activity.
+
+1. Call `lad_projects` to find an authorized open design, or use `lad_project_create` for a new independent design window. `lad_project_open` opens LAD's native design chooser; it does not accept an arbitrary filesystem path.
+2. Call `lad_task_begin` with the returned `projectID` and a concise `request`. Optional `model` and `reasoningEffort` describe the external agent for the audit; LAD does not choose or run that model. Retain the returned `taskID`, `expectedStateToken`, and `uploadURL`.
+3. Upload the complete program and any original reference inputs as binary files using the client credential. For example, with the returned upload URL and credential in task-local environment variables:
+
+   ```sh
+   curl --fail-with-body \
+     --header "Authorization: Bearer $LAD_MCP_TOKEN" \
+     --header 'Content-Type: application/octet-stream' \
+     --data-binary @candidate.py \
+     "${LAD_UPLOAD_URL}?name=candidate.py"
+   ```
+
+   The upload returns an opaque `fileID`. Uploads do not grant access to arbitrary local paths, and never change the original file. Put references and brief metadata in agent context; do not paste program or asset contents into prompts.
+4. Call `lad_build` with `taskID`, `programID` set to the uploaded file ID, and the candidate's `title`, `summary`, and required `assetIDs`. Use `lad_inspect`, `lad_measure`, `lad_validate`, and `lad_render` to review and repair candidates. Existing tool arguments named `path`, `queryPath`, or similar accept task file IDs in this external interface. Tools return file IDs and authenticated download URLs, rather than requiring a shared filesystem. Render and screenshot tools return the exact PNG as MCP image content.
+5. Call `lad_commit` with `taskID`, the reviewed `artifactID`, `expectedStateToken`, and a unique `idempotencyKey`. Builds and color edits remain speculative until this call. A commit reuses the exact validated native geometry, publishes its revision, and uses LAD's existing autosave writer. A current-design color-only commit updates that revision while preserving history selection. A changed design produces a conflict instead of silently replacing newer work; repeated successful commit requests resolve to the existing revision, including after task cleanup or reopening an authorized design. Check `committed` separately from the response's `persistence.status`, which reports `memory`, `pending`, `saved`, or `failed` and includes an error when saving fails.
+6. Use `lad_task_status` to inspect the task, `lad_task_cancel` to stop it, and `lad_task_end` to release temporary files and candidates. All three take `taskID`. A committed task accepts status, downloads, commit retries, and cleanup; start a fresh task for further uploads or CAD operations. Exported files are temporary authenticated downloads; only required original reference assets and complete replay programs become part of a saved design.
+
+Saved history, colors, native inspection, measurements, imports, exports, and mesh reconstruction use the same CAD operations as LAD's internal agent. Task IDs keep work and activity separate across clients and designs. Ordinary renders do not move the live viewport. Optional dependency permission requests still use LAD's existing per-operation policy and owning design window. LAD restricts operations performed through its tools; an external agent remains responsible for its independently executed commands and installations.
+
 ## Verification
 
 ```sh

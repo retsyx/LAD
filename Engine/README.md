@@ -133,6 +133,17 @@ are `lad_runtime`, `lad_request_permission`, `lad_versions`, `lad_version`, `lad
 `lad_get_part_colors`, `lad_set_part_colors`, `lad_measure`, `lad_validate`,
 `lad_render`, `lad_screenshot`, `lad_export_step` and `lad_import`.
 
+`agent-tools.json` is the canonical CAD tool schema catalog shared by this
+adapter and LAD's native external-agent interface. When enabled in Settings,
+the app also serves MCP Streamable HTTP at `http://127.0.0.1:<port>/mcp`
+(default port 47512). The external interface uses per-client credentials,
+explicit design/task IDs, an isolated worker per task, binary file uploads,
+and opaque task file IDs. `lad_build.programID` refers to an uploaded program;
+other file arguments refer to opaque IDs rather than host paths. Authenticated
+downloads expose task results without a shared filesystem. See the root
+[External agents guide](../README.md#external-agents) for connection and workflow
+details.
+
 The iterative `lad_mesh_*` tools keep immutable reference evidence and private
 reconstruction revisions. Optional `lad_mesh_inspect` recognition finds supported
 surface regions, toroidal blends, measured helical profiles, rounded ports and
@@ -152,9 +163,21 @@ Builds use this worker and the configured CAD runtime. Inspection/measurement
 use session topology and native BRep; PNG images use LAD's native Metal renderer
 and are returned as MCP image blocks for visual review. Build/export/import
 outputs stay in the task workspace until final commit. Stop cancels native work
-and releases waiting MCP calls. No listening port or global MCP configuration
-is installed. Source files, audit snapshots and geometry input references remain
+and releases waiting MCP calls. The built-in Codex adapter does not install a
+listener or global MCP configuration. The optional external listener exists
+only while enabled in the running app and binds exclusively to 127.0.0.1.
+Source files, audit snapshots and geometry input references remain
 separate from the bounded initial prompt.
+
+External builds remain speculative until `lad_commit`. Its expected state token
+protects newer design state, and its idempotency key is saved with a revision
+receipt so retries do not create duplicate revisions. The app reuses the
+matching validated native candidate, preserves the existing part-organization
+and color rules, and publishes through the same coordinated autosave writer.
+External task audits retain the initiating request and public client identity,
+with model and effort only when supplied. They do not invent chat messages or
+Codex turns. Request text, candidate programs and source snapshots use the
+existing shared hash asset table; derived media stays transient.
 
 Failed worker calls publish a bounded `error.json` alongside stderr. Native
 validation reports OpenCascade's actual per-entity status codes, the validation

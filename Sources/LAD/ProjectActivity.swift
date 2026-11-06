@@ -34,15 +34,39 @@ struct ProjectActivityEvent: Codable, Sendable, Identifiable, Equatable {
     }
 }
 
+/// The credential identity and public client metadata of an external agent.
+/// Credentials themselves never enter a design or its activity transcript.
+struct ProjectExternalAgentIdentity: Codable, Sendable, Equatable {
+    var clientID: String
+    var name: String
+    var version: String? = nil
+}
+
 struct ProjectTaskAudit: Codable, Sendable, Identifiable, Equatable {
     var id = UUID()
-    var userMessageID: UUID
+    var userMessageID: UUID? = nil
     var startedAt = Date()
     var finishedAt: Date? = nil
-    var model: String
-    var reasoningEffort: String
+    var model: String? = nil
+    var reasoningEffort: String? = nil
     var status = "running"
     var events: [ProjectActivityEvent] = []
     /// Accepted same-turn supplemental messages, separate from the initiating prompt.
     var additionalUserMessageIDs: [UUID]? = nil
+    var externalClient: ProjectExternalAgentIdentity? = nil
+    /// The external task's initiating request, independent of the chat composer.
+    var request: String? = nil
+    /// A persisted receipt lets retried external commits resolve to one revision.
+    var committedRevisionID: UUID? = nil
+    var commitKey: String? = nil
+    var commitArtifactID: String? = nil
+
+    var actorDescription: String {
+        if let client = externalClient {
+            return ([client.name] + [model, reasoningEffort].compactMap { value in
+                value.flatMap { $0.isEmpty ? nil : $0 }
+            }).joined(separator: " · ")
+        }
+        return "\(model.flatMap { $0.isEmpty ? nil : $0 } ?? "Default model") · \(reasoningEffort.flatMap { $0.isEmpty ? nil : $0.capitalized } ?? "Default")"
+    }
 }

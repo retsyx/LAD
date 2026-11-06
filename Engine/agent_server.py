@@ -57,88 +57,12 @@ INSTRUCTIONS = (
 )
 
 
-def schema(properties=None, required=()):
-    return {"type": "object", "properties": properties or {}, "required": list(required), "additionalProperties": False}
-
-
-def prop(type, **extra):
-    return {"type": type, **extra}
-
-
-ARTIFACT = {"artifactID": prop("string", description="Artifact ID returned by lad_build/lad_import, or current for the existing design.")}
-INDICES = prop("array", items=prop("integer", minimum=0), description="Zero-based physical solid indices from lad_inspect.")
-TOOLS = [
-    ("lad_runtime", "Discover LAD's ready-to-use Python/CadQuery/OCP runtime, capabilities, task workspace and available imported asset IDs.", schema(), True),
-    ("lad_request_permission", "Request a current permission decision for a proposed task-workspace operation, such as an optional download or dependency installation. Call for each new operation that needs permission, including after an earlier always-allow/always-deny result. Describe the operation and why it is needed. Returns allowed, source, rememberedPolicy and task-workspace scope only; does not install or execute anything. A Mac-local global policy may answer automatically and can change in Settings. If allowed, execute the operation yourself; optional installs belong in an isolated environment inside the task workspace. Never modify LAD's shared runtime, global settings, original inputs or files outside the workspace; final CAD replay must use bundled dependencies only. A denial or canceled request grants no permission.",
-     schema({"operation": prop("string", minLength=1, maxLength=200, description="Specific proposed operation, including optional dependency names and versions when relevant."),
-             "reason": prop("string", minLength=1, maxLength=2000, description="Why this operation is needed for the user's request; no commands are executed by this tool.")}, ["operation", "reason"]), False),
-    ("lad_versions", "List the task's saved design versions with stable IDs, vN history positions, custom names, dates and the current-version marker. Read-only history lookup; does not build geometry, select a version or change the viewport.",
-     schema({"offset": prop("integer", minimum=0, default=0), "limit": prop("integer", minimum=1, maximum=100, default=50)}), True),
-    ("lad_version", "Look up a saved design version by its stable UUID, vN history position or exact case-sensitive custom name. Stable UUIDs take precedence; duplicate names or a name matching another version's vN label return ambiguity candidates. Returns metadata and local paths to the complete saved CAD program and exact required original inputs, never inline source or binary data. Ambiguous names return candidates instead of guessing. Does not build geometry, select a version or change the viewport.",
-     schema({"reference": prop("string", description="Stable version UUID, history position such as v3, or exact custom version name. Use a returned stable UUID to disambiguate names or vN collisions.")}, ["reference"]), True),
-    ("lad_build", "Build a workspace Python CAD program with exact native geometry checks and temporary STEP roundtrip verification before acceptance. Returns an artifact ID and exact geometry metadata; does not commit the design or retain STEP.",
-     schema({"programPath": prop("string"), "title": prop("string"), "summary": prop("string"), "assetIDs": prop("array", items=prop("string")),
-             "versionID": prop("string", description="Optional stable UUID returned by lad_version. Binds that saved version's exact original STEP and imported_assets inputs for this build only; does not change the current design or register historical inputs for the final replacement program.")}, ["programPath"]), False),
-    ("lad_inspect", "Inspect exact geometry metadata, named parts and native topology IDs. Paginate vertices, edges or faces to find entities for measurements.",
-     schema({**ARTIFACT, "kind": prop("string", enum=["summary", "parts", "vertices", "edges", "faces"]), "solidIndices": INDICES,
-             "offset": prop("integer", minimum=0), "limit": prop("integer", minimum=1, maximum=500)}), True),
-    ("lad_get_part_colors", "Read current opaque sRGB colors, stable part and folder IDs, and parent relationships. Paginated; current works from the saved parts layout even when its geometry preview is unavailable. Never rebuilds geometry or changes the design.",
-     schema({**ARTIFACT, "offset": prop("integer", minimum=0, default=0), "limit": prop("integer", minimum=1, maximum=500, default=100)}), True),
-    ("lad_set_part_colors", "Stage an atomic batch of part or folder color assignments for one artifact without rebuilding geometry or changing the live design. Folder assignments expand to physical parts; conflicting overlaps are rejected. Use color:null to set the neutral default finish. Only a successful final response commits the current patch or the final replacement program's matching artifact patch.",
-     schema({**ARTIFACT, "changes": prop("array", minItems=1, maxItems=256, items=schema({
-         "partID": prop("string", minLength=1, maxLength=1024),
-         "color": {"anyOf": [schema({channel: prop("number", minimum=0, maximum=1) for channel in ("red", "green", "blue")}, ["red", "green", "blue"]), {"type": "null"}]}
-     }, ["partID", "color"]))}, ["changes"]), False),
-    ("lad_measure", "Measure native vertices, edges, curves, faces or whole parts. Returns exact properties and OpenCascade minimum distances/closest points and supported analytic angles.",
-     schema({**ARTIFACT, "features": prop("array", items=schema({"kind": prop("string", enum=["vertex", "edge", "face"]),
-                                                               "solidIndex": prop("integer", minimum=0), "localIndex": prop("integer", minimum=0)},
-                                                              ["kind", "solidIndex", "localIndex"])), "solidIndices": INDICES}), True),
-    ("lad_validate", "Check that an artifact passed exact native topology, closed-solid, positive-volume, STEP roundtrip and preview validation before acceptance.", schema(ARTIFACT), True),
-    ("lad_render", "Render an artifact through LAD's native camera, lights and display pipeline using a preset or arbitrary camera. Returns a PNG image attachment for visual review without changing the user's view. Camera coordinates are CAD-world millimetres; angles are degrees. Zoom 1 uses automatic fit, 2 doubles magnification, and 0.5 halves it. An explicit cameraPosition defines the base eye position. Perspective zoom dollies that position around cameraTarget by dividing its target distance; orthographic zoom keeps the eye position unchanged and divides the view scale. Do not combine cameraPosition with yawDegrees or elevationDegrees.",
-     schema({**ARTIFACT, "view": prop("string", enum=["isometric", "front", "back", "top", "bottom", "left", "right"], default="isometric",
-                                    description="Preset starting orientation, retained when angular overrides are omitted."),
-             "yawDegrees": prop("number", description="Optional camera azimuth overriding the preset: 0 looks from +X, 90 from +Y. Any finite angle; cannot combine with cameraPosition."),
-             "elevationDegrees": prop("number", minimum=-90, maximum=90,
-                                      description="Optional elevation overriding the preset: 0 is in the XY plane, +90 is above (+Z), -90 below. Cannot combine with cameraPosition."),
-             "rollDegrees": prop("number", default=0, description="Rotation about the viewing axis; positive angles rotate the image counterclockwise. Works with either angular or position-based cameras."),
-             "cameraPosition": prop("array", items=prop("number", minimum=-1000000, maximum=1000000), minItems=3, maxItems=3,
-                                    description="Optional base camera [x,y,z] in CAD-world millimetres, looking toward cameraTarget. Must differ from the target. Overrides preset orientation; cannot combine with yawDegrees/elevationDegrees. Perspective zoom divides the eye-to-target distance by zoom; orthographic zoom retains this eye position and changes only the view scale."),
-             "cameraTarget": prop("array", items=prop("number", minimum=-1000000, maximum=1000000), minItems=3, maxItems=3,
-                                  description="Optional look-at [x,y,z] in CAD-world millimetres. Defaults to the automatic fit center of the visible artifact or solidIndices subset."),
-             "zoom": prop("number", minimum=0.000001, maximum=1000000, default=1,
-                          description="Positive magnification multiplier: 1 is automatic fit, 2 zooms in, 0.5 zooms out. With cameraPosition, 1 uses that exact base position. Perspective zoom divides the base eye-to-target distance; orthographic zoom keeps the eye unchanged and divides the orthographic view scale. Does not change geometry."),
-             "projection": prop("string", enum=["perspective", "isometric"]), "display": prop("string", enum=["shaded", "edges", "translucent", "wireframe"]),
-             "width": prop("integer", minimum=256, maximum=2048), "height": prop("integer", minimum=256, maximum=2048), "solidIndices": INDICES}), True),
-    ("lad_screenshot", "Capture the current LAD viewport as a PNG image attachment. Uses an explicitly disclosed offscreen fallback if no live viewport is attached.", schema(), True),
-    ("lad_export_step", "Export exact whole or selected artifact geometry with its current part RGB colors as STEP into the task workspace. Includes staged colors and neutral finishes; preserves separate solids and original coordinates. Returns a file reference without sending the file bytes as text.",
-     schema({**ARTIFACT, "path": prop("string"), "solidIndices": INDICES}), False),
-    ("lad_import", "Import pre-existing external/reference STEP/BREP or closed STL/OBJ geometry from the task workspace, including faithful format conversions of user-provided inputs. Never import geometry generated as part of the current design by LAD or external tools. Binary and ASCII STL are supported directly without extra dependencies; meshes must be watertight and use millimeter coordinates. Existing file-size and preview resource limits apply. Returns an input asset ID, validated artifact and fidelity notes. Access the reference shape using imported_assets[assetID].",
-     schema({"path": prop("string"), "name": prop("string"), "producerPaths": prop("array", items=prop("string"), description="Optional source-conversion code and dependency file references for a pre-existing external/reference input's task audit.")}, ["path"]), False),
-]
-TOOLS += [
-    ("lad_mesh_open_reference", "Open immutable original STL/indexed triangle JSON with explicit source units and final maximum deviation. Returns contextID, empty revisionID and private branchID. Working coordinates are explicitly normalized to millimeters; source bytes and triangle identities stay unchanged. No solid conversion or design-window edit.",
-     schema({"path":prop("string"),"units":prop("string"),"maxDeviation":prop("number",minimum=0),"sourceKind":prop("string",enum=["unknown","cad_tessellation","scan"]),"policyPath":prop("string",description="Optional workspace JSON reference interpretation, obligations, invariants and bounded algorithm policies.")},["path","units","maxDeviation"]),False),
-    ("lad_mesh_inspect", "Obtain immutable selectable evidence on the reference/current revision: select, grow, shrink, partition, combine, section, measure, or refresh discrepancies. Empty CAD is supported. Optional source-only query kind=recognize with scope/selection and families finds regional torus, helical_sweep, rounded_rectangle_extrusion and concentric_spherical_shell alternatives for fit; material decisions remain explicit edits. Complete selections and provenance stay in recordPath; queryPath is a workspace JSON object. See meshAPIHelpPath for exact schemas.",
-     schema({"contextID":prop("string"),"revisionID":prop("string"),"queryPath":prop("string")},["contextID","revisionID","queryPath"]),False),
-    ("lad_mesh_fit", "Fit permitted geometric explanations to evidence. Every returned FitCandidate.id is one alternative; joint members inside a candidate share its constraints. Fit success does not construct a body, discharge obligations, or prove final agreement. Returns immutable candidates with support, inferred extents, residuals and ambiguity.",
-     schema({"contextID":prop("string"),"revisionID":prop("string"),"evidenceIDs":prop("array",items=prop("string"),minItems=1,maxItems=32),"families":{"oneOf":[prop("string"),prop("array",items=prop("string"),maxItems=16)]},"constraintsPath":prop("string")},["contextID","revisionID","evidenceIDs"]),False),
-    ("lad_mesh_try_edit", "Stage a reversible typed CAD decision or complete program replacement against an exact revision. editPath is workspace JSON; programPath references complete CadQuery/OCP Python when replacing a program. Returns previewID, commit eligibility, native validity, invariant checks and automatic before/after preview comparisons. Valid incomplete solids may be committed. Failure preserves the base. No faceted fallback.",
-     schema({"contextID":prop("string"),"revisionID":prop("string"),"editPath":prop("string"),"programPath":prop("string")},["contextID","revisionID","editPath"]),False),
-    ("lad_mesh_compare", "Compare the original mesh with an exact reconstruction revision or preview. Preview/local results never grant final pass. Final checks return pass, fail or inconclusive with explicit continuous bounds, native validity, representation, obligations and coverage. Does not fit, heal or alter geometry.",
-     schema({"contextID":prop("string"),"targetID":prop("string"),"scope":{"oneOf":[prop("string",enum=["all"]),prop("object",additionalProperties=True)]},"quality":prop("string",enum=["preview","final"])},["contextID","targetID"]),False),
-    ("lad_mesh_commit", "Atomically keep an eligible preview in the current private reconstruction branch if expectedRevisionID still matches its base. Does not replace the user's design and does not imply final reconstruction acceptance. Returns a new immutable revisionID.",
-     schema({"contextID":prop("string"),"previewID":prop("string"),"expectedRevisionID":prop("string")},["contextID","previewID","expectedRevisionID"]),False),
-    ("lad_mesh_set_delivery", "Choose final delivery for one exact committed reconstruction revision. Default verified mode requires its passing full final comparison. If completing reconstruction is not achievable, the agent may explicitly choose intermediate with a reason and unresolved items to keep useful valid interim solids without requesting user approval. LAD saves the limitation disclosure; this never grants verified status, applies to another recipe, or bypasses checked STEP export. Does not move the branch or change the design window.",
-     schema({"contextID":prop("string"),"revisionID":prop("string"),"mode":prop("string",enum=["verified","intermediate"]),"reason":prop("string",minLength=1,maxLength=512),"unresolved":prop("array",items=prop("string",minLength=1,maxLength=256),minItems=1,maxItems=8)},["contextID","revisionID","mode"]),False),
-    ("lad_mesh_undo", "Move the private reconstruction branch to its previous retained revision. Leaves the design window unchanged and preserves exact provenance; stale comparisons cannot certify another revision.",
-     schema({"contextID":prop("string"),"expectedRevisionID":prop("string")},["contextID"]),False),
-    ("lad_mesh_redo", "Move the private reconstruction branch to its next retained revision after undo. Does not modify the design window.",
-     schema({"contextID":prop("string"),"expectedRevisionID":prop("string")},["contextID"]),False),
-    ("lad_mesh_branch", "Start and select a new private reconstruction branch from an exact retained revision, keeping existing history intact. Returns branchID and revisionID; design window unchanged.",
-     schema({"contextID":prop("string"),"revisionID":prop("string")},["contextID","revisionID"]),False),
-    ("lad_mesh_export_step", "Export a committed reconstruction only with its matching full accepted comparison. Validate solid STEP readback and compare that readback against the original reference under the same allowance. Returns a workspace path only on success.",
-     schema({"contextID":prop("string"),"revisionID":prop("string"),"comparisonID":prop("string"),"path":prop("string")},["contextID","revisionID","comparisonID"]),False),
-]
+# One canonical tool catalog is shared by the internal stdio adapter and the
+# native external MCP endpoint. It is bundled beside this adapter.
+with Path(__file__).with_name("agent-tools.json").open(encoding="utf-8") as catalog_file:
+    TOOL_CATALOG = json.load(catalog_file)
+TOOLS = [(tool["name"], tool["description"], tool["inputSchema"],
+          tool["annotations"]["readOnlyHint"]) for tool in TOOL_CATALOG]
 TOOL_NAMES = {tool[0] for tool in TOOLS}
 
 

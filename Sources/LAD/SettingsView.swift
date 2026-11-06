@@ -69,6 +69,7 @@ struct LADSettingsView: View {
                 }
                 .pickerStyle(.menu)
             }
+            ExternalAgentSettingsView()
             Section("CAD engine") {
                 if cadRuntime.phase == .preparing {
                     HStack { ProgressView().controlSize(.small); Text("Preparing CAD runtime…") }
@@ -82,7 +83,7 @@ struct LADSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 650, height: 420)
+        .frame(width: 650, height: 620)
     }
 
     private func chooseProjectDirectory() {

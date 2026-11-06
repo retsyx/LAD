@@ -188,7 +188,7 @@ struct ProjectActivityView: View {
             if $0 { expandedTasks.insert(task.id) } else { expandedTasks.remove(task.id) }
         })) {
             VStack(alignment: .leading, spacing: 12) {
-                if let prompt = state.messages.first(where: { $0.id == task.userMessageID })?.content {
+                if let prompt = task.request ?? state.messages.first(where: { $0.id == task.userMessageID })?.content {
                     Text(prompt).font(.system(size: 11)).foregroundStyle(Palette.muted)
                         .textSelection(.enabled).padding(.top, 4)
                 }
@@ -200,7 +200,7 @@ struct ProjectActivityView: View {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Image(systemName: statusSymbol(task.status)).foregroundStyle(statusColor(task.status))
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("\(task.model.isEmpty ? "Default model" : task.model) · \(task.reasoningEffort.isEmpty ? "Default" : task.reasoningEffort.capitalized)")
+                    Text(task.actorDescription)
                         .font(.system(size: 12, weight: .semibold))
                     Text("\(task.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(task.events.count) events")
                         .font(.system(size: 10)).foregroundStyle(Palette.muted)
@@ -396,8 +396,15 @@ private struct ProjectActivityText: NSViewRepresentable {
 enum ProjectActivityTranscript {
     static func text(for tasks: [ProjectTaskAudit]) -> String {
         tasks.map { task in
-            let heading = "\(task.startedAt.formatted(date: .abbreviated, time: .standard)) · \(task.model) · \(task.reasoningEffort.isEmpty ? "Default" : task.reasoningEffort) · \(task.status)"
-            return ([heading] + task.events.map { text(for: $0) }).joined(separator: "\n\n")
+            let actor = task.externalClient != nil ? task.actorDescription :
+                "\(task.model.flatMap { $0.isEmpty ? nil : $0 } ?? "Default model") · \(task.reasoningEffort.flatMap { $0.isEmpty ? nil : $0 } ?? "Default")"
+            let heading = "\(task.startedAt.formatted(date: .abbreviated, time: .standard)) · \(actor) · \(task.status)"
+            var sections = [heading]
+            if let client = task.externalClient {
+                sections.append("Client: \(client.name)\(client.version.map { " (\($0))" } ?? "")\nClient ID: \(client.clientID)")
+            }
+            if let request = task.request { sections.append("Request:\n\(request)") }
+            return (sections + task.events.map { text(for: $0) }).joined(separator: "\n\n")
         }.joined(separator: "\n\n────────────────────\n\n")
     }
 

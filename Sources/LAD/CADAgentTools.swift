@@ -31,6 +31,7 @@ final class CADAgentTools {
     private weak var permissionWindow: NSWindow?
     private var permissionWindowWasBound: Bool
     private let hasPermissionViewport: Bool
+    private var hasExplicitPermissionWindow: Bool
     private let hiddenSolids: Set<Int>
     private let partLayout: PartLayout?
     private let initialPartColors: [String: PartColor]
@@ -54,7 +55,7 @@ final class CADAgentTools {
          solidColors: [Int: PartColor] = [:],
          referenceAssets: [CADInputAsset] = [], versions: ProjectVersionContext = .empty,
          partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:],
-         permissionController: AgentPermissionController? = nil) throws {
+         permissionController: AgentPermissionController? = nil, permissionWindow: NSWindow? = nil) throws {
         workspace = try CADAgentWorkspace(directory: directory)
         self.python = python
         self.threads = threads
@@ -63,9 +64,10 @@ final class CADAgentTools {
         self.engine = engine
         self.permissionController = permissionController ?? .shared
         self.viewport = viewport
-        permissionWindow = viewport?.window
-        permissionWindowWasBound = viewport?.window != nil
+        self.permissionWindow = permissionWindow ?? viewport?.window
+        permissionWindowWasBound = self.permissionWindow != nil
         hasPermissionViewport = viewport != nil
+        hasExplicitPermissionWindow = permissionWindow != nil
         self.hiddenSolids = hiddenSolids
         self.partLayout = partLayout
         let currentParts = partLayout?.nodes ?? Self.parts(in: currentPreview)
@@ -96,10 +98,17 @@ final class CADAgentTools {
         // changing the current design or substituting its imported_model.
         try registerReferenceAssets(referenceAssets)
         if let current {
+            // CodexFileContext owns creation of context/. Native candidate
+            // references live under artifacts/ for both MCP transports.
+            let programURL = try workspace.write(Data(current.script.utf8), path: "artifacts/current/program.py")
             artifacts["current"] = Artifact(id: "current", model: current, preview: currentPreview,
-                programURL: workspace.root.appendingPathComponent("context/current-model.json"),
+                programURL: programURL,
                 metadataURL: workspace.root.appendingPathComponent("artifacts/current/metadata.json"),
                 parts: currentParts, partLayout: partLayout, partColors: currentColors)
+            if currentPreview != nil, let artifact = artifacts["current"] {
+                _ = try workspace.write(JSONSerialization.data(withJSONObject: summary(artifact), options: [.sortedKeys]),
+                                        path: "artifacts/current/metadata.json")
+            }
         }
     }
 
@@ -154,6 +163,30 @@ final class CADAgentTools {
             return preview
         }
         return nil
+    }
+
+    /// External agents commit a named candidate, never arbitrary source paired
+    /// with another candidate's geometry. This boundary applies the same final
+    /// replay and reconstruction checks as an internal Codex response.
+    func validatedCandidate(artifactID: String) throws -> (model: ModelSpec, preview: PreviewMesh, colorChanges: [CADPartColorChange]) {
+        try checkCancellation()
+        guard let artifact = artifacts[artifactID], let preview = artifact.preview,
+              let nativePath = preview.brepPath, FileManager.default.fileExists(atPath: nativePath) else {
+            throw LADError.message("Build and validate this CAD candidate before committing it.")
+        }
+        guard artifact.versionID == nil else {
+            throw LADError.message("Historical builds use read-only saved input bindings. Register any required original reference files and build the final complete CAD program without versionID before committing it.")
+        }
+        var model = resolvingReconstructionInputs(in: artifact.model)
+        model = try resolvingFinalDelivery(in: model)
+        try ProjectStore.validateModel(model)
+        guard constructionMatches(artifact.model, model) else {
+            throw LADError.message("The final CAD program no longer matches its validated geometry. Build it again before committing.")
+        }
+        // Construction matching permits geometry reuse, but speculative color
+        // patches belong to one exact artifact. A later matching candidate must
+        // never replace the colors reviewed on the explicitly committed one.
+        return (model, preview, artifact.colorChanges)
     }
 
     func finalDeliveryDisclosure(for model: ModelSpec) throws -> String? {
@@ -211,6 +244,19 @@ final class CADAgentTools {
         return renderedImageData
     }
 
+    func bindPermissionWindow(_ window: NSWindow) throws {
+        try checkCancellation()
+        guard !hasExplicitPermissionWindow || permissionWindow === window else {
+            throw LADError.message("This task's permission request belongs to a different design window.")
+        }
+        if let owningViewportWindow = viewport?.window, owningViewportWindow !== window {
+            throw LADError.message("Use this task's owning design window for permission requests.")
+        }
+        permissionWindow = window
+        permissionWindowWasBound = true
+        hasExplicitPermissionWindow = true
+    }
+
     func handle(name: String, arguments: [String: Any]) async throws -> [String: Any] {
         renderedImageData = nil
         try checkCancellation()
@@ -234,7 +280,10 @@ final class CADAgentTools {
             guard permissionRequest == nil else { throw LADError.message("A permission request is already pending for this task.") }
             let controller = permissionController
             let owner: NSWindow?
-            if hasPermissionViewport {
+            if hasExplicitPermissionWindow {
+                guard let window = permissionWindow else { throw CancellationError() }
+                owner = window
+            } else if hasPermissionViewport {
                 if !permissionWindowWasBound, let window = viewport?.window {
                     permissionWindow = window
                     permissionWindowWasBound = true
@@ -853,6 +902,32 @@ struct CADAgentWorkspace: Sendable {
             guard data.count <= maximumBytes else { throw LADError.message("The workspace file exceeds its size limit.") }
         }
         return data
+    }
+
+    /// Inspect bounded output metadata without reading a potentially large
+    /// external reference or STEP export into the UI process a second time.
+    func fileSize(_ path: String, maximumBytes: Int, allowEmpty: Bool = false) throws -> Int {
+        let url = try url(path)
+        let parent = try parentDescriptor(url, create: false)
+        defer { Darwin.close(parent) }
+        let descriptor = Darwin.openat(parent, url.lastPathComponent, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { throw LADError.message("The workspace file is missing or is a symbolic link.") }
+        defer { Darwin.close(descriptor) }
+        var info = stat()
+        guard Darwin.fstat(descriptor, &info) == 0, info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              info.st_nlink == 1, info.st_size >= (allowEmpty ? 0 : 1), info.st_size <= maximumBytes else {
+            throw LADError.message("Use a bounded regular workspace file without symbolic or hard links.")
+        }
+        return Int(info.st_size)
+    }
+
+    func removeFile(_ path: String) throws {
+        let url = try url(path)
+        let parent = try parentDescriptor(url, create: false)
+        defer { Darwin.close(parent) }
+        guard Darwin.unlinkat(parent, url.lastPathComponent, 0) == 0 || errno == ENOENT else {
+            throw LADError.message("Could not remove the temporary task file.")
+        }
     }
 
     @discardableResult

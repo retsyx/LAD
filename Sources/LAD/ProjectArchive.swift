@@ -132,14 +132,19 @@ enum ProjectArchive {
 
     private struct ArchivedTaskAudit: Codable {
         var id: UUID
-        var userMessageID: UUID
+        var userMessageID: UUID?
         var startedAt: Date
         var finishedAt: Date?
-        var model: String
-        var reasoningEffort: String
+        var model: String?
+        var reasoningEffort: String?
         var status: String
         var events: [ArchivedActivityEvent]
         var additionalUserMessageIDs: [UUID]?
+        var externalClient: ProjectExternalAgentIdentity?
+        var requestAsset: String?
+        var committedRevisionID: UUID?
+        var commitKey: String?
+        var commitArtifactID: String?
 
         init(_ task: ProjectTaskAudit, writer: inout AssetWriter) throws {
             id = task.id; userMessageID = task.userMessageID
@@ -147,13 +152,19 @@ enum ProjectArchive {
             model = task.model; reasoningEffort = task.reasoningEffort; status = task.status
             events = try task.events.map { try ArchivedActivityEvent($0, writer: &writer) }
             additionalUserMessageIDs = task.additionalUserMessageIDs
+            externalClient = task.externalClient
+            requestAsset = try task.request.map { try writer.store(Data($0.utf8), role: .activity) }
+            committedRevisionID = task.committedRevisionID; commitKey = task.commitKey; commitArtifactID = task.commitArtifactID
         }
 
         func restored(reader: inout AssetReader) throws -> ProjectTaskAudit {
             ProjectTaskAudit(id: id, userMessageID: userMessageID, startedAt: startedAt, finishedAt: finishedAt,
                              model: model, reasoningEffort: reasoningEffort, status: status,
                              events: try events.map { try $0.restored(reader: &reader) },
-                             additionalUserMessageIDs: additionalUserMessageIDs)
+                             additionalUserMessageIDs: additionalUserMessageIDs,
+                             externalClient: externalClient,
+                             request: try requestAsset.map { try reader.text($0, role: .activity) },
+                             committedRevisionID: committedRevisionID, commitKey: commitKey, commitArtifactID: commitArtifactID)
         }
     }
 

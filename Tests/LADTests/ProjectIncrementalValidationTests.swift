@@ -104,7 +104,7 @@ final class ProjectIncrementalValidationTests: XCTestCase {
             { $0.events[0].files![0].name = "geometry.brep" },
             { $0.events.append($0.events[0]) },
             { $0.model = "invalid\nmodel" },
-            { $0.additionalUserMessageIDs = [$0.userMessageID] }
+            { $0.additionalUserMessageIDs = [$0.userMessageID!] }
         ]
         for corrupt in corruptions {
             var changed = previous

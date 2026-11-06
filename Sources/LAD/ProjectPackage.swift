@@ -652,12 +652,12 @@ enum ProjectPackage {
     private static func cacheRecords(_ metadata: [String: Any], dependencies: inout Dependencies,
                                      changed: Set<String>? = nil) throws -> Set<String> {
         var live = Set<String>(), updated = Set<String>()
-        func record(_ row: [String: Any], key: String, needsBytes: Bool) throws {
+        func record(_ row: [String: Any], key: String, needsBytes: Bool, countsAsHistoryRecord: Bool = true) throws {
             live.insert(key)
             if changed == nil || changed!.contains(key) || dependencies.assetReferences[key] == nil {
                 if needsBytes { dependencies.recordData[key] = try json(row) }
                 dependencies.assetReferences[key] = assetReferences(row)
-                updated.insert(key)
+                if countsAsHistoryRecord { updated.insert(key) }
             }
         }
         for row in metadata["revisions"] as? [[String: Any]] ?? [] {
@@ -670,6 +670,11 @@ enum ProjectPackage {
         }
         for task in metadata["taskAudits"] as? [[String: Any]] ?? [] {
             guard let id = task["id"] as? String else { throw invalid("A task identity is invalid.") }
+            var taskMetadata = task
+            taskMetadata.removeValue(forKey: "events")
+            // Task headers have their own encodedTaskRecords metric. Their
+            // asset-reference cache must not count as another event row.
+            try record(taskMetadata, key: "activity/\(id)", needsBytes: false, countsAsHistoryRecord: false)
             for row in task["events"] as? [[String: Any]] ?? [] {
                 guard let event = row["id"] as? String else { throw invalid("An activity identity is invalid.") }
                 try record(row, key: "activity/\(id)/\(event)", needsBytes: true)
@@ -719,9 +724,14 @@ enum ProjectPackage {
         }
         let oldTasks = Dictionary(uniqueKeysWithValues: (previous.project.taskAudits ?? []).map { ($0.id, $0) })
         var reusedEventFields = [String: Set<String>]()
+        var reusedTaskRequests = Set<UUID>()
         changed.taskAudits = sameTasks ? nil : project.taskAudits?.compactMap { task in
             guard oldTasks[task.id] != task else { return nil }
             var value = task
+            if let old = oldTasks[task.id], task.request == old.request {
+                value.request = nil
+                reusedTaskRequests.insert(task.id)
+            }
             let oldEvents = Dictionary(uniqueKeysWithValues: (oldTasks[task.id]?.events ?? []).map { ($0.id, $0) })
             value.events = task.events.filter { oldEvents[$0.id] != $0 }.map { event in
                 var value = event
@@ -826,6 +836,7 @@ enum ProjectPackage {
         }
         for task in metadata["taskAudits"] as? [[String: Any]] ?? [] {
             guard let id = task["id"] as? String else { continue }
+            changedKeys.insert("activity/\(id)")
             for row in task["events"] as? [[String: Any]] ?? [] {
                 if let event = row["id"] as? String { changedKeys.insert("activity/\(id)/\(event)") }
             }
@@ -846,6 +857,7 @@ enum ProjectPackage {
             let currentTasks = Dictionary(uniqueKeysWithValues: (project.taskAudits ?? []).map { ($0.id.uuidString, $0) })
             for index in mergedTasks.indices {
                 guard let id = mergedTasks[index]["id"] as? String, let task = currentTasks[id], oldTasks[task.id] != task else { continue }
+                if reusedTaskRequests.contains(task.id) { mergedTasks[index]["requestAsset"] = oldTaskRecords[id]?["requestAsset"] }
                 let old = oldTaskRecords[id]?["events"] as? [[String: Any]] ?? []
                 let new = mergedTasks[index]["events"] as? [[String: Any]] ?? []
                 let events = Dictionary((old + new).compactMap { row in (row["id"] as? String).map { ($0, row) } }, uniquingKeysWith: { _, new in new })
@@ -917,7 +929,7 @@ enum ProjectPackage {
     }
 
     private static func assetReferences(_ value: Any) -> Set<String> {
-        let fields: Set<String> = ["scriptAsset", "sourceSTEPAsset", "dataAsset", "contentAsset", "inputAsset", "outputAsset"]
+        let fields: Set<String> = ["scriptAsset", "sourceSTEPAsset", "dataAsset", "contentAsset", "inputAsset", "outputAsset", "requestAsset"]
         var result = Set<String>()
         func visit(_ value: Any) {
             if let object = value as? [String: Any] {

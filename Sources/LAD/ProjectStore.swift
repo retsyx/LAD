@@ -125,7 +125,8 @@ enum ProjectStore {
             }
         }
         if let taskAudits = project.taskAudits {
-            try validateTaskAudits(taskAudits, messages: project.messages, validatedPrevious: validatedPrevious?.taskAudits)
+            try validateTaskAudits(taskAudits, messages: project.messages, validatedPrevious: validatedPrevious?.taskAudits,
+                                   revisionIDs: Set(project.revisions.map(\.id)))
         }
         let messageIndices = Dictionary(uniqueKeysWithValues: project.messages.enumerated().map { ($0.element.id, $0.offset) })
         let oldRevisions = Dictionary(uniqueKeysWithValues: (validatedPrevious?.revisions ?? []).map { ($0.id, $0) })
@@ -346,7 +347,7 @@ enum ProjectStore {
     }
 
     static func validateTaskAudits(_ audits: [ProjectTaskAudit], messages: [ChatMessage],
-                                   validatedPrevious: [ProjectTaskAudit]? = nil) throws {
+                                   validatedPrevious: [ProjectTaskAudit]? = nil, revisionIDs: Set<UUID> = []) throws {
         let statuses: Set<String> = ["running", "completed", "failed", "canceled", "interrupted"]
         let categories: Set<String> = ["tool", "command", "file_change", "web_search", "plan", "lifecycle", "validation", "diagnostic", "steering"]
         let userIDs = Set(messages.filter { $0.role == "user" }.map(\.id))
@@ -354,12 +355,38 @@ enum ProjectStore {
             throw invalid("Tool activity contains too many tasks or duplicate task IDs.")
         }
         let oldTasks = Dictionary(uniqueKeysWithValues: (validatedPrevious ?? []).map { ($0.id, $0) })
+        func validMetadata(_ value: String) -> Bool {
+            value.utf8.count <= 256 && value.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+        }
         var totalEvents = 0
         for task in audits {
-            guard userIDs.contains(task.userMessageID), statuses.contains(task.status),
+            if let client = task.externalClient {
+                guard task.userMessageID == nil, task.additionalUserMessageIDs?.isEmpty ?? true,
+                      !client.clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !client.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      validMetadata(client.clientID), validMetadata(client.name),
+                      client.version.map(validMetadata) ?? true,
+                      let request = task.request, !request.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      request.utf8.count <= 1_000_000, !request.contains("\0") else {
+                    throw invalid("The saved external tool task provenance is invalid.")
+                }
+            } else {
+                guard let userID = task.userMessageID, userIDs.contains(userID),
+                      task.request == nil, task.model != nil, task.reasoningEffort != nil else {
+                    throw invalid("The saved tool task has an invalid initiating request.")
+                }
+            }
+            if task.committedRevisionID != nil || task.commitKey != nil || task.commitArtifactID != nil {
+                guard task.externalClient != nil, let revisionID = task.committedRevisionID, revisionIDs.contains(revisionID),
+                      let key = task.commitKey, !key.isEmpty, key.utf8.count <= 128, validMetadata(key),
+                      let artifactID = task.commitArtifactID, !artifactID.isEmpty, validMetadata(artifactID) else {
+                    throw invalid("The saved external commit receipt is invalid.")
+                }
+            }
+            guard statuses.contains(task.status),
                   task.startedAt.timeIntervalSinceReferenceDate.isFinite,
                   task.finishedAt.map({ $0.timeIntervalSinceReferenceDate.isFinite && $0 >= task.startedAt }) ?? true,
-                  [task.model, task.reasoningEffort].allSatisfy({ $0.utf8.count <= 256 && $0.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) } }),
+                  [task.model, task.reasoningEffort].compactMap({ $0 }).allSatisfy(validMetadata),
                   task.events.count <= 100_000 - totalEvents,
                   Set(task.events.map(\.id)).count == task.events.count else {
                 throw invalid("The saved tool task metadata is invalid.")
@@ -367,7 +394,7 @@ enum ProjectStore {
             totalEvents += task.events.count
             if let additional = task.additionalUserMessageIDs {
                 guard additional.count <= 10_000, Set(additional).count == additional.count,
-                      !additional.contains(task.userMessageID), additional.allSatisfy(userIDs.contains) else {
+                      !additional.contains(where: { $0 == task.userMessageID }), additional.allSatisfy(userIDs.contains) else {
                     throw invalid("A saved tool task has invalid supplemental message references.")
                 }
             }

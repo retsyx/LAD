@@ -196,6 +196,7 @@ final class LADAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSWindow.allowsAutomaticWindowTabbing = false
+        ExternalAgentServer.shared.configure(coordinator: projectWindows)
         if let iconURL = Bundle.main.url(forResource: "LAD", withExtension: "icns"),
            let data = try? Data(contentsOf: iconURL), let icon = NSImage(data: data) {
             NSApp.applicationIconImage = icon
@@ -209,11 +210,13 @@ final class LADAppDelegate: NSObject, NSApplicationDelegate {
         isTerminating = true
         Task { @MainActor in
             let shouldQuit = await projectWindows.prepareToQuit()
-            if !shouldQuit { isTerminating = false }
+            if shouldQuit { ExternalAgentServer.shared.stop() }
+            else { isTerminating = false }
             sender.reply(toApplicationShouldTerminate: shouldQuit)
         }
         return .terminateLater
     }
+    func applicationWillTerminate(_ notification: Notification) { ExternalAgentServer.shared.stop() }
 }
 
 enum Palette {

@@ -9,10 +9,10 @@ final class AppState: ObservableObject {
     let activityImages = ProjectActivityImages()
     weak var viewportView: CADSceneView?
     @Published var revisions: [ProjectRevision] = [] {
-        didSet { projectThumbnailRevisionsChanged(from: oldValue) }
+        didSet { agentStateGeneration &+= 1; projectThumbnailRevisionsChanged(from: oldValue) }
     }
     @Published var selectedRevisionID: UUID? {
-        didSet { if selectedRevisionID != oldValue { scheduleProjectThumbnail() } }
+        didSet { if selectedRevisionID != oldValue { agentStateGeneration &+= 1; scheduleProjectThumbnail() } }
     }
     @Published var mesh: PreviewMesh? {
         didSet {
@@ -43,7 +43,9 @@ final class AppState: ObservableObject {
     @Published var activity = "Ready"
     @Published private(set) var runningCodexSelection: String?
     @Published private(set) var codexSettings = CodexProjectSettings()
-    @Published private(set) var projectName: String?
+    @Published private(set) var projectName: String? {
+        didSet { if projectName != oldValue { agentStateGeneration &+= 1 } }
+    }
     @Published private(set) var recentPartColors: [PartColor] = []
     @Published private(set) var partsPaneFraction = 0.75
     @Published var error: String?
@@ -79,13 +81,15 @@ final class AppState: ObservableObject {
     @Published private(set) var isMeasuring = false
     @Published var selectedPartNodeIDs: Set<String> = []
     @Published var hiddenSolids: Set<Int> = [] {
-        didSet { if hiddenSolids != oldValue { scheduleProjectThumbnail() } }
+        didSet { if hiddenSolids != oldValue { agentStateGeneration &+= 1; scheduleProjectThumbnail() } }
     }
     @Published var pendingAttachments: [SourceAttachment] = [] {
         didSet { if pendingAttachments != oldValue { scheduleDebouncedAutosave() } }
     }
     var onOpenProject: ((URL) -> Void)?
     var onRecentProjectChanged: ((URL, URL?) -> Void)?
+    var onProjectAgentInvalidated: (() -> Void)?
+    private var agentStateGeneration: UInt64 = 0
     var awaitingResponse: Bool {
         !isWorking && messages.last(where: { $0.role == "assistant" && $0.phase != "commentary" })?.phase == "response"
     }
@@ -392,6 +396,7 @@ final class AppState: ObservableObject {
     }
 
     func prepareToQuit() async {
+        onProjectAgentInvalidated?()
         cancel()
         cancelProjectThumbnail(clearImage: false)
         auditSaveTask?.cancel(); auditSaveTask = nil
@@ -403,6 +408,7 @@ final class AppState: ObservableObject {
     }
 
     func flushForReplacement() async throws {
+        onProjectAgentInvalidated?()
         let wasGenerating = generationFeedback != nil
         cancel()
         cancelProjectThumbnail(clearImage: false)
@@ -475,6 +481,7 @@ final class AppState: ObservableObject {
     }
 
     func newProject() {
+        onProjectAgentInvalidated?()
         cancel()
         cancelProjectThumbnail()
         activityImages.reset()
@@ -721,8 +728,8 @@ final class AppState: ObservableObject {
                 // final result may arrive while the steering RPC is in flight.
                 let message = ChatMessage(role: "user", content: content, date: request.date, attachments: request.attachments,
                                           selection: request.selection)
-                if let audit = self.taskAudits.first(where: { $0.id == auditID }),
-                   let revision = self.revisions.last(where: { $0.userMessageID == audit.userMessageID }),
+                if let audit = self.taskAudits.first(where: { $0.id == auditID }), let userMessageID = audit.userMessageID,
+                   let revision = self.revisions.last(where: { $0.userMessageID == userMessageID }),
                    let responseID = revision.responseMessageID,
                    let responseIndex = self.messages.firstIndex(where: { $0.id == responseID }) {
                     self.messages.insert(message, at: responseIndex)
@@ -1132,28 +1139,41 @@ final class AppState: ObservableObject {
     }
 
     private func commit(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout? = nil, previouslyHidden: Set<String> = [], userMessageID: UUID, previousColors: [String: PartColor] = [:], colorChanges: [CADPartColorChange] = [], startedColors: [String: PartColor] = [:]) throws {
+        let response = ChatMessage(role: "assistant", content: spec.summary + "\n\nDesign ready.", phase: "final_answer")
+        _ = try appendValidatedRevision(spec, preview: preview, previousLayout: previousLayout,
+            previouslyHidden: previouslyHidden, previousColors: previousColors, colorChanges: colorChanges,
+            startedColors: startedColors, date: response.date, userMessageID: userMessageID, responseMessageID: response.id)
+        finishGenerationFeedback()
+        finishTaskAudit(status: "completed")
+        messages.append(response)
+        activity = "Ready"; isWorking = false; operation = nil; error = nil
+        setSteeringAvailable(false)
+        queueCanAdvance = true
+        autosave()
+        drainQueueIfPossible()
+    }
+
+    /// Both agent entry points publish through the same revision transaction.
+    /// Callers own task completion; this operation never finishes another task.
+    @discardableResult
+    private func appendValidatedRevision(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout?,
+        previouslyHidden: Set<String>, previousColors: [String: PartColor], colorChanges: [CADPartColorChange],
+        startedColors: [String: PartColor], date: Date = Date(), userMessageID: UUID? = nil,
+        responseMessageID: UUID? = nil) throws -> UUID {
         let defaults = Self.defaultParts(for: preview)
         let layout = previousLayout?.reconciled(with: defaults, allowingPlacementChanges: Set(spec.reorganizePartIDs ?? [])) ?? PartLayout(nodes: defaults)
         try ProjectStore.validatePartHierarchy(layout.nodes, solidCount: preview.solids)
         let colors = try Self.partColors(applying: colorChanges, in: layout.nodes,
                                         current: previousColors, startedWith: startedColors)
         let hidden = Set(layout.nodes.flatMap(\.flattened).filter { previouslyHidden.contains($0.id) }.flatMap(\.solidIndices))
-        let response = ChatMessage(role: "assistant", content: spec.summary + "\n\nDesign ready.", phase: "final_answer")
-        let revision = ProjectRevision(model: spec, date: response.date, preview: preview, partLayout: layout, hiddenSolids: hidden.sorted(), parts: defaults, runtime: preview.runtime,
-                                      userMessageID: userMessageID, responseMessageID: response.id,
+        let revision = ProjectRevision(model: spec, date: date, preview: preview, partLayout: layout, hiddenSolids: hidden.sorted(), parts: defaults, runtime: preview.runtime,
+                                      userMessageID: userMessageID, responseMessageID: responseMessageID,
                                       partColors: colors.isEmpty ? nil : colors, validatedHash: preview.validatedHash)
         revisions.append(revision)
         selectedRevisionID = revision.id; builtRevisionID = revision.id
         mesh = preview; selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = hidden
-        finishGenerationFeedback()
-        finishTaskAudit(status: "completed")
-        messages.append(response)
         viewportCommand = ViewportCommand(.fit)
-        activity = "Ready"; isWorking = false; operation = nil; error = nil
-        setSteeringAvailable(false)
-        queueCanAdvance = true
-        autosave()
-        drainQueueIfPossible()
+        return revision.id
     }
 
     private func drainGenerationFeedback(_ feedback: CodexConversationFeedback, token: UUID) {
@@ -1173,7 +1193,12 @@ final class AppState: ObservableObject {
     }
 
     func recordTaskEvent(_ incoming: ProjectActivityEvent) {
-        guard let id = activeTaskAuditID, let index = taskAudits.firstIndex(where: { $0.id == id }) else { return }
+        guard let id = activeTaskAuditID else { return }
+        recordTaskEvent(incoming, taskID: id)
+    }
+
+    func recordTaskEvent(_ incoming: ProjectActivityEvent, taskID id: UUID) {
+        guard let index = taskAudits.firstIndex(where: { $0.id == id }) else { return }
         if incoming.category == "tool", incoming.status == "completed",
            ["lad_render", "lad_screenshot"].contains(incoming.title), let png = incoming.imageData {
             activityImages.store(png, for: ProjectActivityImageKey(taskID: id, eventID: incoming.id))
@@ -1870,6 +1895,7 @@ final class AppState: ObservableObject {
     }
 
     private func restore(_ project: LADProject) {
+        onProjectAgentInvalidated?()
         cancelProjectThumbnail()
         projectReady = false
         // Existing files retain normal autosaving, including empty archives.
@@ -2276,6 +2302,86 @@ final class AppState: ObservableObject {
                 self.projectThumbnailTask = nil
             }
         }
+    }
+}
+
+extension AppState {
+    var agentStateToken: String { "\(projectSessionID.uuidString):\(agentStateGeneration)" }
+
+    func agentSnapshot() -> ProjectAgentSnapshot {
+        ProjectAgentSnapshot(projectID: projectID, editingID: projectSessionID, stateToken: agentStateToken,
+            current: current, preview: builtRevisionID == selectedRevisionID ? mesh : nil,
+            versions: ProjectVersionContext(revisions: revisions, selectedRevisionID: selectedRevisionID),
+            partLayout: selectedPartLayout, partColors: revisions.first(where: { $0.id == selectedRevisionID })?.partColors ?? [:],
+            hiddenSolids: hiddenSolids, solidColors: solidColors)
+    }
+
+    func beginExternalAgentAudit(id: UUID, client: ProjectExternalAgentIdentity, request: String,
+                                 model: String? = nil, effort: String? = nil) throws {
+        guard projectReady, !preserveUnreadableSession, taskAudits.count < 10_000 else {
+            throw LADError.message("The design is unavailable for another agent task.")
+        }
+        let audit = ProjectTaskAudit(id: id, model: model, reasoningEffort: effort, externalClient: client, request: request)
+        try ProjectStore.validateTaskAudits([audit], messages: messages, revisionIDs: Set(revisions.map(\.id)))
+        taskAudits.append(audit)
+        projectSavingEnabled = true
+        autosave()
+    }
+
+    func finishExternalAgentAudit(id: UUID, status: String) {
+        guard let index = taskAudits.firstIndex(where: { $0.id == id }), taskAudits[index].externalClient != nil,
+              taskAudits[index].status == "running" else { return }
+        taskAudits[index].status = status
+        taskAudits[index].finishedAt = Date()
+        for item in taskAudits[index].events.indices where taskAudits[index].events[item].status == "running" {
+            taskAudits[index].events[item].status = status == "completed" ? "interrupted" : status
+        }
+        autosave()
+    }
+
+    func externalAgentReceipt(clientID: String, key: String) -> ProjectTaskAudit? {
+        taskAudits.first { $0.externalClient?.clientID == clientID && $0.commitKey == key }
+    }
+
+    func commitExternalAgent(_ candidate: ProjectAgentCandidate, taskID: UUID, artifactID: String,
+                             expectedStateToken: String, key: String, snapshot: ProjectAgentSnapshot) throws -> UUID {
+        guard projectReady, !preserveUnreadableSession, projectID == snapshot.projectID,
+              projectSessionID == snapshot.editingID, agentStateToken == expectedStateToken,
+              expectedStateToken == snapshot.stateToken, !isWorking else {
+            throw ProjectAgentError.conflict("The design changed or is busy. Start a new task against its current state before committing.")
+        }
+        guard let index = taskAudits.firstIndex(where: { $0.id == taskID }), taskAudits[index].status == "running",
+              taskAudits[index].externalClient != nil else { throw ProjectAgentError.unavailable }
+        try ProjectStore.validateModel(candidate.model)
+        guard revisions.count < 1_000 else { throw LADError.message("The design already has the maximum number of versions.") }
+        let revisionID: UUID
+        if artifactID == "current", let selectedRevisionID, current == candidate.model {
+            try applyAgentPartColorChanges(candidate.colorChanges, to: selectedRevisionID,
+                matching: current, startedWith: snapshot.partColors)
+            revisionID = selectedRevisionID
+        } else {
+            revisionID = try appendValidatedRevision(candidate.model, preview: candidate.preview,
+                previousLayout: selectedPartLayout, previouslyHidden: hiddenPartIDs,
+                previousColors: Self.completePartColors(in: partTree, stored: revisions.first(where: { $0.id == selectedRevisionID })?.partColors ?? [:]),
+                colorChanges: candidate.colorChanges, startedColors: snapshot.partColors)
+        }
+        taskAudits[index].committedRevisionID = revisionID
+        taskAudits[index].commitKey = key
+        taskAudits[index].commitArtifactID = artifactID
+        taskAudits[index].status = "completed"
+        taskAudits[index].finishedAt = Date()
+        error = nil
+        autosave()
+        return revisionID
+    }
+
+    /// Await the existing writer without canceling any other design work.
+    func flushExternalAgentCommit() async throws { try await flushProject() }
+
+    var agentPersistenceStatus: [String: Any] {
+        var value: [String: Any] = ["status": hasUnsavedChanges ? "pending" : (projectURL == nil ? "memory" : "saved")]
+        if let saveStatus, saveStatus.hasPrefix("Not saved:") { value["status"] = "failed"; value["error"] = saveStatus }
+        return value
     }
 }
 

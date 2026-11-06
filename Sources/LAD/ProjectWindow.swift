@@ -111,6 +111,38 @@ final class ProjectWindowCoordinator: ObservableObject {
     private var isQuitting = false
     var onReopenProjectWindow: (@MainActor (ProjectWindowRequest) -> Void)?
 
+    /// External tools address shared documents, independently of key-window routing.
+    var agentProjects: [AppState] {
+        guard !isQuitting else { return [] }
+        var seen = Set<ObjectIdentifier>()
+        return (uniqueStates() + Array(reopeningStates.values)).filter {
+            $0.canRenameProject && seen.insert(ObjectIdentifier($0)).inserted
+        }
+    }
+
+    func agentWindow(for state: AppState) -> NSWindow? {
+        focusOrder.reversed().compactMap { id in entries[id]?.state === state ? windows[id]?.window : nil }.first
+    }
+
+    func createAgentProject() throws -> AppState {
+        guard !isQuitting, let opening = onReopenProjectWindow else {
+            throw LADError.message("Open a LAD design window before creating another design.")
+        }
+        let state = AppState()
+        state.newProject()
+        let request = ProjectWindowRequest()
+        reopeningStates[request.id] = state
+        opening(request)
+        return state
+    }
+
+    func openAgentProject(at url: URL) throws {
+        guard !isQuitting, let opening = onReopenProjectWindow else {
+            throw LADError.message("Open a LAD design window before opening another design.")
+        }
+        openProject(at: url, createWindow: opening)
+    }
+
     init(closeSession: @escaping @MainActor (AppState) async -> Void = { await $0.prepareToQuit() },
          saveUnsavedProject: @escaping @MainActor (AppState) async -> Bool = { await ProjectQuitSave.save($0) },
          readProject: @escaping @Sendable (URL) async throws -> LADProject = { url in
