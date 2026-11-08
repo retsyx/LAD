@@ -19,21 +19,27 @@ final class AppStateActivityImageTests: XCTestCase {
         let repairID = "repair:tool:shared-render-id"
         let projectKey = ProjectActivityImageKey(taskID: taskID, eventID: projectID)
         let repairKey = ProjectActivityImageKey(taskID: taskID, eventID: repairID)
+        let viewedID = "project:server:thread:image-1"
+        let viewedKey = ProjectActivityImageKey(taskID: taskID, eventID: viewedID)
 
         state.recordTaskEvent(event(projectID, status: "running", image: red))
         XCTAssertNil(state.activityImages.images[projectKey], "An unfinished tool result must not expose a completed render image.")
         state.recordTaskEvent(event(projectID, image: red))
         state.recordTaskEvent(event(repairID, title: "lad_screenshot", image: blue))
-        XCTAssertEqual(state.activityImages.images[projectKey]?.png, red)
-        XCTAssertEqual(state.activityImages.images[repairKey]?.png, blue,
+        state.recordTaskEvent(event(viewedID, title: "imageView", status: "running", image: blue))
+        XCTAssertNil(state.activityImages.images[viewedKey])
+        state.recordTaskEvent(event(viewedID, title: "imageView", image: blue))
+        XCTAssertEqual(state.activityImages.images[viewedKey]?.data, blue)
+        XCTAssertEqual(state.activityImages.images[projectKey]?.data, red)
+        XCTAssertEqual(state.activityImages.images[repairKey]?.data, blue,
                        "Project and repair attempts may reuse native tool IDs without sharing their images.")
-        XCTAssertEqual(state.taskAudits.first?.events.count, 2)
+        XCTAssertEqual(state.taskAudits.first?.events.count, 3)
         XCTAssertTrue(state.taskAudits.first?.events.allSatisfy { $0.imageData == nil } == true)
 
         state.recordTaskEvent(event(projectID, output: "Metadata-only completion update"))
-        XCTAssertEqual(state.activityImages.images[projectKey]?.png, red,
+        XCTAssertEqual(state.activityImages.images[projectKey]?.data, red,
                        "Text-only upserts must retain the matching already-produced image.")
-        XCTAssertEqual(state.taskAudits.first?.events.count, 2)
+        XCTAssertEqual(state.taskAudits.first?.events.count, 3)
         XCTAssertEqual(state.taskAudits.first?.events.first?.output, "Metadata-only completion update")
 
         state.cancel() // Cancel before yielding: no Codex or CAD worker starts.
@@ -63,7 +69,7 @@ final class AppStateActivityImageTests: XCTestCase {
         state.recordTaskEvent(event(acceptedID, image: blue))
         state.recordTaskEvent(event("project:tool:late", image: blue))
         XCTAssertEqual(state.taskAudits, finished)
-        XCTAssertEqual(state.activityImages.images[acceptedKey]?.png, red)
+        XCTAssertEqual(state.activityImages.images[acceptedKey]?.data, red)
         XCTAssertNil(state.activityImages.images[ProjectActivityImageKey(taskID: taskID, eventID: "project:tool:late")])
         await state.prepareToQuit()
     }
@@ -83,8 +89,8 @@ final class AppStateActivityImageTests: XCTestCase {
         let eventID = "project:tool:reused"
         first.recordTaskEvent(event(eventID, image: red))
         second.recordTaskEvent(event(eventID, image: blue))
-        XCTAssertEqual(first.activityImages.images[ProjectActivityImageKey(taskID: firstTask, eventID: eventID)]?.png, red)
-        XCTAssertEqual(second.activityImages.images[ProjectActivityImageKey(taskID: secondTask, eventID: eventID)]?.png, blue)
+        XCTAssertEqual(first.activityImages.images[ProjectActivityImageKey(taskID: firstTask, eventID: eventID)]?.data, red)
+        XCTAssertEqual(second.activityImages.images[ProjectActivityImageKey(taskID: secondTask, eventID: eventID)]?.data, blue)
         XCTAssertNil(first.activityImages.images[ProjectActivityImageKey(taskID: secondTask, eventID: eventID)])
         XCTAssertNil(second.activityImages.images[ProjectActivityImageKey(taskID: firstTask, eventID: eventID)])
         first.cancel()
@@ -92,8 +98,8 @@ final class AppStateActivityImageTests: XCTestCase {
         let nextTask = try XCTUnwrap(first.taskAudits.last?.id)
         XCTAssertNotEqual(firstTask, nextTask)
         first.recordTaskEvent(event(eventID, image: blue))
-        XCTAssertEqual(first.activityImages.images[ProjectActivityImageKey(taskID: firstTask, eventID: eventID)]?.png, red)
-        XCTAssertEqual(first.activityImages.images[ProjectActivityImageKey(taskID: nextTask, eventID: eventID)]?.png, blue)
+        XCTAssertEqual(first.activityImages.images[ProjectActivityImageKey(taskID: firstTask, eventID: eventID)]?.data, red)
+        XCTAssertEqual(first.activityImages.images[ProjectActivityImageKey(taskID: nextTask, eventID: eventID)]?.data, blue)
         first.cancel(); second.cancel()
         await first.prepareToQuit(); await second.prepareToQuit()
     }
@@ -112,7 +118,7 @@ final class AppStateActivityImageTests: XCTestCase {
         let completed = event(eventID, image: png)
         state.recordTaskEvent(completed)
         let key = ProjectActivityImageKey(taskID: taskID, eventID: eventID)
-        XCTAssertEqual(state.activityImages.images[key]?.png, png)
+        XCTAssertEqual(state.activityImages.images[key]?.data, png)
         XCTAssertNil(state.taskAudits.first?.events.first?.imageData)
         let encodedEvent = try JSONEncoder().encode(completed)
         XCTAssertFalse(String(decoding: encodedEvent, as: UTF8.self).contains("imageData"))
@@ -131,7 +137,7 @@ final class AppStateActivityImageTests: XCTestCase {
 
         let reopened = fixture.state("reopened")
         reopened.activityImages.store(png, for: key)
-        XCTAssertEqual(reopened.activityImages.images[key]?.png, png)
+        XCTAssertEqual(reopened.activityImages.images[key]?.data, png)
         reopened.loadProject(saved, from: url)
         XCTAssertTrue(reopened.activityImages.images.isEmpty, "Loading an archive must discard any previous design's session images.")
         XCTAssertEqual(reopened.taskAudits, saved.taskAudits)
@@ -149,7 +155,7 @@ final class AppStateActivityImageTests: XCTestCase {
         let png = try ImageAttachmentTestImage.png(.orange)
         let oldID = "project:tool:old"
         state.recordTaskEvent(event(oldID, image: png))
-        XCTAssertEqual(state.activityImages.images[ProjectActivityImageKey(taskID: oldTaskID, eventID: oldID)]?.png, png)
+        XCTAssertEqual(state.activityImages.images[ProjectActivityImageKey(taskID: oldTaskID, eventID: oldID)]?.data, png)
         state.newProject()
         XCTAssertTrue(state.activityImages.images.isEmpty)
         XCTAssertTrue(state.taskAudits.isEmpty)

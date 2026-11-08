@@ -24,7 +24,7 @@ struct ProjectActivityEvent: Codable, Sendable, Identifiable, Equatable {
     var durationSeconds: Double? = nil
     /// Exact candidate and producer instructions, stored once by content hash.
     var files: [ProjectActivityFile]? = nil
-    /// Transient exact PNG for this completed image tool call. The app moves it
+    /// Transient exact image bytes for this completed image tool call, moved
     /// into a bounded session cache before retaining the text audit record.
     /// Generated render bytes must never enter a project archive or a prompt.
     var imageData: Data? = nil

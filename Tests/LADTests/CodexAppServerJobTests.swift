@@ -1,4 +1,7 @@
+import CoreGraphics
+import Darwin
 import Foundation
+import ImageIO
 import XCTest
 @testable import LAD
 
@@ -143,6 +146,84 @@ final class CodexAppServerJobTests: XCTestCase {
         XCTAssertTrue(serialized.contains("encodedByteCount"))
     }
 
+    func testCompletedImageViewsRetainExactWorkspaceImagesAfterTaskCleanup() async throws {
+        let fixture = try AppServerFixture(onTurn: """
+        note('item/started', {'item': {'id': 'png', 'type': 'imageView', 'path': os.path.join(ROOT, 'images', 'render.png')}})
+        note('item/completed', {'item': {'id': 'png', 'type': 'imageView', 'path': os.path.join(ROOT, 'images', 'render.png')}})
+        note('item/completed', {'threadId': 'child-thread', 'item': {'id': 'jpeg', 'type': 'imageView', 'path': 'images/reference.jpg'}})
+        finish({'imagesViewed': True})
+        """)
+        defer { fixture.remove() }
+        let imageDirectory = fixture.directory.appendingPathComponent("images", isDirectory: true)
+        try FileManager.default.createDirectory(at: imageDirectory, withIntermediateDirectories: false)
+        let png = try imageData(type: "public.png")
+        let jpeg = try imageData(type: "public.jpeg")
+        let pngURL = imageDirectory.appendingPathComponent("render.png")
+        try png.write(to: pngURL)
+        try jpeg.write(to: imageDirectory.appendingPathComponent("reference.jpg"))
+        let capture = AppServerCapture()
+        let result = try await fixture.job(capture: capture).run(input: Data("Inspect these images".utf8))
+        XCTAssertEqual((try JSONSerialization.jsonObject(with: result) as? [String: Bool])?["imagesViewed"], true)
+        fixture.remove()
+
+        let events = capture.events.filter { $0.title == "imageView" }
+        XCTAssertEqual(events.count, 3)
+        XCTAssertNil(events.first?.imageData, "Started events retain metadata only.")
+        let completedPNG = try XCTUnwrap(events.first { $0.id == "server:thread-1:png" && $0.status == "completed" })
+        let completedJPEG = try XCTUnwrap(events.first { $0.id == "server:child-thread:jpeg" })
+        XCTAssertEqual(completedPNG.imageData, png)
+        XCTAssertEqual(completedJPEG.imageData, jpeg, "Image viewing preserves the original encoding and bytes.")
+        let output = try XCTUnwrap(completedPNG.output)
+        let metadata = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: String])
+        XCTAssertEqual(metadata, ["id": "png", "type": "imageView", "path": pngURL.path])
+        let archived = try JSONEncoder().encode(events)
+        XCTAssertTrue(try JSONDecoder().decode([ProjectActivityEvent].self, from: archived).allSatisfy { $0.imageData == nil })
+    }
+
+    func testUnsafeOrUnavailableImageViewsKeepMetadataWithoutFailingTheTask() async throws {
+        let fixture = try AppServerFixture(onTurn: """
+        paths = {
+            'missing': 'missing.png',
+            'empty': '',
+            'no-path': None,
+            'directory': 'images',
+            'oversized': 'oversized.png',
+            'traversal': '../' + os.path.basename(ROOT) + '-outside/reference.png',
+            'outside': ROOT + '-outside/reference.png',
+            'symlink': 'linked.png',
+            'parent-symlink': 'linked-directory/reference.png',
+            'hardlink': 'hardlinked.png',
+            'pipe': 'pipe.png',
+        }
+        for id, path in paths.items():
+            note('item/completed', {'item': {'id': id, 'type': 'imageView', 'path': path}})
+        finish({'imagesUnavailable': True})
+        """)
+        defer { fixture.remove() }
+        let manager = FileManager.default
+        let outside = URL(fileURLWithPath: fixture.directory.path + "-outside", isDirectory: true)
+        try manager.createDirectory(at: outside, withIntermediateDirectories: false)
+        defer { try? manager.removeItem(at: outside) }
+        let reference = outside.appendingPathComponent("reference.png")
+        try imageData(type: "public.png").write(to: reference)
+        try manager.createDirectory(at: fixture.directory.appendingPathComponent("images"), withIntermediateDirectories: false)
+        try manager.createSymbolicLink(at: fixture.directory.appendingPathComponent("linked.png"), withDestinationURL: reference)
+        try manager.createSymbolicLink(at: fixture.directory.appendingPathComponent("linked-directory"), withDestinationURL: outside)
+        try manager.linkItem(at: reference, to: fixture.directory.appendingPathComponent("hardlinked.png"))
+        let oversized = fixture.directory.appendingPathComponent("oversized.png")
+        XCTAssertTrue(manager.createFile(atPath: oversized.path, contents: nil))
+        let file = try FileHandle(forWritingTo: oversized)
+        try file.truncate(atOffset: 32 * 1024 * 1024 + 1)
+        try file.close()
+        XCTAssertEqual(Darwin.mkfifo(fixture.directory.appendingPathComponent("pipe.png").path, 0o600), 0)
+        let capture = AppServerCapture()
+        let result = try await fixture.job(capture: capture).run(input: Data("Inspect these images".utf8))
+        XCTAssertEqual((try JSONSerialization.jsonObject(with: result) as? [String: Bool])?["imagesUnavailable"], true)
+        let events = capture.events.filter { $0.title == "imageView" }
+        XCTAssertEqual(events.count, 11)
+        XCTAssertTrue(events.allSatisfy { $0.status == "completed" && $0.imageData == nil && $0.output != nil })
+    }
+
     func testFragmentedOversizedFrameIsScannedOnceAndValidFramesAfterItSurvive() async throws {
         let fixture = try AppServerFixture(onTurn: """
         chunk = 'x' * 16384
@@ -239,6 +320,19 @@ final class CodexAppServerJobTests: XCTestCase {
         let check = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: fixture.directory.appendingPathComponent("staged-check.json"))) as? [[String: Any]])
         XCTAssertEqual(check.first?["matches"] as? Bool, true)
         XCTAssertNotEqual(check.first?["readPath"] as? String, source.path)
+    }
+
+    private func imageData(type: String) throws -> Data {
+        let context = try XCTUnwrap(CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(CGColor(red: 0.8, green: 0.6, blue: 0.2, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        let image = try XCTUnwrap(context.makeImage())
+        let data = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data, type as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return data as Data
     }
 
     private func waitUntil(_ condition: () -> Bool) async throws {

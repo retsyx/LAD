@@ -1200,8 +1200,8 @@ final class AppState: ObservableObject {
     func recordTaskEvent(_ incoming: ProjectActivityEvent, taskID id: UUID) {
         guard let index = taskAudits.firstIndex(where: { $0.id == id }) else { return }
         if incoming.category == "tool", incoming.status == "completed",
-           ["lad_render", "lad_screenshot"].contains(incoming.title), let png = incoming.imageData {
-            activityImages.store(png, for: ProjectActivityImageKey(taskID: id, eventID: incoming.id))
+           ["lad_render", "lad_screenshot", "imageView"].contains(incoming.title), let image = incoming.imageData {
+            activityImages.store(image, for: ProjectActivityImageKey(taskID: id, eventID: incoming.id))
         }
         var event = incoming
         // Keep heavy derived media separate from persistent audit state.

@@ -57,6 +57,7 @@ final class CodexAppServerJob: @unchecked Sendable {
     private var outbound: [Data] = []
     private var publishedAvailability = false
     private let directory: URL
+    private let activityWorkspace: CADAgentWorkspace?
     private let model: String
     private let effort: String?
     private let schema: Data
@@ -87,6 +88,7 @@ final class CodexAppServerJob: @unchecked Sendable {
          onSteeringAvailability: @escaping @Sendable (Bool) -> Void,
          environment overrides: [String: String]) {
         self.directory = directory
+        activityWorkspace = try? CADAgentWorkspace(directory: directory)
         self.model = model
         self.effort = effort
         self.schema = schema
@@ -530,13 +532,28 @@ final class CodexAppServerJob: @unchecked Sendable {
         case "mcpToolCall": item["type"] = "mcp_tool_call"; item["duration_ms"] = source["durationMs"]
         case "webSearch": item["type"] = "web_search"
         case "plan": item["type"] = "plan"
-        case "collabAgentToolCall", "dynamicToolCall", "imageView", "sleep", "subAgentActivity":
+        case "imageView":
+            onActivity(ProjectActivityEvent(id: "server:\(thread):\(id)", category: "tool", title: originalKind,
+                status: completed ? "completed" : "running", output: CodexActivity.json(CodexActivity.sanitize(source)),
+                imageData: completed ? activityImageData(source["path"] as? String) : nil))
+            return
+        case "collabAgentToolCall", "dynamicToolCall", "sleep", "subAgentActivity":
             onActivity(ProjectActivityEvent(id: "server:\(thread):\(id)", category: "tool", title: source["tool"] as? String ?? originalKind,
                 status: completed ? "completed" : "running", output: CodexActivity.json(CodexActivity.sanitize(source))))
             return
         default: return
         }
         if let event = CodexActivity.event(["type": completed ? "item.completed" : "item.started", "item": item], starts: &activityStarts) { onActivity(event) }
+    }
+    private func activityImageData(_ path: String?) -> Data? {
+        lock.lock(); let isCancelled = cancelled; lock.unlock()
+        guard !isCancelled, let path, let activityWorkspace else { return nil }
+        // This utility I/O thread captures the original encoded bytes before
+        // task cleanup. Descriptor-relative, bounded reads reject links and
+        // special files without decoding images or following external paths.
+        let data = try? activityWorkspace.read(path, maximumBytes: 32 * 1024 * 1024)
+        lock.lock(); let stopped = cancelled; lock.unlock()
+        return stopped ? nil : data
     }
     private func emitCommentary(_ id: String, message: Message) {
         guard message.phase == nil || message.phase == "commentary" else { return }

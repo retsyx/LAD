@@ -1,5 +1,4 @@
 import AppKit
-import ImageIO
 import SwiftUI
 
 /// Auxiliary panes need their owning window before CAD geometry is available.
@@ -235,8 +234,8 @@ struct ProjectActivityEventView: View {
 
     private var imageKey: ProjectActivityImageKey { ProjectActivityImageKey(taskID: taskID, eventID: event.id) }
     private var hasImageResult: Bool {
-        ["lad_render", "lad_screenshot"].contains(event.title) && event.status == "completed" &&
-            event.output?.contains("image_path") == true
+        event.status == "completed" && (event.title == "imageView" ||
+            (["lad_render", "lad_screenshot"].contains(event.title) && event.output?.contains("image_path") == true))
     }
 
     var body: some View {
@@ -267,7 +266,7 @@ struct ProjectActivityEventView: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let input = event.input, !input.isEmpty { detail("Input", text: input) }
                 if let reference = images.images[imageKey] {
-                    ProjectActivityImagePreview(reference: reference)
+                    ProjectActivityImagePreview(reference: reference, images: images)
                 } else if hasImageResult {
                     Text("Preview unavailable").font(.caption).foregroundStyle(Palette.muted)
                 }
@@ -320,40 +319,6 @@ private enum ProjectActivityAppearance {
 
     static func color(_ status: String) -> Color {
         ["failed", "error", "running", "started", "in_progress"].contains(status) ? Palette.accent : Palette.muted
-    }
-}
-
-/// Only the image shown inside an expanded tool result is decoded, off the
-/// main actor. These are exact tool PNGs, never another render or screenshot.
-private struct ProjectActivityImagePreview: View {
-    var reference: ProjectActivityImageReference
-    @State private var image: NSImage?
-    @State private var failed = false
-
-    var body: some View {
-        Group {
-            if let image {
-                Image(nsImage: image).resizable().scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: 420)
-                    .accessibilityLabel("Rendered screenshot")
-            } else if failed {
-                Text("Preview unavailable").font(.caption).foregroundStyle(Palette.muted)
-            } else {
-                ProgressView().controlSize(.small).frame(maxWidth: .infinity).frame(height: 160)
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .task(id: reference.id) {
-            image = nil; failed = false
-            let png = reference.png
-            let decoded = await Task.detached(priority: .userInitiated) {
-                guard let source = CGImageSourceCreateWithData(png as CFData, nil) else { return nil as CGImage? }
-                return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
-            }.value
-            guard !Task.isCancelled else { return }
-            if let decoded { image = NSImage(cgImage: decoded, size: .zero) }
-            else { failed = true }
-        }
     }
 }
 
