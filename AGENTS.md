@@ -2,8 +2,13 @@
 
 ## General
 
+- Don't update this file unless explicity asked to do so.
 - LAD supports Apple Silicon (`arm64`) only. Build, package and test that architecture exclusively; do not add support for other architectures.
 - This project is in early development. There is no need for backward compatibility with prior revisions of the software. This remains true as long as this instruction is in this file. When the software is more mature, this instruction will be replaced with an instruction to ensure backward compatibility between software revisions.
+- When working on a feature, don't change ancillary items that are not directly related to the feature. If in doubt, ask.
+- Don't babble in documents. Only update documents with information that is pertinent to the long term understanding of Amity's architecture and codebase.
+- Identify the actual invariant before “fixing” a race. Not every possible ordering is a bug.
+- Do not put internal protocol or build-profile terminology or descriptions into the UI or the top README.md.
 
 ## Naming
 
@@ -17,15 +22,9 @@
 - Call LAD documents designs in all app-owned UI, including menus, dialogs, help, accessibility labels, status, and errors.
 - Don't state with labels or prompts the default/obvious/expected behavior in the UI.
 - Keep viewport mouse and keyboard control instructions in the dedicated nonmodal LAD Help window, opened from Help → LAD Help (⌘?). Reuse one help window, keep it out of Project state and session restoration, and support normal native close/reopen behavior. Settings contains configuration rather than the viewport controls guide.
-- Show each version's custom name, or `vN` from its history position by default, in the version selector. Allow inline naming in that dropdown without selecting, rebuilding, or changing the design title. Save version names in the `.lad` package; show only version names in the list.
-- Keep transient save and rename feedback outside the header's sizing flow, using the existing padding. Feedback appearing, changing or disappearing must not shift the design name or resize the workspace; retain complete errors in help and accessibility text.
-- Keep two persistent vertically resizable sections in the left panel: Parts above and Design below, with Design information followed by selection Measurements in the lower section. Default to a 3/4 Parts and 1/4 Design split, save the user's divider fraction per project, and never resize the panes for selection or content changes. Keep separate scrolling for Parts and lower-pane information. The expanded CadQuery program fills the lower section's remaining height and full width, with both scroll directions available for complete long lines; do not cap its height or nest it inside an unbounded shared vertical scroll area. Omit the redundant design title and do not provide a details-visibility toggle.
-- Keep the Parts list's scroll position stable when selecting or deselecting items, including nested folders and Measurements appearing or disappearing within the lower pane. Content changes must not move the divider or replace the user's scroll position.
 - All LAD branding icons (application, project documents, and the iCloud folder badge) must match the window header: the gold `cube.transparent.fill` symbol with light weight and `Palette.accent` color. Do not use an alternate cube or letter emblem.
 - Let macOS supply `.lad` file icons from the app's document-type registration; never write per-document custom-icon metadata. For the ordinary iCloud LAD folder, apply the custom icon only when Finder's persistent custom-icon flag is absent, preserving existing user icons across launches. Serialize this folder-only AppKit work on the main actor after file coordination, without blocking autosave.
 - Provide design-specific Finder content thumbnails through the bundled Quick Look thumbnail extension, retaining the registered LAD icon as the fallback. Store one small, separately referenced PNG presentation image in the package; generate it asynchronously from validated geometry without moving the live viewport. Thumbnail failure, absence or corruption must never prevent saving or opening a design. The extension reads the existing image only and never rebuilds CAD geometry or launches Codex.
-- Verify Finder thumbnails at both 1× and 2× backing scales and multiple request sizes through the native Quick Look service and live Finder. Core Graphics reply bitmap bounds include backing scale; derive drawing bounds from the actual bitmap and its coordinate transform.
-- Keep ambient viewport illumination and attach the directional key/fill lights to the camera, with the main light above-right and fill above-left. Their directions must stay fixed relative to the view through orbit, pan, zoom, and projection changes; highlights should respond naturally to curved surface normals.
 - Shade preview faces with finite, unit, outward normals from the exact OpenCascade face surfaces at their triangulation UV nodes, respecting face orientation and locations. Triangle-averaged lighting normals create splotchy highlights on curved blends. Preserve hard boundaries and the existing mesh/edge positions; keep lighting normals derived and session-only, separate from geometric triangle-plane normals used for edge occlusion.
 - Prepare viewport drawing resources asynchronously before revealing a newly loaded model. Keep pending preparation safe across model replacement and view teardown, and avoid reassigning materials or requesting redraws for unchanged display state.
 - Wake SceneKit playback for bounded redraw bursts after camera, material, visibility, highlight, layout, and activation changes; pause again when idle and cancel pending redraw tasks on detachment. A paused Metal view can ignore AppKit's `needsDisplay` flag alone. Verify fresh live-window frames after idle as well as independent render captures when changing rendering lifecycle behavior.
@@ -124,14 +123,8 @@
 
 ## Codex model selection
 
-- Discover the Codex executable automatically, preferring the installed Codex app, then the ChatGPT app, standalone command locations and architecture-compatible VS Code extension fallbacks. Support both the app's `codex-cli/bin/codex` launcher layout and the earlier `Resources/codex` layout. Keep Codex configuration out of LAD Settings. Any explicit executable override retained for development or tests stays hidden and wins even when unavailable; clearing it restores automatic discovery. Codex installation, configuration and sign-in remain the user's responsibility; LAD must not launch installers or a sign-in flow.
-- Do not provide a Codex Settings section, executable picker, health panel or background Settings health checks. Installation, configuration and sign-in belong to the user’s Codex installation. Keep actionable failures attached to the operation that needs Codex, without exposing account identity or credentials in UI, diagnostics or preferences.
-- Keep model and reasoning selection together in the composer, with model first. Populate model names and supported reasoning levels from the installed Codex catalog rather than a hard-coded model list.
 - Model and reasoning selection, including custom model IDs, belongs exclusively in the chat composer. Do not expose model selection in Settings.
 - Store the model, reasoning level, and remembered reasoning preferences per model in each `.lad` project. Restore these choices when opening that file; do not use app-global preferences or inherit another project's selections. Initialize a new project's selection from the installed Codex configuration, then retain the explicit choice in the project.
 - Reconcile unsupported reasoning levels when switching models. Apply the captured model/effort pair to new requests and their repair attempts.
 - Show both model and reasoning level in the selector and running Codex task status. Keep the running status tied to the pair captured for that task, even when the selector changes for a later request.
 
-## Restarting LAD
-
-- Restart LAD after completing app changes when requested in the session. If LAD prompts to save during the restart, choose not to save.
