@@ -55,6 +55,7 @@ final class EngineService {
         var nativePath: String
         var selection: [Int]?
         var colors: [STEPExportColor]
+        var arrangeFor3DPrinting: Bool
     }
     private var exportedSTEP: [STEPExportKey: Data] = [:]
     private var exportedSTEPOrder: [STEPExportKey] = []
@@ -179,8 +180,9 @@ final class EngineService {
     }
 
     /// Export an already built native solid, with no program replay or meshing.
-    /// Repeated exports reuse bytes only for the same geometry, subset and RGB.
+    /// Repeated exports reuse bytes only for the same geometry, subset, RGB and arrangement.
     func exportSTEP(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, solidColors: [Int: PartColor] = [:],
+                    arrangeFor3DPrinting: Bool = false,
                     python: String, threads: Int) async throws -> Data {
         defer { withExtendedLifetime(preview.buildArtifacts) {} }
         try Task.checkCancellation()
@@ -195,9 +197,9 @@ final class EngineService {
         }
         let selection: [Int]? = solidIndices.flatMap { $0.count == preview.solids ? nil : $0.sorted() }
         let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
-        // Raw bytes are valid only when the caller requests no display colors.
-        // Any supplied current RGB must be written from native geometry.
-        if selection == nil, colors.isEmpty, let artifacts = preview.buildArtifacts, artifacts.containsSTEP,
+        // Raw bytes retain their original coordinates and carry no requested display colors.
+        // Arrangement and current RGB must be written from native geometry.
+        if !arrangeFor3DPrinting, selection == nil, colors.isEmpty, let artifacts = preview.buildArtifacts, artifacts.containsSTEP,
            preview.stepPath == artifacts.folder.appendingPathComponent("model.step").path {
             let source = URL(fileURLWithPath: preview.stepPath)
             return try await Task.detached(priority: .userInitiated) {
@@ -208,7 +210,8 @@ final class EngineService {
         }
         if let path = preview.brepPath, let artifacts = preview.buildArtifacts,
            path == artifacts.folder.appendingPathComponent("model.brep").path {
-            let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors)
+            let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors,
+                                        arrangeFor3DPrinting: arrangeFor3DPrinting)
             if let cached = exportedSTEP[cacheKey] {
                 exportedSTEPOrder.removeAll { $0 == cacheKey }
                 exportedSTEPOrder.append(cacheKey)
@@ -220,6 +223,7 @@ final class EngineService {
                 var payload: [String: Any] = ["operation": "export", "brepAsset": "source.brep"]
                 if let selection { payload["solidIndices"] = selection }
                 if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
+                if arrangeFor3DPrinting { payload["arrangeFor3DPrinting"] = true }
                 try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
             }
             let data = try await Task.detached(priority: .userInitiated) {

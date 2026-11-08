@@ -100,6 +100,53 @@ final class EngineSTEPColorTests: XCTestCase {
         } catch EngineExportError.nativeArtifactUnavailable {}
     }
 
+    @MainActor
+    func testPrintingArrangementBypassesOriginalSTEPAndHasSeparateColorAndSubsetCache() async throws {
+        try requireRuntime()
+        let service = EngineService()
+        let preview = try await service.build(assembly(), python: EngineService.defaultPython, threads: 2)
+        defer { try? FileManager.default.removeItem(at: URL(fileURLWithPath: preview.stepPath).deletingLastPathComponent()) }
+        let native = URL(fileURLWithPath: try XCTUnwrap(preview.brepPath))
+        let nativeBefore = try Data(contentsOf: native)
+        let original = try await service.exportSTEP(preview, python: "/missing/python", threads: 1)
+        let arranged = try await service.exportSTEP(preview, arrangeFor3DPrinting: true,
+                                                    python: EngineService.defaultPython, threads: 2)
+        XCTAssertNotEqual(arranged, original, "Printing arrangement must bypass original-coordinate STEP bytes.")
+        let imported = try await EngineService().previewSTEP(arranged, parts: nil, python: EngineService.defaultPython, threads: 2)
+        defer { try? FileManager.default.removeItem(at: URL(fileURLWithPath: imported.stepPath).deletingLastPathComponent()) }
+        XCTAssertEqual(imported.solids, 2)
+        XCTAssertEqual(imported.volume, preview.volume, accuracy: 1e-6)
+        XCTAssertEqual(imported.bounds[2], 0, accuracy: 1e-6)
+        let colors = [0: red, 1: blue]
+        let colored = try await service.exportSTEP(preview, solidColors: colors, arrangeFor3DPrinting: true,
+                                                   python: EngineService.defaultPython, threads: 2)
+        let coloredPalette = try await palette(colored)
+        assertContains(red, in: coloredPalette)
+        assertContains(blue, in: coloredPalette)
+        let subset = try await service.exportSTEP(preview, solidIndices: [1], solidColors: colors,
+                                                  arrangeFor3DPrinting: true, python: EngineService.defaultPython, threads: 2)
+        let subsetPalette = try await palette(subset)
+        assertContains(blue, in: subsetPalette)
+        XCTAssertFalse(contains(red, in: subsetPalette))
+        let importedSubset = try await EngineService().previewSTEP(subset, parts: nil, python: EngineService.defaultPython, threads: 2)
+        defer { try? FileManager.default.removeItem(at: URL(fileURLWithPath: importedSubset.stepPath).deletingLastPathComponent()) }
+        XCTAssertEqual(importedSubset.solids, 1)
+        XCTAssertEqual(importedSubset.volume, 30, accuracy: 1e-6)
+        XCTAssertEqual(importedSubset.bounds[2], 0, accuracy: 1e-6)
+        XCTAssertEqual(try Data(contentsOf: native), nativeBefore, "Arranging export must leave the live native geometry unchanged.")
+        try FileManager.default.removeItem(at: native)
+        let cached = try await service.exportSTEP(preview, solidColors: colors, arrangeFor3DPrinting: true,
+                                                  python: "/missing/python", threads: 1)
+        XCTAssertEqual(cached, colored)
+        let cachedSubset = try await service.exportSTEP(preview, solidIndices: [1], solidColors: colors,
+                                                        arrangeFor3DPrinting: true, python: "/missing/python", threads: 1)
+        XCTAssertEqual(cachedSubset, subset)
+        do {
+            _ = try await service.exportSTEP(preview, solidColors: colors, python: "/missing/python", threads: 1)
+            XCTFail("Original-coordinate exports must not reuse an arranged color variant.")
+        } catch EngineExportError.nativeArtifactUnavailable {}
+    }
+
     private func contains(_ expected: PartColor, in palette: [PartColor]) -> Bool {
         palette.contains { abs($0.red - expected.red) < 1e-5 && abs($0.green - expected.green) < 1e-5 && abs($0.blue - expected.blue) < 1e-5 }
     }

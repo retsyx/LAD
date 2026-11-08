@@ -44,6 +44,18 @@ display data in memory when revisiting revisions. An export request containing
 native solid to STEP without rerunning the model or tessellating it again.
 Repeated app exports reuse the exact STEP bytes in memory.
 
+The STEP save dialog can arrange physical solids for 3D printing. A bounded
+orientation search combines planar normals, rotational and inertia axes, the
+supplied pose and sphere directions. It ranks overhangs using trimmed planar
+areas and area-weighted native curved-surface normals, verifies bed contact
+against whole-solid analytic bounds, and packs separate solids on Z=0 with
+50 mm clearance. When a stable planar base exists, overhang minimization is
+restricted to those poses: the volume centroid must project inside the support
+hull of actual contact boundaries. Parts without one retain the unrestricted
+search. The export applies rigid locations only, without tessellation
+or changing the live design. Matching translated instances share orientation
+work within that export; cached STEP variants include the arrangement option.
+
 Preview extraction uses explicit indexed access to OpenCascade topology maps.
 This avoids the repeated native exception overhead of Python sequence iteration
 on per-face maps, while retaining CadQuery's subshape order, orientations,

@@ -2308,10 +2308,348 @@ def write_step(solids, path, cq, colors=None, indices=None):
                          diagnostic={"stage": "step_export"}) from error
 
 
+def _print_surface_samples(solid):
+    """Area-weighted exact-surface normals; never create or read a mesh.
+
+    Planes contribute their complete trimmed area. Curves use bounded UV
+    quadrature, rejecting samples outside the face and weighting by the surface
+    Jacobian before normalizing to its native area. Sampling is done once, not
+    once per candidate orientation.
+    """
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepClass import BRepClass_FaceClassifier
+    from OCP.BRepGProp import BRepGProp_Face
+    from OCP.GeomAbs import (GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone,
+                             GeomAbs_Sphere, GeomAbs_Torus, GeomAbs_SurfaceOfRevolution)
+    from OCP.TopAbs import TopAbs_IN, TopAbs_ON
+    from OCP.gp import gp_Pnt, gp_Pnt2d, gp_Vec
+    normals, points, weights, planes, axes = [], [], [], [], []
+    for face in _shape_entities(solid, "Face"):
+        area, center = _shape_measurements(face)
+        if not math.isfinite(area) or area <= 0:
+            continue
+        adaptor = BRepAdaptor_Surface(face.wrapped)
+        kind = adaptor.GetType()
+        if kind == GeomAbs_Plane:
+            normal = face.normalAt().toTuple()
+            planes.append((normal, center, area, face))
+            normals.append(normal); points.append(center); weights.append(area)
+            continue
+        if kind in (GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Torus, GeomAbs_SurfaceOfRevolution):
+            axis = {GeomAbs_Cylinder: adaptor.Cylinder, GeomAbs_Cone: adaptor.Cone,
+                    GeomAbs_Torus: adaptor.Torus,
+                    GeomAbs_SurfaceOfRevolution: adaptor.AxeOfRevolution}[kind]()
+            if kind != GeomAbs_SurfaceOfRevolution:
+                axis = axis.Axis()
+            axes.append((axis.Direction().Coord(), area))
+        surface = BRepGProp_Face(face.wrapped)
+        u0, u1, v0, v1 = surface.Bounds()
+        if not all(math.isfinite(value) for value in (u0, u1, v0, v1)):
+            raise ModelError("A part has an unbounded surface and cannot be arranged for 3D printing.")
+        # More angular samples for complete round surfaces; small blends use a
+        # short rule. Midpoints avoid poles and periodic seams.
+        nu = 12 if kind in (GeomAbs_Cylinder, GeomAbs_Cone, GeomAbs_Sphere, GeomAbs_Torus) else 6
+        nv = 8 if kind in (GeomAbs_Sphere, GeomAbs_Torus) else 4
+        classifier = BRepClass_FaceClassifier()
+        point, normal = gp_Pnt(), gp_Vec()
+        samples = []
+        for refinement in (1, 2, 4):
+            for i in range(nu * refinement):
+                u = u0 + (u1 - u0) * (i + 0.5) / (nu * refinement)
+                for j in range(nv * refinement):
+                    v = v0 + (v1 - v0) * (j + 0.5) / (nv * refinement)
+                    classifier.Perform(face.wrapped, gp_Pnt2d(u, v), 1e-7)
+                    if classifier.State() not in (TopAbs_IN, TopAbs_ON):
+                        continue
+                    surface.Normal(u, v, point, normal)
+                    jacobian = normal.Magnitude()
+                    if jacobian > 1e-20 and math.isfinite(jacobian):
+                        samples.append((tuple(value / jacobian for value in normal.Coord()),
+                                        point.Coord(), jacobian))
+            if samples:
+                break
+        if not samples:
+            # Extremely thin trimmed patches can evade the bounded grid. Use a
+            # point on a boundary p-curve, still evaluated on the exact surface.
+            from OCP.BRepAdaptor import BRepAdaptor_Curve2d
+            for edge in _shape_entities(face, "Edge"):
+                curve = BRepAdaptor_Curve2d(edge.wrapped, face.wrapped)
+                uv = curve.Value((curve.FirstParameter() + curve.LastParameter()) / 2)
+                surface.Normal(uv.X(), uv.Y(), point, normal)
+                jacobian = normal.Magnitude()
+                if jacobian > 1e-20 and math.isfinite(jacobian):
+                    samples.append((tuple(value / jacobian for value in normal.Coord()), point.Coord(), jacobian))
+        if not samples:
+            raise ModelError("A part's surface normals could not be evaluated for 3D printing.")
+        scale = area / sum(sample[2] for sample in samples)
+        for normal, point, jacobian in samples:
+            normals.append(normal); points.append(point); weights.append(jacobian * scale)
+    return normals, points, weights, planes, axes
+
+
+def _print_candidates(solid, planes, axes, properties=None):
+    """Shortlist geometry directions, grouping equivalent face/axis evidence."""
+    import numpy as np
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    grouped = {}
+
+    def add(direction, importance=0):
+        direction = np.asarray(direction, dtype=float)
+        length = np.linalg.norm(direction)
+        if not np.isfinite(length) or length < 1e-12:
+            return
+        direction /= length
+        key = tuple(round(float(value), 6) for value in direction)
+        if key in grouped:
+            grouped[key][1] += importance
+        else:
+            grouped[key] = [direction, importance]
+
+    for normal, _, area, _ in planes:
+        add([-value for value in normal], area)
+    for axis, area in axes:
+        axis = np.asarray(axis)
+        reference = np.eye(3)[np.argmin(np.abs(axis))]
+        perpendicular = np.cross(axis, reference)
+        for direction in (axis, perpendicular, np.cross(axis, perpendicular)):
+            add(direction, area); add(-direction, area)
+    # Limit only the ranked CAD shortlist; flat faces split into many pieces
+    # accumulate their areas instead of receiving extra candidate votes.
+    directions = [item[0] for item in sorted(grouped.values(), key=lambda item: -item[1])[:48]]
+    grouped.clear()
+    add((0, 0, 1))  # Keep the supplied pose first in equal-score ties.
+    for direction in directions:
+        add(direction)
+    if properties is None:
+        properties = GProp_GProps()
+        BRepGProp.VolumeProperties_s(solid.wrapped, properties)
+    principal = properties.PrincipalProperties()
+    for axis in (principal.FirstAxisOfInertia(), principal.SecondAxisOfInertia(), principal.ThirdAxisOfInertia()):
+        vector = np.asarray(axis.Coord())
+        add(vector); add(-vector)
+    for axis in np.eye(3):
+        add(axis); add(-axis)
+    # Deterministic equal-area sphere coverage supplies oblique/freeform poses.
+    for index in range(32):
+        z = 1 - 2 * (index + 0.5) / 32
+        angle = index * math.pi * (3 - math.sqrt(5))
+        radius = math.sqrt(1 - z * z)
+        add((radius * math.cos(angle), radius * math.sin(angle), z))
+    return np.asarray([item[0] for item in grouped.values()])
+
+
+def _print_rotation(direction):
+    from OCP.gp import gp_Quaternion, gp_Trsf, gp_Vec
+    transform = gp_Trsf()
+    transform.SetRotation(gp_Quaternion(gp_Vec(*direction), gp_Vec(0, 0, 1)))
+    return transform
+
+
+def _print_contact_is_stable(faces, direction, centroid, boundary_points=None):
+    """Require gravity to fall inside real planar support, not a bounding box.
+
+    A convex hull of native boundary points is conservative: its points lie on
+    the actual contact faces, including circular rims and disconnected feet.
+    This is a two-dimensional support polygon, with no solid tessellation.
+    """
+    import numpy as np
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GeomAbs import GeomAbs_Line
+    if boundary_points is None:
+        boundary_points = {}
+    points = []
+    for face in faces:
+        key = id(face)
+        if key not in boundary_points:
+            boundary = []
+            for edge in _shape_entities(face, "Edge"):
+                curve = BRepAdaptor_Curve(edge.wrapped)
+                count = 1 if curve.GetType() == GeomAbs_Line else 16
+                first, last = curve.FirstParameter(), curve.LastParameter()
+                boundary.extend(curve.Value(first + (last - first) * index / count).Coord()
+                                for index in range(count + 1))
+            boundary_points[key] = boundary
+        points.extend(boundary_points[key])
+    if len(points) < 3:
+        return False
+    normal = np.asarray(direction)
+    tangent = np.cross(normal, np.eye(3)[np.argmin(np.abs(normal))])
+    tangent /= np.linalg.norm(tangent)
+    other = np.cross(normal, tangent)
+    relative = np.asarray(points) - np.asarray(centroid)
+    projected = sorted(set(zip(relative @ tangent, relative @ other)))
+
+    def cross(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    lower, upper = [], []
+    for chain, sequence in ((lower, projected), (upper, reversed(projected))):
+        for point in sequence:
+            while len(chain) >= 2 and cross(chain[-2], chain[-1], point) <= 0:
+                chain.pop()
+            chain.append(point)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return False
+    tolerance = max(1e-7, float(np.ptp(relative, axis=0).max()) * 1e-9)
+    return all(cross(a, b, (0, 0)) > tolerance * math.hypot(b[0] - a[0], b[1] - a[1])
+               for a, b in zip(hull, hull[1:] + hull[:1]))
+
+
+def print_orientation(solid, cq):
+    """Minimize a 45-degree overhang integral over the bounded CAD shortlist.
+
+    Prefer a stable planar bed when one exists, then minimize overhang within
+    those feasible poses. Otherwise an oblique pose balancing on an edge could
+    beat every usable base. Smooth parts without a stable planar base retain
+    the unrestricted search. All scoring varies the bed normal against fixed
+    CAD samples; exact contact checks use shared native reference-frame locations.
+    """
+    import numpy as np
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    normals, points, weights, planes, axes = _print_surface_samples(solid)
+    properties = GProp_GProps()
+    BRepGProp.VolumeProperties_s(solid.wrapped, properties)
+    centroid = properties.CentreOfMass().Coord()
+    directions = _print_candidates(solid, planes, axes, properties)
+    normals, points, weights = np.asarray(normals), np.asarray(points), np.asarray(weights)
+    # Centre the dot products to preserve precision for parts far from origin.
+    origin = points[0].copy()
+    points -= origin
+    costs = np.zeros(len(directions))
+    lows, highs = np.full(len(directions), np.inf), np.full(len(directions), -np.inf)
+    threshold = math.sqrt(0.5)
+    # Bounded intermediate storage on large assemblies.
+    for start in range(0, len(weights), 2048):
+        block = slice(start, start + 2048)
+        penalties = np.maximum(0, -normals[block] @ directions.T - threshold)
+        costs += weights[block] @ (penalties * penalties)
+        heights = points[block] @ directions.T
+        lows = np.minimum(lows, heights.min(axis=0)); highs = np.maximum(highs, heights.max(axis=0))
+    possible_contacts = [[] for _ in directions]
+    contact_limits = np.zeros(len(directions))
+    for normal, center, area, face in planes:
+        normal = np.asarray(normal)
+        candidates = np.flatnonzero(directions @ normal < -1 + 1e-10)
+        for index in candidates:
+            height = float((np.asarray(center) - origin) @ directions[index])
+            tolerance = max(1e-6, (highs[index] - lows[index]) * 1e-8)
+            if height > lows[index] + tolerance:
+                continue
+            possible_contacts[index].append((height, area, tolerance, face))
+            contact_limits[index] += area
+    relief = (1 - threshold) ** 2
+    lower_costs = np.maximum(0, costs - contact_limits * relief)
+    epsilon = max(1e-10, float(weights.sum()) * 1e-9)
+    heights = highs - lows
+    # Evaluate optimistic scores first. Once a pose cannot beat the verified
+    # winner, skip its native extrema. This matters on spline-heavy assemblies,
+    # where each exact bound is much dearer than all the cached dot products.
+    order = sorted(range(len(directions)), key=lambda index:
+                   (round(float(lower_costs[index]) / epsilon), -contact_limits[index], heights[index], index))
+    best, best_cost, best_contact = None, math.inf, -1.0
+    support_bounds = {}
+    verified_contacts, boundary_points = {}, {}
+    for require_stable_bed in (True, False):
+        for index in order:
+            if lower_costs[index] > best_cost + epsilon:
+                continue
+            if lower_costs[index] >= best_cost - epsilon and contact_limits[index] < best_contact - 1e-10:
+                continue
+            if require_stable_bed:
+                # A subset of these possible faces cannot provide a larger
+                # support hull. Reject impossible support before native extrema.
+                faces = [entry[3] for entry in possible_contacts[index]]
+                if not _print_contact_is_stable(faces, directions[index], centroid, boundary_points):
+                    continue
+            if index not in verified_contacts:
+                contacts = []
+                if possible_contacts[index]:
+                    located = solid.moved(cq.Location(_print_rotation(directions[index])))
+                    support_bounds[index] = exact_bounds(located)
+                    bottom = support_bounds[index][2] - float(origin @ directions[index])
+                    contacts = [entry for entry in possible_contacts[index]
+                                if abs(entry[0] - bottom) <= entry[2]]
+                verified_contacts[index] = contacts
+            contacts = verified_contacts[index]
+            if require_stable_bed and not _print_contact_is_stable(
+                    [entry[3] for entry in contacts], directions[index], centroid, boundary_points):
+                continue
+            contact = sum(entry[1] for entry in contacts)
+            cost = max(0, costs[index] - contact * relief)
+            if (cost < best_cost - epsilon or
+                    (abs(cost - best_cost) <= epsilon and
+                     (best is None or (-contact, heights[index], index) < (-best_contact, heights[best], best)))):
+                best, best_cost, best_contact = index, cost, contact
+        if best is not None:
+            break
+    rotated = solid.moved(cq.Location(_print_rotation(directions[best])))
+    return rotated, support_bounds.get(best) or exact_bounds(rotated)
+
+
+def arrange_print_solids(solids, cq):
+    """Independently orient and shelf-pack exact solids on z=0 with 50 mm gaps.
+
+    Rigid locations preserve analytic geometry, native solid order and colors;
+    no Boolean operation, tessellation or change to the live design is needed.
+    """
+    from OCP.gp import gp_Vec
+    arranged, sizes = [], []
+    oriented_instances = {}
+    for solid in solids:
+        # Assembly instances often share native geometry and rotation. Remove
+        # translation only, retaining the supplied build direction and sphere
+        # candidates. Reuse within this export, with an equality collision guard;
+        # never retain measurements on mutable shapes or across builds.
+        pose = solid.wrapped.Location().Transformation()
+        canonical = solid.located(cq.Location())
+        rotation = tuple(pose.Value(row, column) for row in range(1, 4) for column in range(1, 4))
+        key = (hash(canonical.wrapped), solid.wrapped.Orientation(), rotation)
+        match = next((entry for entry in oriented_instances.get(key, ())
+                      if entry[0].wrapped.IsPartner(solid.wrapped)), None)
+        if match is None:
+            pose.SetTranslationPart(gp_Vec())
+            unshifted = solid.located(cq.Location(pose))
+            oriented, bounds = print_orientation(unshifted, cq)
+            oriented_instances.setdefault(key, []).append((solid, oriented, bounds))
+        else:
+            _, oriented, bounds = match
+        width, depth = bounds[3] - bounds[0], bounds[4] - bounds[1]
+        # In-plane quarter turns reduce long narrow rows without changing the
+        # printing direction or overhang score.
+        if depth > width:
+            from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf
+            transform = gp_Trsf()
+            transform.SetRotation(gp_Ax1(gp_Pnt(), gp_Dir(0, 0, 1)), math.pi / 2)
+            oriented = oriented.moved(cq.Location(transform))
+            bounds = [-bounds[4], bounds[0], bounds[2], -bounds[1], bounds[3], bounds[5]]
+            width, depth = depth, width
+        arranged.append((oriented, bounds)); sizes.append((width, depth))
+    gap = 50.0
+    target = max(max(width for width, _ in sizes),
+                 math.sqrt(sum((width + gap) * (depth + gap) for width, depth in sizes)))
+    positions = [None] * len(solids)
+    x = y = row_depth = 0.0
+    for index in sorted(range(len(solids)), key=lambda index: (-sizes[index][1], -sizes[index][0], index)):
+        width, depth = sizes[index]
+        if x > 0 and x + width > target:
+            x = 0.0; y += row_depth + gap; row_depth = 0.0
+        oriented, bounds = arranged[index]
+        positions[index] = oriented.moved(cq.Location(cq.Vector(x - bounds[0], y - bounds[1], -bounds[2])))
+        x += width + gap
+        row_depth = max(row_depth, depth)
+    return positions
+
+
 def export_brep(spec, asset_directory, output, cq, threads):
     """Create whole or selected STEP without replaying or tessellating."""
-    if set(spec) - {"operation", "brepAsset", "solidIndices", "solidColors"} or spec.get("brepAsset") != "source.brep":
+    if set(spec) - {"operation", "brepAsset", "solidIndices", "solidColors", "arrangeFor3DPrinting"} or spec.get("brepAsset") != "source.brep":
         raise ModelError("STEP export requires the private source.brep asset.")
+    arrange = spec.get("arrangeFor3DPrinting", False)
+    if not isinstance(arrange, bool):
+        raise ModelError("The 3D printing arrangement option must be true or false.")
     shape = read_brep(spec, asset_directory, cq, threads)
     solids = shape.Solids()
     indices = selected_solids(spec, solids)
@@ -2323,6 +2661,11 @@ def export_brep(spec, asset_directory, output, cq, threads):
         shape = chosen[0] if len(chosen) == 1 else cq.Compound.makeCompound(chosen)
     else:
         indices = list(range(len(solids)))
+    if arrange:
+        arranged = arrange_print_solids([solids[index] for index in indices], cq)
+        solids = list(solids)
+        for index, solid in zip(indices, arranged):
+            solids[index] = solid
     step = output / "model.step"
     write_step(solids, step, cq, colors=colors, indices=indices)
     return {"solids": len(shape.Solids()), "faces": len(shape.Faces())}

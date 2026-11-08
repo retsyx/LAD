@@ -1778,8 +1778,10 @@ final class AppState: ObservableObject {
         panel.title = "Export design"
         panel.allowedContentTypes = [UTType(filenameExtension: "step") ?? .data]
         panel.nameFieldStringValue = "\(safeName(title)).step"
+        let options = STEPExportOptionsView()
+        panel.accessoryView = options
         guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url else { return }
-        exportSTEP(to: url)
+        exportSTEP(to: url, arrangeFor3DPrinting: options.arrangeFor3DPrinting)
     }
 
     func exportSelectedPartsSTEP(_ solidIndices: Set<Int>? = nil) {
@@ -1791,14 +1793,16 @@ final class AppState: ObservableObject {
         panel.title = "Export selected parts"
         panel.allowedContentTypes = [UTType(filenameExtension: "step") ?? .data]
         panel.nameFieldStringValue = "\(safeName(title)) selected parts.step"
+        let options = STEPExportOptionsView()
+        panel.accessoryView = options
         guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url,
               revisionID == selectedRevisionID, sessionID == projectSessionID else { return }
-        exportSTEP(to: url, solidIndices: solids)
+        exportSTEP(to: url, solidIndices: solids, arrangeFor3DPrinting: options.arrangeFor3DPrinting)
     }
 
     /// Export the captured geometry and current colors. The engine caches
-    /// session bytes by geometry, selected solids and RGB assignments.
-    func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil) {
+    /// session bytes by geometry, selected solids, RGB assignments and arrangement.
+    func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil, arrangeFor3DPrinting: Bool = false) {
         guard canExport, let preview = mesh, let revisionID = selectedRevisionID,
               let revision = revisions.first(where: { $0.id == revisionID }) else { return }
         if let solidIndices, solidIndices.isEmpty || !solidIndices.isSubset(of: Set(0..<preview.solids)) { return }
@@ -1814,6 +1818,7 @@ final class AppState: ObservableObject {
                 let data: Data
                 do {
                     data = try await engine.exportSTEP(preview, solidIndices: solidIndices, solidColors: exportColors,
+                                                       arrangeFor3DPrinting: arrangeFor3DPrinting,
                                                        python: runtime, threads: cores)
                 } catch EngineExportError.nativeArtifactUnavailable {
                     // Replay can enumerate solids differently. Bind the
@@ -1825,7 +1830,8 @@ final class AppState: ObservableObject {
                     let rebuiltColors = PartColorState.solidColors(in: restored.layout?.nodes ?? restored.parts, overrides: colors)
                     try cacheReplayedPreview(rebuilt, at: index)
                     data = try await engine.exportSTEP(rebuilt, solidIndices: solidIndices == nil ? nil : restored.selected,
-                                                       solidColors: rebuiltColors, python: runtime, threads: cores)
+                                                       solidColors: rebuiltColors, arrangeFor3DPrinting: arrangeFor3DPrinting,
+                                                       python: runtime, threads: cores)
                 }
                 guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
                       !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
