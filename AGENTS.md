@@ -9,7 +9,7 @@
 - Don't babble in documents. Only update documents with information that is pertinent to the long term understanding of Amity's architecture and codebase.
 - Identify the actual invariant before “fixing” a race. Not every possible ordering is a bug.
 - Do not put internal protocol or build-profile terminology or descriptions into the UI or the top README.md.
-- When restarting LAD, do not save open designs.
+- When restarting LAD, do not save open designs. Files are autosaved already.
 
 ## Naming
 
