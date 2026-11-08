@@ -1778,10 +1778,11 @@ final class AppState: ObservableObject {
         panel.title = "Export design"
         panel.allowedContentTypes = [UTType(filenameExtension: "step") ?? .data]
         panel.nameFieldStringValue = "\(safeName(title)).step"
-        let options = STEPExportOptionsView()
+        let options = STEPExportOptionsView(panel: panel, projectName: STEPIndividualExport.folderName(for: title))
         panel.accessoryView = options
         guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url else { return }
-        exportSTEP(to: url, arrangeFor3DPrinting: options.arrangeFor3DPrinting)
+        exportSTEP(to: url, arrangeFor3DPrinting: options.arrangeFor3DPrinting,
+                   exportIndividualParts: options.exportIndividualParts, replaceExisting: true)
     }
 
     func exportSelectedPartsSTEP(_ solidIndices: Set<Int>? = nil) {
@@ -1793,16 +1794,18 @@ final class AppState: ObservableObject {
         panel.title = "Export selected parts"
         panel.allowedContentTypes = [UTType(filenameExtension: "step") ?? .data]
         panel.nameFieldStringValue = "\(safeName(title)) selected parts.step"
-        let options = STEPExportOptionsView()
+        let options = STEPExportOptionsView(panel: panel, projectName: STEPIndividualExport.folderName(for: title))
         panel.accessoryView = options
         guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url,
               revisionID == selectedRevisionID, sessionID == projectSessionID else { return }
-        exportSTEP(to: url, solidIndices: solids, arrangeFor3DPrinting: options.arrangeFor3DPrinting)
+        exportSTEP(to: url, solidIndices: solids, arrangeFor3DPrinting: options.arrangeFor3DPrinting,
+                   exportIndividualParts: options.exportIndividualParts, replaceExisting: true)
     }
 
     /// Export the captured geometry and current colors. The engine caches
     /// session bytes by geometry, selected solids, RGB assignments and arrangement.
-    func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil, arrangeFor3DPrinting: Bool = false) {
+    func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil, arrangeFor3DPrinting: Bool = false,
+                    exportIndividualParts: Bool = false, replaceExisting: Bool = false) {
         guard canExport, let preview = mesh, let revisionID = selectedRevisionID,
               let revision = revisions.first(where: { $0.id == revisionID }) else { return }
         if let solidIndices, solidIndices.isEmpty || !solidIndices.isSubset(of: Set(0..<preview.solids)) { return }
@@ -1815,11 +1818,11 @@ final class AppState: ObservableObject {
         isWorking = true; activity = "Exporting STEP…"; error = nil
         operation = Task {
             do {
-                let data: Data
+                let output: (files: [Data], parts: [STEPIndividualExport.Part])
                 do {
-                    data = try await engine.exportSTEP(preview, solidIndices: solidIndices, solidColors: exportColors,
-                                                       arrangeFor3DPrinting: arrangeFor3DPrinting,
-                                                       python: runtime, threads: cores)
+                    output = try await stepExportOutput(preview, solidIndices: solidIndices, nodes: nodes,
+                                                        colors: exportColors, arrangeFor3DPrinting: arrangeFor3DPrinting,
+                                                        individualParts: exportIndividualParts, python: runtime, threads: cores)
                 } catch EngineExportError.nativeArtifactUnavailable {
                     // Replay can enumerate solids differently. Bind the
                     // captured colors and subset to fresh stable ownership.
@@ -1827,18 +1830,25 @@ final class AppState: ObservableObject {
                     guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
                           !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
                     let restored = try Self.restoredPartState(for: revision, preview: rebuilt, selected: solidIndices ?? [])
-                    let rebuiltColors = PartColorState.solidColors(in: restored.layout?.nodes ?? restored.parts, overrides: colors)
+                    let rebuiltNodes = restored.layout?.nodes ?? restored.parts
+                    let rebuiltColors = PartColorState.solidColors(in: rebuiltNodes, overrides: colors)
                     try cacheReplayedPreview(rebuilt, at: index)
-                    data = try await engine.exportSTEP(rebuilt, solidIndices: solidIndices == nil ? nil : restored.selected,
-                                                       solidColors: rebuiltColors, arrangeFor3DPrinting: arrangeFor3DPrinting,
-                                                       python: runtime, threads: cores)
+                    output = try await stepExportOutput(rebuilt, solidIndices: solidIndices == nil ? nil : restored.selected,
+                                                        nodes: rebuiltNodes, colors: rebuiltColors,
+                                                        arrangeFor3DPrinting: arrangeFor3DPrinting,
+                                                        individualParts: exportIndividualParts, python: runtime, threads: cores)
                 }
                 guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
                       !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
                 revisions[index].stepData = nil
                 let writing = Task.detached(priority: .userInitiated) {
                     try Task.checkCancellation()
-                    try data.write(to: url, options: .atomic)
+                    if exportIndividualParts {
+                        try STEPIndividualExport.write(output.files, parts: output.parts, to: url,
+                                                       replaceExisting: replaceExisting)
+                    } else {
+                        try output.files[0].write(to: url, options: .atomic)
+                    }
                 }
                 try await withTaskCancellationHandler {
                     try await writing.value
@@ -1855,6 +1865,20 @@ final class AppState: ObservableObject {
                 activity = "Export needs attention"; isWorking = false; operation = nil
             }
         }
+    }
+
+    private func stepExportOutput(_ preview: PreviewMesh, solidIndices: Set<Int>?, nodes: [PartNode],
+                                  colors: [Int: PartColor], arrangeFor3DPrinting: Bool, individualParts: Bool,
+                                  python: String, threads: Int) async throws -> (files: [Data], parts: [STEPIndividualExport.Part]) {
+        if individualParts {
+            let parts = STEPIndividualExport.parts(in: nodes, selected: solidIndices, solidCount: preview.solids)
+            let files = try await engine.exportSTEPParts(preview, parts: parts.map(\.solidIndices), solidColors: colors,
+                                                         arrangeFor3DPrinting: arrangeFor3DPrinting, python: python, threads: threads)
+            return (files, parts)
+        }
+        let data = try await engine.exportSTEP(preview, solidIndices: solidIndices, solidColors: colors,
+                                               arrangeFor3DPrinting: arrangeFor3DPrinting, python: python, threads: threads)
+        return ([data], [])
     }
 
     private func safeName(_ name: String) -> String {

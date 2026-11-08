@@ -147,6 +147,76 @@ final class EngineSTEPColorTests: XCTestCase {
         } catch EngineExportError.nativeArtifactUnavailable {}
     }
 
+    @MainActor
+    func testIndividualExportsRejectInvalidPartitionsBeforeReadingNativeGeometry() async throws {
+        let preview = unavailablePreview()
+        for parts in [[], [[]], [[0], [0]], [[0, 0]], [[-1]], [[2]], [[0, 1], [1]]] {
+            do {
+                _ = try await EngineService().exportSTEPParts(preview, parts: parts, python: "/missing/python", threads: 1)
+                XCTFail("Invalid individual part ownership must not start a worker.")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, "Select distinct available parts to export individually.")
+            }
+        }
+        do {
+            _ = try await EngineService().exportSTEPParts(preview, parts: [[0]], python: "/missing/python", threads: 1)
+            XCTFail("Individual export requires owned native geometry.")
+        } catch EngineExportError.nativeArtifactUnavailable {}
+    }
+
+    @MainActor
+    func testIndividualExportsPreserveOrderColorsGeometryPrintingPlacementAndSeparateCache() async throws {
+        try requireRuntime()
+        let service = EngineService()
+        let preview = try await service.buildPreview(assembly(), python: EngineService.defaultPython, threads: 2)
+        let native = URL(fileURLWithPath: try XCTUnwrap(preview.brepPath))
+        defer { try? FileManager.default.removeItem(at: native.deletingLastPathComponent()) }
+        let nativeBefore = try Data(contentsOf: native)
+        let colors = [0: red, 1: blue]
+        let ordinary = try await service.exportSTEPParts(preview, parts: [[1], [0]], solidColors: colors,
+                                                         python: EngineService.defaultPython, threads: 2)
+        let arranged = try await service.exportSTEPParts(preview, parts: [[1], [0]], solidColors: colors,
+                                                         arrangeFor3DPrinting: true, python: EngineService.defaultPython, threads: 2)
+        XCTAssertEqual(ordinary.count, 2)
+        XCTAssertEqual(arranged.count, 2)
+        var printingBounds: [[Double]] = []
+        for (printing, files) in [(false, ordinary), (true, arranged)] {
+            for index in files.indices {
+                let expectedColor = index == 0 ? blue : red
+                let palette = try await palette(files[index])
+                assertContains(expectedColor, in: palette)
+                XCTAssertFalse(contains(index == 0 ? red : blue, in: palette))
+                let imported = try await EngineService().previewSTEP(files[index], parts: nil,
+                    python: EngineService.defaultPython, threads: 2)
+                defer { try? FileManager.default.removeItem(at: URL(fileURLWithPath: imported.stepPath).deletingLastPathComponent()) }
+                XCTAssertEqual(imported.solids, 1)
+                XCTAssertEqual(imported.volume, index == 0 ? 30 : 24, accuracy: 1e-6)
+                if printing {
+                    XCTAssertEqual(imported.bounds[2], 0, accuracy: 1e-6)
+                    printingBounds.append(imported.bounds)
+                } else {
+                    let expected = index == 0 ? [20.0, 7, 9, 25, 9, 12] : [0.0, 0, 0, 2, 3, 4]
+                    for (actual, value) in zip(imported.bounds, expected) { XCTAssertEqual(actual, value, accuracy: 1e-6) }
+                }
+            }
+        }
+        let a = printingBounds[0], b = printingBounds[1]
+        XCTAssertGreaterThanOrEqual(max(b[0] - a[3], a[0] - b[3], b[1] - a[4], a[1] - b[4]), 50 - 1e-6)
+        XCTAssertEqual(try Data(contentsOf: native), nativeBefore)
+        try FileManager.default.removeItem(at: native)
+        let cached = try await service.exportSTEPParts(preview, parts: [[1], [0]], solidColors: [1: blue, 0: red],
+            arrangeFor3DPrinting: true, python: "/missing/python", threads: 1)
+        XCTAssertEqual(cached, arranged)
+        let ordinaryCached = try await service.exportSTEPParts(preview, parts: [[1], [0]], solidColors: colors,
+            python: "/missing/python", threads: 1)
+        XCTAssertEqual(ordinaryCached, ordinary)
+        do {
+            _ = try await service.exportSTEPParts(preview, parts: [[0], [1]], solidColors: colors,
+                arrangeFor3DPrinting: true, python: "/missing/python", threads: 1)
+            XCTFail("A differently ordered partition must not return mismatched cached files.")
+        } catch EngineExportError.nativeArtifactUnavailable {}
+    }
+
     private func contains(_ expected: PartColor, in palette: [PartColor]) -> Bool {
         palette.contains { abs($0.red - expected.red) < 1e-5 && abs($0.green - expected.green) < 1e-5 && abs($0.blue - expected.blue) < 1e-5 }
     }

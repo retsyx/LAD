@@ -56,8 +56,9 @@ final class EngineService {
         var selection: [Int]?
         var colors: [STEPExportColor]
         var arrangeFor3DPrinting: Bool
+        var parts: [[Int]]? = nil
     }
-    private var exportedSTEP: [STEPExportKey: Data] = [:]
+    private var exportedSTEP: [STEPExportKey: [Data]] = [:]
     private var exportedSTEPOrder: [STEPExportKey] = []
     private var exportedSTEPBytes = 0
 
@@ -212,11 +213,7 @@ final class EngineService {
            path == artifacts.folder.appendingPathComponent("model.brep").path {
             let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors,
                                         arrangeFor3DPrinting: arrangeFor3DPrinting)
-            if let cached = exportedSTEP[cacheKey] {
-                exportedSTEPOrder.removeAll { $0 == cacheKey }
-                exportedSTEPOrder.append(cacheKey)
-                return cached
-            }
+            if let cached = cachedSTEP(for: cacheKey) { return cached[0] }
             let bytes = try await nativeBytes(preview)
             let output = try await run(python: python, threads: threads, scriptMode: false, action: "export this design") { folder in
                 try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
@@ -233,22 +230,93 @@ final class EngineService {
                 return data
             }.value
             guard generation == output.token, !Task.isCancelled else { throw CancellationError() }
-            cacheSTEP(data, for: cacheKey)
+            cacheSTEP([data], for: cacheKey)
             return data
         }
         throw EngineExportError.nativeArtifactUnavailable
     }
 
-    private func cacheSTEP(_ data: Data, for key: STEPExportKey) {
+    /// Export all requested named parts in one worker, preserving their order.
+    /// Printing placement is shared across files, so importing them together
+    /// reconstructs the same bed layout as a combined export.
+    func exportSTEPParts(_ preview: PreviewMesh, parts: [[Int]], solidColors: [Int: PartColor] = [:],
+                         arrangeFor3DPrinting: Bool = false,
+                         python: String, threads: Int) async throws -> [Data] {
+        defer { withExtendedLifetime(preview.buildArtifacts) {} }
+        try Task.checkCancellation()
+        let indices = parts.flatMap { $0 }
+        guard !parts.isEmpty, parts.count <= preview.solids, parts.allSatisfy({ !$0.isEmpty }),
+              indices.count <= preview.solids, Set(indices).count == indices.count,
+              indices.allSatisfy({ (0..<preview.solids).contains($0) }) else {
+            throw LADError.message("Select distinct available parts to export individually.")
+        }
+        guard solidColors.count <= preview.solids,
+              solidColors.allSatisfy({ (0..<preview.solids).contains($0.key) && $0.value.isValid }) else {
+            throw LADError.message("The export colors must refer to available parts and use finite sRGB components between 0 and 1.")
+        }
+        let parts = parts.map { $0.sorted() }
+        let selection = indices.count == preview.solids ? nil : indices.sorted()
+        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
+        guard let path = preview.brepPath, let artifacts = preview.buildArtifacts,
+              path == artifacts.folder.appendingPathComponent("model.brep").path else {
+            throw EngineExportError.nativeArtifactUnavailable
+        }
+        let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors,
+                                     arrangeFor3DPrinting: arrangeFor3DPrinting, parts: parts)
+        if let cached = cachedSTEP(for: cacheKey) { return cached }
+        let bytes = try await nativeBytes(preview)
+        let output = try await run(python: python, threads: threads, scriptMode: false, action: "export these design parts") { folder in
+            try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
+            var payload: [String: Any] = ["operation": "export", "brepAsset": "source.brep", "individualParts": parts]
+            if let selection { payload["solidIndices"] = selection }
+            if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
+            if arrangeFor3DPrinting { payload["arrangeFor3DPrinting"] = true }
+            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+        }
+        struct ExportedPart: Decodable { var path: String; var solidIndices: [Int] }
+        struct ExportedParts: Decodable { var partFiles: [ExportedPart] }
+        let data = try await Task.detached(priority: .userInitiated) {
+            let metadata = try EngineArtifact.read(output.folder.appendingPathComponent("result.json"), in: output.folder,
+                                                   maximumBytes: 1_000_000)
+            let files = try JSONDecoder().decode(ExportedParts.self, from: metadata).partFiles
+            guard files.count == parts.count else { throw LADError.message("The CAD engine returned an incomplete parts export.") }
+            var result: [Data] = [], total = 0
+            for (index, file) in files.enumerated() {
+                try Task.checkCancellation()
+                guard file.path == String(format: "part-%04d.step", index), file.solidIndices == parts[index] else {
+                    throw LADError.message("The CAD engine returned an invalid parts export.")
+                }
+                let bytes = try EngineArtifact.read(output.folder.appendingPathComponent(file.path), in: output.folder,
+                                                    maximumBytes: ProjectStore.maximumSTEPBytes - total)
+                try Self.validateSTEP(bytes)
+                total += bytes.count
+                result.append(bytes)
+            }
+            return result
+        }.value
+        guard generation == output.token, !Task.isCancelled else { throw CancellationError() }
+        cacheSTEP(data, for: cacheKey)
+        return data
+    }
+
+    private func cachedSTEP(for key: STEPExportKey) -> [Data]? {
+        guard let data = exportedSTEP[key] else { return nil }
+        exportedSTEPOrder.removeAll { $0 == key }
+        exportedSTEPOrder.append(key)
+        return data
+    }
+
+    private func cacheSTEP(_ data: [Data], for key: STEPExportKey) {
         // Recoloring can produce many large STEP variants of one assembly.
         // Keep a small, byte-bounded LRU rather than retaining every finish.
+        let bytes = data.reduce(0) { $0 + $1.count }
         while !exportedSTEPOrder.isEmpty &&
-                (exportedSTEP.count >= 8 || exportedSTEPBytes + data.count > ProjectStore.maximumSTEPBytes) {
+                (exportedSTEP.count >= 8 || exportedSTEPBytes + bytes > ProjectStore.maximumSTEPBytes) {
             let oldest = exportedSTEPOrder.removeFirst()
-            if let removed = exportedSTEP.removeValue(forKey: oldest) { exportedSTEPBytes -= removed.count }
+            if let removed = exportedSTEP.removeValue(forKey: oldest) { exportedSTEPBytes -= removed.reduce(0) { $0 + $1.count } }
         }
         exportedSTEP[key] = data
-        exportedSTEPBytes += data.count
+        exportedSTEPBytes += bytes
         exportedSTEPOrder.append(key)
     }
 

@@ -2645,7 +2645,7 @@ def arrange_print_solids(solids, cq):
 
 def export_brep(spec, asset_directory, output, cq, threads):
     """Create whole or selected STEP without replaying or tessellating."""
-    if set(spec) - {"operation", "brepAsset", "solidIndices", "solidColors", "arrangeFor3DPrinting"} or spec.get("brepAsset") != "source.brep":
+    if set(spec) - {"operation", "brepAsset", "solidIndices", "solidColors", "arrangeFor3DPrinting", "individualParts"} or spec.get("brepAsset") != "source.brep":
         raise ModelError("STEP export requires the private source.brep asset.")
     arrange = spec.get("arrangeFor3DPrinting", False)
     if not isinstance(arrange, bool):
@@ -2656,6 +2656,20 @@ def export_brep(spec, asset_directory, output, cq, threads):
     colors = export_solid_colors(spec.get("solidColors", []), len(solids))
     if not indices:
         raise ModelError("Select at least one part to export.")
+    parts = spec.get("individualParts")
+    if "individualParts" in spec:
+        if not isinstance(parts, list) or not 1 <= len(parts) <= len(indices):
+            raise ModelError("Individual STEP files require a nonempty list of available parts.")
+        used, selected = set(), set(indices)
+        for part in parts:
+            if (not isinstance(part, list) or not part
+                    or any(isinstance(index, bool) or not isinstance(index, int)
+                           or index not in selected for index in part)
+                    or len(set(part)) != len(part) or used.intersection(part)):
+                raise ModelError("Individual STEP files must contain distinct selected parts.")
+            used.update(part)
+        if used != selected:
+            raise ModelError("Individual STEP files must include every selected part exactly once.")
     if set(indices) != set(range(len(solids))):
         chosen = [solids[index] for index in indices]
         shape = chosen[0] if len(chosen) == 1 else cq.Compound.makeCompound(chosen)
@@ -2666,9 +2680,22 @@ def export_brep(spec, asset_directory, output, cq, threads):
         solids = list(solids)
         for index, solid in zip(indices, arranged):
             solids[index] = solid
-    step = output / "model.step"
-    write_step(solids, step, cq, colors=colors, indices=indices)
-    return {"solids": len(shape.Solids()), "faces": len(shape.Faces())}
+    report = {"solids": len(shape.Solids()), "faces": len(shape.Faces())}
+    if parts is not None:
+        files, total = [], 0
+        for position, part in enumerate(parts):
+            name = f"part-{position:04d}.step"
+            step = output / name
+            write_step(solids, step, cq, colors=colors, indices=part)
+            size = step.stat().st_size
+            if size < 100 or size > MAX_GEOMETRY_BYTES - total:
+                raise ModelError("The exported STEP parts are invalid or exceed 512 MB in total.")
+            total += size
+            files.append({"path": name, "solidIndices": part})
+        report["partFiles"] = files
+    else:
+        write_step(solids, output / "model.step", cq, colors=colors, indices=indices)
+    return report
 
 
 def measure_brep(spec, asset_directory, cq, threads):
@@ -2822,6 +2849,7 @@ def run(request, output, threads, defer_step=False, validated_hash=None):
             return result
     is_preview = isinstance(spec, dict) and spec.get("operation") == "preview"
     is_export = isinstance(spec, dict) and spec.get("operation") == "export"
+    is_parts_export = is_export and "individualParts" in spec
     is_measurement = isinstance(spec, dict) and spec.get("operation") == "measure"
     is_runtime = spec == {"operation": "runtime"}
     if not is_preview and not is_export and not is_measurement and not is_runtime:
@@ -2876,10 +2904,11 @@ def run(request, output, threads, defer_step=False, validated_hash=None):
         brep = (output / "model.brep").resolve()
         write_brep(shape, brep)
         preview["brepPath"] = str(brep)
-    if not is_runtime and not is_measurement and (not defer_step or is_preview or is_export) and (not step.is_file() or step.stat().st_size < 100):
+    if not is_runtime and not is_measurement and not is_parts_export and (not defer_step or is_preview or is_export) and (not step.is_file() or step.stat().st_size < 100):
         raise ModelError("STEP export did not produce a design file.")
-    preview.update(buildSeconds=time.perf_counter() - started, threads=threads,
-                   stepPath=str(step), runtime=runtime_info(cq))
+    preview.update(buildSeconds=time.perf_counter() - started, threads=threads, runtime=runtime_info(cq))
+    if not is_parts_export:
+        preview["stepPath"] = str(step)
     temporary = output / "result.json.tmp"
     temporary.write_text(json.dumps(preview, separators=(",", ":"), allow_nan=False))
     temporary.replace(output / "result.json")

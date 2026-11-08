@@ -55,6 +55,12 @@ hull of actual contact boundaries. Parts without one retain the unrestricted
 search. The export applies rigid locations only, without tessellation
 or changing the live design. Matching translated instances share orientation
 work within that export; cached STEP variants include the arrangement option.
+Individual-part export batches the selected native solids in the same worker,
+then publishes one complete folder with filenames from the current parts tree.
+Approved replacement atomically swaps in that complete folder after staging,
+including removal of obsolete outputs.
+Printing placement is shared across those files, retaining the combined bed
+layout. Both export options are remembered as app-wide preferences.
 
 Preview extraction uses explicit indexed access to OpenCascade topology maps.
 This avoids the repeated native exception overhead of Python sequence iteration

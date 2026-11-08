@@ -8,6 +8,116 @@ final class AppStateSTEPColorExportTests: XCTestCase {
     private let green = PartColor(red: 0.12, green: 0.75, blue: 0.25)
 
     @MainActor
+    func testApprovedIndividualExportReplacesTheCompleteExistingFolder() async throws {
+        try requireRuntime()
+        let fixture = try await Fixture()
+        defer { fixture.cleanUp() }
+        let parts = try XCTUnwrap(fixture.preview.parts)
+        let revision = ProjectRevision(model: fixture.model, preview: fixture.preview, stepData: fixture.staleSTEP,
+            partLayout: PartLayout(nodes: parts), parts: parts, partColors: ["first": red, "second": blue])
+        fixture.state.revisions = [revision]
+        fixture.state.selectedRevisionID = revision.id
+        XCTAssertTrue(fixture.state.loadStoredRevision())
+        let folder = fixture.directory.appendingPathComponent("Existing individual export", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try Data("previous STEP".utf8).write(to: folder.appendingPathComponent("First.step"))
+        try Data("obsolete part".utf8).write(to: folder.appendingPathComponent("Obsolete.step"))
+        fixture.state.exportSTEP(to: folder, arrangeFor3DPrinting: true,
+                                 exportIndividualParts: true, replaceExisting: true)
+        try await finish(fixture.state, expecting: folder)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: folder.path)), ["First.step", "Second.step"])
+        let first = try await readParts(folder.appendingPathComponent("First.step"))
+        let second = try await readParts(folder.appendingPathComponent("Second.step"))
+        XCTAssertEqual(first.count, 1)
+        XCTAssertEqual(second.count, 1)
+        XCTAssertEqual(try XCTUnwrap(first.first).volume, 24, accuracy: 1e-6)
+        XCTAssertEqual(try XCTUnwrap(second.first).volume, 30, accuracy: 1e-6)
+        XCTAssertEqual(try XCTUnwrap(first.first).bounds[2], 0, accuracy: 1e-6)
+        XCTAssertEqual(try XCTUnwrap(second.first).bounds[2], 0, accuracy: 1e-6)
+        XCTAssertEqual(fixture.state.revisions.map(\.id), [revision.id])
+    }
+
+    @MainActor
+    func testIndividualPartsUseCurrentNamesColorsAndPrintingArrangement() async throws {
+        try requireRuntime()
+        let fixture = try await Fixture()
+        defer { fixture.cleanUp() }
+        let parts = try XCTUnwrap(fixture.preview.parts)
+        var layout = PartLayout(nodes: parts)
+        try layout.rename("first", to: "Base")
+        try layout.rename("second", to: "Lid")
+        let revision = ProjectRevision(model: fixture.model, preview: fixture.preview, stepData: fixture.staleSTEP,
+            partLayout: layout, parts: parts, partColors: ["first": red, "second": blue])
+        fixture.state.revisions = [revision]
+        fixture.state.selectedRevisionID = revision.id
+        XCTAssertTrue(fixture.state.loadStoredRevision())
+        let native = URL(fileURLWithPath: try XCTUnwrap(fixture.preview.brepPath))
+        let nativeBefore = try Data(contentsOf: native)
+        let folder = fixture.directory.appendingPathComponent("Individual parts", isDirectory: true)
+        fixture.state.exportSTEP(to: folder, arrangeFor3DPrinting: true, exportIndividualParts: true)
+        try await finish(fixture.state, expecting: folder)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: folder.path)), ["Base.step", "Lid.step"])
+        let base = try await readParts(folder.appendingPathComponent("Base.step"))
+        let lid = try await readParts(folder.appendingPathComponent("Lid.step"))
+        XCTAssertEqual(base.count, 1)
+        XCTAssertEqual(lid.count, 1)
+        let a = try XCTUnwrap(base.first), b = try XCTUnwrap(lid.first)
+        XCTAssertEqual(a.volume, 24, accuracy: 1e-6)
+        XCTAssertEqual(b.volume, 30, accuracy: 1e-6)
+        XCTAssertEqual(a.bounds[2], 0, accuracy: 1e-6)
+        XCTAssertEqual(b.bounds[2], 0, accuracy: 1e-6)
+        XCTAssertGreaterThanOrEqual(max(b.bounds[0] - a.bounds[3], a.bounds[0] - b.bounds[3],
+                                       b.bounds[1] - a.bounds[4], a.bounds[1] - b.bounds[4]), 50 - 1e-6)
+        for (part, color) in [(a, red), (b, blue)] {
+            let actual = try XCTUnwrap(part.color)
+            for (value, expected) in zip(actual, [color.red, color.green, color.blue]) {
+                XCTAssertEqual(value, expected, accuracy: 1e-5)
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: native), nativeBefore)
+        XCTAssertEqual(fixture.state.revisions.map(\.id), [revision.id])
+    }
+
+    @MainActor
+    func testIndividualSubsetReplayRetainsRenamedPartAndCapturedColor() async throws {
+        try requireRuntime()
+        let fixture = try await Fixture()
+        defer { fixture.cleanUp() }
+        let generated = try XCTUnwrap(fixture.preview.parts)
+        func permuted(_ nodes: [PartNode]) -> [PartNode] {
+            nodes.map { node in
+                var value = node
+                value.solidIndices = node.solidIndices.map { fixture.preview.solids - 1 - $0 }
+                if let children = node.children { value.children = permuted(children) }
+                return value
+            }
+        }
+        let savedParts = permuted(generated)
+        let oldSecond = try XCTUnwrap(savedParts.flatMap(\.flattened).first { $0.id == "second" })
+        var layout = PartLayout(nodes: savedParts)
+        try layout.rename("second", to: "Renamed lid")
+        let cached = PreviewMesh(vertices: [], triangles: [], edges: [], bounds: fixture.preview.bounds,
+            volume: fixture.preview.volume, area: fixture.preview.area, solids: fixture.preview.solids,
+            faces: fixture.preview.faces, buildSeconds: 0, threads: 2,
+            stepPath: fixture.directory.appendingPathComponent("unregistered.step").path, parts: savedParts)
+        let revision = ProjectRevision(model: fixture.model, preview: cached, stepData: fixture.staleSTEP,
+            partLayout: layout, parts: savedParts, partColors: ["first": red, "second": blue])
+        fixture.state.revisions = [revision]
+        fixture.state.selectedRevisionID = revision.id
+        XCTAssertTrue(fixture.state.loadStoredRevision())
+        let folder = fixture.directory.appendingPathComponent("Selected parts", isDirectory: true)
+        fixture.state.exportSTEP(to: folder, solidIndices: Set(oldSecond.solidIndices), exportIndividualParts: true)
+        fixture.state.setPartColor(green, for: "second")
+        try await finish(fixture.state, expecting: folder)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["Renamed lid.step"])
+        let exported = try await readParts(folder.appendingPathComponent("Renamed lid.step"))
+        XCTAssertEqual(exported.count, 1)
+        try assertPart(at: [22.5, 8, 10.5], volume: 30, bounds: [20, 7, 9, 25, 9, 12], color: blue, in: exported)
+        XCTAssertEqual(fixture.state.revisions[0].partColors?["second"], green)
+        XCTAssertEqual(fixture.state.revisions.map(\.id), [revision.id])
+    }
+
+    @MainActor
     func testFullRecolorResetAndSubsetExportsUseCurrentRGBInsteadOfStaleRevisionSTEP() async throws {
         try requireRuntime()
         let fixture = try await Fixture()
