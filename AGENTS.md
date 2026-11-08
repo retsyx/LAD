@@ -9,6 +9,7 @@
 - Don't babble in documents. Only update documents with information that is pertinent to the long term understanding of Amity's architecture and codebase.
 - Identify the actual invariant before “fixing” a race. Not every possible ordering is a bug.
 - Do not put internal protocol or build-profile terminology or descriptions into the UI or the top README.md.
+- When restarting LAD, do not save open designs.
 
 ## Naming
 
@@ -127,4 +128,3 @@
 - Store the model, reasoning level, and remembered reasoning preferences per model in each `.lad` project. Restore these choices when opening that file; do not use app-global preferences or inherit another project's selections. Initialize a new project's selection from the installed Codex configuration, then retain the explicit choice in the project.
 - Reconcile unsupported reasoning levels when switching models. Apply the captured model/effort pair to new requests and their repair attempts.
 - Show both model and reasoning level in the selector and running Codex task status. Keep the running status tied to the pair captured for that task, even when the selector changes for a later request.
-
