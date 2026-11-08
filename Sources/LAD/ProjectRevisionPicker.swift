@@ -20,7 +20,6 @@ struct ProjectRevisionPicker: View {
             }
             .font(.system(size: 10, weight: .medium, design: .monospaced))
             .foregroundStyle(Palette.accent)
-            .frame(maxWidth: 140, alignment: .trailing)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
