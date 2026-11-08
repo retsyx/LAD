@@ -15,6 +15,47 @@ final class ProjectThumbnailReaderTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: package.appendingPathComponent("revisions").path))
     }
 
+    func testThumbnailReadDoesNotWaitForAnotherFileCoordinationClaim() throws {
+        let package = try temporaryPackage()
+        defer { try? FileManager.default.removeItem(at: package) }
+        let image = try png()
+        try write(image, to: package)
+        let writerEntered = expectation(description: "The competing write claim is held")
+        let writerFinished = expectation(description: "The competing writer has finished")
+        let releaseWriter = DispatchSemaphore(value: 0)
+        let readerFinished = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global().async {
+            let coordinator = NSFileCoordinator(filePresenter: nil)
+            var error: NSError?
+            coordinator.coordinate(writingItemAt: package, options: [], error: &error) { _ in
+                writerEntered.fulfill()
+                XCTAssertEqual(releaseWriter.wait(timeout: .now() + 15), .success)
+            }
+            XCTAssertNil(error)
+            writerFinished.fulfill()
+        }
+        wait(for: [writerEntered], timeout: 5)
+
+        // Quick Look already coordinates its request. A nested read must not
+        // queue behind a writer that can itself be waiting for that request.
+        DispatchQueue.global().async {
+            defer { readerFinished.signal() }
+            do {
+                let actual = try ProjectThumbnailReader.imageData(in: package)
+                XCTAssertEqual(actual, image)
+            } catch { XCTFail("Could not read the existing thumbnail: \(error)") }
+        }
+        let readWhileWriterHeld = readerFinished.wait(timeout: .now() + 5)
+        releaseWriter.signal()
+        wait(for: [writerFinished], timeout: 5)
+        if readWhileWriterHeld == .timedOut {
+            XCTAssertEqual(readerFinished.wait(timeout: .now() + 5), .success)
+        }
+        XCTAssertEqual(readWhileWriterHeld, .success,
+                       "Thumbnail reads must not acquire another file-coordination claim.")
+    }
+
     func testMissingThumbnailUsesDocumentIcon() throws {
         let package = try temporaryPackage()
         defer { try? FileManager.default.removeItem(at: package) }

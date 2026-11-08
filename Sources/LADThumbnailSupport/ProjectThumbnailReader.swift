@@ -10,19 +10,6 @@ public enum ProjectThumbnailReader {
     public static let maximumManifestBytes = 32 * 1_024 * 1_024
     public static let maximumDimension = 4_096
 
-    public static func imageData(in package: URL) throws -> Data? {
-        let coordinator = NSFileCoordinator(filePresenter: nil)
-        var coordinationError: NSError?
-        var result: Result<Data?, Error>?
-        coordinator.coordinate(readingItemAt: package, options: [], error: &coordinationError) { readable in
-            result = Result { try readImage(in: readable) }
-        }
-        guard let result else {
-            throw coordinationError ?? CocoaError(.fileReadUnknown)
-        }
-        return try result.get()
-    }
-
     private struct Manifest: Decodable {
         var thumbnail: Thumbnail?
     }
@@ -32,7 +19,11 @@ public enum ProjectThumbnailReader {
         var sha256: String
     }
 
-    private static func readImage(in package: URL) throws -> Data? {
+    public static func imageData(in package: URL) throws -> Data? {
+        // Quick Look already coordinates the thumbnail request. A second read
+        // claim can queue behind an autosave waiting for that request to finish,
+        // creating a circular wait. Read the atomic manifest and immutable PNG
+        // directly; a concurrent replacement may simply make it unavailable.
         // Open every component relative to the already-open package and refuse
         // symlinks, including during replacement of an untrusted package.
         let descriptor = open(package.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
