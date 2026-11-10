@@ -1,6 +1,23 @@
 # LAD
 
-A native macOS CAD workspace: describe a part to Codex, inspect the solid in a Metal viewport, refine it in conversation, and export STEP.
+Language Aided Design
+
+LAD eschews traditional CAD in favor of a pure agent chat. Tell the agent what you want, review the design, request changes, and export STEP files.
+
+LAD requires that ChatGPT/Codex be already installed for the built-in chat. A LAD MCP server, for use by the agent of your choice, can be enabled in LAD Settings.
+
+You must bring have your own Codex (or equivalent) subscription. LAD does not provide agent functionality on its own.
+
+## Features
+
+- Full CAD implementation for agent modeling.
+- Mesh tools to enable an agent to model objects based on a mesh (useful for STL -> STEP conversion).
+- Simple design viewer for inspecting and measuring proposed designs.
+- Moving assemblies - drag parts to test design motion, or use precision inputs to select positions.
+- Attach reference images to the chat for the agent to use in modeling.
+- Reference external files (STL, STEP, KiCad, etc.) to guide the agent in modeling.
+- Export STEP files optionally oriented for 3D printing.
+
 
 ## Run
 
