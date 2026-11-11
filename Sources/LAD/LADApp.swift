@@ -203,6 +203,7 @@ final class LADAppDelegate: NSObject, NSApplicationDelegate {
             NSApp.dockTile.display()
         }
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { AgentVendorChoicePrompt.presentIfNeeded() }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

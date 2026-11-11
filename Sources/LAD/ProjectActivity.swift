@@ -47,6 +47,8 @@ struct ProjectTaskAudit: Codable, Sendable, Identifiable, Equatable {
     var userMessageID: UUID? = nil
     var startedAt = Date()
     var finishedAt: Date? = nil
+    /// The built-in agent that ran this task; external clients identify themselves.
+    var agent: String? = nil
     var model: String? = nil
     var reasoningEffort: String? = nil
     var status = "running"
@@ -67,6 +69,8 @@ struct ProjectTaskAudit: Codable, Sendable, Identifiable, Equatable {
                 value.flatMap { $0.isEmpty ? nil : $0 }
             }).joined(separator: " · ")
         }
-        return "\(model.flatMap { $0.isEmpty ? nil : $0 } ?? "Default model") · \(reasoningEffort.flatMap { $0.isEmpty ? nil : $0.capitalized } ?? "Default")"
+        let selection = "\(model.flatMap { $0.isEmpty ? nil : $0 } ?? "Default model") · \(reasoningEffort.flatMap { $0.isEmpty ? nil : $0.capitalized } ?? "Default")"
+        guard let vendor = agent.flatMap(AgentVendor.init(rawValue:)) else { return selection }
+        return "\(vendor.displayName) · \(selection)"
     }
 }

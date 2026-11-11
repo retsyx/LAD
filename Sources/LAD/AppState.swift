@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -144,6 +145,7 @@ final class AppState: ObservableObject {
         isWorking || isSendingQueuedRequestID != nil || (!queuedRequests.isEmpty && !awaitingResponse)
     }
     private let codex = CodexService()
+    private var agentPreferenceSubscription: AnyCancellable?
     private let engine = EngineService()
     private var operation: Task<Void, Never>?
     private var operationID = UUID()
@@ -244,6 +246,16 @@ final class AppState: ObservableObject {
             if !self.hasUnsavedChanges { self.hasUnsavedChanges = true }
         }
         projectActivity.onSaveRequested = { [weak self] in self?.autosave() }
+        agentPreferenceSubscription = NotificationCenter.default.publisher(for: AgentVendorPreference.changed)
+            .sink { [weak self] _ in MainActor.assumeIsolated { self?.adoptPreferredAgentIfUnused() } }
+    }
+
+    /// The first-launch agent choice can arrive after a new window opened. Only
+    /// a design that has never sent a request follows it; others keep their own.
+    private func adoptPreferredAgentIfUnused() {
+        guard projectReady, !projectSavingEnabled, messages.isEmpty, revisions.isEmpty, queuedRequests.isEmpty,
+              !isWorking, editingQueuedRequestID == nil else { return }
+        selectAgentVendor(AgentVendorPreference.defaultVendor)
     }
 
     private static let recentProjectPathKey = "lastAutosavedProjectPath"
@@ -304,11 +316,12 @@ final class AppState: ObservableObject {
     var canSaveProject: Bool { projectReady && projectSavingEnabled && !preserveUnreadableSession }
     var canSaveNew: Bool { canSaveProject && !revisions.isEmpty && !isWorking }
     var python: String { runtimeOverride ?? EngineService.defaultPython }
-    var executable: String { CodexService.configuredExecutable }
+    var agentVendor: AgentVendor { codexSettings.vendor }
+    var executable: String { agentVendor.configuredExecutable }
     var model: String { codexSettings.model }
     var reasoningEffort: CodexReasoningEffort {
         let effort = CodexReasoningEffort(rawValue: codexSettings.reasoningEffort) ?? .defaultConfiguration
-        let catalog = CodexModelCatalog.shared
+        let catalog = CodexModelCatalog.catalog(for: agentVendor)
         guard effort != .defaultConfiguration, catalog.matches(executable: executable),
               let selected = CodexModelSelection.effectiveModel(id: model, models: catalog.models,
                                                                 configuredModelID: catalog.configuredModelID),
@@ -319,7 +332,6 @@ final class AppState: ObservableObject {
         return CodexReasoningEffort(rawValue: fallback) ?? .defaultConfiguration
     }
     var threads: Int { let count = UserDefaults.standard.integer(forKey: "workerThreads"); return count > 0 ? count : ProcessInfo.processInfo.activeProcessorCount }
-    var isCodexInstalled: Bool { CodexService.resolveExecutable(executable) != nil }
     var activityStatus: String {
         guard let runningCodexSelection else { return activity }
         return "\(activity) · \(runningCodexSelection)"
@@ -358,13 +370,23 @@ final class AppState: ObservableObject {
         guard selected.utf8.count <= 256,
               selected.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else { return }
         var settings = codexSettings
-        let catalog = CodexModelCatalog.shared
+        let catalog = CodexModelCatalog.catalog(for: settings.vendor)
         settings.reasoningEffort = CodexModelSelection.selectModel(selected, currentModel: settings.model,
                                                                   currentEffort: settings.reasoningEffort,
                                                                   models: catalog.matches(executable: executable) ? catalog.models : [],
                                                                   configuredModelID: catalog.matches(executable: executable) ? catalog.configuredModelID : nil,
                                                                   preferences: &settings.reasoningByModel)
         settings.model = selected
+        updateCodexSettings(normalizedCodexSettings(settings))
+    }
+
+    /// Switching agents keeps each agent's last model and reasoning choice in
+    /// this design; an agent chosen for the first time starts from its own
+    /// installed configuration.
+    func selectAgentVendor(_ vendor: AgentVendor) {
+        guard vendor != codexSettings.vendor else { return }
+        var settings = codexSettings
+        settings.switchAgent(to: vendor)
         updateCodexSettings(normalizedCodexSettings(settings))
     }
 
@@ -390,8 +412,8 @@ final class AppState: ObservableObject {
     }
 
     private func normalizedCodexSettings(_ settings: CodexProjectSettings) -> CodexProjectSettings {
-        let catalog = CodexModelCatalog.shared
-        guard catalog.matches(executable: executable), !catalog.isLoading else { return settings }
+        let catalog = CodexModelCatalog.catalog(for: settings.vendor)
+        guard catalog.matches(executable: settings.vendor.configuredExecutable), !catalog.isLoading else { return settings }
         return Self.normalizedCodexSettings(settings, models: catalog.models,
                                             configuredModelID: catalog.configuredModelID,
                                             configuredReasoningEffort: catalog.configuredReasoningEffort)
@@ -576,7 +598,7 @@ final class AppState: ObservableObject {
         showGrid = true
         projectionMode = .perspective
         displayMode = .edges
-        codexSettings = normalizedCodexSettings(CodexProjectSettings())
+        codexSettings = normalizedCodexSettings(CodexProjectSettings(vendor: AgentVendorPreference.defaultVendor))
         messages = []; revisions = []; selectedRevisionID = nil
         projectActivity.restore()
         resetQueueWork()
@@ -1002,14 +1024,15 @@ final class AppState: ObservableObject {
         let feedback = CodexConversationFeedback()
         generationFeedback = feedback
         let settings = request.codexSettings ?? codexSettings
-        let path = executable, modelName = settings.model, runtime = python, cores = threads
+        let vendor = settings.vendor
+        let path = vendor.configuredExecutable, modelName = settings.model, runtime = python, cores = threads
         let effort = CodexReasoningEffort(rawValue: settings.reasoningEffort) ?? .defaultConfiguration
-        let catalog = CodexModelCatalog.shared
-        let modelStatus = CodexModelSelection.statusLabel(modelID: modelName, effort: effort,
+        let catalog = CodexModelCatalog.catalog(for: vendor)
+        let modelStatus = vendor.displayName + " · " + CodexModelSelection.statusLabel(modelID: modelName, effort: effort,
                                                           models: catalog.matches(executable: path) ? catalog.models : [],
                                                           configuredModelID: catalog.matches(executable: path) ? catalog.configuredModelID : nil,
                                                           configuredReasoningEffort: catalog.matches(executable: path) ? catalog.configuredReasoningEffort : nil)
-        projectActivity.beginCodex(userMessageID: userMessage.id, model: modelName, effort: effort.rawValue)
+        projectActivity.beginCodex(userMessageID: userMessage.id, agent: vendor, model: modelName, effort: effort.rawValue)
         autosave()
         operation = Task { [self] in
             let progress: @Sendable (String) -> Void = { [weak self] status in
@@ -1045,8 +1068,8 @@ final class AppState: ObservableObject {
                     messages[index].attachments = sources.isEmpty ? nil : sources
                 }
                 autosave()
-                guard isCodexInstalled else { throw LADError.message(CodexExecutable.setupMessage) }
-                let result = try await codex.generate(prompt: text, current: previous, history: history, attachments: sources, partLayout: previousLayout, partColors: previousColors,
+                guard vendor.resolveExecutable(path) != nil else { throw LADError.message(vendor.setupMessage) }
+                let result = try await codex.generate(vendor: vendor, prompt: text, current: previous, history: history, attachments: sources, partLayout: previousLayout, partColors: previousColors,
                                                     executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
                                                     onMessage: { commentary("project", $0) }, onActivity: { toolActivity("project", $0) },
                                                     python: runtime, threads: cores, engine: engine, currentPreview: previousPreview,
@@ -1112,7 +1135,7 @@ final class AppState: ObservableObject {
 
                     Preserve the intended shape and dimensions. Fix or simplify the failing operations and return the complete replacement design.
                     """
-                    let repairResult = try await codex.generate(prompt: repairRequest, current: spec, history: messages, attachments: sources, partLayout: previousLayout, partColors: previousColors,
+                    let repairResult = try await codex.generate(vendor: vendor, prompt: repairRequest, current: spec, history: messages, attachments: sources, partLayout: previousLayout, partColors: previousColors,
                                                      executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
                                                      onMessage: { commentary("repair", $0) }, onActivity: { toolActivity("repair", $0) },
                                                      python: runtime, threads: cores, engine: engine, viewport: viewportView,

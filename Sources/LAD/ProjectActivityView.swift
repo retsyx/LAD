@@ -368,8 +368,9 @@ private struct ProjectActivityText: NSViewRepresentable {
 enum ProjectActivityTranscript {
     static func text(for tasks: [ProjectTaskAudit]) -> String {
         tasks.map { task in
+            let selection = "\(task.model.flatMap { $0.isEmpty ? nil : $0 } ?? "Default model") · \(task.reasoningEffort.flatMap { $0.isEmpty ? nil : $0 } ?? "Default")"
             let actor = task.externalClient != nil ? task.actorDescription :
-                "\(task.model.flatMap { $0.isEmpty ? nil : $0 } ?? "Default model") · \(task.reasoningEffort.flatMap { $0.isEmpty ? nil : $0 } ?? "Default")"
+                task.agent.flatMap(AgentVendor.init(rawValue:)).map { "\($0.displayName) · \(selection)" } ?? selection
             let heading = "\(task.startedAt.formatted(date: .abbreviated, time: .standard)) · \(actor) · \(task.status)"
             var sections = [heading]
             if let client = task.externalClient {

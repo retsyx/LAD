@@ -135,6 +135,7 @@ enum ProjectArchive {
         var userMessageID: UUID?
         var startedAt: Date
         var finishedAt: Date?
+        var agent: String?
         var model: String?
         var reasoningEffort: String?
         var status: String
@@ -149,7 +150,7 @@ enum ProjectArchive {
         init(_ task: ProjectTaskAudit, writer: inout AssetWriter) throws {
             id = task.id; userMessageID = task.userMessageID
             startedAt = task.startedAt; finishedAt = task.finishedAt
-            model = task.model; reasoningEffort = task.reasoningEffort; status = task.status
+            agent = task.agent; model = task.model; reasoningEffort = task.reasoningEffort; status = task.status
             events = try task.events.map { try ArchivedActivityEvent($0, writer: &writer) }
             additionalUserMessageIDs = task.additionalUserMessageIDs
             externalClient = task.externalClient
@@ -159,7 +160,7 @@ enum ProjectArchive {
 
         func restored(reader: inout AssetReader) throws -> ProjectTaskAudit {
             ProjectTaskAudit(id: id, userMessageID: userMessageID, startedAt: startedAt, finishedAt: finishedAt,
-                             model: model, reasoningEffort: reasoningEffort, status: status,
+                             agent: agent, model: model, reasoningEffort: reasoningEffort, status: status,
                              events: try events.map { try $0.restored(reader: &reader) },
                              additionalUserMessageIDs: additionalUserMessageIDs,
                              externalClient: externalClient,

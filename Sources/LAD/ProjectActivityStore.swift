@@ -16,8 +16,8 @@ final class ProjectActivityStore: ObservableObject {
 
     deinit { saveTask?.cancel() }
 
-    func beginCodex(userMessageID: UUID, model: String, effort: String) {
-        let task = ProjectTaskAudit(userMessageID: userMessageID, model: model, reasoningEffort: effort)
+    func beginCodex(userMessageID: UUID, agent: AgentVendor? = nil, model: String, effort: String) {
+        let task = ProjectTaskAudit(userMessageID: userMessageID, agent: agent?.rawValue, model: model, reasoningEffort: effort)
         tasks.append(task)
         activeTaskID = task.id
     }

@@ -99,24 +99,42 @@ struct LADSettingsView: View {
     }
 }
 
-/// Model and reasoning choices belong to the project shown in this composer.
-/// Choosing a model first limits the following section to that model's efforts.
+/// Agent, model and reasoning choices belong to the project shown in this
+/// composer. The agent limits the models; a model limits the reasoning levels.
 @MainActor
 struct CodexModelMenu: View {
     @ObservedObject var state: AppState
-    // The executable remains an application preference. Observe changes here
-    // so its catalog refreshes even when the active project has not changed.
-    @AppStorage("codexPath") private var codexPath = ""
-    @ObservedObject private var catalog = CodexModelCatalog.shared
+    // Executables remain application preferences. Observe changes here so the
+    // catalogs refresh even when the active project has not changed.
+    @AppStorage(CodexExecutable.preferenceKey) private var codexPath = ""
+    @AppStorage(ClaudeExecutable.preferenceKey) private var claudePath = ""
+    @ObservedObject private var codexCatalog = CodexModelCatalog.shared
+    @ObservedObject private var claudeCatalog = CodexModelCatalog.claude
+    @State private var availableAgents: Set<AgentVendor> = []
     @State private var showsCustomModel = false
     @State private var customModelID = ""
     @FocusState private var customModelFocused: Bool
 
+    private var vendor: AgentVendor { state.codexSettings.vendor }
+    private var catalog: CodexModelCatalog { vendor == .codex ? codexCatalog : claudeCatalog }
     private var model: String { state.codexSettings.model }
     private var reasoningEffort: String { state.codexSettings.reasoningEffort }
+    /// Available agents, plus this design's agent even when it is unavailable.
+    private var agentChoices: [AgentVendor] {
+        AgentVendor.allCases.filter { availableAgents.contains($0) || $0 == vendor }
+    }
 
     var body: some View {
         Menu {
+            if agentChoices.count > 1 {
+                Section("Agent") {
+                    Picker("Agent", selection: vendorBinding) {
+                        ForEach(agentChoices) { agent in
+                            Text(agent.displayName).tag(agent)
+                        }
+                    }.pickerStyle(.inline).labelsHidden()
+                }
+            }
             Section("Model") {
                 Picker("Model", selection: modelBinding) {
                     if model.isEmpty {
@@ -157,13 +175,14 @@ struct CodexModelMenu: View {
                 }
                 Button("Refresh models") {
                     Task {
+                        availableAgents = await Task.detached(priority: .utility) { AgentVendorPreference.availableVendors() }.value
                         await catalog.refresh(executable: state.executable, force: true)
                         state.normalizeCodexSelection()
                     }
                 }.disabled(catalog.isLoading)
             }
         } label: {
-            Text("\(modelTitle) · \(reasoningTitle)")
+            Text(selectionTitle)
                 .foregroundStyle(Palette.accent)
                 .lineLimit(1).truncationMode(.middle)
                 .font(.system(size: 11)).padding(.vertical, 6)
@@ -171,21 +190,33 @@ struct CodexModelMenu: View {
         }
         .menuStyle(.borderlessButton).menuIndicator(.visible)
         .fixedSize(horizontal: true, vertical: true).layoutPriority(1)
-        .accessibilityLabel("Model and reasoning level")
-        .accessibilityValue("\(modelTitle), \(reasoningTitle)")
-        .help("\(modelTitle) · \(reasoningTitle). Applies to your next message.")
+        .accessibilityLabel(agentChoices.count > 1 ? "Agent, model and reasoning level" : "Model and reasoning level")
+        .accessibilityValue(agentChoices.count > 1 ? "\(vendor.displayName), \(modelTitle), \(reasoningTitle)" : "\(modelTitle), \(reasoningTitle)")
+        .help("\(selectionTitle). Applies to your next message.")
         .popover(isPresented: $showsCustomModel) { customModelEditor }
-        .task(id: codexPath) {
+        .task(id: "\(vendor.rawValue)|\(codexPath)|\(claudePath)") {
             await catalog.refresh(executable: state.executable)
             state.normalizeCodexSelection()
         }
-        .onChange(of: catalog.models) { _, _ in state.normalizeCodexSelection() }
+        .task(id: "\(codexPath)|\(claudePath)") {
+            availableAgents = await Task.detached(priority: .utility) { AgentVendorPreference.availableVendors() }.value
+        }
+        .onChange(of: codexCatalog.models) { _, _ in state.normalizeCodexSelection() }
+        .onChange(of: claudeCatalog.models) { _, _ in state.normalizeCodexSelection() }
         .onChange(of: catalog.configuredModelID) { _, _ in state.normalizeCodexSelection() }
         .onChange(of: catalog.configuredReasoningEffort) { _, _ in state.normalizeCodexSelection() }
         .onChange(of: catalog.isLoading) { _, loading in
             if !loading { state.normalizeCodexSelection() }
         }
         .onChange(of: state.codexSettings) { _, _ in state.normalizeCodexSelection() }
+    }
+
+    private var selectionTitle: String {
+        agentChoices.count > 1 ? "\(vendor.displayName) · \(modelTitle) · \(reasoningTitle)" : "\(modelTitle) · \(reasoningTitle)"
+    }
+
+    private var vendorBinding: Binding<AgentVendor> {
+        Binding(get: { vendor }, set: { state.selectAgentVendor($0) })
     }
 
     private var selectedModel: CodexModelDescriptor? {

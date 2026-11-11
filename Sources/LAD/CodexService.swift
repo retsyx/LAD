@@ -34,14 +34,17 @@ enum CodexError: LocalizedError {
     }
 }
 
-/// Uses the user's authenticated Codex CLI; LAD does not handle API keys or tokens.
+/// Runs design requests with the user's authenticated Codex or Claude Code
+/// installation; LAD does not handle API keys or tokens. Both agents share the
+/// task workspace, LAD tool bridge, file context and response validation.
 @MainActor
 final class CodexService {
     // Leave headroom below the CLI's observed 1,048,576-character boundary.
     // UTF-8 bytes are a conservative upper bound for its character count.
     nonisolated static let maximumRequestBytes = 1_000_000
-    private var activeJob: CodexAppServerJob?
+    private var activeJob: AgentTaskJob?
     private var activeWorkspace: URL?
+    private var activeVendor: AgentVendor = .codex
 
     var canSteer: Bool { activeJob?.canSteer ?? false }
     var currentTurnID: String? { activeJob?.currentTurnID }
@@ -57,6 +60,7 @@ final class CodexService {
     }
 
     func generate(
+        vendor: AgentVendor = .codex,
         prompt: String,
         current: ModelSpec?,
         history: [ChatMessage],
@@ -80,15 +84,16 @@ final class CodexService {
         guard activeJob == nil else { throw CodexError.failed("A design request is already running.") }
         validatedModel = nil; validatedMesh = nil; partColorChanges = []
         let requestedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let executableURL = Self.resolveExecutable(requestedExecutable) else {
-            throw CodexError.executableMissing(requestedExecutable)
+        guard let executableURL = vendor.resolveExecutable(requestedExecutable) else {
+            if vendor == .codex { throw CodexError.executableMissing(requestedExecutable) }
+            throw CodexError.failed("Claude Code could not be found\(requestedExecutable.isEmpty ? "" : " at \(requestedExecutable)"). \(ClaudeExecutable.setupMessage)")
         }
         guard let instructionsURL = Bundle.module.url(forResource: "model-instructions", withExtension: "md", subdirectory: "Resources"),
               let schemaURL = Bundle.module.url(forResource: "model-schema", withExtension: "json", subdirectory: "Resources") else {
             throw CodexError.resourcesMissing
         }
         let instructions = try String(contentsOf: instructionsURL, encoding: .utf8)
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-Codex-\(UUID().uuidString)", isDirectory: true)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-\(vendor.displayName)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
         let runtime = try await CADRuntimeManager.resolvePython(python)
@@ -104,9 +109,18 @@ final class CodexService {
             partLayout: partLayout, partColors: partColors, permissionController: permissionController)
         activeBridge = bridge
         defer { bridge.stop(); if activeBridge === bridge { activeBridge = nil } }
-        var arguments = ["app-server", "--listen", "stdio://"]
-        arguments += try CADAgentBridge.codexArguments(workspace: directory, python: taskRuntime, server: server)
         let selectedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effort = reasoningEffort == .defaultConfiguration ? nil : reasoningEffort.rawValue
+        let schema = try Data(contentsOf: schemaURL)
+        let arguments: [String]
+        switch vendor {
+        case .codex:
+            arguments = ["app-server", "--listen", "stdio://"]
+                + (try CADAgentBridge.codexArguments(workspace: directory, python: taskRuntime, server: server))
+        case .claude:
+            arguments = try ClaudeCodeJob.arguments(model: selectedModel, effort: effort, schema: schema,
+                                                    workspace: directory, python: taskRuntime, server: server)
+        }
 
         let request = try await Task.detached(priority: .userInitiated) {
             try SourceImport.validateAttachments(attachments.filter(\.isImage))
@@ -119,7 +133,8 @@ final class CodexService {
                 partLayout: contextLayout, selection: selection, selectionModel: selectionModel,
                 selectionModelsByRevision: selectionModelsByRevision)
             return (text: try Self.makeRequest(instructions: instructions, prompt: prompt, current: current, history: history, files: files,
-                                               workspace: directory, python: taskRuntime, versions: versions), images: files.currentImagePaths)
+                                               workspace: directory, python: taskRuntime, versions: versions, vendor: vendor),
+                    images: files.currentImagePaths)
         }.value
 
         let temporary = directory.appendingPathComponent("tmp", isDirectory: true)
@@ -128,12 +143,20 @@ final class CodexService {
         let taskEnvironment = ["LAD_PYTHON": taskRuntime, "LAD_WORKSPACE": directory.path, "TMPDIR": temporary.path,
                                "XDG_CACHE_HOME": cache.path, "PIP_CACHE_DIR": cache.appendingPathComponent("pip").path,
                                "MPLCONFIGDIR": cache.appendingPathComponent("matplotlib").path, "PYTHONDONTWRITEBYTECODE": "1"]
-        let job = CodexAppServerJob(executable: executableURL, arguments: arguments, directory: directory,
-            model: selectedModel, effort: reasoningEffort == .defaultConfiguration ? nil : reasoningEffort.rawValue,
-            schema: try Data(contentsOf: schemaURL), onProgress: onProgress, onMessage: onMessage,
-            onActivity: onActivity, onSteeringAvailability: onSteeringAvailability, environment: taskEnvironment)
+        let job: AgentTaskJob
+        switch vendor {
+        case .codex:
+            job = CodexAppServerJob(executable: executableURL, arguments: arguments, directory: directory,
+                model: selectedModel, effort: effort, schema: schema, onProgress: onProgress, onMessage: onMessage,
+                onActivity: onActivity, onSteeringAvailability: onSteeringAvailability, environment: taskEnvironment)
+        case .claude:
+            job = ClaudeCodeJob(executable: executableURL, arguments: arguments, directory: directory,
+                onProgress: onProgress, onMessage: onMessage, onActivity: onActivity,
+                onSteeringAvailability: onSteeringAvailability, environment: taskEnvironment)
+        }
         activeJob = job
         activeWorkspace = directory
+        activeVendor = vendor
         defer { if activeJob === job { activeJob = nil; activeWorkspace = nil } }
         try Task.checkCancellation()
         bridge.start()
@@ -145,7 +168,7 @@ final class CodexService {
         } catch let error as CodexError {
             let diagnostic = error.localizedDescription
             let lower = diagnostic.lowercased()
-            if ["unauthorized", "not logged in", "authentication", "401", "sign in", "login required"].contains(where: lower.contains) {
+            if ["unauthorized", "not logged in", "authentication", "401", "sign in", "login required", "/login", "invalid api key"].contains(where: lower.contains) {
                 throw CodexError.failed("Configuration and sign-in are required. Complete setup in your installed app or CLI, then try again.\n\n\(String(diagnostic.suffix(1_600)))")
             }
             throw error
@@ -209,7 +232,8 @@ final class CodexService {
     }
 
     nonisolated private static func makeRequest(instructions: String, prompt: String, current: ModelSpec?, history: [ChatMessage], files: CodexFileContext,
-                                                workspace: URL, python: String, versions: ProjectVersionContext) throws -> String {
+                                                workspace: URL, python: String, versions: ProjectVersionContext,
+                                                vendor: AgentVendor = .codex) throws -> String {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var request = instructions + "\n\nDESIGN CONTEXT\n"
         request += "TASK WORKSPACE: \(workspace.path)\nLAD PYTHON RUNTIME: \(python)\n"
@@ -235,11 +259,13 @@ final class CodexService {
         }
         if let path = files.imageManifestPath {
             request += "IMAGE REFERENCE MANIFEST FILE:\n" + String(decoding: try encoder.encode(path), as: UTF8.self) + "\n\n"
-            request += "This complete local JSON index includes every saved image occurrence, its attachment/message IDs and dates, and file.readPath for its extracted image bytes. It includes older log images even when their original files no longer exist. Inspect relevant referenced images with the image-viewing tool as needed; keep inputs unchanged. The index and image bytes are not embedded in this text.\n\n"
+            request += "This complete local JSON index includes every saved image occurrence, its attachment/message IDs and dates, and file.readPath for its extracted image bytes. It includes older log images even when their original files no longer exist. Inspect relevant referenced images with \(vendor == .claude ? "the Read tool" : "the image-viewing tool") as needed; keep inputs unchanged. The index and image bytes are not embedded in this text.\n\n"
             if !files.images.isEmpty {
                 request += "CURRENT IMAGE FILE REFERENCES (JSON):\n"
                 request += String(decoding: try encoder.encode(files.images), as: UTF8.self) + "\n\n"
-                request += "These current images are also supplied as visual inputs in attachment order.\n\n"
+                request += vendor == .claude
+                    ? "These are the current user image attachments, in attachment order. View each one by reading its readPath with the Read tool before relying on it; they are not attached as separate visual inputs.\n\n"
+                    : "These current images are also supplied as visual inputs in attachment order.\n\n"
             }
         }
         if let layoutPath = files.partLayoutPath {
@@ -262,7 +288,10 @@ final class CodexService {
             let phase = message.role == "assistant" ? message.phase.map { " [\($0)]" } ?? "" : ""
             request += "\(message.role.uppercased())\(phase): \(String(message.content.prefix(6_000)))\n\n"
         }
-        request += "USER REQUEST:\n\(prompt)\n\nFor construction work, start with the brief user-facing plan described above and provide useful progress commentary while working. Finish with only the response JSON, using status message for an answer or clarification that does not change geometry."
+        request += "USER REQUEST:\n\(prompt)\n\nFor construction work, start with the brief user-facing plan described above and provide useful progress commentary while working. "
+        request += vendor == .claude
+            ? "Finish by delivering the response JSON through the structured output tool, using status message for an answer or clarification that does not change geometry. Do not restate the final response as text."
+            : "Finish with only the response JSON, using status message for an answer or clarification that does not change geometry."
         guard request.utf8.count <= maximumRequestBytes else {
             throw CodexError.failed("The design request is too long to send. Shorten the message or reference a local source file instead of pasting its contents. No request was sent; the current design is preserved.")
         }
@@ -277,16 +306,18 @@ final class CodexService {
             throw CodexSteeringError.unavailable
         }
         try activeBridge?.tools.registerReferenceAssets(selectionModel?.inputAssets ?? [])
+        let vendor = activeVendor
         let request = try await Task.detached(priority: .userInitiated) {
             try Self.makeSteeringRequest(prompt: prompt, attachments: attachments, directory: directory,
-                                         selection: selection, selectionModel: selectionModel)
+                                         selection: selection, selectionModel: selectionModel, vendor: vendor)
         }.value
         guard activeJob === job else { throw CancellationError() }
         return try await job.steer(text: request.text, imagePaths: request.images)
     }
 
     nonisolated private static func makeSteeringRequest(prompt: String, attachments: [SourceAttachment], directory: URL,
-                                                       selection: ProjectSelectionContext?, selectionModel: ModelSpec?) throws -> (text: String, images: [String]) {
+                                                       selection: ProjectSelectionContext?, selectionModel: ModelSpec?,
+                                                       vendor: AgentVendor = .codex) throws -> (text: String, images: [String]) {
         var request = "ADDITIONAL USER INFORMATION FOR THE CURRENT DESIGN TASK:\n" + prompt
         // Each accepted/rejected steering attempt has immutable local context;
         // an edit or later send must never replace an earlier snapshot's files.
@@ -328,7 +359,9 @@ final class CodexService {
             }
             if !imageReferences.isEmpty {
                 request += "\n\nATTACHED IMAGE FILE REFERENCES (JSON):\n" + String(decoding: try encoder.encode(imageReferences), as: UTF8.self)
-                request += "\nThese images are also supplied as visual inputs in attachment order. Their local snapshots stay available for this turn; image bytes are not embedded in this text. Keep original inputs unchanged."
+                request += vendor == .claude
+                    ? "\nView each image by reading its readPath with the Read tool; they are not attached as separate visual inputs. Their local snapshots stay available for this task; image bytes are not embedded in this text. Keep original inputs unchanged."
+                    : "\nThese images are also supplied as visual inputs in attachment order. Their local snapshots stay available for this turn; image bytes are not embedded in this text. Keep original inputs unchanged."
             }
         }
         if let selection, !selection.parts.isEmpty || !selection.features.isEmpty {

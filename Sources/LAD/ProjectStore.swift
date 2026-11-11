@@ -207,9 +207,16 @@ enum ProjectStore {
         func validModel(_ value: String) -> Bool {
             value.utf8.count <= 256 && value.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
         }
-        guard validModel(settings.model), CodexReasoningEffort(rawValue: settings.reasoningEffort) != nil,
-              settings.reasoningByModel.count <= 256,
-              settings.reasoningByModel.allSatisfy({ validModel($0.key) && CodexReasoningEffort(rawValue: $0.value) != nil }) else {
+        func validChoice(_ model: String, _ effort: String, _ memory: [String: String]) -> Bool {
+            validModel(model) && CodexReasoningEffort(rawValue: effort) != nil && memory.count <= 256 &&
+                memory.allSatisfy({ validModel($0.key) && CodexReasoningEffort(rawValue: $0.value) != nil })
+        }
+        guard validChoice(settings.model, settings.reasoningEffort, settings.reasoningByModel),
+              settings.otherAgents.count < AgentVendor.allCases.count,
+              settings.otherAgents.allSatisfy({ key, choice in
+                  AgentVendor(rawValue: key).map { $0 != settings.vendor } == true &&
+                      validChoice(choice.model, choice.reasoningEffort, choice.reasoningByModel)
+              }) else {
             throw invalid("The saved model or reasoning selection is invalid.")
         }
     }
@@ -393,6 +400,7 @@ enum ProjectStore {
                   task.startedAt.timeIntervalSinceReferenceDate.isFinite,
                   task.finishedAt.map({ $0.timeIntervalSinceReferenceDate.isFinite && $0 >= task.startedAt }) ?? true,
                   [task.model, task.reasoningEffort].compactMap({ $0 }).allSatisfy(validMetadata),
+                  task.agent.map({ AgentVendor(rawValue: $0) != nil && task.externalClient == nil }) ?? true,
                   task.events.count <= 100_000 - totalEvents,
                   Set(task.events.map(\.id)).count == task.events.count else {
                 throw invalid("The saved tool task metadata is invalid.")

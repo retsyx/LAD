@@ -35,11 +35,45 @@ struct CodexReasoningEffort: RawRepresentable, CaseIterable, Identifiable, Senda
     }
 }
 
-/// Selection and per-model reasoning memory belong to a single LAD project.
-struct CodexProjectSettings: Codable, Sendable, Equatable {
+/// One agent's model, reasoning level and per-model reasoning memory.
+struct AgentModelChoice: Codable, Sendable, Equatable {
     var model: String = ""
     var reasoningEffort: String = ""
     var reasoningByModel: [String: String] = [:]
+}
+
+/// Agent, model, reasoning and per-model reasoning memory belong to a single
+/// LAD project. The top-level model fields describe the selected agent; the
+/// other agents' last choices are kept so switching back restores them.
+struct CodexProjectSettings: Codable, Sendable, Equatable {
+    var vendor: AgentVendor = .codex
+    var model: String = ""
+    var reasoningEffort: String = ""
+    var reasoningByModel: [String: String] = [:]
+    var otherAgents: [String: AgentModelChoice] = [:]
+
+    mutating func switchAgent(to vendor: AgentVendor) {
+        guard vendor != self.vendor else { return }
+        otherAgents[self.vendor.rawValue] = AgentModelChoice(model: model, reasoningEffort: reasoningEffort,
+                                                             reasoningByModel: reasoningByModel)
+        let restored = otherAgents.removeValue(forKey: vendor.rawValue) ?? AgentModelChoice()
+        self.vendor = vendor
+        model = restored.model
+        reasoningEffort = restored.reasoningEffort
+        reasoningByModel = restored.reasoningByModel
+    }
+}
+
+extension CodexProjectSettings {
+    /// Selections saved before agent choice existed were made with Codex.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        vendor = try values.decodeIfPresent(AgentVendor.self, forKey: .vendor) ?? .codex
+        model = try values.decode(String.self, forKey: .model)
+        reasoningEffort = try values.decode(String.self, forKey: .reasoningEffort)
+        reasoningByModel = try values.decode([String: String].self, forKey: .reasoningByModel)
+        otherAgents = try values.decodeIfPresent([String: AgentModelChoice].self, forKey: .otherAgents) ?? [:]
+    }
 }
 
 /// Selection policy for the conversation composer. Callers provide the current

@@ -556,11 +556,8 @@ final class CodexAppServerJob: @unchecked Sendable {
         return stopped ? nil : data
     }
     private func emitCommentary(_ id: String, message: Message) {
-        guard message.phase == nil || message.phase == "commentary" else { return }
-        let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !text.hasPrefix("{"), !text.hasPrefix("["), !text.contains("```"), !text.contains("~~~"),
-              text.range(of: #"(?m)^\s*(?:import\s+|from\s+\w.*\s+import\s+|result\s*=|def\s+|class\s+|FeatureScript\s+|ISO-10303-21;|\(kicad_pcb\b|(?:const|let|var)\s+\w+\s*=)"#, options: .regularExpression) == nil else { return }
-        let visible = String(text.prefix(4_000))
+        guard message.phase == nil || message.phase == "commentary",
+              let visible = AgentCommentary.visibleText(message.text) else { return }
         guard emittedCommentary[id] != visible, emittedCommentary.count < 256 || emittedCommentary[id] != nil else { return }
         emittedCommentary[id] = visible
         onMessage(CodexProgressMessage(id: id, text: visible))
