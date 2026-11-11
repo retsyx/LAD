@@ -418,7 +418,7 @@ SceneKit can smooth normals within a curved face without smoothing sharp CAD
 edges. STEP is exported from the exact solid, independently of preview quality.
 
 `requirements.txt` pins the top-level tested engine version. The full tested
-Python 3.11 / Apple Silicon environment is in `requirements-lock.txt`. CadQuery
+Python 3.14 / Apple Silicon environment is in `requirements-lock.txt`. CadQuery
 and its dependencies are third-party packages; their licenses remain applicable.
 
 Saved revisions carry one optional `validated_hash` field. The worker computes

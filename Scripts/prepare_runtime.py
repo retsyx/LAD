@@ -15,8 +15,9 @@ import tempfile
 from audit_runtime import audit_runtime
 
 
-def remove_external_tool_plugins(python):
-    site = python / "lib/python3.11/site-packages"
+def remove_external_tool_plugins(python, python_version):
+    major, minor = python_version.split(".")[:2]
+    site = python / f"lib/python{major}.{minor}/site-packages"
     # These optional upstream plugins already require separately installed
     # solvers, MATLAB or OpenMP. None is used by CadQuery's CAD construction,
     # sketch solver or bundled IPOPT assembly solver. Never leave native images
@@ -84,7 +85,7 @@ def prepare(root, archive, architecture):
         checked([str(python), "-m", "pip", "install", "--no-index", "--no-deps", "--no-compile",
                  "--find-links", str(wheels), "--requirement", str(requirements)])
         checked([str(python), "-m", "pip", "check"])
-        excluded_plugins = remove_external_tool_plugins(expanded / "python")
+        excluded_plugins = remove_external_tool_plugins(expanded / "python", source["pythonVersion"])
         native_audit = audit_runtime(expanded / "python", architecture, repair_build_rpaths=True)
         checked([str(python), "-I", "-B", str(root / "Scripts/check_runtime.py")])
         for cache in expanded.rglob("__pycache__"):

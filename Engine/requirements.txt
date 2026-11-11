@@ -1,2 +1,2 @@
-# Tested native arm64 / Python 3.11 kernel. Native OCCT wheels use C++ threads.
+# Tested native arm64 / Python 3.14 kernel. Native OCCT wheels use C++ threads.
 cadquery==2.8.0
