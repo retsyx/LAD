@@ -184,6 +184,10 @@ final class CADSceneView: SCNView {
     }
     private var commandGrabGesture = false
     private var assemblyGrab: AssemblyGrabGesture?
+    private var pointerPoint: NSPoint?
+    private var commandPressed = false
+    private var commandCursorSet = false
+    private var modifierMonitor: Any?
     var isGrabbingAssembly: Bool { assemblyGrab != nil }
     private var rightDragging = false
     private var topology: CADTopology?
@@ -267,7 +271,11 @@ final class CADSceneView: SCNView {
     var onShowAll: (() -> Void)?
     var onActivated: ((CADSceneView) -> Void)?
     var assemblyGrabbingEnabled = false {
-        didSet { if !assemblyGrabbingEnabled { cancelAssemblyGrab() } }
+        didSet {
+            guard assemblyGrabbingEnabled != oldValue else { return }
+            if !assemblyGrabbingEnabled { cancelAssemblyGrab() }
+            refreshPointerFeedback()
+        }
     }
     var onAssemblyGrabBegan: ((Int, [Double], AssemblyGrabProjection) -> Bool)?
     var onAssemblyGrabMoved: (([Double]) -> Void)?
@@ -296,6 +304,7 @@ final class CADSceneView: SCNView {
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { false }
+    deinit { if let modifierMonitor { NSEvent.removeMonitor(modifierMonitor) } }
     override var delegate: (any SCNSceneRendererDelegate)? {
         get { super.delegate }
         set {
@@ -1343,7 +1352,12 @@ final class CADSceneView: SCNView {
     }
 
     override func cursorUpdate(with event: NSEvent) {
-        if assemblyGrab != nil { NSCursor.closedHand.set() } else { NSCursor.arrow.set() }
+        trackPointer(with: event)
+        updatePointerCursor()
+    }
+    override func flagsChanged(with event: NSEvent) {
+        super.flagsChanged(with: event)
+        updateModifiers(with: event)
     }
     override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
@@ -1351,6 +1365,9 @@ final class CADSceneView: SCNView {
         return resigned
     }
     override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if let modifierMonitor { NSEvent.removeMonitor(modifierMonitor) }
+        modifierMonitor = nil
+        clearPointerFeedback()
         cancelAssemblyGrab()
         NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: window)
         NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: window)
@@ -1370,6 +1387,12 @@ final class CADSceneView: SCNView {
         super.viewDidMoveToWindow()
         if let window {
             window.acceptsMouseMovedEvents = true
+            // Modifier events go to the first responder, which may be the
+            // composer even while the pointer is over this viewport.
+            modifierMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+                MainActor.assumeIsolated { self?.updateModifiers(with: event) }
+                return event
+            }
             NotificationCenter.default.addObserver(self, selector: #selector(windowResignedKey),
                                                    name: NSWindow.didResignKeyNotification, object: window)
             NotificationCenter.default.addObserver(self, selector: #selector(windowBecameKey),
@@ -1392,6 +1415,7 @@ final class CADSceneView: SCNView {
     }
 
     @objc private func windowResignedKey() {
+        clearPointerFeedback()
         cancelAssemblyGrab()
         cancelCameraTransition()
         setHoveredFeature(nil)
@@ -1426,15 +1450,79 @@ final class CADSceneView: SCNView {
 
     override func mouseEntered(with event: NSEvent) { updateHover(with: event) }
     override func mouseMoved(with event: NSEvent) { updateHover(with: event) }
-    override func mouseExited(with event: NSEvent) { setHoveredFeature(nil) }
+    override func mouseExited(with event: NSEvent) { clearPointerFeedback() }
 
-    private func updateHover(with event: NSEvent) {
+    private func ownsPointer(_ point: NSPoint) -> Bool {
+        guard point.x.isFinite, point.y.isFinite, bounds.contains(point) else { return false }
+        guard let window else { return true }
+        guard let content = window.contentView,
+              let hit = content.hitTest(convert(point, to: content.superview)) else { return false }
+        return hit === self || hit.isDescendant(of: self)
+    }
+
+    private func trackPointer(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard !commandGrabGesture, !isAnimatingCamera, rightDownPoint == nil, NSEvent.pressedMouseButtons == 0, bounds.contains(point) else {
+        pointerPoint = ownsPointer(point) ? point : nil
+        commandPressed = event.modifierFlags.contains(.command)
+    }
+
+    private func updateModifiers(with event: NSEvent) {
+        if let window {
+            guard window.isKeyWindow, NSApp.isActive, event.window == nil || event.window === window else { return }
+            // A key event's location can be stale. Query the pointer and hit
+            // target so overlays and the composer retain their own cursors.
+            let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            let owned = ownsPointer(point) ? point : nil
+            let pressed = event.modifierFlags.contains(.command)
+            guard pressed != commandPressed || owned != pointerPoint else { return }
+            commandPressed = pressed
+            pointerPoint = owned
+        } else {
+            let pressed = event.modifierFlags.contains(.command)
+            guard pressed != commandPressed else { return }
+            commandPressed = pressed
+        }
+        refreshPointerFeedback()
+    }
+
+    private func updatePointerCursor() {
+        if rightDragging || otherDragPoint != nil {
+            NSCursor.closedHand.set()
+        } else if pointerPoint != nil && assemblyGrabbingEnabled && commandPressed {
+            NSCursor.closedHand.set()
+            commandCursorSet = true
+        } else {
+            if pointerPoint != nil || (commandCursorSet && NSCursor.current === NSCursor.closedHand) {
+                NSCursor.arrow.set()
+            }
+            commandCursorSet = false
+        }
+    }
+
+    private func clearPointerFeedback() {
+        pointerPoint = nil
+        commandPressed = false
+        if (commandCursorSet || rightDragging || otherDragPoint != nil), NSCursor.current === NSCursor.closedHand {
+            NSCursor.arrow.set()
+        }
+        commandCursorSet = false
+        setHoveredFeature(nil)
+    }
+
+    private func refreshPointerFeedback() {
+        updatePointerCursor()
+        guard let point = pointerPoint, !(assemblyGrabbingEnabled && commandPressed),
+              !commandGrabGesture, !isAnimatingCamera, rightDownPoint == nil,
+              NSEvent.pressedMouseButtons == 0 else {
             setHoveredFeature(nil)
             return
         }
         setHoveredFeature(feature(at: point))
+    }
+
+    private func updateHover(with event: NSEvent) {
+        trackPointer(with: event)
+        refreshPointerFeedback()
     }
 
     private func setHoveredFeature(_ feature: CADFeatureID?) {
@@ -1444,6 +1532,7 @@ final class CADSceneView: SCNView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        trackPointer(with: event)
         cancelAssemblyGrab()
         cancelCameraTransition()
         window?.makeFirstResponder(self)
@@ -1452,13 +1541,13 @@ final class CADSceneView: SCNView {
             commandGrabGesture = true
             resetNavigationGesture()
             setHoveredFeature(nil)
+            updatePointerCursor()
             guard bounds.contains(point), let hit = visibleHit(at: point),
                   let solid = solidIndex(of: hit.node), let projection = assemblyGrabProjection() else { return }
             let original = (solidMatrices[solid].map(simd_inverse) ?? matrix_identity_double4x4)
                 * SIMD4(Double(hit.worldCoordinates.x), Double(hit.worldCoordinates.y), Double(hit.worldCoordinates.z), 1)
             guard onAssemblyGrabBegan?(solid, [original.x, original.y, original.z], projection) == true else { return }
             assemblyGrab = AssemblyGrabGesture(solid: solid, start: point)
-            NSCursor.closedHand.set()
             return
         }
         let feature = feature(at: point)
@@ -1470,6 +1559,7 @@ final class CADSceneView: SCNView {
         if let feature { selectFeatures(ViewportFeaturePicking.toggling(feature, in: selectedFeatures)) }
     }
     override func mouseUp(with event: NSEvent) {
+        trackPointer(with: event)
         if commandGrabGesture {
             deliverAssemblyGrab(at: convert(event.locationInWindow, from: nil))
             let accepted = assemblyGrab != nil
@@ -1477,9 +1567,11 @@ final class CADSceneView: SCNView {
             commandGrabGesture = false
             if accepted { onAssemblyGrabEnded?() }
         }
-        NSCursor.arrow.set()
+        updatePointerCursor()
     }
     override func mouseDragged(with event: NSEvent) {
+        trackPointer(with: event)
+        updatePointerCursor()
         setHoveredFeature(nil)
         if commandGrabGesture { deliverAssemblyGrab(at: convert(event.locationInWindow, from: nil)) }
     }
@@ -1494,9 +1586,9 @@ final class CADSceneView: SCNView {
     }
     override func rightMouseUp(with event: NSEvent) {
         guard rightDownPoint != nil else { return }
+        trackPointer(with: event)
         let wasDragging = rightDragging
         resetNavigationGesture()
-        NSCursor.arrow.set()
         if !wasDragging {
             showContextMenu(event)
         }
@@ -1534,8 +1626,9 @@ final class CADSceneView: SCNView {
     }
     override func otherMouseUp(with event: NSEvent) {
         guard !commandGrabGesture else { return }
+        trackPointer(with: event)
         otherDragPoint = nil
-        NSCursor.arrow.set()
+        updatePointerCursor()
     }
     override func otherMouseDragged(with event: NSEvent) {
         guard let previous = otherDragPoint else { return }
@@ -1563,7 +1656,7 @@ final class CADSceneView: SCNView {
         assemblyGrab = nil
         commandGrabGesture = false
         if accepted { onAssemblyGrabCancelled?() }
-        if accepted { NSCursor.arrow.set() }
+        if accepted { updatePointerCursor() }
     }
 
     /// Freeze actual camera XY/w projection once for a grab. Camera-local
@@ -1595,7 +1688,7 @@ final class CADSceneView: SCNView {
         rightDragPoint = nil
         otherDragPoint = nil
         rightDragging = false
-        NSCursor.arrow.set()
+        updatePointerCursor()
     }
 
     private func select(_ solids: Set<Int>) {
