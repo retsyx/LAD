@@ -45,6 +45,11 @@ final class ViewportCavitySurfaceTests: XCTestCase {
             ])
             view.update(mesh: preview, mode: mode, grid: false, command: nil,
                         selectedSolids: [], hiddenSolids: [], projection: .perspective)
+            let deadline = ContinuousClock.now + .seconds(30)
+            while view.isPreparingResources, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertFalse(view.isPreparingResources)
             try view.configureAgentView(named: "front", camera: .init(yawDegrees: 90, elevationDegrees: 35, zoom: 1.5))
             view.layout()
             let png = try await CADAgentRenderer.capturePNG(view: view)

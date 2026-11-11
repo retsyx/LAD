@@ -92,6 +92,121 @@ final class ViewportPreparationTests: XCTestCase {
     }
 
     @MainActor
+    func testLargePreparationYieldsAndInstallsLatestStylePoseAndExplicitCamera() async throws {
+        let view = try makeView(), preview = largeMesh("latest-state")
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [])
+        XCTAssertTrue(view.isPreparingResources)
+        XCTAssertFalse(view.hasRenderableGeometry, "Large CPU preparation must return before creating scene geometry.")
+        XCTAssertNil(view.scene?.rootNode.childNode(withName: "solid:0", recursively: true))
+        let pose = [1.0, 0, 0, 4, 0, 1, 0, -2, 0, 0, 1, 0, 0, 0, 0, 1]
+        view.update(mesh: preview, mode: .translucent, grid: true, command: ViewportCommand(.top),
+                    selectedSolids: [1], hiddenSolids: [0], projection: .isometric, solidTransforms: [1: pose])
+        let requestedCamera = CADAgentCamera(yawDegrees: 25, elevationDegrees: 30, rollDegrees: 17, zoom: 1.2)
+        try view.configureAgentView(named: "front", camera: requestedCamera)
+        try await waitForPreparation(view)
+        XCTAssertTrue(try node("solid:0", in: view).isHidden)
+        let selected = try node("solid:1", in: view)
+        XCTAssertFalse(selected.isHidden)
+        XCTAssertEqual(selected.simdTransform.columns.3, SIMD4(4, -2, 0, 1))
+        let color = try XCTUnwrap((selected.geometry?.firstMaterial?.diffuse.contents as? NSColor)?.usingColorSpace(.sRGB))
+        XCTAssertEqual(color.redComponent, 0.92, accuracy: 1e-6)
+        XCTAssertFalse(try XCTUnwrap(selected.geometry?.firstMaterial).writesToDepthBuffer)
+        let camera = try XCTUnwrap(view.pointOfView).simdTransform
+        try view.configureAgentView(named: "front", camera: requestedCamera)
+        XCTAssertEqual(view.pointOfView?.simdTransform, camera,
+            "A camera configured while preparing must resolve from the final visible, posed bounds.")
+    }
+
+    @MainActor
+    func testLargeReplacementAndEscapeCannotPublishStaleBuffersOrStrandPreparation() async throws {
+        let view = try makeView()
+        view.update(mesh: mesh("existing"), mode: .edges, grid: false, command: nil,
+                    selectedSolids: [1], hiddenSolids: [])
+        try await waitForPreparation(view)
+        view.update(mesh: largeMesh("discarded"), mode: .edges, grid: false, command: nil,
+                    selectedSolids: [1], hiddenSolids: [])
+        let escape = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: 0, context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+            isARepeat: false, keyCode: 53))
+        view.keyDown(with: escape)
+        try await waitForPreparation(view)
+        let unselected = try XCTUnwrap((node("solid:1", in: view).geometry?.firstMaterial?.diffuse.contents as? NSColor)?.usingColorSpace(.sRGB))
+        XCTAssertEqual(unselected.redComponent, 0.70, accuracy: 1e-6,
+            "Escape while preparing must neither invalidate the CPU generation nor skip the final unselected style.")
+
+        view.update(mesh: largeMesh("replaced"), mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [])
+        let final = mesh("replacement")
+        view.update(mesh: final, mode: .shaded, grid: false, command: nil,
+                    selectedSolids: [0], hiddenSolids: [1])
+        let replacement = try node("solid:0", in: view)
+        try await waitForPreparation(view)
+        XCTAssertTrue(try node("solid:0", in: view) === replacement)
+        XCTAssertEqual(replacement.geometry?.elements.first?.primitiveCount, 2)
+        XCTAssertTrue(try node("solid:1", in: view).isHidden)
+    }
+
+    @MainActor
+    func testDetachmentCancelsLargePreparationAndSameIdentityResumesOnReattachment() async throws {
+        _ = NSApplication.shared
+        let view = try makeView()
+        let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        defer { window.contentView = nil; window.close() }
+        let preview = largeMesh("reattached")
+        view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [1], hiddenSolids: [])
+        XCTAssertTrue(view.isPreparingResources)
+        window.contentView = nil
+        // Yield to cancellation and any queued completion. Detached inputs may
+        // be retained for reattachment, but cannot install a stale scene.
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(view.hasRenderableGeometry)
+        window.contentView = view
+        try await waitForPreparation(view)
+        XCTAssertTrue(view.hasRenderableGeometry)
+        XCTAssertNotNil(view.scene?.rootNode.childNode(withName: "solid:1", recursively: true))
+        XCTAssertEqual(view.agentCaptureMetadata["usesOrthographicProjection"] as? Bool, false)
+    }
+
+    @MainActor
+    func testLargeCPUPreparationDoesNotKeepRemovedViewAlive() throws {
+        weak var removed: CADSceneView?
+        try autoreleasepool {
+            let view = try makeView()
+            removed = view
+            view.update(mesh: largeMesh("released"), mode: .edges, grid: false, command: nil,
+                        selectedSolids: [], hiddenSolids: [])
+            XCTAssertTrue(view.isPreparingResources)
+        }
+        XCTAssertNil(removed, "Pending CPU work must not retain the view through its task handle.")
+    }
+
+    @MainActor
+    func testCubeDirectionWaitsForTheNewBoundsBeforeFitting() async throws {
+        let view = try makeView()
+        view.update(mesh: mesh("cube-existing"), mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [])
+        try await waitForPreparation(view)
+        var preview = largeMesh("cube-replacement")
+        preview.vertices = preview.vertices.map { $0.map { $0 * 100 } }
+        preview.edges = preview.edges.map { $0.map { $0 * 100 } }
+        preview.bounds = preview.bounds.map { $0 * 100 }
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [])
+        let before = try XCTUnwrap(view.pointOfView).simdTransform
+        view.selectOrientationCubeCorner(.rightBackTop)
+        XCTAssertEqual(view.pointOfView?.simdTransform, before, "Do not start a transition fitted to the outgoing mesh.")
+        XCTAssertFalse(view.isAnimatingCamera)
+        try await waitForPreparation(view)
+        let fitted = try XCTUnwrap(view.pointOfView).simdTransform
+        view.selectOrientationCubeCorner(.rightBackTop)
+        XCTAssertEqual(view.pointOfView?.simdTransform, fitted, "The queued corner must already fit the replacement's complete bounds.")
+    }
+
+    @MainActor
     private func waitForPreparation(_ view: CADSceneView) async throws {
         let deadline = Date().addingTimeInterval(5)
         while view.isPreparingResources, Date() < deadline {
@@ -122,5 +237,12 @@ final class ViewportPreparationTests: XCTestCase {
                     bounds: [-3, -1, 0, 3, 1, 0], volume: 1, area: 8, solids: 2, faces: 2,
                     buildSeconds: 0, threads: 1, stepPath: "/tmp/viewport-preparation-\(identity)",
                     triangleSolids: [0, 0, 1, 1], edgeSolids: [0, 0, 1, 1])
+    }
+
+    private func largeMesh(_ identity: String) -> PreviewMesh {
+        var preview = mesh(identity)
+        preview.triangles = Array(repeating: preview.triangles, count: 20_000).flatMap { $0 }
+        preview.triangleSolids = Array(repeating: [0, 0, 1, 1], count: 20_000).flatMap { $0 }
+        return preview
     }
 }

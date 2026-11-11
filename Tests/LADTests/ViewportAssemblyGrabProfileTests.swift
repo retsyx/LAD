@@ -64,6 +64,7 @@ final class ViewportAssemblyGrabProfileTests: XCTestCase {
         defer { view.delegate = nil; window.orderOut(nil); window.contentView = nil; window.close() }
         view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top), selectedSolids: [], hiddenSolids: [],
                     solidTransforms: state.assemblyPose?.solidTransforms ?? [:])
+        try await waitUntil { !view.isPreparingResources }
         let node = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:\(body)", recursively: true))
         counter.bind(node)
         view.delegate = counter

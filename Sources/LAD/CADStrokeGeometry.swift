@@ -95,19 +95,44 @@ enum CADStrokeGeometry {
     }
     """
 
+    /// CPU buffers cross the preparation boundary without any SceneKit or
+    /// AppKit objects. Float components match SceneKit's uploaded attributes;
+    /// positions, directions and surface normals are still calculated in Double.
+    struct Prepared: Sendable {
+        let vertices: Data
+        let directions: Data
+        let coordinates: Data
+        let firstNormalXY: Data
+        let middleNormals: Data
+        let secondNormalYZ: Data
+        let indices: Data
+        let vertexCount: Int
+        let indexCount: Int
+    }
+
+    nonisolated static func prepare(_ segments: [[Double]], surfaces: [CADStrokeSurface]? = nil) throws -> Prepared {
+        try buffers(segments, surfaces: surfaces, checkCancellation: { try Task.checkCancellation() })
+    }
+
     static func make(_ segments: [[Double]], color: NSColor, viewportHeight: CGFloat,
                      surfaces: [CADStrokeSurface]? = nil) -> SCNGeometry {
-        var vertices = [SCNVector3]()
-        var directions = [SCNVector3]()
-        var coordinates = [CGPoint]()
-        var firstNormalXY = [CGPoint](), middleNormals = [CGPoint](), secondNormalYZ = [CGPoint]()
+        make(buffers(segments, surfaces: surfaces, checkCancellation: {}), color: color, viewportHeight: viewportHeight)
+    }
+
+    nonisolated private static func buffers(_ segments: [[Double]], surfaces: [CADStrokeSurface]?,
+                                            checkCancellation: () throws -> Void) rethrows -> Prepared {
+        try checkCancellation()
+        var vertices = [Float]()
+        var directions = [Float]()
+        var coordinates = [Float]()
+        var firstNormalXY = [Float](), middleNormals = [Float](), secondNormalYZ = [Float]()
         var indices = [Int32]()
-        vertices.reserveCapacity(segments.count * 4)
-        directions.reserveCapacity(segments.count * 4)
-        coordinates.reserveCapacity(segments.count * 4)
-        firstNormalXY.reserveCapacity(segments.count * 4)
-        middleNormals.reserveCapacity(segments.count * 4)
-        secondNormalYZ.reserveCapacity(segments.count * 4)
+        vertices.reserveCapacity(segments.count * 12)
+        directions.reserveCapacity(segments.count * 12)
+        coordinates.reserveCapacity(segments.count * 8)
+        firstNormalXY.reserveCapacity(segments.count * 8)
+        middleNormals.reserveCapacity(segments.count * 8)
+        secondNormalYZ.reserveCapacity(segments.count * 8)
         indices.reserveCapacity(segments.count * 6)
         func finiteNormal(_ normal: SIMD3<Double>) -> SIMD3<Double> {
             guard normal.x.isFinite, normal.y.isFinite, normal.z.isFinite,
@@ -115,33 +140,70 @@ enum CADStrokeGeometry {
             return simd_normalize(normal)
         }
         for (segmentIndex, segment) in segments.enumerated() {
+            if segmentIndex.isMultiple(of: 256) { try checkCancellation() }
             guard segment.count == 6, segment.allSatisfy({ $0.isFinite && abs($0) < 1e12 }) else { continue }
             let a = SIMD3(segment[0], segment[1], segment[2])
             let b = SIMD3(segment[3], segment[4], segment[5])
             let delta = b - a
-            guard simd_length_squared(delta) > 1e-24, vertices.count <= Int(Int32.max) - 4 else { continue }
+            let vertexCount = vertices.count / 3
+            guard simd_length_squared(delta) > 1e-24, vertexCount <= Int(Int32.max) - 4 else { continue }
             // Direction, rather than a second point, remains valid if SceneKit
             // normalizes this attribute before the geometry entry point.
             let direction = simd_normalize(delta)
-            let first = Int32(vertices.count)
-            let start = SCNVector3(a.x, a.y, a.z), end = SCNVector3(b.x, b.y, b.z)
-            vertices.append(contentsOf: [start, start, end, end])
-            directions.append(contentsOf: Array(repeating: SCNVector3(direction.x, direction.y, direction.z), count: 4))
-            coordinates.append(contentsOf: [CGPoint(x: -1, y: -1), CGPoint(x: 1, y: -1),
-                                            CGPoint(x: -1, y: 1), CGPoint(x: 1, y: 1)])
+            let first = Int32(vertexCount)
+            vertices.append(contentsOf: [Float(a.x), Float(a.y), Float(a.z), Float(a.x), Float(a.y), Float(a.z),
+                                         Float(b.x), Float(b.y), Float(b.z), Float(b.x), Float(b.y), Float(b.z)])
+            coordinates.append(contentsOf: [-1, -1, 1, -1, -1, 1, 1, 1])
             let surface = surfaces.flatMap { $0.indices.contains(segmentIndex) ? $0[segmentIndex] : nil } ?? CADStrokeSurface()
             let n0 = finiteNormal(surface.first), n1 = finiteNormal(surface.second)
-            firstNormalXY.append(contentsOf: Array(repeating: CGPoint(x: n0.x, y: n0.y), count: 4))
-            middleNormals.append(contentsOf: Array(repeating: CGPoint(x: n0.z, y: n1.x), count: 4))
-            secondNormalYZ.append(contentsOf: Array(repeating: CGPoint(x: n1.y, y: n1.z), count: 4))
+            for _ in 0..<4 {
+                directions.append(contentsOf: [Float(direction.x), Float(direction.y), Float(direction.z)])
+                firstNormalXY.append(contentsOf: [Float(n0.x), Float(n0.y)])
+                middleNormals.append(contentsOf: [Float(n0.z), Float(n1.x)])
+                secondNormalYZ.append(contentsOf: [Float(n1.y), Float(n1.z)])
+            }
             indices.append(contentsOf: [first, first + 1, first + 2, first + 2, first + 1, first + 3])
         }
-        let geometry = SCNGeometry(sources: [SCNGeometrySource(vertices: vertices), SCNGeometrySource(normals: directions),
-                                             SCNGeometrySource(textureCoordinates: coordinates),
-                                             SCNGeometrySource(textureCoordinates: firstNormalXY),
-                                             SCNGeometrySource(textureCoordinates: middleNormals),
-                                             SCNGeometrySource(textureCoordinates: secondNormalYZ)],
-                                   elements: [SCNGeometryElement(indices: indices, primitiveType: .triangles)])
+        try checkCancellation()
+        let vertexData = packed(vertices)
+        try checkCancellation()
+        let directionData = packed(directions)
+        try checkCancellation()
+        let coordinateData = packed(coordinates)
+        try checkCancellation()
+        let firstNormalData = packed(firstNormalXY)
+        try checkCancellation()
+        let middleNormalData = packed(middleNormals)
+        try checkCancellation()
+        let secondNormalData = packed(secondNormalYZ)
+        try checkCancellation()
+        let indexData = packed(indices)
+        try checkCancellation()
+        return Prepared(vertices: vertexData, directions: directionData, coordinates: coordinateData,
+                        firstNormalXY: firstNormalData, middleNormals: middleNormalData, secondNormalYZ: secondNormalData,
+                        indices: indexData, vertexCount: vertices.count / 3, indexCount: indices.count)
+    }
+
+    nonisolated private static func packed<T>(_ values: [T]) -> Data {
+        values.withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+
+    static func make(_ prepared: Prepared, color: NSColor, viewportHeight: CGFloat) -> SCNGeometry {
+        func source(_ data: Data, _ semantic: SCNGeometrySource.Semantic, components: Int) -> SCNGeometrySource {
+            SCNGeometrySource(data: data, semantic: semantic, vectorCount: prepared.vertexCount,
+                              usesFloatComponents: true, componentsPerVector: components,
+                              bytesPerComponent: MemoryLayout<Float>.size, dataOffset: 0,
+                              dataStride: components * MemoryLayout<Float>.size)
+        }
+        let geometry = SCNGeometry(sources: [source(prepared.vertices, .vertex, components: 3),
+                                             source(prepared.directions, .normal, components: 3),
+                                             source(prepared.coordinates, .texcoord, components: 2),
+                                             source(prepared.firstNormalXY, .texcoord, components: 2),
+                                             source(prepared.middleNormals, .texcoord, components: 2),
+                                             source(prepared.secondNormalYZ, .texcoord, components: 2)],
+                                   elements: [SCNGeometryElement(data: prepared.indices, primitiveType: .triangles,
+                                                                 primitiveCount: prepared.indexCount / 3,
+                                                                 bytesPerIndex: MemoryLayout<Int32>.size)])
         geometry.shaderModifiers = [.geometry: modifier]
         setViewportHeight(viewportHeight, on: geometry)
         let material = SCNMaterial()

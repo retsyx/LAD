@@ -223,6 +223,15 @@ final class CADSceneView: SCNView {
     }
     private var appliedStyle: RenderStyle?
     private var resourcePreparationID = UUID()
+    private var meshPreparationTask: Task<Void, Never>?
+    private var pendingMesh: PreviewMesh?
+    private var requestedSolidTransforms: [Int: [Double]] = [:]
+    private enum PendingCamera {
+        case command(ViewportCommand.Action)
+        case orientation(yaw: Double, elevation: Double)
+        case agent(name: String, camera: CADAgentCamera)
+    }
+    private var pendingCamera: PendingCamera?
     private let redrawDriver = ViewportRedrawDriver()
     private var opaqueHighlightTechnique: SCNTechnique?
     private var translucentHighlightTechnique: SCNTechnique?
@@ -309,7 +318,10 @@ final class CADSceneView: SCNView {
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { false }
-    deinit { if let modifierMonitor { NSEvent.removeMonitor(modifierMonitor) } }
+    deinit {
+        meshPreparationTask?.cancel()
+        if let modifierMonitor { NSEvent.removeMonitor(modifierMonitor) }
+    }
     override var delegate: (any SCNSceneRendererDelegate)? {
         get { super.delegate }
         set {
@@ -437,6 +449,8 @@ final class CADSceneView: SCNView {
         finishes.merge(solidColors.filter { (0..<4_096).contains($0.key) && $0.value.isValid },
                        uniquingKeysWith: { _, override in override })
         self.solidColors = finishes
+        requestedSolidTransforms = solidTransforms
+        if gridChanged { gridNode.isHidden = !grid }
         var installedModel = false
         if meshChanged {
             loadedPath = mesh?.stepPath
@@ -446,14 +460,26 @@ final class CADSceneView: SCNView {
             edgeNode.isHidden = true
             appliedStyle = nil
             if let mesh {
-                install(mesh)
-                installedModel = hasModel
+                if CADViewportPreparedMesh.requiresBackgroundPreparation(mesh) {
+                    prepareMesh(mesh)
+                } else if let prepared = try? CADViewportPreparedMesh.prepare(mesh) {
+                    install(prepared)
+                    installedModel = hasModel
+                } else { clearModel() }
             } else {
                 clearModel()
             }
         }
+        if pendingMesh != nil {
+            if let command, command.id != lastCommand {
+                lastCommand = command.id
+                pendingCamera = .command(command.action)
+            }
+            if projectionChanged { applyCamera() }
+            if meshChanged || projectionChanged || visibilityChanged || modeChanged || gridChanged { requestRedraw() }
+            return
+        }
         let poseChanged = updateSolidTransforms(solidTransforms, reinstalling: meshChanged)
-        if gridChanged { gridNode.isHidden = !grid }
         let styleChanged = applyStyle()
         let featuresChanged = updateFeatureHighlights()
         if let command, command.id != lastCommand {
@@ -524,45 +550,23 @@ final class CADSceneView: SCNView {
         return true
     }
 
-    private func install(_ mesh: PreviewMesh) {
-        // Stored projects are validated before reaching the view. Keep these
-        // checks at the rendering boundary too: malformed indices must never
-        // reach SceneKit or Swift's fixed-width index-buffer conversion.
-        guard mesh.bounds.count == 6, mesh.bounds.allSatisfy({ $0.isFinite && abs($0) < 1e12 }),
-              (0..<3).allSatisfy({ mesh.bounds[$0] <= mesh.bounds[$0 + 3] }),
-              !mesh.vertices.isEmpty, mesh.vertices.count <= 1_000_000,
-              !mesh.triangles.isEmpty, mesh.triangles.count <= 1_000_000,
-              mesh.vertices.allSatisfy({ $0.count == 3 && $0.allSatisfy({ $0.isFinite && abs($0) < 1e12 }) }),
-              mesh.triangles.allSatisfy({ $0.count == 3 && $0.allSatisfy({ $0 >= 0 && $0 < mesh.vertices.count }) }),
-              mesh.normals == nil || mesh.hasValidNormals else {
-            clearModel()
-            return
+    private func install(_ prepared: CADViewportPreparedMesh) {
+        let mesh = prepared.mesh
+        appliedStyle = nil
+        func makeSource(_ data: Data, semantic: SCNGeometrySource.Semantic) -> SCNGeometrySource {
+            SCNGeometrySource(data: data, semantic: semantic, vectorCount: prepared.vertexCount,
+                usesFloatComponents: true, componentsPerVector: 3, bytesPerComponent: MemoryLayout<Float>.size,
+                dataOffset: 0, dataStride: 3 * MemoryLayout<Float>.size)
         }
-        let vertices = mesh.vertices.map { SCNVector3($0[0], $0[1], $0[2]) }
-        let source = SCNGeometrySource(vertices: vertices)
-        // Native previews carry exact surface derivatives, avoiding highlights
-        // that wobble with the triangulation's varying triangle sizes. Keep a
-        // fallback only for synthetic previews without a CAD surface.
-        let normals = mesh.normals?.map { SCNVector3($0[0], $0[1], $0[2]) }
-            ?? smoothNormals(vertices: mesh.vertices, triangles: mesh.triangles)
-        let normalSource = SCNGeometrySource(normals: normals)
+        let source = makeSource(prepared.vertexData, semantic: .vertex)
+        let normalSource = makeSource(prepared.normalData, semantic: .normal)
         resetFeatureResources()
         topology = mesh.topology
         meshSources = [source, normalSource]
-        let solidMap = mesh.triangleSolids.flatMap { map in
-            map.count == mesh.triangles.count && map.allSatisfy({ $0 >= 0 && $0 < mesh.solids }) ? map : nil
-        }
-        var groups = [Int: [Int32]]()
-        for (index, triangle) in mesh.triangles.enumerated() {
-            let solid = solidMap?.count == mesh.triangles.count ? solidMap![index] : 0
-            groups[solid, default: []].append(contentsOf: triangle.map(Int32.init))
-            let feature = faceID(forTriangle: index, in: mesh, solid: solid)
-            faceIDsBySolid[solid, default: []].append(feature)
-            if let feature {
-                faceIndices[feature, default: []].append(contentsOf: triangle.map(Int32.init))
-                for vertex in triangle { faceBounds[feature, default: .init()].include(mesh.vertices[vertex]) }
-            }
-        }
+        let groups = prepared.groups
+        faceIDsBySolid = prepared.faceIDsBySolid
+        faceIndices = prepared.faceIndices
+        faceBounds = prepared.faceBounds
         modelNode.childNodes.forEach { $0.removeFromParentNode() }
         modelNode.geometry = nil
         silhouetteNode.childNodes.forEach { $0.removeFromParentNode() }
@@ -593,25 +597,9 @@ final class CADSceneView: SCNView {
             silhouetteNode.addChildNode(silhouette)
             partSilhouettes[solid] = silhouette
         }
-        solidBounds.removeAll(keepingCapacity: true)
-        for part in mesh.topology?.parts ?? [] where part.bounds.count == 6 && part.bounds.allSatisfy(\.isFinite) {
-            solidBounds[part.solidIndex] = part.bounds
-        }
-        // Native previews already carry analytic per-part bounds. Only small
-        // synthetic previews need this display-buffer fallback.
-        for (solid, indices) in groups where solidBounds[solid] == nil {
-            var bounds = [Double](repeating: .infinity, count: 3) + [Double](repeating: -.infinity, count: 3)
-            for index in indices {
-                let point = mesh.vertices[Int(index)]
-                for axis in 0..<3 {
-                    bounds[axis] = min(bounds[axis], point[axis])
-                    bounds[axis + 3] = max(bounds[axis + 3], point[axis])
-                }
-            }
-            solidBounds[solid] = bounds
-        }
+        solidBounds = prepared.solidBounds
         originalMeshBounds = mesh.bounds
-        installEdges(mesh)
+        installEdges(prepared)
         edgeNode.renderingOrder = 1
         meshBounds = mesh.bounds
         let first = !hasModel
@@ -650,12 +638,58 @@ final class CADSceneView: SCNView {
     }
 
     private func invalidateResourcePreparation() {
+        meshPreparationTask?.cancel()
+        meshPreparationTask = nil
+        pendingMesh = nil
+        pendingCamera = nil
         resourcePreparationID = UUID()
         isPreparingResources = false
     }
 
+    private func prepareMesh(_ mesh: PreviewMesh) {
+        let token = UUID()
+        resourcePreparationID = token
+        pendingMesh = mesh
+        isPreparingResources = true
+        updateModelVisibility()
+        let worker = Task.detached(priority: .userInitiated) {
+            try CADViewportPreparedMesh.prepare(mesh)
+        }
+        meshPreparationTask = Task { @MainActor [weak self] in
+            do {
+                let prepared = try await withTaskCancellationHandler { try await worker.value }
+                    onCancel: { worker.cancel() }
+                guard !Task.isCancelled, let self, self.resourcePreparationID == token else { return }
+                self.meshPreparationTask = nil
+                self.pendingMesh = nil
+                guard let prepared else { self.clearModel(); self.requestRedraw(); return }
+                self.install(prepared)
+                _ = self.updateSolidTransforms(self.requestedSolidTransforms, reinstalling: true)
+                _ = self.applyStyle()
+                _ = self.updateFeatureHighlights()
+                let camera = self.pendingCamera
+                self.pendingCamera = nil
+                switch camera {
+                case .command(let action): self.perform(action)
+                case .orientation(let yaw, let elevation):
+                    var destination = self.rig
+                    destination.yaw = yaw; destination.elevation = elevation
+                    self.fitOrientationCubeView(destination)
+                case .agent(let name, let camera): try self.configureAgentView(named: name, camera: camera)
+                case nil: break
+                }
+                self.prepareModelResources()
+                self.requestRedraw()
+            } catch {
+                guard let self, self.resourcePreparationID == token else { return }
+                self.clearModel()
+                self.requestRedraw()
+            }
+        }
+    }
+
     private func prepareModelResources() {
-        guard hasModel, let scene else { return }
+        guard pendingMesh == nil, hasModel, let scene else { return }
         let token = UUID()
         resourcePreparationID = token
         isPreparingResources = true
@@ -689,13 +723,6 @@ final class CADSceneView: SCNView {
             silhouetteNode.isHidden = hidden
             updateSilhouettes(active: highlightedFeatures)
         }
-    }
-
-    private func faceID(forTriangle index: Int, in mesh: PreviewMesh, solid: Int) -> CADFeatureID? {
-        guard let topology = mesh.topology, let faces = mesh.triangleFaces,
-              faces.count == mesh.triangles.count, topology.faces.indices.contains(faces[index]) else { return nil }
-        let id = topology.faces[faces[index]].id
-        return id.kind == .face && id.solidIndex == solid ? id : nil
     }
 
     private func resetFeatureResources() {
@@ -1004,26 +1031,14 @@ final class CADSceneView: SCNView {
         point.count == 3 && point.allSatisfy { $0.isFinite && abs($0) < 1e12 }
     }
 
-    private func installEdges(_ mesh: PreviewMesh) {
+    private func installEdges(_ prepared: CADViewportPreparedMesh) {
         edgeNode.geometry = nil
         edgeNode.childNodes.forEach { $0.removeFromParentNode() }
         ownedEdgeSolids.removeAll()
-        let owners = mesh.edgeSolids.flatMap { indices in
-            indices.count == mesh.edges.count && indices.allSatisfy({ $0 >= 0 && $0 < mesh.solids }) ? indices : nil
-        }
-        hasOwnedEdges = owners != nil
-        var groups = [Int: [[Double]]]()
-        var surfaceGroups = [Int: [CADStrokeSurface]]()
-        let surfaces = CADStrokeSurface.matching(mesh)
-        for (index, segment) in mesh.edges.prefix(250_000).enumerated() {
-            guard segment.count == 6, segment.allSatisfy({ $0.isFinite && abs($0) < 1e12 }) else { continue }
-            let solid = owners?[index] ?? -1
-            groups[solid, default: []].append(segment)
-            surfaceGroups[solid, default: []].append(surfaces[index])
-        }
-        for solid in groups.keys.sorted() {
-            let node = SCNNode(geometry: CADStrokeGeometry.make(groups[solid]!, color: Self.edgeInk,
-                viewportHeight: bounds.height, surfaces: surfaceGroups[solid]))
+        hasOwnedEdges = prepared.hasOwnedEdges
+        for solid in prepared.edges.keys.sorted() {
+            let node = SCNNode(geometry: CADStrokeGeometry.make(prepared.edges[solid]!, color: Self.edgeInk,
+                viewportHeight: bounds.height))
             node.name = solid < 0 ? "legacy-edges" : "edges:\(solid)"
             node.categoryBitMask = 2
             node.renderingOrder = 1
@@ -1031,21 +1046,6 @@ final class CADSceneView: SCNView {
             node.geometry?.firstMaterial?.isDoubleSided = true
             edgeNode.addChildNode(node)
             if solid >= 0 { ownedEdgeSolids.insert(solid) }
-        }
-    }
-
-    private func smoothNormals(vertices: [[Double]], triangles: [[Int]]) -> [SCNVector3] {
-        var sums = [SIMD3<Double>](repeating: .zero, count: vertices.count)
-        for t in triangles where t.count == 3 {
-            let a = SIMD3(vertices[t[0]][0], vertices[t[0]][1], vertices[t[0]][2])
-            let b = SIMD3(vertices[t[1]][0], vertices[t[1]][1], vertices[t[1]][2])
-            let c = SIMD3(vertices[t[2]][0], vertices[t[2]][1], vertices[t[2]][2])
-            let normal = simd_cross(b - a, c - a)
-            for index in t { sums[index] += normal }
-        }
-        return sums.map { v in
-            let n = simd_length_squared(v) > 1e-24 ? simd_normalize(v) : SIMD3<Double>(0, 0, 1)
-            return SCNVector3(n.x, n.y, n.z)
         }
     }
 
@@ -1172,6 +1172,7 @@ final class CADSceneView: SCNView {
     }
 
     private func perform(_ action: ViewportCommand.Action) {
+        if pendingMesh != nil { pendingCamera = .command(action); return }
         cancelCameraTransition()
         switch action {
         case .fit:
@@ -1214,6 +1215,10 @@ final class CADSceneView: SCNView {
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
         cancelCameraTransition()
+        if pendingMesh != nil {
+            pendingCamera = .orientation(yaw: destination.yaw, elevation: destination.elevation)
+            return
+        }
         zoomAnchor = nil
         var destination = destination
         destination.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
@@ -1257,6 +1262,7 @@ final class CADSceneView: SCNView {
     }
 
     private func cancelCameraTransition() {
+        if case .orientation = pendingCamera { pendingCamera = nil }
         cameraTransitionID = nil
         cameraTransitionTask?.cancel()
         cameraTransitionTask = nil
@@ -1267,6 +1273,15 @@ final class CADSceneView: SCNView {
     func configureAgentView(named name: String, camera: CADAgentCamera = CADAgentCamera()) throws {
         cancelAssemblyGrab()
         cancelCameraTransition()
+        if let pendingMesh {
+            // Preserve callers that configure an independent view immediately
+            // after supplying a large preview. Resolve the final pose only once
+            // validated bounds and current rigid placements have been installed.
+            _ = try camera.resolved(view: name, bounds: pendingMesh.bounds, width: Double(bounds.width),
+                                    height: Double(bounds.height), orthographic: rig.usesOrthographicProjection)
+            pendingCamera = .agent(name: name, camera: camera)
+            return
+        }
         var fittingBounds = meshBounds
         if !hiddenSolids.isEmpty {
             let visible = solidBounds.compactMap { solid, bounds -> [Double]? in
@@ -1487,13 +1502,23 @@ final class CADSceneView: SCNView {
         setHoveredFeature(nil)
         resetNavigationGesture()
         cancelCameraTransition()
-        if newWindow == nil { stopRedraw() }
+        if newWindow == nil {
+            stopRedraw()
+            if pendingMesh != nil {
+                // Retain the requested input for reattachment, but discard work
+                // and completions owned by the detached rendering surface.
+                resourcePreparationID = UUID()
+                meshPreparationTask?.cancel()
+                meshPreparationTask = nil
+            }
+        }
         super.viewWillMove(toWindow: newWindow)
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let window {
+            if let pendingMesh, meshPreparationTask == nil { prepareMesh(pendingMesh) }
             window.acceptsMouseMovedEvents = true
             // Modifier events go to the first responder, which may be the
             // composer even while the pointer is over this viewport.

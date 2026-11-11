@@ -6,6 +6,44 @@ import XCTest
 
 final class ViewportStrokeTests: XCTestCase {
     @MainActor
+    func testDetachedStrokePreparationPreservesSurfaceChannelsAfterSkippedSegments() async throws {
+        let segments: [[Double]] = [[0, 0, 0, 0, 0, 0], [1, 2, 3, 4, 6, 3]]
+        let surfaces = [CADStrokeSurface(first: SIMD3(1, 0, 0)),
+                        CADStrokeSurface(first: SIMD3(0, 0, 4), second: SIMD3(0, -2, 0))]
+        let prepared = try await Task.detached {
+            try CADStrokeGeometry.prepare(segments, surfaces: surfaces)
+        }.value
+        let geometry = CADStrokeGeometry.make(prepared, color: .white, viewportHeight: 192)
+        let positions = try XCTUnwrap(geometry.sources(for: .vertex).first)
+        let directions = try XCTUnwrap(geometry.sources(for: .normal).first)
+        let channels = geometry.sources(for: .texcoord)
+        XCTAssertEqual(positions.vectorCount, 4)
+        XCTAssertEqual(channels.count, 4)
+        XCTAssertEqual(try value(positions, vector: 0, component: 0), 1)
+        XCTAssertEqual(try value(positions, vector: 3, component: 1), 6)
+        XCTAssertEqual(try value(directions, vector: 0, component: 0), 0.6, accuracy: 1e-6)
+        XCTAssertEqual(try value(directions, vector: 0, component: 1), 0.8, accuracy: 1e-6)
+        XCTAssertEqual(try value(channels[0], vector: 0, component: 1), -1)
+        XCTAssertEqual(try value(channels[0], vector: 3, component: 1), 1)
+        XCTAssertEqual(try value(channels[1], vector: 0, component: 0), 0)
+        XCTAssertEqual(try value(channels[2], vector: 0, component: 0), 1)
+        XCTAssertEqual(try value(channels[3], vector: 0, component: 0), -1)
+        let element = try XCTUnwrap(geometry.elements.first)
+        XCTAssertEqual(try (0..<6).map { try index(element, at: $0) }, [0, 1, 2, 2, 1, 3])
+    }
+
+    func testCanceledStrokePreparationDoesNotReturnBuffers() async throws {
+        let preparation = Task.detached {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try CADStrokeGeometry.prepare([[0, 0, 0, 1, 0, 0]])
+        }
+        do {
+            _ = try await preparation.value
+            XCTFail("Canceled preparation must not publish drawing resources.")
+        } catch is CancellationError { }
+    }
+
+    @MainActor
     func testStrokeBuffersRejectInvalidSegmentsAndContainFiniteIndexedTriangles() throws {
         let geometry = CADStrokeGeometry.make([
             [-1, 0, 0, 1, 0, 0],

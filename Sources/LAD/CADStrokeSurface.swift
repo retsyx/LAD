@@ -10,6 +10,15 @@ struct CADStrokeSurface: Sendable {
     /// vertices at face boundaries and supplies already located world points.
     /// Only requested segments enter the lookup; each triangle is visited once.
     static func matching(_ mesh: PreviewMesh) -> [CADStrokeSurface] {
+        matching(mesh, checkCancellation: {})
+    }
+
+    static func matchingCancellable(_ mesh: PreviewMesh) throws -> [CADStrokeSurface] {
+        try matching(mesh, checkCancellation: { try Task.checkCancellation() })
+    }
+
+    private static func matching(_ mesh: PreviewMesh, checkCancellation: () throws -> Void) rethrows -> [CADStrokeSurface] {
+        try checkCancellation()
         var result = [CADStrokeSurface](repeating: CADStrokeSurface(), count: mesh.edges.count)
         guard !mesh.edges.isEmpty, !mesh.triangles.isEmpty else { return result }
         let edgeOwners: [Int]?, triangleOwners: [Int]?
@@ -29,6 +38,7 @@ struct CADStrokeSurface: Sendable {
         requested.reserveCapacity(mesh.edges.count)
         var aliases = [Int](repeating: -1, count: mesh.edges.count)
         for (index, edge) in mesh.edges.enumerated() {
+            if index.isMultiple(of: 256) { try checkCancellation() }
             let owner = edgeOwners?[index] ?? 0
             guard edge.count == 6, owner >= 0, edgeOwners == nil || owner < mesh.solids,
                   let start = Point(edge[0], edge[1], edge[2]),
@@ -38,12 +48,14 @@ struct CADStrokeSurface: Sendable {
             else { requested[segment] = index; aliases[index] = index }
         }
         guard !requested.isEmpty else { return result }
-        let points: [Point?] = mesh.vertices.map {
-            guard $0.count == 3 else { return nil }
-            return Point($0[0], $0[1], $0[2])
+        let points: [Point?] = try mesh.vertices.enumerated().map { index, vertex in
+            if index.isMultiple(of: 256) { try checkCancellation() }
+            guard vertex.count == 3 else { return nil }
+            return Point(vertex[0], vertex[1], vertex[2])
         }
 
         for (index, triangle) in mesh.triangles.enumerated() {
+            if index.isMultiple(of: 256) { try checkCancellation() }
             let owner = triangleOwners?[index] ?? 0
             guard triangle.count == 3, owner >= 0, triangleOwners == nil || owner < mesh.solids else { continue }
             let a = triangle[0], b = triangle[1], c = triangle[2]
@@ -60,9 +72,12 @@ struct CADStrokeSurface: Sendable {
         }
         // Duplicate or oppositely directed display segments share the same
         // adjacent planes without multiplying triangle-to-segment work.
-        for index in aliases.indices where aliases[index] >= 0 && aliases[index] != index {
+        for index in aliases.indices {
+            if index.isMultiple(of: 256) { try checkCancellation() }
+            guard aliases[index] >= 0, aliases[index] != index else { continue }
             result[index] = result[aliases[index]]
         }
+        try checkCancellation()
         return result
     }
 

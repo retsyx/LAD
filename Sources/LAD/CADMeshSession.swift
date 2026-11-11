@@ -111,9 +111,15 @@ final class CADMeshSession {
                 throw LADError.message("Declare a finite nonnegative maximum deviation in the source units.")
             }
             let access = workspace
-            assets["source." + suffix] = try await Task.detached(priority: .userInitiated) {
-                try access.read(path, maximumBytes: ProjectStore.maximumSTEPBytes)
-            }.value
+            let reading = Task.detached(priority: .userInitiated) {
+                try Task.checkCancellation()
+                let data = try access.read(path, maximumBytes: ProjectStore.maximumSTEPBytes)
+                try Task.checkCancellation()
+                return data
+            }
+            assets["source." + suffix] = try await withTaskCancellationHandler { try await reading.value }
+                onCancel: { reading.cancel() }
+            try Task.checkCancellation()
             request["sourceAsset"] = "source." + suffix
             options = ["units": try text("units", arguments), "max_deviation": number.doubleValue,
                        "source_kind": arguments["sourceKind"] ?? "unknown"]
@@ -126,7 +132,7 @@ final class CADMeshSession {
             let id = try text(name == "lad_mesh_compare" ? "targetID" : "revisionID", arguments)
             let record = try resolve(id, context: context, previewsAllowed: name == "lad_mesh_compare")
             targetID = id; assets["revision.json"] = record.data; request["revisionAsset"] = "revision.json"
-            let definition = try object(record.data)
+            let definition = try await decoded(record.data)
             if let hash = definition["geometry_hash"] as? String {
                 guard let bytes = native[hash] else { throw LADError.message("This reconstruction's exact geometry is unavailable.") }
                 assets["source.brep"] = bytes; request["brepAsset"] = "source.brep"
@@ -137,13 +143,13 @@ final class CADMeshSession {
                 try stageJSON("queryPath", arguments, as: "query.json", key: "queryAsset", required: true, assets: &assets, request: &request)
                 let query = try object(assets["query.json"]!)
                 let records = try referencedRecords(query, pool: evidence, context: context)
-                assets["evidence.json"] = try json(records); request["evidenceAsset"] = "evidence.json"
+                assets["evidence.json"] = try await encodedRecords(records); request["evidenceAsset"] = "evidence.json"
             case "lad_mesh_fit":
                 try allowed(arguments, ["contextID", "revisionID", "evidenceIDs", "families", "constraintsPath"])
                 let ids = try strings("evidenceIDs", arguments)
                 guard !ids.isEmpty else { throw LADError.message("Select evidence from lad_mesh_inspect before fitting.") }
-                let records = try ids.map { try self.record($0, pool: evidence, context: context) }
-                assets["evidence.json"] = try json(records); request["evidenceAsset"] = "evidence.json"
+                let records = try ids.map { try self.recordData($0, pool: evidence, context: context) }
+                assets["evidence.json"] = try await encodedRecords(records); request["evidenceAsset"] = "evidence.json"
                 options["families"] = arguments["families"] ?? "auto"
                 try stageJSON("constraintsPath", arguments, as: "constraints.json", key: "constraintsAsset", assets: &assets, request: &request, array: true)
             case "lad_mesh_try_edit":
@@ -158,15 +164,16 @@ final class CADMeshSession {
                 }
                 assets["edit.json"] = try json(edit)
                 let records = try referencedRecords(edit, pool: fits, context: context)
-                assets["fits.json"] = try json(records); request["fitsAsset"] = "fits.json"
+                assets["fits.json"] = try await encodedRecords(records); request["fitsAsset"] = "fits.json"
             case "lad_mesh_compare":
                 try allowed(arguments, ["contextID", "targetID", "scope", "quality"])
                 options = ["scope": arguments["scope"] ?? "all", "quality": arguments["quality"] ?? "preview"]
             case "lad_mesh_export_step":
                 try allowed(arguments, ["contextID", "revisionID", "comparisonID", "path"])
-                let report = try self.record(try text("comparisonID", arguments), pool: comparisons, context: context)
+                let reportData = try recordData(try text("comparisonID", arguments), pool: comparisons, context: context)
+                let report = try await decoded(reportData)
                 guard report["model_ref"] as? String == id else { throw LADError.message("The acceptance report belongs to another reconstruction revision.") }
-                assets["comparison.json"] = try json(report); request["comparisonAsset"] = "comparison.json"
+                assets["comparison.json"] = reportData; request["comparisonAsset"] = "comparison.json"
                 let colors: [[String: Any]] = solidColors.keys.sorted().map { index in
                     let color = solidColors[index]!
                     return ["solidIndex": index, "color": ["red": color.red, "green": color.green, "blue": color.blue]]
@@ -178,18 +185,27 @@ final class CADMeshSession {
         request["options"] = options
         let output = try await engine.meshOperation(request: json(request), files: assets, python: python, threads: threads)
         try Task.checkCancellation()
-        var values = try object(output.metadata)
-        for key in ["native_preview", "program_available", "step_available"] { values.removeValue(forKey: key) }
-        let recordData = output.record
-        let full = try await Task.detached(priority: .userInitiated) {
-            guard let value = try JSONSerialization.jsonObject(with: recordData) as? [String: Any] else {
+        let metadata = output.metadata, workerRecordData = output.record, nativeData = output.native
+        let preparation = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            guard let values = try JSONSerialization.jsonObject(with: metadata) as? [String: Any],
+                  let value = try JSONSerialization.jsonObject(with: workerRecordData) as? [String: Any] else {
                 throw LADError.message("The reconstruction returned an invalid record.")
             }
-            return value
-        }.value
+            try Task.checkCancellation()
+            let recordHash = SHA256.hash(data: workerRecordData).map { String(format: "%02x", $0) }.joined()
+            let nativeHash = nativeData.map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() }
+            try Task.checkCancellation()
+            return (values, value, recordHash, nativeHash)
+        }
+        let (metadataValues, full, recordHash, nativeHash) = try await withTaskCancellationHandler {
+            try await preparation.value
+        } onCancel: { preparation.cancel() }
         try Task.checkCancellation()
+        var values = metadataValues
+        for key in ["native_preview", "program_available", "step_available"] { values.removeValue(forKey: key) }
         guard full["status"] as? String != "error" else { return Output(values: values, program: nil, preview: nil) }
-        let recordURL = try writeRecord(output.record)
+        let recordURL = try await writeRecord(output.record, hash: recordHash)
         values["recordPath"] = recordURL.path
         var program: String?
         var returnedPreview: PreviewMesh?
@@ -197,11 +213,13 @@ final class CADMeshSession {
             let payload = try dictionary(full["payload"])
             let context = try dictionary(payload["context"]), revision = try dictionary(payload["revision"])
             let identity = try text("id", context), revisionID = try text("id", revision)
+            let sourceHash = try text("source_hash", context)
             let contextBytes = try await encoded(context)
+            let revisionBytes = try await encoded(revision)
             try Task.checkCancellation()
             try retainContext(identity, data: contextBytes)
-            contextSourceHashes[identity] = try text("source_hash", context)
-            try retain(revisionID, data: json(revision), context: identity, pool: &revisions)
+            contextSourceHashes[identity] = sourceHash
+            try retain(revisionID, data: revisionBytes, context: identity, pool: &revisions)
             let branch = "branch-" + UUID().uuidString
             branches[branch] = Branch(contextID: identity, history: [revisionID], index: 0)
             currentBranches[identity] = branch
@@ -218,20 +236,25 @@ final class CADMeshSession {
                     values["evidenceID"] = id
                 }
             case "lad_mesh_fit":
+                var prepared: [(String, Data)] = []
                 for candidate in full["payload"] as? [[String: Any]] ?? [] {
-                    try retain(try text("id", candidate), data: json(candidate), context: contextID, pool: &fits)
+                    let id = try text("id", candidate)
+                    let data = try await encoded(candidate)
+                    prepared.append((id, data))
                 }
+                for (id, data) in prepared { try retain(id, data: data, context: contextID, pool: &fits) }
             case "lad_mesh_try_edit":
                 if let payload = full["payload"] as? [String: Any] {
                     let id = try text("id", payload)
+                    let data = try await encoded(payload)
                     if let bytes = output.native, let hash = payload["geometry_hash"] as? String {
-                        guard SHA256.hash(data: bytes).map({ String(format: "%02x", $0) }).joined() == hash else { throw LADError.message("The reconstruction native geometry identity is invalid.") }
+                        guard nativeHash == hash else { throw LADError.message("The reconstruction native geometry identity is invalid.") }
                         if native[hash] == nil {
                             guard nativeBytes + bytes.count <= maximumBytes else { throw LADError.message("Reconstruction geometry exceeds this task's 256 MB limit.") }
                             native[hash] = bytes; nativeBytes += bytes.count
                         }
                     }
-                    try retain(id, data: json(payload), context: contextID, pool: &previews)
+                    try retain(id, data: data, context: contextID, pool: &previews)
                     returnedPreview = output.preview ?? targetID.flatMap { display[$0] }
                     if let returnedPreview { cacheDisplay(returnedPreview, id: id) }
                     // Native validity and final eligibility are separate. A
@@ -252,18 +275,23 @@ final class CADMeshSession {
                 if var payload = full["payload"] as? [String: Any] {
                     let id = (payload["comparison_id"] as? String) ?? (payload["id"] as? String) ?? "comparison-\(UUID().uuidString)"
                     payload["comparison_id"] = id
-                    try retain(id, data: json(payload), context: contextID, pool: &comparisons)
+                    let data = try await encoded(payload)
+                    var acceptedRevision: String?
                     if let targetID, let revision = revisions[targetID], revision.contextID == contextID,
-                       let sourceHash = contextSourceHashes[contextID],
-                       acceptsFinal(payload, revisionID: targetID, revision: try object(revision.data), contextID: contextID, sourceHash: sourceHash) {
-                        acceptedRevisions.insert(targetID)
+                       let sourceHash = contextSourceHashes[contextID] {
+                        let definition = try await decoded(revision.data)
+                        if acceptsFinal(payload, revisionID: targetID, revision: definition, contextID: contextID, sourceHash: sourceHash) {
+                            acceptedRevision = targetID
+                        }
                     }
+                    try retain(id, data: data, context: contextID, pool: &comparisons)
+                    if let acceptedRevision { acceptedRevisions.insert(acceptedRevision) }
                     values["comparisonID"] = id
                 }
             case "lad_mesh_export_step":
                 if let bytes = output.step {
                     let path = arguments["path"] as? String ?? "mesh/exports/\(UUID().uuidString).step"
-                    values["path"] = try workspace.write(bytes, path: path).path
+                    values["path"] = try await writeOutput(bytes, path: path).path
                 }
             default: break
             }
@@ -408,10 +436,13 @@ final class CADMeshSession {
         return value
     }
     private func record(_ id: String, pool: [String: Record], context: String) throws -> [String: Any] {
-        guard let value = pool[id], value.contextID == context else { throw LADError.message("A reconstruction handle is stale, unknown or belongs to another context.") }
-        return try object(value.data)
+        try object(recordData(id, pool: pool, context: context))
     }
-    private func referencedRecords(_ object: Any, pool: [String: Record], context: String) throws -> [[String: Any]] {
+    private func recordData(_ id: String, pool: [String: Record], context: String) throws -> Data {
+        guard let value = pool[id], value.contextID == context else { throw LADError.message("A reconstruction handle is stale, unknown or belongs to another context.") }
+        return value.data
+    }
+    private func referencedRecords(_ object: Any, pool: [String: Record], context: String) throws -> [Data] {
         var ids = Set<String>()
         func walk(_ value: Any) {
             if let id = value as? String, pool[id] != nil { ids.insert(id) }
@@ -419,7 +450,7 @@ final class CADMeshSession {
             else if let values = value as? [String: Any] { values.values.forEach(walk) }
         }
         walk(object)
-        return try ids.sorted().map { try record($0, pool: pool, context: context) }
+        return try ids.sorted().map { try recordData($0, pool: pool, context: context) }
     }
     private func stageJSON(_ argument: String, _ arguments: [String: Any], as name: String, key: String,
                            required: Bool = false, assets: inout [String: Data], request: inout [String: Any], array: Bool = false) throws {
@@ -432,13 +463,25 @@ final class CADMeshSession {
         guard array ? value is [Any] : value is [String: Any] else { throw LADError.message("The reconstruction JSON file has an invalid root value.") }
         assets[name] = bytes; request[key] = name
     }
-    private func writeRecord(_ data: Data) throws -> URL {
-        let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    private func writeRecord(_ data: Data, hash: String) async throws -> URL {
         if !files.contains(hash) {
             guard data.count <= maximumBytes - fileBytes else { throw LADError.message("Reconstruction files exceed this task's 256 MB limit.") }
+            // A canceled write may already have published its private file.
+            // Reserve first so repeated canceled calls cannot evade the quota.
             files.insert(hash); fileBytes += data.count
         }
-        return try workspace.write(data, path: "mesh/records/\(hash).json")
+        return try await writeOutput(data, path: "mesh/records/\(hash).json")
+    }
+    private func writeOutput(_ data: Data, path: String) async throws -> URL {
+        let workspace = workspace
+        let writing = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try workspace.write(data, path: path)
+        }
+        let url = try await withTaskCancellationHandler { try await writing.value }
+            onCancel: { writing.cancel() }
+        try Task.checkCancellation()
+        return url
     }
     private func identity(_ values: [String: Any], keys: [String]) throws -> String {
         for key in keys { if let id = values[key] as? String, !id.isEmpty { return id } }
@@ -461,9 +504,49 @@ final class CADMeshSession {
     }
     private func object(_ data: Data) throws -> [String: Any] { try dictionary(JSONSerialization.jsonObject(with: data)) }
     private func json(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes]) }
+    private func decoded(_ data: Data) async throws -> [String: Any] {
+        let decoding = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            guard let value = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw LADError.message("The reconstruction returned an invalid record.")
+            }
+            try Task.checkCancellation()
+            return value
+        }
+        let value = try await withTaskCancellationHandler { try await decoding.value }
+            onCancel: { decoding.cancel() }
+        try Task.checkCancellation()
+        return value
+    }
+    private func encodedRecords(_ records: [Data]) async throws -> Data {
+        let encoding = Task.detached(priority: .userInitiated) {
+            let values = try records.map { data -> [String: Any] in
+                try Task.checkCancellation()
+                guard let value = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw LADError.message("The reconstruction returned an invalid record.")
+                }
+                return value
+            }
+            try Task.checkCancellation()
+            let data = try JSONSerialization.data(withJSONObject: values, options: [.sortedKeys, .withoutEscapingSlashes])
+            try Task.checkCancellation()
+            return data
+        }
+        let data = try await withTaskCancellationHandler { try await encoding.value }
+            onCancel: { encoding.cancel() }
+        try Task.checkCancellation()
+        return data
+    }
     private func encoded(_ value: Any) async throws -> Data {
-        try await Task.detached(priority: .userInitiated) {
-            try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
-        }.value
+        let encoding = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
+            try Task.checkCancellation()
+            return data
+        }
+        let data = try await withTaskCancellationHandler { try await encoding.value }
+            onCancel: { encoding.cancel() }
+        try Task.checkCancellation()
+        return data
     }
 }

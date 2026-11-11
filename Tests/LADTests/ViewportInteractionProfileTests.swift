@@ -42,13 +42,23 @@ final class ViewportInteractionProfileTests: XCTestCase {
         application.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         let pose = try preview.assemblyMotion?.solve(parts: preview.parts ?? [])
+        let preparationStarted = ProcessInfo.processInfo.systemUptime
         view.update(mesh: preview, mode: display, grid: true, command: nil,
                     selectedSolids: [], hiddenSolids: [], projection: .perspective,
                     solidTransforms: pose?.solidTransforms ?? [:])
+        let synchronousInstallMS = (ProcessInfo.processInfo.systemUptime - preparationStarted) * 1_000
         view.layout()
         let deadline = ContinuousClock.now + .seconds(30)
-        while view.isPreparingResources, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        var preparationActorGapsMS = [Double]()
+        var previousPreparationTick = preparationStarted
+        while view.isPreparingResources, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+            let now = ProcessInfo.processInfo.systemUptime
+            preparationActorGapsMS.append((now - previousPreparationTick) * 1_000)
+            previousPreparationTick = now
+        }
         XCTAssertFalse(view.isPreparingResources)
+        let preparationMS = (ProcessInfo.processInfo.systemUptime - preparationStarted) * 1_000
         let beforeFirst = frames.count
         while frames.count <= beforeFirst, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertGreaterThan(frames.count, beforeFirst, "The real hosted SCNView must render before profiling input.")
@@ -124,6 +134,9 @@ final class ViewportInteractionProfileTests: XCTestCase {
             "displayMode": display.rawValue,
             "viewportPoints": [618, 770],
             "backingScale": window.backingScaleFactor,
+            "synchronousInstallMS": synchronousInstallMS,
+            "preparationMS": preparationMS,
+            "preparationActorGaps": summary(preparationActorGapsMS),
             "triangles": preview.triangles.count,
             "solids": preview.solids,
             "vertices": topology?.vertices.count ?? 0,
@@ -146,7 +159,7 @@ final class ViewportInteractionProfileTests: XCTestCase {
         try data.write(to: URL(fileURLWithPath: "/tmp/lad-viewport-interaction-profile.json"), options: [.atomic])
         let dragP95 = summary(dragCosts)["p95MS"] ?? 0
         let warmP95 = summary(warmCosts)["p95MS"] ?? 0
-        print("LAD viewport profile: drag p95=\(dragP95) ms, FPS=\(Double(dragFrameCount) / max(0.001, dragElapsed)), cold pick=\(coldCost) ms, warm pick p95=\(warmP95) ms")
+        print("LAD viewport profile: synchronous install=\(synchronousInstallMS) ms, preparation=\(preparationMS) ms, drag p95=\(dragP95) ms, FPS=\(Double(dragFrameCount) / max(0.001, dragElapsed)), cold pick=\(coldCost) ms, warm pick p95=\(warmP95) ms")
     }
 
     private func summary(_ values: [Double]) -> [String: Double] {
