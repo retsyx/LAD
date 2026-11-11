@@ -1550,6 +1550,19 @@ final class CADSceneView: SCNView {
             assemblyGrab = AssemblyGrabGesture(solid: solid, start: point)
             return
         }
+        if event.modifierFlags.contains(.option) {
+            setHoveredFeature(nil)
+            let hit = bounds.contains(point) ? visibleHit(at: point) : nil
+            if event.clickCount >= 2 {
+                if hit == nil { deselectAll() }
+                return
+            }
+            if let hit, let solid = solidIndex(of: hit.node) {
+                selectFeatures([])
+                select(selectedSolids.symmetricDifference([solid]))
+            }
+            return
+        }
         let feature = feature(at: point)
         setHoveredFeature(feature)
         if event.clickCount >= 2 {
@@ -1720,8 +1733,7 @@ final class CADSceneView: SCNView {
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
-        // Opening a context menu preserves the selection. Whole parts are
-        // selected from the parts tree; viewport clicks select CAD features.
+        // Opening a context menu preserves both part and feature selections.
         let menu = NSMenu(title: "Viewport")
         let fit = menu.addItem(withTitle: "Fit Design", action: #selector(menuFit), keyEquivalent: "")
         fit.target = self

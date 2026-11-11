@@ -5,6 +5,7 @@ struct LADHelpView: View {
         Form {
             Section("Viewport controls") {
                 control("Left-click", "Toggle a vertex, edge, or face")
+                control("Option-left-click", "Select or deselect a part")
                 control("Command-left-drag", "Move a mechanism part within its mates and travel limits")
                 control("Parts tree", "Select whole parts or folders")
                 control("Right-click", "Context menu")

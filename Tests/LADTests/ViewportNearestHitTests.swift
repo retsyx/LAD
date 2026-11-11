@@ -38,6 +38,16 @@ final class ViewportNearestHitTests: XCTestCase {
                     view.onFeatureSelectionChanged = { clicked = $0 }
                     view.mouseDown(with: try click(at: point))
                     XCTAssertEqual(clicked, [expected], "Native clicks must select the same nearest face. \(context)")
+
+                    var partSelections = [Set<Int>]()
+                    view.onSelectionChanged = { partSelections.append($0) }
+                    view.mouseDown(with: try click(at: point, modifiers: .option))
+                    XCTAssertEqual(partSelections, [[expected.solidIndex]],
+                                   "Option-click must select the nearest visible owner. \(context)")
+                    XCTAssertTrue(clicked.isEmpty, "Whole-part selection must clear the previous feature selection. \(context)")
+                    view.mouseDown(with: try click(at: point, modifiers: .option))
+                    XCTAssertEqual(partSelections, [[expected.solidIndex], []],
+                                   "A second Option-click must deselect the owner. \(context)")
                 }
             }
         }
@@ -77,8 +87,8 @@ final class ViewportNearestHitTests: XCTestCase {
         }
     }
 
-    private func click(at point: NSPoint) throws -> NSEvent {
-        try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+    private func click(at point: NSPoint, modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: modifiers,
             timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
     }
 

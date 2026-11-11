@@ -5,6 +5,47 @@ import XCTest
 
 final class ViewportPartsTests: XCTestCase {
     @MainActor
+    func testOptionClickTogglesPartsIndependentlyAcrossProjectionAndDisplayModes() async throws {
+        for projection in ViewportProjectionMode.allCases {
+            for mode in [ViewportDisplayMode.edges, .wireframe] {
+                let view = makeView()
+                let preview = mesh()
+                view.update(mesh: preview, mode: mode, grid: false, command: ViewportCommand(.top),
+                            selectedSolids: [], hiddenSolids: [], projection: projection)
+                try await waitForPreparation(view)
+                var selections = [Set<Int>]()
+                var featureChanges = 0
+                var clearCount = 0
+                view.onSelectionChanged = { selections.append($0) }
+                view.onFeatureSelectionChanged = { _ in featureChanges += 1 }
+                view.onDeselectAll = { clearCount += 1 }
+                let points = [-2.0, 2.0].map { x in
+                    let projected = view.projectPoint(SCNVector3(x, 0, 0))
+                    return NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+                }
+                for point in [points[0], points[1], points[0], points[0]] {
+                    view.mouseDown(with: try optionClick(at: point))
+                }
+                XCTAssertEqual(selections, [[0], [0, 1], [1], [0, 1]],
+                               "Option-click must toggle only the clicked part in \(mode.rawValue), \(projection.rawValue).")
+                XCTAssertEqual(featureChanges, 0)
+
+                let empty = NSPoint(x: 4, y: 4)
+                view.mouseDown(with: try optionClick(at: empty))
+                XCTAssertEqual(selections.count, 4, "An empty Option-click must preserve part selection.")
+                view.mouseDown(with: try optionClick(at: empty, count: 2))
+                XCTAssertEqual(selections.last, [])
+                XCTAssertEqual(clearCount, 1)
+
+                view.update(mesh: preview, mode: mode, grid: false, command: nil,
+                            selectedSolids: [1], hiddenSolids: [0], projection: projection)
+                view.mouseDown(with: try optionClick(at: points[0]))
+                XCTAssertEqual(selections.count, 5, "A user-hidden part must not be selectable.")
+            }
+        }
+    }
+
+    @MainActor
     func testOwnedEdgesHideTogetherWithTheirPartAndPreserveMultiselection() async throws {
         let view = makeView()
         var selectionChanges = 0
@@ -71,6 +112,19 @@ final class ViewportPartsTests: XCTestCase {
         CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640), options: [
             SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
         ])
+    }
+
+    private func optionClick(at point: NSPoint, count: Int = 1) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: .option,
+            timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1, clickCount: count, pressure: 1))
+    }
+
+    @MainActor
+    private func waitForPreparation(_ view: CADSceneView) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while view.isPreparingResources, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertFalse(view.isPreparingResources)
+        SCNTransaction.flush()
     }
 
     @MainActor
