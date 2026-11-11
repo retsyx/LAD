@@ -41,12 +41,19 @@ class RenderCameraMCPTests(unittest.TestCase):
         self.assertIn('orthographic zoom retains this eye position', properties['cameraPosition']['description'])
         self.assertIn('orthographic zoom keeps the eye position unchanged', description)
         self.assertEqual(properties['projection']['enum'], ['perspective', 'isometric'])
+        self.assertEqual(properties['jointPositions']['type'], 'object')
+        self.assertEqual(properties['jointPositions']['maxProperties'], 256)
+        self.assertEqual(properties['jointPositions']['additionalProperties']['type'], 'number')
+        self.assertIn('render only', properties['jointPositions']['description'])
+        self.assertEqual(properties['drivingJoint']['type'], 'string')
+        self.assertIn('passive joints', properties['drivingJoint']['description'])
 
     def test_custom_angle_and_position_requests_reach_the_native_host_unchanged(self):
         requests_to_send = [
             {'artifactID': 'candidate', 'view': 'front', 'yawDegrees': 23.75, 'elevationDegrees': -12.5,
              'rollDegrees': 31, 'cameraTarget': [12, -3, 8], 'zoom': 1.75, 'projection': 'perspective',
-             'display': 'edges', 'width': 800, 'height': 600, 'solidIndices': [1, 4]},
+             'display': 'edges', 'width': 800, 'height': 600, 'solidIndices': [1, 4],
+             'jointPositions': {'hinge': 35.5, 'slide': 12}, 'drivingJoint': 'hinge'},
             {'artifactID': 'candidate', 'cameraPosition': [80.5, -24, 41], 'cameraTarget': [12, -3, 8],
              'rollDegrees': -10, 'zoom': 0.5, 'projection': 'isometric'},
         ]

@@ -91,6 +91,7 @@ struct CADViewport: NSViewRepresentable {
     var hiddenSolids: Set<Int>
     var solidColors: [Int: PartColor] = [:]
     var selectedFeatures: [CADFeatureID] = []
+    var solidTransforms: [Int: [Double]] = [:]
     var onSelectionChanged: ((Set<Int>) -> Void)? = nil
     var onFeatureSelectionChanged: (([CADFeatureID]) -> Void)? = nil
     var onDeselectAll: (() -> Void)? = nil
@@ -111,7 +112,7 @@ struct CADViewport: NSViewRepresentable {
         view.onActivated = onViewReady
         view.update(mesh: mesh, mode: displayMode, grid: showGrid, command: command,
                     selectedSolids: selectedSolids, hiddenSolids: hiddenSolids, projection: projectionMode,
-                    solidColors: solidColors, selectedFeatures: selectedFeatures)
+                    solidColors: solidColors, selectedFeatures: selectedFeatures, solidTransforms: solidTransforms)
         onViewReady?(view)
     }
 }
@@ -168,6 +169,10 @@ final class CADSceneView: SCNView {
     private var otherDragPoint: NSPoint?
     private var rightDragging = false
     private var topology: CADTopology?
+    private var solidTransforms: [Int: [Double]] = [:]
+    private var solidMatrices: [Int: simd_double4x4] = [:]
+    private var solidBounds: [Int: [Double]] = [:]
+    private var originalMeshBounds: [Double] = []
     private var faceIDsBySolid = [Int: [CADFeatureID?]]()
     private var faceIndices = [CADFeatureID: [Int32]]()
     private var meshSources = [SCNGeometrySource]()
@@ -230,6 +235,8 @@ final class CADSceneView: SCNView {
             "gridVisible": gridVisible,
             "hiddenSolidIndices": hiddenSolids.sorted(),
             "selectedSolidIndices": selectedSolids.sorted(),
+            "solidTransformLayout": "row-major",
+            "solidTransforms": solidTransforms.keys.sorted().map { ["solid": $0, "matrix": solidTransforms[$0]!] as [String: Any] },
             "selectedFeatures": selectedFeatures.map {
                 ["id": $0.id, "kind": $0.kind.rawValue, "solidIndex": $0.solidIndex, "localIndex": $0.localIndex] as [String: Any]
             }
@@ -359,7 +366,8 @@ final class CADSceneView: SCNView {
 
     func update(mesh: PreviewMesh?, mode: ViewportDisplayMode, grid: Bool, command: ViewportCommand?,
                 selectedSolids: Set<Int>, hiddenSolids: Set<Int>, projection: ViewportProjectionMode = .perspective,
-                solidColors: [Int: PartColor] = [:], selectedFeatures: [CADFeatureID] = []) {
+                solidColors: [Int: PartColor] = [:], selectedFeatures: [CADFeatureID] = [],
+                solidTransforms: [Int: [Double]] = [:]) {
         let orthographic = projection == .isometric
         let projectionChanged = rig.usesOrthographicProjection != orthographic
         let gridChanged = gridVisible != grid
@@ -399,6 +407,7 @@ final class CADSceneView: SCNView {
                 clearModel()
             }
         }
+        let poseChanged = updateSolidTransforms(solidTransforms, reinstalling: meshChanged)
         if gridChanged { gridNode.isHidden = !grid }
         let styleChanged = applyStyle()
         let featuresChanged = updateFeatureHighlights()
@@ -415,7 +424,59 @@ final class CADSceneView: SCNView {
         } else {
             updateModelVisibility()
         }
-        if meshChanged || styleChanged || featuresChanged || gridChanged { requestRedraw() }
+        if meshChanged || poseChanged || styleChanged || featuresChanged || gridChanged { requestRedraw() }
+    }
+
+    /// Moving a rigid body changes node poses only. Display buffers, native
+    /// feature identities, and materials stay attached to the original preview.
+    @discardableResult
+    private func updateSolidTransforms(_ requested: [Int: [Double]], reinstalling: Bool) -> Bool {
+        if !reinstalling, requested == solidTransforms { return false }
+        var matrices: [Int: simd_double4x4] = [:]
+        let valid = requested.count <= 4_096 && requested.allSatisfy { solid, values in
+            guard solidBounds[solid] != nil, let matrix = ViewportRigidTransform.matrix(values) else { return false }
+            matrices[solid] = matrix
+            return true
+        }
+        let next = valid ? requested : [:]
+        guard reinstalling || next != solidTransforms else { return false }
+        solidTransforms = next
+        solidMatrices = valid ? matrices : [:]
+        projectedFeatures = nil
+        hoveredFeature = nil
+        zoomAnchor = nil
+        let sceneMatrices = solidMatrices.mapValues(ViewportRigidTransform.sceneMatrix)
+        func apply(_ node: SCNNode, solid: Int) {
+            let matrix = sceneMatrices[solid] ?? matrix_identity_float4x4
+            if node.simdTransform != matrix { node.simdTransform = matrix }
+        }
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
+        for node in modelNode.childNodes {
+            if let solid = solidIndex(of: node) { apply(node, solid: solid) }
+        }
+        for node in edgeNode.childNodes {
+            if let solid = solidIndex(of: node, prefix: "edges:") { apply(node, solid: solid) }
+        }
+        for (solid, node) in partSilhouettes { apply(node, solid: solid) }
+        for (feature, node) in featureNodes { apply(node, solid: feature.solidIndex) }
+        SCNTransaction.commit()
+        if next.isEmpty {
+            if !originalMeshBounds.isEmpty { meshBounds = originalMeshBounds }
+        } else {
+            let bounds = solidBounds.map { solid, bounds in
+                ViewportRigidTransform.bounds(bounds, matrix: solidMatrices[solid] ?? matrix_identity_double4x4)
+            }
+            if !bounds.isEmpty {
+                meshBounds = (0..<3).map { axis in bounds.map { $0[axis] }.min()! }
+                    + (0..<3).map { axis in bounds.map { $0[axis + 3] }.max()! }
+            }
+        }
+        if reinstalling, !next.isEmpty {
+            rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+            applyCamera()
+        }
+        return true
     }
 
     private func install(_ mesh: PreviewMesh) {
@@ -481,6 +542,24 @@ final class CADSceneView: SCNView {
             silhouetteNode.addChildNode(silhouette)
             partSilhouettes[solid] = silhouette
         }
+        solidBounds.removeAll(keepingCapacity: true)
+        for part in mesh.topology?.parts ?? [] where part.bounds.count == 6 && part.bounds.allSatisfy(\.isFinite) {
+            solidBounds[part.solidIndex] = part.bounds
+        }
+        // Native previews already carry analytic per-part bounds. Only small
+        // synthetic previews need this display-buffer fallback.
+        for (solid, indices) in groups where solidBounds[solid] == nil {
+            var bounds = [Double](repeating: .infinity, count: 3) + [Double](repeating: -.infinity, count: 3)
+            for index in indices {
+                let point = mesh.vertices[Int(index)]
+                for axis in 0..<3 {
+                    bounds[axis] = min(bounds[axis], point[axis])
+                    bounds[axis + 3] = max(bounds[axis + 3], point[axis])
+                }
+            }
+            solidBounds[solid] = bounds
+        }
+        originalMeshBounds = mesh.bounds
         installEdges(mesh)
         edgeNode.renderingOrder = 1
         meshBounds = mesh.bounds
@@ -507,6 +586,10 @@ final class CADSceneView: SCNView {
         ownedEdgeSolids.removeAll()
         hasOwnedEdges = false
         hasModel = false
+        solidBounds.removeAll()
+        originalMeshBounds.removeAll()
+        solidTransforms.removeAll()
+        solidMatrices.removeAll()
         appliedStyle = nil
         updateHighlightTechnique(silhouetteCount: 0)
         updateModelVisibility()
@@ -600,6 +683,7 @@ final class CADSceneView: SCNView {
                 node.addChildNode(silhouette)
             }
             node.isHidden = true
+            node.simdTransform = ViewportRigidTransform.sceneMatrix(solidMatrices[feature.solidIndex] ?? matrix_identity_double4x4)
             featureNode.addChildNode(node)
             featureNodes[feature] = node
             featureCreationOrder.append(feature)
@@ -743,6 +827,11 @@ final class CADSceneView: SCNView {
         for (index, slot) in silhouetteSlots.enumerated() {
             let mask = masks.indices.contains(index) ? masks[index] : nil
             if slot.geometry !== mask?.geometry { slot.geometry = mask?.geometry }
+            // Mask slots live beside the parts, while a face mask lives under
+            // its feature overlay. Carry the complete rigid pose into DRAW_NODE.
+            let transform = mask.map { simd_inverse(silhouetteNode.simdWorldTransform) * $0.simdWorldTransform }
+                ?? matrix_identity_float4x4
+            if slot.simdTransform != transform { slot.simdTransform = transform }
             let hidden = !hasModel || isPreparingResources || mask == nil || mask?.isHidden == true ||
                 (mask?.parent !== silhouetteNode && mask?.parent?.isHidden == true)
             if slot.isHidden != hidden { slot.isHidden = hidden }
@@ -1039,7 +1128,18 @@ final class CADSceneView: SCNView {
     /// camera and project display preferences are never changed by rendering.
     func configureAgentView(named name: String, camera: CADAgentCamera = CADAgentCamera()) throws {
         cancelCameraTransition()
-        let pose = try camera.resolved(view: name, bounds: meshBounds, width: Double(bounds.width),
+        var fittingBounds = meshBounds
+        if !hiddenSolids.isEmpty {
+            let visible = solidBounds.compactMap { solid, bounds -> [Double]? in
+                guard !hiddenSolids.contains(solid) else { return nil }
+                return ViewportRigidTransform.bounds(bounds, matrix: solidMatrices[solid] ?? matrix_identity_double4x4)
+            }
+            if !visible.isEmpty {
+                fittingBounds = (0..<3).map { axis in visible.map { $0[axis] }.min()! }
+                    + (0..<3).map { axis in visible.map { $0[axis + 3] }.max()! }
+            }
+        }
+        let pose = try camera.resolved(view: name, bounds: fittingBounds, width: Double(bounds.width),
                                        height: Double(bounds.height), orthographic: rig.usesOrthographicProjection)
         rig = pose.rig
         needsInitialFit = false
@@ -1505,7 +1605,9 @@ final class CADSceneView: SCNView {
         let width = Double(bounds.width), height = max(Double(bounds.height), 1)
         func projected(_ position: [Double], id: CADFeatureID) -> ViewportFeaturePicking.Vertex? {
             guard validFeaturePoint(position), !hiddenSolids.contains(id.solidIndex) else { return nil }
-            let world = SIMD3(position[0], position[1], position[2])
+            let original = SIMD4(position[0], position[1], position[2], 1)
+            let transformed = solidMatrices[id.solidIndex].map { $0 * original } ?? original
+            let world = SIMD3(transformed.x, transformed.y, transformed.z)
             let delta = world - cameraPosition
             let depth = -simd_dot(delta, backward)
             guard depth > 0 else { return nil }

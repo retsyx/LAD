@@ -439,11 +439,36 @@ final class CADAgentTools {
             let solids = try indices(arguments, preview: preview, optional: true)
             let offset = try integer("offset", arguments, fallback: 0, range: 0...1_000_000)
             let limit = try integer("limit", arguments, fallback: 100, range: 1...500)
+            var pageTopology = CADTopology(vertices: [], edges: [], faces: [], parts: [])
+            let total: Int
+            switch kind {
+            case "parts":
+                let selected = topology.parts.filter { solids?.contains($0.solidIndex) ?? true }
+                total = selected.count; pageTopology.parts = Array(selected.dropFirst(offset).prefix(limit))
+            case "vertices":
+                let selected = topology.vertices.filter { solids?.contains($0.id.solidIndex) ?? true }
+                total = selected.count; pageTopology.vertices = Array(selected.dropFirst(offset).prefix(limit))
+            case "edges":
+                let selected = topology.edges.filter { solids?.contains($0.id.solidIndex) ?? true }
+                total = selected.count; pageTopology.edges = Array(selected.dropFirst(offset).prefix(limit))
+            case "faces":
+                let selected = topology.faces.filter { solids?.contains($0.id.solidIndex) ?? true }
+                total = selected.count; pageTopology.faces = Array(selected.dropFirst(offset).prefix(limit))
+            default: throw LADError.message("Inspect summary, parts, vertices, edges or faces.")
+            }
+            let features = pageTopology.vertices.map(\.id) + pageTopology.edges.map(\.id) + pageTopology.faces.map(\.id)
+            let partIndices = Set(pageTopology.parts.map(\.solidIndex))
+            let moved = !(preview.assemblyPose?.solidTransforms.isEmpty ?? true)
+            if moved, !features.isEmpty || !partIndices.isEmpty {
+                pageTopology = try await engine.assemblyProperties(preview, features: features, solids: partIndices,
+                                                                  python: python, threads: threads)
+                try checkCancellation()
+            }
             let items: [[String: Any]]
             switch kind {
             case "parts":
                 let nodes = artifact.parts.flatMap(\.flattened)
-                items = try topology.parts.filter { solids?.contains($0.solidIndex) ?? true }.map { part in
+                items = try pageTopology.parts.map { part in
                     var item = try json(part)
                     if let owner = nodes.first(where: { $0.solidIndices.contains(part.solidIndex) }) {
                         item["partID"] = owner.id; item["name"] = owner.name
@@ -451,16 +476,16 @@ final class CADAgentTools {
                     }
                     return item
                 }
-            case "vertices": items = try topology.vertices.filter { solids?.contains($0.id.solidIndex) ?? true }.map(json)
-            case "edges": items = try topology.edges.filter { solids?.contains($0.id.solidIndex) ?? true }.map {
+            case "vertices": items = try pageTopology.vertices.map(json)
+            case "edges": items = try pageTopology.edges.map {
                 var item = try json($0); item.removeValue(forKey: "polyline"); return item
             }
-            case "faces": items = try topology.faces.filter { solids?.contains($0.id.solidIndex) ?? true }.map(json)
+            case "faces": items = try pageTopology.faces.map(json)
             default: throw LADError.message("Inspect summary, parts, vertices, edges or faces.")
             }
-            let page = Array(items.dropFirst(offset).prefix(limit))
             return try result(["artifactID": artifact.id, "kind": kind, "offset": offset,
-                               "total": items.count, "items": page, "hasMore": offset + page.count < items.count])
+                               "total": total, "items": items, "hasMore": offset + items.count < total,
+                               "coordinateSpace": moved ? "currentAssemblyPose" : "builtGeometry"])
         case "lad_measure":
             try allowed(arguments, ["artifactID", "features", "solidIndices"])
             let artifact = try await artifact(arguments)
@@ -480,7 +505,8 @@ final class CADAgentTools {
             return try result(info)
         case "lad_render":
             try allowed(arguments, ["artifactID", "view", "projection", "display", "width", "height", "solidIndices",
-                                    "yawDegrees", "elevationDegrees", "rollDegrees", "cameraPosition", "cameraTarget", "zoom"])
+                                    "yawDegrees", "elevationDegrees", "rollDegrees", "cameraPosition", "cameraTarget", "zoom",
+                                    "jointPositions", "drivingJoint"])
             let view = try string("view", arguments) ?? "isometric"
             guard ["isometric", "front", "back", "top", "bottom", "left", "right"].contains(view),
                   let projection = ViewportProjectionMode(rawValue: try string("projection", arguments) ?? "isometric"),
@@ -490,8 +516,27 @@ final class CADAgentTools {
             let width = try integer("width", arguments, fallback: 1024, range: 256...2048)
             let height = try integer("height", arguments, fallback: 768, range: 256...2048)
             let camera = try renderCamera(arguments)
+            let jointPositions = try renderJointPositions(arguments)
+            let drivingJoint = try string("drivingJoint", arguments)
+            if let drivingJoint {
+                guard !drivingJoint.isEmpty, drivingJoint.utf8.count <= 1024, jointPositions?[drivingJoint] != nil else {
+                    throw LADError.message("The assembly drivingJoint must name a joint supplied in jointPositions.")
+                }
+            }
             let artifact = try await artifact(arguments)
-            let preview = artifact.preview!
+            var preview = artifact.preview!
+            if let jointPositions {
+                guard let motion = preview.assemblyMotion else {
+                    throw LADError.message("The design has no assembly joints to position.")
+                }
+                let parts = artifact.parts
+                let positions = (preview.assemblyPose?.positions ?? [:]).merging(jointPositions) { _, requested in requested }
+                let solving = Task.detached(priority: .userInitiated) {
+                    try motion.solve(parts: parts, positions: positions, driving: drivingJoint)
+                }
+                preview.assemblyPose = try await withTaskCancellationHandler(operation: { try await solving.value }, onCancel: { solving.cancel() })
+                try checkCancellation()
+            }
             let selected = try indices(arguments, preview: preview, optional: true)
             let hidden = selected.map { Set(0..<preview.solids).subtracting($0) } ?? []
             let captured = try await CADAgentRenderer.renderWithMetadata(preview: preview, view: view, projection: projection,
@@ -506,6 +551,7 @@ final class CADAgentTools {
             metadata["cameraParameters"] = arguments.filter {
                 ["yawDegrees", "elevationDegrees", "rollDegrees", "cameraPosition", "cameraTarget", "zoom"].contains($0.key)
             }
+            if let pose = preview.assemblyPose { metadata["jointPositions"] = pose.positions }
             return try imageResult(url, metadata: metadata)
         case "lad_screenshot":
             try allowed(arguments, [])
@@ -583,7 +629,7 @@ final class CADAgentTools {
 
     private func build(_ model: ModelSpec, id: String? = nil, versionID: UUID? = nil, preparedPreview: PreviewMesh? = nil) async throws -> Artifact {
         let id = id ?? UUID().uuidString
-        let preview: PreviewMesh
+        var preview: PreviewMesh
         if let preparedPreview { preview = preparedPreview }
         else if let cached = validatedPreview(for: model) { preview = cached }
         else { preview = try await engine.buildPreview(model, python: python, threads: threads) }
@@ -601,6 +647,12 @@ final class CADAgentTools {
                 allowingPlacementChanges: Set(model.reorganizePartIDs ?? []))
         } ?? PartLayout(nodes: defaults)
         let nodes = resolvedLayout.nodes
+        if let version, let positions = version.jointPositions,
+           constructionMatches(version.model, model), let motion = preview.assemblyMotion {
+            let solving = Task.detached(priority: .userInitiated) { try motion.solve(parts: nodes, positions: positions) }
+            preview.assemblyPose = try await withTaskCancellationHandler(operation: { try await solving.value }, onCancel: { solving.cancel() })
+            try checkCancellation()
+        }
         let inherited = previous?.partColors ?? (versionID != nil ? version?.partColors ?? [:]
             : artifacts["current"]?.partColors ?? initialPartColors)
         let physicalIDs = Self.physicalIDs(in: nodes)
@@ -725,11 +777,21 @@ final class CADAgentTools {
         let preview = artifact.preview!
         var result: [String: Any] = ["artifactID": artifact.id, "units": "mm", "programPath": artifact.programURL.path,
                                     "metadataPath": artifact.metadataURL.path, "solids": preview.solids, "faces": preview.faces,
-                                    "bounds": preview.bounds, "size": preview.size, "volume": preview.volume, "surfaceArea": preview.area,
+                                    "volume": preview.volume, "surfaceArea": preview.area,
                                     "buildSeconds": preview.buildSeconds, "threads": preview.threads,
                                     "assetIDs": (artifact.model.inputAssets ?? []).map(\.id),
                                     "topologyCounts": ["vertices": preview.topology?.vertices.count ?? 0,
                                                        "edges": preview.topology?.edges.count ?? 0, "faces": preview.topology?.faces.count ?? 0]]
+        if !(preview.assemblyPose?.solidTransforms.isEmpty ?? true) {
+            result["builtBounds"] = preview.bounds; result["builtSize"] = preview.size
+            result["boundsAvailability"] = "Use lad_inspect kind=parts for exact bounds at the current assembly pose."
+        } else {
+            result["bounds"] = preview.bounds; result["size"] = preview.size
+        }
+        if let motion = preview.assemblyMotion, let definition = try? json(motion) {
+            result["assemblyMotion"] = definition
+            result["jointPositions"] = preview.assemblyPose?.positions ?? Dictionary(uniqueKeysWithValues: motion.joints.map { ($0.id, $0.position) })
+        }
         if let runtime = preview.runtime, let info = try? json(runtime) { result["runtime"] = info }
         if let versionID = artifact.versionID { result["versionID"] = versionID.uuidString }
         return result
@@ -843,6 +905,23 @@ final class CADAgentTools {
         camera.zoom = try scalar("zoom") ?? 1
         try camera.validate()
         return camera
+    }
+    private func renderJointPositions(_ values: [String: Any]) throws -> [String: Double]? {
+        guard let raw = values["jointPositions"] else { return nil }
+        guard let positions = raw as? [String: Any], positions.count <= 256 else {
+            throw LADError.message("Assembly jointPositions must map at most 256 joint IDs to finite positions.")
+        }
+        var result = [String: Double]()
+        for (id, raw) in positions {
+            guard !id.isEmpty, id.utf8.count <= 1024,
+                  !id.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                  let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+                  value.doubleValue.isFinite, abs(value.doubleValue) <= 1e9 else {
+                throw LADError.message("Assembly jointPositions must map joint IDs to finite numeric positions.")
+            }
+            result[id] = value.doubleValue
+        }
+        return result
     }
     private func indices(_ values: [String: Any], preview: PreviewMesh, optional: Bool, allowEmpty: Bool = false) throws -> Set<Int>? {
         guard let raw = values["solidIndices"] else { return optional ? nil : [] }

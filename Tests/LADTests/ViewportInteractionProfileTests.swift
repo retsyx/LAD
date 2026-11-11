@@ -41,8 +41,10 @@ final class ViewportInteractionProfileTests: XCTestCase {
         }
         application.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        let pose = try preview.assemblyMotion?.solve(parts: preview.parts ?? [])
         view.update(mesh: preview, mode: display, grid: true, command: nil,
-                    selectedSolids: [], hiddenSolids: [], projection: .perspective)
+                    selectedSolids: [], hiddenSolids: [], projection: .perspective,
+                    solidTransforms: pose?.solidTransforms ?? [:])
         view.layout()
         let deadline = ContinuousClock.now + .seconds(30)
         while view.isPreparingResources, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }

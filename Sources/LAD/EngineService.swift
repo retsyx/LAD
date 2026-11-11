@@ -57,6 +57,7 @@ final class EngineService {
         var colors: [STEPExportColor]
         var arrangeFor3DPrinting: Bool
         var parts: [[Int]]? = nil
+        var transforms: [AssemblySolidTransform] = []
     }
     private var exportedSTEP: [STEPExportKey: [Data]] = [:]
     private var exportedSTEPOrder: [STEPExportKey] = []
@@ -183,10 +184,11 @@ final class EngineService {
     /// Export an already built native solid, with no program replay or meshing.
     /// Repeated exports reuse bytes only for the same geometry, subset, RGB and arrangement.
     func exportSTEP(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, solidColors: [Int: PartColor] = [:],
-                    arrangeFor3DPrinting: Bool = false,
+                    arrangeFor3DPrinting: Bool = false, solidTransforms: [Int: [Double]]? = nil,
                     python: String, threads: Int) async throws -> Data {
         defer { withExtendedLifetime(preview.buildArtifacts) {} }
         try Task.checkCancellation()
+        let transforms = try AssemblySolidTransform.validatedRecords(solidTransforms ?? preview.assemblyPose?.solidTransforms ?? [:], solidCount: preview.solids)
         if let solidIndices {
             guard !solidIndices.isEmpty, solidIndices.allSatisfy({ $0 >= 0 && $0 < preview.solids }) else {
                 throw LADError.message("Select at least one available part to export.")
@@ -200,7 +202,7 @@ final class EngineService {
         let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
         // Raw bytes retain their original coordinates and carry no requested display colors.
         // Arrangement and current RGB must be written from native geometry.
-        if !arrangeFor3DPrinting, selection == nil, colors.isEmpty, let artifacts = preview.buildArtifacts, artifacts.containsSTEP,
+        if transforms.isEmpty, !arrangeFor3DPrinting, selection == nil, colors.isEmpty, let artifacts = preview.buildArtifacts, artifacts.containsSTEP,
            preview.stepPath == artifacts.folder.appendingPathComponent("model.step").path {
             let source = URL(fileURLWithPath: preview.stepPath)
             return try await Task.detached(priority: .userInitiated) {
@@ -212,13 +214,14 @@ final class EngineService {
         if let path = preview.brepPath, let artifacts = preview.buildArtifacts,
            path == artifacts.folder.appendingPathComponent("model.brep").path {
             let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors,
-                                        arrangeFor3DPrinting: arrangeFor3DPrinting)
+                                        arrangeFor3DPrinting: arrangeFor3DPrinting, transforms: transforms)
             if let cached = cachedSTEP(for: cacheKey) { return cached[0] }
             let bytes = try await nativeBytes(preview)
             let output = try await run(python: python, threads: threads, scriptMode: false, action: "export this design") { folder in
                 try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
                 var payload: [String: Any] = ["operation": "export", "brepAsset": "source.brep"]
                 if let selection { payload["solidIndices"] = selection }
+                if !transforms.isEmpty { payload["solidTransforms"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(transforms)) }
                 if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
                 if arrangeFor3DPrinting { payload["arrangeFor3DPrinting"] = true }
                 try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
@@ -240,10 +243,11 @@ final class EngineService {
     /// Printing placement is shared across files, so importing them together
     /// reconstructs the same bed layout as a combined export.
     func exportSTEPParts(_ preview: PreviewMesh, parts: [[Int]], solidColors: [Int: PartColor] = [:],
-                         arrangeFor3DPrinting: Bool = false,
+                         arrangeFor3DPrinting: Bool = false, solidTransforms: [Int: [Double]]? = nil,
                          python: String, threads: Int) async throws -> [Data] {
         defer { withExtendedLifetime(preview.buildArtifacts) {} }
         try Task.checkCancellation()
+        let transforms = try AssemblySolidTransform.validatedRecords(solidTransforms ?? preview.assemblyPose?.solidTransforms ?? [:], solidCount: preview.solids)
         let indices = parts.flatMap { $0 }
         guard !parts.isEmpty, parts.count <= preview.solids, parts.allSatisfy({ !$0.isEmpty }),
               indices.count <= preview.solids, Set(indices).count == indices.count,
@@ -262,13 +266,14 @@ final class EngineService {
             throw EngineExportError.nativeArtifactUnavailable
         }
         let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors,
-                                     arrangeFor3DPrinting: arrangeFor3DPrinting, parts: parts)
+                                     arrangeFor3DPrinting: arrangeFor3DPrinting, parts: parts, transforms: transforms)
         if let cached = cachedSTEP(for: cacheKey) { return cached }
         let bytes = try await nativeBytes(preview)
         let output = try await run(python: python, threads: threads, scriptMode: false, action: "export these design parts") { folder in
             try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
             var payload: [String: Any] = ["operation": "export", "brepAsset": "source.brep", "individualParts": parts]
             if let selection { payload["solidIndices"] = selection }
+            if !transforms.isEmpty { payload["solidTransforms"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(transforms)) }
             if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
             if arrangeFor3DPrinting { payload["arrangeFor3DPrinting"] = true }
             try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
@@ -320,37 +325,74 @@ final class EngineService {
         exportedSTEPOrder.append(key)
     }
 
-    /// Exact single-item properties are already available in session metadata.
-    /// Only a general two-entity distance needs a native-kernel process.
-    func measure(_ preview: PreviewMesh, features: [CADFeatureID], solids: Set<Int>, python: String, threads: Int) async throws -> CADMeasurementReport {
+    /// Unmoved single-item properties reuse session metadata. Posed properties
+    /// and minimum distances come from the transformed native solids.
+    func measure(_ preview: PreviewMesh, features: [CADFeatureID], solids: Set<Int>,
+                 solidTransforms: [Int: [Double]]? = nil, python: String, threads: Int) async throws -> CADMeasurementReport {
+        let transforms = solidTransforms ?? preview.assemblyPose?.solidTransforms ?? [:]
+        if !transforms.isEmpty {
+            let exact = try await nativeMeasurement(preview, features: features, solids: solids,
+                                                    transforms: transforms, python: python, threads: threads)
+            guard let topology = exact.topology else { throw LADError.message("The CAD engine returned incomplete assembly measurements.") }
+            var posed = preview
+            posed.topology = topology
+            var report = try CADMeasurements.report(posed, features: features, solids: solids)
+            if features.count + solids.count == 2, !(solids.isEmpty && features.allSatisfy({ $0.kind == .vertex })) {
+                report.metrics += exact.metrics
+                report.closestPoints = exact.closestPoints
+            }
+            return report
+        }
         var report = try CADMeasurements.report(preview, features: features, solids: solids)
         guard report.features.count + report.solidIndices.count == 2,
               !(report.solidIndices.isEmpty && report.features.allSatisfy({ $0.kind == .vertex })) else { return report }
-        let bytes = try await nativeBytes(preview)
-        let requestedFeatures = report.features, selectedIndices = report.solidIndices
-        // Measuring an existing revision must not cancel a concurrent CAD build.
-        let measurementWorker = EngineService()
-        let output = try await measurementWorker.run(python: python, threads: threads, scriptMode: false, action: "measure these items") { folder in
-            try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
-            let featureData = try JSONSerialization.jsonObject(with: JSONEncoder().encode(requestedFeatures))
-            let payload: [String: Any] = ["operation": "measure", "brepAsset": "source.brep", "features": featureData,
-                                          "solidIndices": selectedIndices]
-            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
-        }
-        let exact = try await Task.detached(priority: .userInitiated) {
-            let data = try EngineArtifact.read(output.folder.appendingPathComponent("result.json"), in: output.folder, maximumBytes: 1_000_000)
-            let report = try JSONDecoder().decode(CADMeasurementReport.self, from: data)
-            guard report.metrics.allSatisfy({ !$0.values.isEmpty && $0.values.allSatisfy(\.isFinite) }),
-                  report.closestPoints?.count == 2,
-                  report.closestPoints?.allSatisfy({ $0.count == 3 && $0.allSatisfy(\.isFinite) }) == true else {
-                throw LADError.message("The CAD engine returned an invalid measurement.")
-            }
-            return report
-        }.value
-        try Task.checkCancellation()
+        let exact = try await nativeMeasurement(preview, features: report.features, solids: Set(report.solidIndices),
+                                                transforms: nil, python: python, threads: threads)
         report.metrics += exact.metrics
         report.closestPoints = exact.closestPoints
         return report
+    }
+
+    /// Sparse exact metadata for the selected posed entities, without remeshing.
+    func assemblyProperties(_ preview: PreviewMesh, features: [CADFeatureID], solids: Set<Int>,
+                            python: String, threads: Int) async throws -> CADTopology {
+        let exact = try await nativeMeasurement(preview, features: features, solids: solids,
+                                                transforms: preview.assemblyPose?.solidTransforms ?? [:], python: python, threads: threads)
+        guard let topology = exact.topology else { throw LADError.message("The CAD engine returned incomplete assembly properties.") }
+        return topology
+    }
+
+    private struct NativeMeasurement: Decodable, Sendable {
+        var metrics: [CADMeasurementMetric]
+        var closestPoints: [[Double]]?
+        var topology: CADTopology?
+    }
+
+    private func nativeMeasurement(_ preview: PreviewMesh, features: [CADFeatureID], solids: Set<Int>,
+                                   transforms: [Int: [Double]]?, python: String, threads: Int) async throws -> NativeMeasurement {
+        let records = try transforms.map { try AssemblySolidTransform.validatedRecords($0, solidCount: preview.solids) }
+        let bytes = try await nativeBytes(preview)
+        // A measurement never cancels a build running on this service.
+        let worker = EngineService()
+        let output = try await worker.run(python: python, threads: threads, scriptMode: false, action: "measure these items") { folder in
+            try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
+            let featureData = try JSONSerialization.jsonObject(with: JSONEncoder().encode(features))
+            var payload: [String: Any] = ["operation": "measure", "brepAsset": "source.brep", "features": featureData,
+                                          "solidIndices": solids.sorted()]
+            if let records { payload["solidTransforms"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(records)) }
+            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+        }
+        let exact = try await Task.detached(priority: .userInitiated) {
+            let data = try EngineArtifact.read(output.folder.appendingPathComponent("result.json"), in: output.folder, maximumBytes: 32_000_000)
+            let result = try JSONDecoder().decode(NativeMeasurement.self, from: data)
+            guard result.metrics.allSatisfy({ !$0.values.isEmpty && $0.values.allSatisfy(\.isFinite) }),
+                  result.closestPoints.map({ $0.count == 2 && $0.allSatisfy({ $0.count == 3 && $0.allSatisfy(\.isFinite) }) }) ?? true else {
+                throw LADError.message("The CAD engine returned an invalid measurement.")
+            }
+            return result
+        }.value
+        try Task.checkCancellation()
+        return exact
     }
 
     private func nativeBytes(_ preview: PreviewMesh) async throws -> Data {
@@ -476,14 +518,17 @@ final class EngineService {
     private func readPreview(_ output: RunResult, deferSTEP: Bool) async throws -> PreviewMesh {
         let folder = output.folder
         let resultURL = folder.appendingPathComponent("result.json")
-        var mesh = try await Task.detached(priority: .userInitiated) {
+        let decoding = Task.detached(priority: .userInitiated) {
             let data = try EngineArtifact.read(resultURL, in: folder, maximumBytes: 256_000_000)
-            let result = try JSONDecoder().decode(PreviewMesh.self, from: data)
+            var result = try JSONDecoder().decode(PreviewMesh.self, from: data)
             guard result.normals != nil else {
                 throw LADError.message("The CAD engine returned an incomplete design preview.")
             }
             try ProjectStore.validatePreview(result)
             try CADMeasurements.validateTopology(result)
+            if let motion = result.assemblyMotion {
+                result.assemblyPose = try motion.solve(parts: result.parts ?? [])
+            }
             // Generated code cannot redirect the app to read an unrelated file.
             guard URL(fileURLWithPath: result.stepPath).path == folder.appendingPathComponent("model.step").path else {
                 throw LADError.message("CAD engine returned an unexpected STEP asset path.")
@@ -510,7 +555,9 @@ final class EngineService {
                 try Self.validateSTEP(step)
             }
             return result
-        }.value
+        }
+        var mesh = try await withTaskCancellationHandler { try await decoding.value }
+            onCancel: { decoding.cancel() }
         guard output.token == generation, !Task.isCancelled else { throw CancellationError() }
         mesh.buildArtifacts = output.artifacts
         return mesh

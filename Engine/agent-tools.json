@@ -430,6 +430,22 @@
           "default": 1,
           "description": "Positive magnification multiplier: 1 is automatic fit, 2 zooms in, 0.5 zooms out. With cameraPosition, 1 uses that exact base position. Perspective zoom divides the base eye-to-target distance; orthographic zoom keeps the eye unchanged and divides the orthographic view scale. Does not change geometry."
         },
+        "jointPositions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "minimum": -1000000000,
+            "maximum": 1000000000
+          },
+          "maxProperties": 256,
+          "description": "Optional isolated assembly pose overrides keyed by stable joint ID: revolute positions are degrees and slider positions are mm. Solves mate constraints for this render only; preserves the artifact and live viewport pose. Other joint positions start from the artifact pose and may move to satisfy closed loops."
+        },
+        "drivingJoint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Optional movable joint ID supplied in jointPositions whose requested value must remain fixed while passive joints satisfy closed-loop constraints."
+        },
         "projection": {
           "type": "string",
           "enum": [

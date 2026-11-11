@@ -58,7 +58,8 @@ enum CADAgentRenderer {
             }
         }
         surface.update(mesh: fittingPreview, mode: display, grid: false, command: nil,
-                       selectedSolids: [], hiddenSolids: hiddenSolids, projection: projection, solidColors: solidColors)
+                       selectedSolids: [], hiddenSolids: hiddenSolids, projection: projection, solidColors: solidColors,
+                       solidTransforms: preview.assemblyPose?.solidTransforms ?? [:])
         guard surface.hasRenderableGeometry else { throw LADError.message("The design has no renderable geometry.") }
         try surface.configureAgentView(named: view, camera: camera)
         surface.layout()

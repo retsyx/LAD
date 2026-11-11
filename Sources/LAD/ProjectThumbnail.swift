@@ -28,6 +28,15 @@ enum ProjectThumbnail {
             throw LADError.message("The design has no selected version to preview.")
         }
         let parts = revision.partLayout?.nodes ?? revision.parts ?? preview.parts ?? []
+        var preview = preview
+        if let motion = preview.assemblyMotion {
+            let nativeParts = preview.parts ?? parts, positions = revision.jointPositions ?? [:]
+            let calculation = Task.detached(priority: .utility) {
+                try motion.solve(parts: nativeParts, positions: positions)
+            }
+            preview.assemblyPose = try await withTaskCancellationHandler { try await calculation.value }
+                onCancel: { calculation.cancel() }
+        }
         return try await render(preview: preview, projection: project.projectionMode ?? .perspective,
             display: project.displayMode ?? .edges, hiddenSolids: Set(revision.hiddenSolids ?? []),
             solidColors: PartColorState.solidColors(in: parts, overrides: revision.partColors ?? [:]))

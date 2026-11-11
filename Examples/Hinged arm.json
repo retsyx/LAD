@@ -1,0 +1,6 @@
+{
+  "title": "Hinged arm",
+  "summary": "A rotating arm on a fixed base with a 240\u00b0 hinge travel.",
+  "units": "mm",
+  "script": "import cadquery as cq\n\nbase = cq.Workplane(\"XY\").box(42, 32, 6, centered=(True, True, False))\nbase = base.union(cq.Workplane(\"XY\").circle(4).extrude(16))\narm = cq.Workplane(\"XY\").box(50, 12, 5).translate((20, 0, 10))\narm = arm.cut(cq.Workplane(\"XY\").circle(4.2).extrude(18))\nresult = cq.Assembly(name=\"Hinged arm\")\nresult.add(base, name=\"Base\", metadata={\"lad_id\": \"base\"})\nresult.add(arm, name=\"Arm\", color=cq.Color(0.18, 0.42, 0.75), metadata={\"lad_id\": \"arm\"})\nresult.metadata[\"lad_motion\"] = {\n    \"grounded\": [\"base\"],\n    \"connectors\": [\n        {\"id\": \"base-pivot\", \"part\": \"base\", \"origin\": [0, 0, 10]},\n        {\"id\": \"arm-pivot\", \"part\": \"arm\", \"origin\": [0, 0, 10]},\n    ],\n    \"joints\": [\n        {\"id\": \"hinge\", \"name\": \"Arm angle\", \"type\": \"revolute\",\n         \"parent\": \"base-pivot\", \"child\": \"arm-pivot\", \"limits\": [-120, 120]},\n    ],\n}\n"
+}

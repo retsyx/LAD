@@ -102,10 +102,11 @@ enum CADAgentVersionFiles {
             let currentParts = PartColorState.nodesWithCurrentColors(parts, stored: version.partColors ?? [:])
             files.append(File(path: "\(base)/parts.json", data: try encoded(currentParts)))
         }
-        if version.hiddenSolids != nil || version.partColors != nil {
+        if version.hiddenSolids != nil || version.partColors != nil || version.jointPositions != nil {
             var display: [String: Any] = [:]
             if let hidden = version.hiddenSolids { display["hiddenSolids"] = hidden }
             if let colors = version.partColors { display["partColors"] = try JSONSerialization.jsonObject(with: encoded(colors)) }
+            if let positions = version.jointPositions { display["jointPositions"] = positions; info["jointPositions"] = positions }
             info["partDisplayPath"] = try path("\(base)/part-display.json")
             files.append(File(path: "\(base)/part-display.json", data: try object(display)))
         }

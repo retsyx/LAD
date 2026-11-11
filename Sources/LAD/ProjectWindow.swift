@@ -453,7 +453,7 @@ final class ProjectWindowCoordinator: ObservableObject {
         guard let entry, !hasWindow(for: entry.state) else { return }
         if !isQuitting { entry.state.setActiveProject(false) }
         guard !isQuitting else { return }
-        entry.state.cancel()
+        entry.state.cancel(preservingAssemblyMotion: true)
         let token = UUID()
         var aliases = Set<URL>()
         if let url = entry.state.projectURL { aliases.insert(Self.canonicalURL(url)) }
@@ -484,7 +484,7 @@ final class ProjectWindowCoordinator: ObservableObject {
         for id in Array(replacements.keys) { cancelReplacement(in: id) }
         let closing = Array(closeTasks.values)
         let sessions = uniqueStates()
-        for state in sessions { state.cancel() }
+        for state in sessions { state.cancel(preservingAssemblyMotion: true) }
         let task = Task { [closeSession, saveUnsavedProject] in
             for replacement in replacing { await replacement.value }
             for closingSession in closing { await closingSession.task.value }

@@ -81,6 +81,7 @@ final class CADAgentVersionToolsTests: XCTestCase {
                                        preview: preview, stepData: Data("never stage generated STEP".utf8),
                                        partLayout: PartLayout(nodes: [part]), hiddenSolids: [0],
                                        runtime: CADRuntime(python: "3.12", cadquery: "2.6", ocp: "7.8"), name: "Before")
+        revision.jointPositions = ["hinge": 42]
         let context = ProjectVersionContext(revisions: [revision], selectedRevisionID: revision.id)
         revision.name = "After"
         revision.model.script = "mutated later"
@@ -90,6 +91,7 @@ final class CADAgentVersionToolsTests: XCTestCase {
         let tools = try makeTools(root, current: current, versions: context)
         let output = try content(try await tools.handle(name: "lad_version", arguments: ["reference": "v1"]))
         XCTAssertEqual(output["name"] as? String, "Before")
+        XCTAssertEqual(output["jointPositions"] as? [String: Double], ["hinge": 42])
         XCTAssertEqual(try read(output, "programPath"), Data(program.utf8))
         let saved = try JSONDecoder().decode(ModelSpec.self, from: read(output, "modelPath"))
         XCTAssertEqual(saved.script, program)

@@ -12,6 +12,9 @@ struct ProjectDetailsPane: View {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 12) {
                         if project != nil { projectInfo }
+                        if let motion = state.mesh?.assemblyMotion, motion.joints.contains(where: \.isMovable) {
+                            AssemblyMotionControls(state: state, motion: motion)
+                        }
                         if let project { programDisclosure(project) }
                         if state.hasMeasurementSelection {
                             MeasurementInfoView(state: state, contentPadding: 0)
@@ -65,13 +68,15 @@ struct ProjectDetailsPane: View {
                 ProjectRevisionPicker(state: state)
             }
             if let mesh = state.mesh {
-                HStack(spacing: 5) {
-                    ForEach(0..<3) { i in
-                        if i > 0 { Text("×").foregroundStyle(Palette.muted) }
-                        Text(mesh.size[i], format: .number.precision(.fractionLength(0...1)))
-                    }
-                    Text("mm").foregroundStyle(Palette.muted)
-                }.font(.system(size: 11, design: .monospaced)).lineLimit(1).minimumScaleFactor(0.8)
+                if state.assemblyPose?.solidTransforms.isEmpty != false {
+                    HStack(spacing: 5) {
+                        ForEach(0..<3) { i in
+                            if i > 0 { Text("×").foregroundStyle(Palette.muted) }
+                            Text(mesh.size[i], format: .number.precision(.fractionLength(0...1)))
+                        }
+                        Text("mm").foregroundStyle(Palette.muted)
+                    }.font(.system(size: 11, design: .monospaced)).lineLimit(1).minimumScaleFactor(0.8)
+                }
                 Rectangle().fill(Palette.line).frame(height: 1)
                 detailRow("Solids", "\(mesh.solids)")
                 detailRow("Volume", "\(mesh.volume.formatted(.number.precision(.fractionLength(0)))) mm³")

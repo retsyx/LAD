@@ -40,7 +40,7 @@ fi
 ditto "$BIN/LAD_LAD.bundle" "$ASSEMBLED/Contents/Resources/LAD_LAD.bundle"
 PACKAGED_ENGINE="$ASSEMBLED/Contents/Resources/Engine"
 mkdir -p "$PACKAGED_ENGINE"
-cp "$ROOT/Engine/worker.py" "$ROOT/Engine/agent_server.py" "$ROOT/Engine/agent-tools.json" \
+cp "$ROOT/Engine/worker.py" "$ROOT/Engine/assembly_motion.py" "$ROOT/Engine/agent_server.py" "$ROOT/Engine/agent-tools.json" \
    "$ROOT/Engine/script.sb" "$ROOT/Engine/requirements-lock.txt" "$PACKAGED_ENGINE/"
 cp "$ROOT"/Engine/mesh_*.py "$ROOT/Engine/mesh-api.md" "$PACKAGED_ENGINE/"
 ditto "$ROOT/Examples" "$ASSEMBLED/Contents/Resources/Examples"

@@ -47,13 +47,15 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
     var parts: [ProjectSelectedPart]
     /// Preserves the user's feature-selection order, including mixed kinds.
     var features: [ProjectSelectedFeature]
+    /// Reproduce the selected mechanism pose when reconciling an older request.
+    var jointPositions: [String: Double]? = nil
 
     static let maximumParts = 8_192
     static let maximumFeatures = 8_192
 
     static func capture(revisionID: UUID, preview: PreviewMesh?, nodes: [PartNode],
                         selectedSolids: Set<Int>, selectedNodeIDs: Set<String>,
-                        selectedFeatures: [CADFeatureID]) -> ProjectSelectionContext? {
+                        selectedFeatures: [CADFeatureID], assemblyPose: AssemblyPose? = nil) -> ProjectSelectionContext? {
         struct Owner {
             var id: String
             var name: String
@@ -91,13 +93,26 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
         func owner(_ index: Int) -> Owner {
             owners[index] ?? Owner(id: "solid:\(index)", name: "Part \(index + 1)", path: ["Part \(index + 1)"])
         }
+        func posed(_ anchor: ProjectSelectionAnchor?, solid: Int) -> ProjectSelectionAnchor? {
+            guard var anchor, let matrix = assemblyPose?.solidTransforms[solid] else { return anchor }
+            anchor.position = anchor.position.map { AssemblySolidTransform.point($0, by: matrix) }
+            anchor.center = anchor.center.map { AssemblySolidTransform.point($0, by: matrix) }
+            anchor.startPoint = anchor.startPoint.map { AssemblySolidTransform.point($0, by: matrix) }
+            anchor.endPoint = anchor.endPoint.map { AssemblySolidTransform.point($0, by: matrix) }
+            anchor.normal = anchor.normal.map { AssemblySolidTransform.point($0, by: matrix, direction: true) }
+            anchor.axis = anchor.axis.map { AssemblySolidTransform.point($0, by: matrix, direction: true) }
+            anchor.direction = anchor.direction.map { AssemblySolidTransform.point($0, by: matrix, direction: true) }
+            // Rotating an old bounding box does not give exact CAD bounds.
+            anchor.bounds = nil
+            return anchor
+        }
         let parts = wholeParts.filter { $0 >= 0 && $0 < solidCount }.sorted().map { index in
             let identity = owner(index)
             let anchor = partFacts[index].map { fact in
                 ProjectSelectionAnchor(center: fact.centroid, area: fact.area, volume: fact.volume, bounds: fact.bounds)
             }
             return ProjectSelectedPart(partID: identity.id, name: identity.name, path: identity.path,
-                                       solidIndex: index, anchor: anchor)
+                                       solidIndex: index, anchor: posed(anchor, solid: index))
         }
         let features = orderedFeatures.compactMap { id -> ProjectSelectedFeature? in
             let anchor: ProjectSelectionAnchor
@@ -117,13 +132,19 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
             }
             let identity = owner(id.solidIndex)
             return ProjectSelectedFeature(id: id, partID: owners[id.solidIndex]?.id, partName: identity.name,
-                                          partPath: identity.path, anchor: anchor)
+                                          partPath: identity.path, anchor: posed(anchor, solid: id.solidIndex))
         }
         guard !parts.isEmpty || !features.isEmpty else { return nil }
-        return ProjectSelectionContext(revisionID: revisionID, parts: parts, features: features)
+        return ProjectSelectionContext(revisionID: revisionID, parts: parts, features: features,
+                                       jointPositions: assemblyPose?.positions.isEmpty == false ? assemblyPose?.positions : nil)
     }
 
     func validate() throws {
+        if let positions = jointPositions {
+            guard positions.count <= 8_192, positions.allSatisfy({
+                !$0.key.isEmpty && $0.key.utf8.count <= 1_024 && $0.value.isFinite && abs($0.value) <= 1e9
+            }) else { throw LADError.message("The saved selection has invalid assembly positions.") }
+        }
         func invalid() -> LADError { .message("The saved selection references are invalid.") }
         func text(_ value: String, maximum: Int = 1_024) -> Bool {
             !value.isEmpty && value.utf8.count <= maximum &&

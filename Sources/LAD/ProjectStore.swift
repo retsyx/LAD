@@ -160,6 +160,11 @@ enum ProjectStore {
             }) else { throw invalid("The saved CAD runtime metadata is invalid.") }
         }
         try validateModel(revision.model)
+        if let positions = revision.jointPositions {
+            guard positions.count <= 8_192, positions.allSatisfy({
+                validPartID($0.key) && $0.value.isFinite && abs($0.value) <= 1e9
+            }) else { throw invalid("The saved assembly positions are invalid.") }
+        }
         if let preview = revision.preview { try validatePreview(preview) }
         if let step = revision.stepData { try validateSTEP(step) }
         let parts = revision.parts ?? revision.preview?.parts
@@ -255,6 +260,7 @@ enum ProjectStore {
             }
         }
         if let parts = mesh.parts { try validatePartHierarchy(parts, solidCount: mesh.solids) }
+        if let motion = mesh.assemblyMotion { try motion.validate(parts: mesh.parts ?? []) }
     }
 
     static func validatePartHierarchy(_ nodes: [PartNode], solidCount: Int) throws {

@@ -17,6 +17,7 @@ final class AppState: ObservableObject {
     @Published var mesh: PreviewMesh? {
         didSet {
             projectThumbnailMeshModel = mesh == nil ? nil : current
+            loadAssemblyPose()
             // Feature IDs belong to one native topology. Even a replacement
             // at the same artifact path must not keep old feature selections.
             selectedFeatures = []
@@ -77,6 +78,12 @@ final class AppState: ObservableObject {
         didSet { if selectedFeatures != oldValue { refreshMeasurements() } }
     }
     @Published private(set) var measurementReport: CADMeasurementReport?
+    @Published private(set) var assemblyPose: AssemblyPose?
+    @Published private(set) var isSolvingAssembly = false
+    @Published private(set) var assemblyMotionError: String?
+    private var assemblyMotionTask: Task<Void, Never>?
+    private var assemblyMotionToken = UUID()
+    private var requestedJointPositions: [String: Double] = [:]
     @Published private(set) var measurementError: String?
     @Published private(set) var isMeasuring = false
     @Published var selectedPartNodeIDs: Set<String> = []
@@ -177,6 +184,7 @@ final class AppState: ObservableObject {
         var brepPath: String?
         var features: [CADFeatureID]
         var solids: [Int]
+        var transforms: [AssemblySolidTransform]
     }
     private var measurementCache: [MeasurementKey: CADMeasurementReport] = [:]
 
@@ -194,6 +202,12 @@ final class AppState: ObservableObject {
     private static let recentProjectIDKey = "lastAutosavedProjectID"
     static var recentProjectURL: URL? {
         UserDefaults.standard.string(forKey: recentProjectPathKey).map { URL(fileURLWithPath: $0) }
+    }
+
+    var posedPreview: PreviewMesh? {
+        guard var preview = mesh else { return nil }
+        preview.assemblyPose = assemblyPose
+        return preview
     }
 
     var current: ModelSpec? { revisions.first(where: { $0.id == selectedRevisionID })?.model }
@@ -225,7 +239,7 @@ final class AppState: ObservableObject {
         if let parts = revision.parts { return parts.flatMap { $0.allSolidIndices }.max().map { $0 + 1 } ?? 0 }
         return revision.preview?.solids ?? (partTree.flatMap { $0.allSolidIndices }.max().map { $0 + 1 } ?? 0)
     }
-    var canExport: Bool { mesh != nil && builtRevisionID == selectedRevisionID && !isWorking }
+    var canExport: Bool { mesh != nil && builtRevisionID == selectedRevisionID && !isWorking && !isSolvingAssembly }
     var featureSelectedSolids: Set<Int> { Set(selectedFeatures.map(\.solidIndex)) }
 
     func setPartsPaneFraction(_ fraction: Double) {
@@ -397,6 +411,7 @@ final class AppState: ObservableObject {
 
     func prepareToQuit() async {
         onProjectAgentInvalidated?()
+        await assemblyMotionTask?.value
         cancel()
         cancelProjectThumbnail(clearImage: false)
         auditSaveTask?.cancel(); auditSaveTask = nil
@@ -409,6 +424,7 @@ final class AppState: ObservableObject {
 
     func flushForReplacement() async throws {
         onProjectAgentInvalidated?()
+        await assemblyMotionTask?.value
         let wasGenerating = generationFeedback != nil
         cancel()
         cancelProjectThumbnail(clearImage: false)
@@ -422,6 +438,7 @@ final class AppState: ObservableObject {
     }
 
     private func flushProject() async throws {
+        await assemblyMotionTask?.value
         guard canSaveProject else { return }
         if let saveConflict { throw saveConflict }
         autosaveSequence += 1
@@ -562,7 +579,8 @@ final class AppState: ObservableObject {
     private func capturedRequestSelection() -> ProjectSelectionContext? {
         guard let revisionID = selectedRevisionID else { return nil }
         return ProjectSelectionContext.capture(revisionID: revisionID, preview: mesh, nodes: partTree,
-            selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedFeatures: selectedFeatures)
+            selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedFeatures: selectedFeatures,
+            assemblyPose: assemblyPose)
     }
 
     func editQueuedRequest(id: UUID, text: String) {
@@ -922,7 +940,7 @@ final class AppState: ObservableObject {
         let sourceRevisionID = selectedRevisionID
         let previousColors = Self.completePartColors(in: previousLayout.nodes,
             stored: revisions.first(where: { $0.id == sourceRevisionID })?.partColors ?? [:])
-        let previousPreview = mesh
+        let previousPreview = posedPreview
         let previousSolidColors = PartColorState.solidColors(in: previousLayout.nodes, overrides: previousColors)
         let previousHiddenSolids = hiddenSolids
         let versions = ProjectVersionContext(revisions: revisions, selectedRevisionID: selectedRevisionID)
@@ -1168,7 +1186,8 @@ final class AppState: ObservableObject {
         let hidden = Set(layout.nodes.flatMap(\.flattened).filter { previouslyHidden.contains($0.id) }.flatMap(\.solidIndices))
         let revision = ProjectRevision(model: spec, date: date, preview: preview, partLayout: layout, hiddenSolids: hidden.sorted(), parts: defaults, runtime: preview.runtime,
                                       userMessageID: userMessageID, responseMessageID: responseMessageID,
-                                      partColors: colors.isEmpty ? nil : colors, validatedHash: preview.validatedHash)
+                                      partColors: colors.isEmpty ? nil : colors, validatedHash: preview.validatedHash,
+                                      jointPositions: preview.assemblyPose?.positions)
         revisions.append(revision)
         selectedRevisionID = revision.id; builtRevisionID = revision.id
         mesh = preview; selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = hidden
@@ -1371,18 +1390,90 @@ final class AppState: ObservableObject {
         isMeasuring = false
     }
 
+    private func loadAssemblyPose() {
+        assemblyMotionTask?.cancel(); assemblyMotionTask = nil
+        assemblyMotionToken = UUID()
+        isSolvingAssembly = false; assemblyMotionError = nil
+        assemblyPose = mesh?.assemblyPose
+        requestedJointPositions = assemblyPose?.positions ?? [:]
+        guard let motion = mesh?.assemblyMotion else { return }
+        let saved = revisions.first(where: { $0.id == selectedRevisionID })?.jointPositions
+        if let saved, saved != assemblyPose?.positions {
+            requestAssemblyPose(positions: saved, driving: nil, fit: true)
+        } else if assemblyPose == nil {
+            requestAssemblyPose(positions: Dictionary(uniqueKeysWithValues: motion.joints.map { ($0.id, $0.position) }),
+                                driving: nil, fit: true)
+        }
+    }
+
+    func jointPosition(_ joint: AssemblyJoint) -> Double {
+        requestedJointPositions[joint.id] ?? assemblyPose?.positions[joint.id] ?? joint.position
+    }
+
+    func setJointPosition(_ id: String, to value: Double) {
+        guard !isWorking, value.isFinite,
+              mesh?.assemblyMotion?.joints.contains(where: { $0.id == id && $0.type != .fixed }) == true else { return }
+        var positions = requestedJointPositions
+        positions[id] = value
+        requestAssemblyPose(positions: positions, driving: id)
+    }
+
+    func resetAssemblyMotion() {
+        guard !isWorking, let motion = mesh?.assemblyMotion else { return }
+        requestAssemblyPose(positions: Dictionary(uniqueKeysWithValues: motion.joints.map { ($0.id, $0.position) }), driving: nil)
+    }
+
+    private func requestAssemblyPose(positions: [String: Double], driving: String?, fit: Bool = false) {
+        guard let preview = mesh, let motion = preview.assemblyMotion, let revisionID = selectedRevisionID else { return }
+        assemblyMotionTask?.cancel()
+        let token = UUID(); assemblyMotionToken = token
+        requestedJointPositions = positions
+        isSolvingAssembly = true; assemblyMotionError = nil
+        let parts = preview.parts ?? partTree
+        let calculation = Task.detached(priority: .userInitiated) {
+            try motion.solve(parts: parts, positions: positions, driving: driving)
+        }
+        assemblyMotionTask = Task { [weak self] in
+            do {
+                let pose = try await withTaskCancellationHandler { try await calculation.value }
+                    onCancel: { calculation.cancel() }
+                guard let self, self.assemblyMotionToken == token, self.selectedRevisionID == revisionID,
+                      self.mesh?.stepPath == preview.stepPath, !Task.isCancelled else { return }
+                self.assemblyPose = pose
+                self.requestedJointPositions = pose.positions
+                self.isSolvingAssembly = false; self.assemblyMotionTask = nil
+                self.agentStateGeneration &+= 1
+                self.refreshMeasurements()
+                if fit { self.viewportCommand = ViewportCommand(.fit) }
+                if let index = self.revisions.firstIndex(where: { $0.id == revisionID }),
+                   self.revisions[index].jointPositions != pose.positions {
+                    self.revisions[index].jointPositions = pose.positions
+                    self.scheduleDebouncedAutosave()
+                }
+            } catch is CancellationError {
+            } catch {
+                guard let self, self.assemblyMotionToken == token else { return }
+                self.isSolvingAssembly = false; self.assemblyMotionTask = nil
+                self.requestedJointPositions = self.assemblyPose?.positions ?? [:]
+                self.assemblyMotionError = error.localizedDescription
+            }
+        }
+    }
+
     private func refreshMeasurements() {
         cancelMeasurement()
         measurementError = nil
         guard let preview = mesh, hasMeasurementSelection else { measurementReport = nil; return }
         let features = selectedFeatures, solids = selectedSolids
-        let key = MeasurementKey(previewPath: preview.stepPath, brepPath: preview.brepPath, features: features, solids: solids.sorted())
+        let transforms = assemblyPose?.solidTransforms ?? [:]
+        let key = MeasurementKey(previewPath: preview.stepPath, brepPath: preview.brepPath, features: features, solids: solids.sorted(),
+                                 transforms: AssemblySolidTransform.records(transforms))
         if let cached = measurementCache[key] { measurementReport = cached; return }
-        do { measurementReport = try CADMeasurements.report(preview, features: features, solids: solids) }
+        do { measurementReport = transforms.isEmpty ? try CADMeasurements.report(preview, features: features, solids: solids) : nil }
         catch { measurementReport = nil; measurementError = error.localizedDescription; return }
         let needsNativeDistance = features.count + solids.count == 2 &&
             !(solids.isEmpty && features.allSatisfy { $0.kind == .vertex })
-        guard needsNativeDistance else { return }
+        guard needsNativeDistance || !transforms.isEmpty else { return }
         let token = measurementToken, sessionID = projectSessionID
         let runtime = python, cores = threads
         isMeasuring = true
@@ -1390,7 +1481,8 @@ final class AppState: ObservableObject {
             do {
                 try await Task.sleep(for: .milliseconds(120))
                 guard let self else { return }
-                let report = try await self.engine.measure(preview, features: features, solids: solids, python: runtime, threads: cores)
+                let report = try await self.engine.measure(preview, features: features, solids: solids, solidTransforms: transforms,
+                                                          python: runtime, threads: cores)
                 guard self.measurementToken == token, self.projectSessionID == sessionID,
                       self.mesh?.stepPath == preview.stepPath, !Task.isCancelled else { return }
                 if self.measurementCache.count >= 128 { self.measurementCache.removeAll() }
@@ -1588,7 +1680,12 @@ final class AppState: ObservableObject {
         try SourceImport.mergeAttachments(existing: existing, added: added)
     }
 
-    func cancel() {
+    func cancel(preservingAssemblyMotion: Bool = false) {
+        if !preservingAssemblyMotion {
+            assemblyMotionTask?.cancel(); assemblyMotionTask = nil
+            assemblyMotionToken = UUID(); isSolvingAssembly = false
+            requestedJointPositions = assemblyPose?.positions ?? [:]
+        }
         queuePaused = true; queueCanAdvance = false
         queuePauseReason = nil
         steeringTask?.cancel(); steeringTask = nil
@@ -1806,7 +1903,7 @@ final class AppState: ObservableObject {
     /// session bytes by geometry, selected solids, RGB assignments and arrangement.
     func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil, arrangeFor3DPrinting: Bool = false,
                     exportIndividualParts: Bool = false, replaceExisting: Bool = false) {
-        guard canExport, let preview = mesh, let revisionID = selectedRevisionID,
+        guard canExport, let preview = posedPreview, let revisionID = selectedRevisionID,
               let revision = revisions.first(where: { $0.id == revisionID }) else { return }
         if let solidIndices, solidIndices.isEmpty || !solidIndices.isSubset(of: Set(0..<preview.solids)) { return }
         let nodes = revision.partLayout?.nodes ?? revision.parts ?? Self.defaultParts(for: preview)
@@ -1826,7 +1923,10 @@ final class AppState: ObservableObject {
                 } catch EngineExportError.nativeArtifactUnavailable {
                     // Replay can enumerate solids differently. Bind the
                     // captured colors and subset to fresh stable ownership.
-                    let rebuilt = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash)
+                    var rebuilt = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash)
+                    if let motion = rebuilt.assemblyMotion {
+                        rebuilt.assemblyPose = try motion.solve(parts: rebuilt.parts ?? [], positions: preview.assemblyPose?.positions ?? [:])
+                    }
                     guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
                           !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
                     let restored = try Self.restoredPartState(for: revision, preview: rebuilt, selected: solidIndices ?? [])
@@ -2249,7 +2349,7 @@ final class AppState: ObservableObject {
     }
 
     private static func projectThumbnailRevisionChanged(_ old: ProjectRevision?, _ new: ProjectRevision?) -> Bool {
-        var changed = !sameProjectThumbnailRecipe(old?.model, new?.model) || old?.validatedHash != new?.validatedHash
+        var changed = !sameProjectThumbnailRecipe(old?.model, new?.model) || old?.validatedHash != new?.validatedHash || old?.jointPositions != new?.jointPositions
         if !changed, let old, let new {
             let oldNodes = Self.projectThumbnailNodes(old), newNodes = Self.projectThumbnailNodes(new)
             if oldNodes != newNodes || old.partColors != new.partColors {
@@ -2314,7 +2414,7 @@ final class AppState: ObservableObject {
                 try await Task.sleep(for: .milliseconds(350))
                 guard let self, self.projectSessionID == session, self.projectThumbnailToken == token,
                       self.currentProjectThumbnailPresentation() == presentation,
-                      self.currentProjectThumbnailInput() == input, let preview = self.mesh else { return }
+                      self.currentProjectThumbnailInput() == input, let preview = self.posedPreview else { return }
                 self.projectThumbnailWork.renders += 1
                 let data = try await self.projectThumbnailRenderer(preview, input)
                 guard !Task.isCancelled, self.projectSessionID == session, self.projectThumbnailToken == token,
@@ -2340,7 +2440,7 @@ extension AppState {
 
     func agentSnapshot() -> ProjectAgentSnapshot {
         ProjectAgentSnapshot(projectID: projectID, editingID: projectSessionID, stateToken: agentStateToken,
-            current: current, preview: builtRevisionID == selectedRevisionID ? mesh : nil,
+            current: current, preview: builtRevisionID == selectedRevisionID ? posedPreview : nil,
             versions: ProjectVersionContext(revisions: revisions, selectedRevisionID: selectedRevisionID),
             partLayout: selectedPartLayout, partColors: revisions.first(where: { $0.id == selectedRevisionID })?.partColors ?? [:],
             hiddenSolids: hiddenSolids, solidColors: solidColors)

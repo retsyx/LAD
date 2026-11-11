@@ -284,7 +284,7 @@ enum ProjectPackage {
             for archived in metadata["revisions"] as? [[String: Any]] ?? [] {
                 guard let id = archived["id"] as? String, let revision = current[id] else { throw invalid("A revision identity is invalid.") }
                 var recipe = archived, parts = [String: Any]()
-                for field in ["parts", "partLayout", "hiddenSolids", "partColors"] {
+                for field in ["parts", "partLayout", "hiddenSolids", "partColors", "jointPositions"] {
                     if let value = recipe.removeValue(forKey: field) { parts[field] = value }
                 }
                 let name = recipe.removeValue(forKey: "name")
@@ -519,7 +519,7 @@ enum ProjectPackage {
             var revision = try object(readReference(entry["recipe"], prefix: "revisions/\(id)/recipe-"))
             guard revision["id"] as? String == id else { throw invalid("A version record has a mismatched identity.") }
             let parts = try object(readReference(entry["parts"], prefix: "revisions/\(id)/parts-"))
-            guard Set(parts.keys).isSubset(of: ["parts", "partLayout", "hiddenSolids", "partColors"]) else { throw invalid("A parts record contains unsupported fields.") }
+            guard Set(parts.keys).isSubset(of: ["parts", "partLayout", "hiddenSolids", "partColors", "jointPositions"]) else { throw invalid("A parts record contains unsupported fields.") }
             revision.merge(parts) { _, value in value }
             revision["name"] = entry["name"]
             revisions.append(revision)
@@ -822,6 +822,7 @@ enum ProjectPackage {
                     try field("partLayout", revision.partLayout ?? revision.parts.map { PartLayout(nodes: $0) })
                     try field("hiddenSolids", revision.hiddenSolids)
                     try field("partColors", revision.partColors)
+                    try field("jointPositions", revision.jointPositions)
                 }
                 rows.append(row)
             }
@@ -913,7 +914,7 @@ enum ProjectPackage {
     }
 
     private static func sameParts(_ lhs: ProjectRevision, _ rhs: ProjectRevision) -> Bool {
-        lhs.partLayout == rhs.partLayout && lhs.hiddenSolids == rhs.hiddenSolids && lhs.parts == rhs.parts && lhs.partColors == rhs.partColors
+        lhs.partLayout == rhs.partLayout && lhs.hiddenSolids == rhs.hiddenSolids && lhs.parts == rhs.parts && lhs.partColors == rhs.partColors && lhs.jointPositions == rhs.jointPositions
     }
 
     private static func sameHistory(_ lhs: LADProject, _ rhs: LADProject) -> Bool {
@@ -925,7 +926,7 @@ enum ProjectPackage {
         lhs.id == rhs.id && lhs.model == rhs.model && lhs.date == rhs.date && lhs.partLayout == rhs.partLayout &&
         lhs.hiddenSolids == rhs.hiddenSolids && lhs.parts == rhs.parts && lhs.runtime == rhs.runtime &&
         lhs.userMessageID == rhs.userMessageID && lhs.responseMessageID == rhs.responseMessageID &&
-        lhs.partColors == rhs.partColors && lhs.name == rhs.name && lhs.validatedHash == rhs.validatedHash
+        lhs.partColors == rhs.partColors && lhs.jointPositions == rhs.jointPositions && lhs.name == rhs.name && lhs.validatedHash == rhs.validatedHash
     }
 
     private static func assetReferences(_ value: Any) -> Set<String> {
@@ -947,7 +948,7 @@ enum ProjectPackage {
         let selected = metadata["selectedRevisionID"] as? String
         let revision = (metadata["revisions"] as? [[String: Any]] ?? []).first { $0["id"] as? String == selected }
         var identity = [String: Any]()
-        for field in ["id", "scriptAsset", "sourceSTEPAsset", "inputAssets", "hiddenSolids", "partColors"] { identity[field] = revision?[field] }
+        for field in ["id", "scriptAsset", "sourceSTEPAsset", "inputAssets", "hiddenSolids", "partColors", "jointPositions"] { identity[field] = revision?[field] }
         for field in ["displayMode", "projectionMode"] { identity[field] = metadata[field] }
         return digest(try json(identity))
     }

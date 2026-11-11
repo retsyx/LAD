@@ -117,6 +117,49 @@ identity is limited by the source solid ordering. A generated ID that collides
 with an explicit ID receives a `generated:` prefix. Repeated explicit IDs are
 rejected instead of silently assigning the user's layout to the wrong part.
 
+Moving assemblies attach a `lad_motion` dictionary to the final root
+`cq.Assembly.metadata`. Its `grounded` array contains physical leaf part IDs;
+`connectors` contains `{id, part, origin, xAxis, zAxis}` frames; and `joints`
+contains `{id, name, type, parent, child, position, limits?}` records. `parent`
+and `child` reference connector IDs. Connector origins and unit perpendicular
+X/Z axes use the final built geometry's world coordinates, including all nested
+Assembly locations. Omitted axes default to world X and Z. The implied Y axis is Z × X. Joint IDs and connector IDs
+are unique within their respective lists. Groups cannot act as physical bodies.
+
+Joint types are `fixed`, `revolute` and `slider`. A zero-position mate aligns
+its connector frames; a revolute position rotates about the parent connector's
+Z axis in degrees, and a slider position translates along that axis in mm.
+`position` defaults to zero, and optional `[lower, upper]` limits must contain
+it. Fixed joints accept only zero position and no limits. Frames need not
+coincide in the construction pose. Closed loops and multiple grounded parts
+are allowed, with at least one grounded physical part in each connected joint
+component. Definitions are bounded to 1,024 connectors and 256 joints.
+The worker validates and normalizes this metadata as preview `assemblyMotion`;
+the native app solves the rigid poses without rebuilding construction geometry.
+Definitions remain part of the complete saved Python program, while poses and
+derived display/topology data remain separate from the native construction.
+
+Native export and measurement requests accept optional
+`solidTransforms: [{solid, matrix}]`. Each matrix is a row-major 4×4 proper rigid
+world-space delta from the built pose, acting on column vectors, with translation
+at indices 3, 7 and 11. Omitted solids retain their built pose. These requests
+preserve native subshape identities and do not replay programs or tessellate.
+Export applies poses before optional printing arrangement. A measurement request
+with this field returns sparse `topology` for its selected features and parts,
+including exact transformed analytic bounds and world-space coordinates,
+centroids and directions. It accepts up to 8,192 features, retains pair metrics
+and `closestPoints` for exactly two selections, and otherwise returns empty
+`metrics`. Without `solidTransforms`, measurement retains its two-item distance
+contract.
+
+`lad_render` accepts optional `jointPositions` overrides and a `drivingJoint`
+whose requested coordinate remains fixed while passive joints satisfy closed
+loops. It solves a private pose for that image and returns the effective joint
+coordinates without changing the candidate or live design. `lad_inspect` reports
+exact native properties at the artifact's current pose, fetching only its
+requested page. Summary metadata identifies construction bounds as `builtBounds`
+while an assembly is posed; current per-part bounds come from native inspection.
+
 For Python programs ending in a Compound, the worker can infer preview
 labels from exact `cq.Shape` or single-value `cq.Workplane` aliases left in the
 program namespace. Matched final `base`, `lid`, and `pcb`/`board` components get
@@ -339,7 +382,7 @@ and its dependencies are third-party packages; their licenses remain applicable.
 
 Saved revisions carry one optional `validated_hash` field. The worker computes
 SHA-256 over the program, units, ordered input identities/formats, exact required
-input bytes, runtime versions, and worker source. Titles, summaries and input
+input bytes, runtime versions, and worker/assembly adapter source. Titles, summaries and input
 display names are excluded, matching validated candidate reuse at final commit. A matching receipt skips exact BRep/shell checks
 and STEP roundtrip validation during replay. Missing or changed hashes require
 full validation; only successful builds return a new receipt. This is an

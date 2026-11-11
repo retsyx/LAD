@@ -10,6 +10,7 @@ import importlib.util
 import json
 from pathlib import Path
 import pstats
+import sys
 import time
 
 
@@ -27,7 +28,9 @@ def main():
     start = time.perf_counter()
     import cadquery  # noqa: F401 -- measure the import excluded by buildSeconds
     times['cadqueryImport'] = time.perf_counter() - start
-    spec = importlib.util.spec_from_file_location('worker', Path(__file__).resolve().parents[1] / 'Engine/worker.py')
+    engine = Path(__file__).resolve().parents[1] / 'Engine'
+    sys.path.insert(0, str(engine))
+    spec = importlib.util.spec_from_file_location('worker', engine / 'worker.py')
     worker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(worker)
     for name in ('build_shape', 'build_script', 'import_step', 'validate_shape', 'write_step',

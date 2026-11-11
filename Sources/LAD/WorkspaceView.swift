@@ -238,6 +238,7 @@ struct WorkspaceView: View {
                         command: state.viewportCommand,
                         selectedSolids: state.selectedSolids, hiddenSolids: state.hiddenSolids, solidColors: state.solidColors,
                         selectedFeatures: state.selectedFeatures,
+                        solidTransforms: state.assemblyPose?.solidTransforms ?? [:],
                         onSelectionChanged: { state.selectParts($0) },
                         onFeatureSelectionChanged: { state.selectFeatures($0) }, onDeselectAll: { state.clearSelections() },
                         onHideSelected: { state.hideSelectedParts() }, onShowAll: { state.showAllParts() },

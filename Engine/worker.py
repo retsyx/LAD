@@ -19,6 +19,9 @@ import re
 import sys
 import time
 
+import assembly_motion
+from assembly_motion import AssemblyMotionError, transformed_solids, validate_motion
+
 MAX_TRIANGLES = 1_000_000
 MAX_VERTICES = 1_000_000
 MAX_EDGE_SEGMENTS = 250_000
@@ -45,6 +48,20 @@ class ModelError(ValueError):
     def __init__(self, message, *, diagnostic=None):
         super().__init__(message)
         self.diagnostic = diagnostic
+
+
+def validate_assembly_motion(definition, parts):
+    try:
+        return validate_motion(definition, parts)
+    except AssemblyMotionError as error:
+        raise ModelError(str(error)) from error
+
+
+def posed_solids(solids, records, cq):
+    try:
+        return transformed_solids(solids, records, cq)
+    except AssemblyMotionError as error:
+        raise ModelError(str(error)) from error
 
 
 @contextmanager
@@ -791,6 +808,8 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
     validate_shape(result, preview_stats=preview_stats)
     if assembly is not None:
         result._lad_parts = assembly_parts(assembly, result)
+        if "lad_motion" in assembly.metadata:
+            result._lad_assembly_motion = validate_assembly_motion(assembly.metadata["lad_motion"], result._lad_parts)
     else:
         # Explicit Assemblies have a strict naming contract. For compound
         # programs, exact shape aliases provide optional preview labels while
@@ -1967,7 +1986,7 @@ def make_preview(shape, preview_stats=None):
     if parts is None:
         parts = [{"id": f"solid/{index}", "name": f"Part {index + 1}",
                   "solidIndices": [index], "children": None} for index in range(len(solids))]
-    return {
+    preview = {
         "vertices": vertices,
         "normals": normals,
         "triangles": triangles,
@@ -1984,6 +2003,10 @@ def make_preview(shape, preview_stats=None):
         "solids": len(solids),
         "faces": prepared["faces"] if prepared is not None else len(_shape_entities(shape, "Face")),
     }
+    motion = getattr(shape, "_lad_assembly_motion", None)
+    if motion is not None:
+        preview["assemblyMotion"] = motion
+    return preview
 
 
 def validate_parts(parts, solid_count):
@@ -2645,13 +2668,13 @@ def arrange_print_solids(solids, cq):
 
 def export_brep(spec, asset_directory, output, cq, threads):
     """Create whole or selected STEP without replaying or tessellating."""
-    if set(spec) - {"operation", "brepAsset", "solidIndices", "solidColors", "arrangeFor3DPrinting", "individualParts"} or spec.get("brepAsset") != "source.brep":
+    if set(spec) - {"operation", "brepAsset", "solidIndices", "solidColors", "arrangeFor3DPrinting", "individualParts", "solidTransforms"} or spec.get("brepAsset") != "source.brep":
         raise ModelError("STEP export requires the private source.brep asset.")
     arrange = spec.get("arrangeFor3DPrinting", False)
     if not isinstance(arrange, bool):
         raise ModelError("The 3D printing arrangement option must be true or false.")
     shape = read_brep(spec, asset_directory, cq, threads)
-    solids = shape.Solids()
+    solids = posed_solids(shape.Solids(), spec.get("solidTransforms", []), cq)
     indices = selected_solids(spec, solids)
     colors = export_solid_colors(spec.get("solidColors", []), len(solids))
     if not indices:
@@ -2699,36 +2722,58 @@ def export_brep(spec, asset_directory, output, cq, threads):
 
 
 def measure_brep(spec, asset_directory, cq, threads):
-    """Exact minimum separation of two bounded native entities.
+    """Exact selected properties and separation on native rigidly posed solids.
 
     The app supplies precomputed single-item properties. This operation does
     not mesh, execute programs, or serialize STEP; all closest points come from
     OpenCascade's extrema solver on the selected trimmed topology.
     """
-    if set(spec) - {"operation", "brepAsset", "features", "solidIndices"}:
+    if set(spec) - {"operation", "brepAsset", "features", "solidIndices", "solidTransforms"}:
         raise ModelError("The measurement request contains unsupported fields.")
     shape = read_brep(spec, asset_directory, cq, threads)
-    solids = shape.Solids()
+    posed = "solidTransforms" in spec
+    solids = posed_solids(_shape_entities(shape, "Solid"), spec.get("solidTransforms", []), cq)
     indices = selected_solids(spec, solids, required=True)
     features = spec.get("features", [])
-    if not isinstance(features, list) or len(features) > 2:
-        raise ModelError("Choose two items for an exact distance measurement.")
-    entities = []
+    if not isinstance(features, list) or len(features) > (8192 if posed else 2):
+        raise ModelError("The selected measurement features are invalid or too numerous.")
+    entities, topology_maps = [], {}
     seen = set()
     for feature in features:
         if not isinstance(feature, dict) or set(feature) != {"kind", "solidIndex", "localIndex"}:
             raise ModelError("The selected topology reference is invalid.")
         kind, owner, local = feature["kind"], feature["solidIndex"], feature["localIndex"]
-        if (kind not in {"vertex", "edge", "face"} or isinstance(owner, bool) or not isinstance(owner, int)
+        if (kind not in ("vertex", "edge", "face") or isinstance(owner, bool) or not isinstance(owner, int)
                 or not 0 <= owner < len(solids) or isinstance(local, bool) or not isinstance(local, int)):
             raise ModelError("The selected topology reference is invalid.")
-        values = {"vertex": solids[owner].Vertices, "edge": solids[owner].Edges, "face": solids[owner].Faces}[kind]()
+        key = kind, owner
+        if key not in topology_maps:
+            topology_maps[key] = _shape_entities(solids[owner], kind.capitalize())
+        values = topology_maps[key]
         if not 0 <= local < len(values) or (kind, owner, local) in seen:
             raise ModelError("The selected topology reference is missing or duplicated.")
         seen.add((kind, owner, local))
         entities.append(values[local])
     entities.extend(solids[index] for index in indices)
+    report = {"title": "Measurements", "metrics": [], "features": features, "solidIndices": indices,
+              "solids": len(solids), "faces": len(_shape_entities(shape, "Face"))}
+    if posed:
+        if not entities:
+            raise ModelError("Select a part, face, edge, or vertex to measure.")
+        topology = {"vertices": [], "edges": [], "faces": [],
+                    "parts": [part_metadata(solids[index], index) for index in indices]}
+        for feature, entity in zip(features, entities):
+            kind, owner, local = feature["kind"], feature["solidIndex"], feature["localIndex"]
+            if kind == "vertex":
+                topology["vertices"].append({"id": feature_id(kind, owner, local), "position": list(entity.toTuple())})
+            elif kind == "edge":
+                topology["edges"].append(edge_metadata(entity, owner, local, []))
+            else:
+                topology["faces"].append(face_metadata(entity, owner, local))
+        report["topology"] = topology
     if len(entities) != 2:
+        if posed:
+            return report
         raise ModelError("Choose two items for an exact distance measurement.")
     from OCP.BRepExtrema import BRepExtrema_DistShapeShape
     extrema = BRepExtrema_DistShapeShape()
@@ -2782,8 +2827,8 @@ def measure_brep(spec, asset_directory, cq, threads):
         delta = [b - a for a, b in zip(*centers)]
         metric("pair:centerDistance", "Circle center distance", [math.sqrt(sum(value * value for value in delta))], "mm")
         metric("pair:centerDelta", "Circle center delta X, Y, Z", delta, "mm")
-    return {"title": "Measurements", "metrics": metrics, "features": features, "solidIndices": indices,
-            "closestPoints": [first, second], "solids": len(solids), "faces": len(shape.Faces())}
+    report.update(metrics=metrics, closestPoints=[first, second])
+    return report
 
 
 def runtime_info(cq):
@@ -2809,6 +2854,7 @@ def validation_hash(spec, directory, cq):
         digest.update(len(data).to_bytes(8, "big"))
         digest.update(data)
     add(Path(__file__).read_bytes())
+    add(Path(assembly_motion.__file__).read_bytes())
     add(json.dumps(runtime_info(cq), sort_keys=True, separators=(",", ":")).encode())
     # Match the app's validated-preview reuse contract: display metadata can
     # change between a successful candidate and its final saved revision.

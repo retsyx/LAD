@@ -20,6 +20,23 @@ def script_spec(script):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_validation_receipt_includes_the_motion_adapter_rules(self):
+        import cadquery as cq
+        import worker
+        spec = script_spec("result = cq.Solid.makeBox(1,2,3)")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = worker.validation_hash(spec, root, cq)
+            read = Path.read_bytes
+            adapter = Path(worker.__file__).with_name("assembly_motion.py")
+
+            def changed(path):
+                data = read(path)
+                return data + b"\n# Updated mate validation\n" if path == adapter else data
+
+            with mock.patch.object(Path, "read_bytes", changed):
+                self.assertNotEqual(worker.validation_hash(spec, root, cq), original)
+
     def test_validation_receipt_reuses_checks_and_invalidates_changed_program(self):
         import worker
         import OCP.BRepCheck
