@@ -118,8 +118,9 @@ enum CADAgentRenderer {
         }
         try Task.checkCancellation()
         let metadata = view.agentCaptureMetadata
+        let batches = view.captureSilhouetteBatches(outputSize: CGSize(width: width, height: height))
         let snapshot = try CADAgentSceneSnapshot(scene: sourceScene, camera: sourceCamera,
-            technique: view.technique, width: width, height: height)
+            technique: view.technique, silhouetteBatches: batches, width: width, height: height)
         let writing = Task.detached(priority: .userInitiated) {
             try snapshot.pngData()
         }
@@ -150,15 +151,22 @@ private final class CADAgentSceneSnapshot: @unchecked Sendable {
     let height: Int
 
     @MainActor
-    init(scene source: SCNScene, camera sourceCamera: SCNNode, technique: SCNTechnique?, width: Int, height: Int) throws {
+    init(scene source: SCNScene, camera sourceCamera: SCNNode, technique: SCNTechnique?,
+         silhouetteBatches: [CADSilhouetteBatching.Batch], width: Int, height: Int) throws {
         let scene = SCNScene()
         scene.background.contents = source.background.contents
         scene.lightingEnvironment.contents = source.lightingEnvironment.contents
         scene.lightingEnvironment.intensity = source.lightingEnvironment.intensity
         let root = source.rootNode.clone()
         var copiedCamera: SCNNode?
+        var copiedMaskContainer: SCNNode?
+        var copiedMasks: [String: SCNNode] = [:]
         func isolate(_ original: SCNNode, _ copy: SCNNode) {
             if original === sourceCamera { copiedCamera = copy }
+            if let name = original.name, name.hasPrefix("ladHighlightMask") {
+                if name == CADHighlightTechnique.silhouetteContainerName { copiedMaskContainer = copy }
+                else { copiedMasks[name] = copy }
+            }
             if original.name == CADHighlightTechnique.completionNodeName {
                 // Independent captures must not acknowledge a live viewport.
                 copy.rendererDelegate = nil
@@ -177,13 +185,38 @@ private final class CADAgentSceneSnapshot: @unchecked Sendable {
             }
         }
         isolate(source.rootNode, root)
+        if let container = copiedMaskContainer {
+            // Output pixels determine padding and which masks can share a pass.
+            // Regroup only the cloned slots, keeping live attachment ownership
+            // and technique capacity untouched by independent captures.
+            var masks: [Int: SCNNode] = [:]
+            for item in silhouetteBatches.flatMap(\.items) {
+                if let mask = copiedMasks[CADHighlightTechnique.silhouetteMaskNodeName(item)] {
+                    masks[item] = mask
+                    container.addChildNode(mask)
+                }
+            }
+            for child in container.childNodes where child.name?.hasPrefix("ladHighlightSilhouette") == true {
+                child.removeFromParentNode()
+            }
+            for (index, batch) in silhouetteBatches.enumerated() {
+                let node = SCNNode()
+                node.name = CADHighlightTechnique.silhouetteNodeName(index)
+                node.categoryBitMask = CADHighlightTechnique.silhouetteCategory
+                for item in batch.items { if let mask = masks[item] { node.addChildNode(mask) } }
+                container.addChildNode(node)
+            }
+        }
         scene.rootNode.addChildNode(root)
         guard let camera = copiedCamera else {
             throw LADError.message("The design camera is unavailable for capture.")
         }
         self.scene = scene
         self.camera = camera
-        self.technique = technique.flatMap { CADHighlightTechnique.copy($0) }
+        self.technique = technique.flatMap { CADHighlightTechnique.copy($0, silhouetteCount: silhouetteBatches.count) }
+        if let technique = self.technique {
+            CADHighlightTechnique.setSilhouetteBounds(silhouetteBatches.map { $0.rect.vector }, on: technique)
+        }
         self.width = width
         self.height = height
     }

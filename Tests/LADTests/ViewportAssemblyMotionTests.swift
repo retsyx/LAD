@@ -53,8 +53,10 @@ final class ViewportAssemblyMotionTests: XCTestCase {
             XCTAssertEqual(node.simdTransform.columns.3, SIMD4(3, -2, 0, 1))
         }
         for index in 0..<2 {
-            XCTAssertEqual(try node(CADHighlightTechnique.silhouetteNodeName(index), in: view).simdTransform.columns.3,
-                           SIMD4(3, -2, 0, 1), "Part and face DRAW_NODE masks must use the body's current pose.")
+            let batch = try node(CADHighlightTechnique.silhouetteNodeName(index), in: view)
+            let mask = try XCTUnwrap(batch.childNodes.first { $0.geometry != nil })
+            XCTAssertEqual(mask.simdWorldTransform.columns.3,
+                           SIMD4(3, -2, 0, 1), "Part and face masks inside DRAW_NODE batches must use the body's current pose.")
         }
         XCTAssertEqual(try node("solid:0", in: view).simdTransform, matrix_identity_float4x4)
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,

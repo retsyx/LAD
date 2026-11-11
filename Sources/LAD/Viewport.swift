@@ -153,6 +153,9 @@ final class CADSceneView: SCNView {
     private let silhouetteNode = SCNNode()
     private var partSilhouettes = [Int: SCNNode]()
     private var silhouetteSlots = [SCNNode]()
+    private var silhouetteBatches = [SCNNode]()
+    private var silhouetteInputBounds = [[Double]]()
+    private var silhouetteBatchBounds = [SIMD4<Float>]()
     private var rig = CameraRig()
     private var cameraTransitionTask: Task<Void, Never>?
     private var cameraTransitionID: UUID?
@@ -197,6 +200,7 @@ final class CADSceneView: SCNView {
     private var originalMeshBounds: [Double] = []
     private var faceIDsBySolid = [Int: [CADFeatureID?]]()
     private var faceIndices = [CADFeatureID: [Int32]]()
+    private var faceBounds = [CADFeatureID: CADSilhouetteBatching.Bounds]()
     private var meshSources = [SCNGeometrySource]()
     private var featureNodes = [CADFeatureID: SCNNode]()
     private var featureCreationOrder = [CADFeatureID]()
@@ -222,6 +226,7 @@ final class CADSceneView: SCNView {
     private let redrawDriver = ViewportRedrawDriver()
     private var opaqueHighlightTechnique: SCNTechnique?
     private var translucentHighlightTechnique: SCNTechnique?
+    private var installedHighlightTemplate: SCNTechnique?
     private var highlightSilhouetteCount = 0
     private var techniqueFrameObserver: ViewportTechniqueFrameObserver?
     private var redrawDelegateInstalled = false
@@ -353,6 +358,7 @@ final class CADSceneView: SCNView {
             scene.rootNode.addChildNode(completion)
             // DRAW_NODE resolves its named node when the technique is set.
             technique = highlightTechnique
+            installedHighlightTemplate = highlightTechnique
         }
         preferredFramesPerSecond = 60
         cameraNode.camera = SCNCamera()
@@ -369,6 +375,7 @@ final class CADSceneView: SCNView {
         scene.rootNode.addChildNode(edgeNode)
         scene.rootNode.addChildNode(gridNode)
         scene.rootNode.addChildNode(featureNode)
+        silhouetteNode.name = CADHighlightTechnique.silhouetteContainerName
         scene.rootNode.addChildNode(silhouetteNode)
         modelNode.categoryBitMask = 1
         edgeNode.categoryBitMask = 2
@@ -551,13 +558,19 @@ final class CADSceneView: SCNView {
             groups[solid, default: []].append(contentsOf: triangle.map(Int32.init))
             let feature = faceID(forTriangle: index, in: mesh, solid: solid)
             faceIDsBySolid[solid, default: []].append(feature)
-            if let feature { faceIndices[feature, default: []].append(contentsOf: triangle.map(Int32.init)) }
+            if let feature {
+                faceIndices[feature, default: []].append(contentsOf: triangle.map(Int32.init))
+                for vertex in triangle { faceBounds[feature, default: .init()].include(mesh.vertices[vertex]) }
+            }
         }
         modelNode.childNodes.forEach { $0.removeFromParentNode() }
         modelNode.geometry = nil
         silhouetteNode.childNodes.forEach { $0.removeFromParentNode() }
         partSilhouettes.removeAll()
         silhouetteSlots.removeAll()
+        silhouetteBatches.removeAll()
+        silhouetteInputBounds.removeAll()
+        silhouetteBatchBounds.removeAll()
         highlightSilhouetteCount = -1
         for solid in groups.keys.sorted() {
             let geometry = SCNGeometry(sources: [source, normalSource],
@@ -620,6 +633,9 @@ final class CADSceneView: SCNView {
         silhouetteNode.childNodes.forEach { $0.removeFromParentNode() }
         partSilhouettes.removeAll()
         silhouetteSlots.removeAll()
+        silhouetteBatches.removeAll()
+        silhouetteInputBounds.removeAll()
+        silhouetteBatchBounds.removeAll()
         highlightSilhouetteCount = -1
         ownedEdgeSolids.removeAll()
         hasOwnedEdges = false
@@ -695,6 +711,7 @@ final class CADSceneView: SCNView {
         highlightedSelection.removeAll()
         faceIDsBySolid.removeAll()
         faceIndices.removeAll()
+        faceBounds.removeAll()
         meshSources.removeAll()
         topology = nil
     }
@@ -843,22 +860,30 @@ final class CADSceneView: SCNView {
 
     private func updateSilhouettes(active: [CADFeatureID]) {
         var masks = [SCNNode]()
+        var bounds = [[Double]]()
         for (solid, node) in partSilhouettes {
             let hidden = !selectedSolids.contains(solid) || hiddenSolids.contains(solid)
             if node.isHidden != hidden { node.isHidden = hidden }
         }
-        masks = selectedSolids.sorted().compactMap { hiddenSolids.contains($0) ? nil : partSilhouettes[$0] }
+        for solid in selectedSolids.sorted() where !hiddenSolids.contains(solid) {
+            if let mask = partSilhouettes[solid] {
+                masks.append(mask); bounds.append(solidBounds[solid] ?? originalMeshBounds)
+            }
+        }
         for feature in active where feature.kind == .face && !hiddenSolids.contains(feature.solidIndex) {
             if let node = featureNodes[feature]?.childNodes.first(where: {
                 $0.categoryBitMask == CADHighlightTechnique.silhouetteCategory
-            }) { masks.append(node) }
+            }) {
+                masks.append(node)
+                bounds.append(faceBounds[feature]?.values ?? solidBounds[feature.solidIndex] ?? originalMeshBounds)
+            }
         }
-        // DRAW_NODE binds an actual node when the technique is installed.
-        // Permanent slots keep those bindings stable as hover targets change.
+        // Slots share immutable geometry and mutable style with their source.
+        // Permanent batch roots, rather than individual items, own DRAW_NODE.
         while silhouetteSlots.count < masks.count {
             let slot = SCNNode()
             slot.categoryBitMask = CADHighlightTechnique.silhouetteCategory
-            slot.name = CADHighlightTechnique.silhouetteNodeName(silhouetteSlots.count)
+            slot.name = CADHighlightTechnique.silhouetteMaskNodeName(silhouetteSlots.count)
             silhouetteNode.addChildNode(slot)
             silhouetteSlots.append(slot)
         }
@@ -874,7 +899,73 @@ final class CADSceneView: SCNView {
                 (mask?.parent !== silhouetteNode && mask?.parent?.isHidden == true)
             if slot.isHidden != hidden { slot.isHidden = hidden }
         }
-        updateHighlightTechnique(silhouetteCount: masks.count)
+        silhouetteInputBounds = bounds
+        refreshSilhouetteBatches()
+    }
+
+    /// Capture layout is computed without changing live nodes or attachments.
+    func captureSilhouetteBatches(outputSize: CGSize) -> [CADSilhouetteBatching.Batch] {
+        projectedSilhouetteBatches(outputSize: outputSize)
+    }
+
+    private func projectedSilhouetteBatches(outputSize: CGSize?) -> [CADSilhouetteBatching.Batch] {
+        let size = outputSize ?? convertToBacking(bounds).size
+        let pixels = SIMD2(Double(size.width), Double(size.height))
+        let projection = assemblyGrabProjection(viewportSize: outputSize)
+        let rectangles: [CADSilhouetteBatching.Rect?] = silhouetteInputBounds.enumerated().map { index, bounds in
+            let slot = silhouetteSlots[index]
+            guard !slot.isHidden else { return nil }
+            guard let projection else { return .full }
+            return CADSilhouetteBatching.project(bounds: bounds, transform: slot.simdWorldTransform,
+                                                 projection: projection, pixels: pixels)
+        }
+        return CADSilhouetteBatching.make(rectangles)
+    }
+
+    func refreshSilhouetteBatches() {
+        let batches = projectedSilhouetteBatches(outputSize: nil)
+        // Keep a small reusable capacity instead of reconstructing techniques
+        // whenever selection or camera movement changes the overlap count.
+        var capacity = max(1, silhouetteBatches.count)
+        while capacity < batches.count { capacity *= 2 }
+        if batches.isEmpty && silhouetteBatches.isEmpty { capacity = 0 }
+        // Keep hover-sized allocations warm, but do not retain thousands of
+        // dormant passes after an overlapping assembly selection is cleared.
+        if capacity > max(8, batches.count * 4) {
+            capacity = batches.isEmpty ? 0 : 1
+            while capacity < batches.count { capacity *= 2 }
+        }
+        if capacity < silhouetteBatches.count {
+            for batch in silhouetteBatches[capacity...] {
+                for slot in batch.childNodes { silhouetteNode.addChildNode(slot) }
+                batch.removeFromParentNode()
+            }
+            silhouetteBatches.removeSubrange(capacity...)
+        }
+        while silhouetteBatches.count < capacity {
+            let batch = SCNNode()
+            batch.categoryBitMask = CADHighlightTechnique.silhouetteCategory
+            batch.name = CADHighlightTechnique.silhouetteNodeName(silhouetteBatches.count)
+            silhouetteNode.addChildNode(batch)
+            silhouetteBatches.append(batch)
+        }
+        var activeSlots = Set<Int>()
+        silhouetteBatchBounds = Array(repeating: .zero, count: capacity)
+        for (index, batch) in batches.enumerated() {
+            silhouetteBatchBounds[index] = batch.rect.vector
+            let parent = silhouetteBatches[index]
+            for item in batch.items {
+                let slot = silhouetteSlots[item]
+                if slot.parent !== parent { parent.addChildNode(slot) }
+                activeSlots.insert(item)
+            }
+        }
+        for (index, slot) in silhouetteSlots.enumerated() where !activeSlots.contains(index) {
+            // Offscreen and removed slots must not remain in a batch's draw.
+            if slot.parent !== silhouetteNode { silhouetteNode.addChildNode(slot) }
+        }
+        for (index, batch) in silhouetteBatches.enumerated() { batch.isHidden = index >= batches.count }
+        updateHighlightTechnique(silhouetteCount: capacity)
     }
 
     private func updateHighlightTechnique(silhouetteCount: Int) {
@@ -894,11 +985,19 @@ final class CADSceneView: SCNView {
             translucentHighlightTechnique = make(translucent: true)
         }
         guard let next = mode == .translucent ? translucentHighlightTechnique ?? opaqueHighlightTechnique : opaqueHighlightTechnique else { return }
-        CADHighlightTechnique.setViewportHeight(bounds.height, on: next)
+        // SCNView copies its technique on assignment. Track the template we
+        // installed, then update the live copy instead of repeatedly replacing
+        // its attachments or changing uniforms on an unrendered template.
+        if installedHighlightTemplate !== next {
+            technique = next
+            installedHighlightTemplate = next
+        }
+        guard let installed = technique else { return }
+        CADHighlightTechnique.setViewportHeight(bounds.height, on: installed)
+        CADHighlightTechnique.setSilhouetteBounds(silhouetteBatchBounds, on: installed)
         CADHighlightTechnique.setVertexHighlightsEnabled(highlightedFeatures.contains {
             $0.kind == .vertex && !hiddenSolids.contains($0.solidIndex)
-        }, on: next)
-        if technique !== next { technique = next }
+        }, on: installed)
     }
 
     private func validFeaturePoint(_ point: [Double]) -> Bool {
@@ -1194,6 +1293,7 @@ final class CADSceneView: SCNView {
         cameraNode.camera?.usesOrthographicProjection = rig.usesOrthographicProjection
         cameraNode.camera?.orthographicScale = pose.orthographicScale
         SCNTransaction.commit()
+        refreshSilhouetteBatches()
         notifyCameraOrientation()
         requestRedraw()
     }
@@ -1220,6 +1320,7 @@ final class CADSceneView: SCNView {
             cameraNode.camera?.orthographicScale = rig.orthographicScale
         }
         SCNTransaction.commit()
+        refreshSilhouetteBatches()
         notifyCameraOrientation()
         requestRedraw()
     }
@@ -1234,6 +1335,7 @@ final class CADSceneView: SCNView {
             projectedFeatures = nil
             setHoveredFeature(nil)
             updateStrokeViewportHeight()
+            refreshSilhouetteBatches()
         }
         if needsInitialFit, bounds.width >= 10, bounds.height >= 10 {
             cancelCameraTransition()
@@ -1242,6 +1344,12 @@ final class CADSceneView: SCNView {
             applyCamera()
         }
         if sizeChanged { requestRedraw() }
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        refreshSilhouetteBatches()
+        requestRedraw()
     }
 
     /// A paused Metal drawable may take longer than a timer to wake. Keep the
@@ -1673,9 +1781,10 @@ final class CADSceneView: SCNView {
 
     /// Freeze actual camera XY/w projection once for a grab. Camera-local
     /// axes preserve custom roll as well as the ordinary orbit camera basis.
-    private func assemblyGrabProjection() -> AssemblyGrabProjection? {
+    private func assemblyGrabProjection(viewportSize: CGSize? = nil) -> AssemblyGrabProjection? {
         let node = pointOfView ?? cameraNode
-        guard let camera = node.camera, bounds.width > 0, bounds.height > 0 else { return nil }
+        let size = viewportSize ?? bounds.size
+        guard let camera = node.camera, size.width > 0, size.height > 0 else { return nil }
         let transform = node.simdWorldTransform
         let right = SIMD3<Double>(SIMD3(transform.columns.0.x, transform.columns.0.y, transform.columns.0.z))
         let up = SIMD3<Double>(SIMD3(transform.columns.1.x, transform.columns.1.y, transform.columns.1.z))
@@ -1683,7 +1792,7 @@ final class CADSceneView: SCNView {
         let position = SIMD3<Double>(SIMD3(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z))
         let vertical = camera.usesOrthographicProjection ? camera.orthographicScale
             : tan(Double(camera.fieldOfView) * .pi / 360)
-        let horizontal = vertical * Double(bounds.width / bounds.height)
+        let horizontal = vertical * Double(size.width / size.height)
         guard vertical.isFinite, horizontal.isFinite, vertical > 0, horizontal > 0 else { return nil }
         let x = right / horizontal, y = up / vertical
         let w = camera.usesOrthographicProjection ? SIMD3<Double>.zero : -backward
@@ -1692,7 +1801,7 @@ final class CADSceneView: SCNView {
                       y.x, y.y, y.z, -simd_dot(y, position),
                       0, 0, 0, 0, w.x, w.y, w.z, offset]
         guard matrix.allSatisfy(\.isFinite) else { return nil }
-        return AssemblyGrabProjection(worldToClip: matrix, viewportSize: [Double(bounds.width), Double(bounds.height)])
+        return AssemblyGrabProjection(worldToClip: matrix, viewportSize: [Double(size.width), Double(size.height)])
     }
 
     private func resetNavigationGesture() {

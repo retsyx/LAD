@@ -12,10 +12,13 @@ enum CADHighlightTechnique {
     static let silhouetteCategory = 128
     static let completionNodeName = "ladHighlightFrameCompleted"
     static func silhouetteNodeName(_ index: Int) -> String { "ladHighlightSilhouette\(index)" }
+    static func silhouetteMaskNodeName(_ index: Int) -> String { "ladHighlightMask\(index)" }
+    static let silhouetteContainerName = "ladHighlightMasks"
     private static let heightKey = "cadReferenceHeight"
     private static let verticesKey = "cadVertexHighlightsEnabled"
     private static let translucentKey = "cadTranslucentFaces"
     private static let colorKeys = ["cadSelectedColor", "cadHoverColor", "cadHoverHaloColor", "cadInkColor"]
+    private static func silhouetteBoundsKey(_ index: Int) -> String { "cadSilhouetteBounds\(index)" }
     private static var cachedLibrary: (device: UInt64, library: any MTLLibrary)?
 
     static func make(viewportHeight: CGFloat, selected: NSColor, hover: NSColor,
@@ -33,7 +36,16 @@ enum CADHighlightTechnique {
         for (key, color) in zip(colorKeys, [selected, hover, hoverHalo, ink]) {
             technique.setValue(linearColor(color), forKey: key)
         }
+        setSilhouetteBounds(Array(repeating: SIMD4(-1, -1, 1, 1), count: max(0, silhouetteCount)), on: technique)
         return technique
+    }
+
+    static func setSilhouetteBounds(_ bounds: [SIMD4<Float>], on technique: SCNTechnique) {
+        for (index, bounds) in bounds.enumerated() {
+            let value = NSValue(scnVector4: SCNVector4(bounds.x, bounds.y, bounds.z, bounds.w))
+            let key = silhouetteBoundsKey(index)
+            if (technique.value(forKey: key) as? NSValue) != value { technique.setValue(value, forKey: key) }
+        }
     }
 
     static func setViewportHeight(_ height: CGFloat, on technique: SCNTechnique) {
@@ -52,10 +64,19 @@ enum CADHighlightTechnique {
 
     /// Reconstruct targets for the independent renderer rather than sharing
     /// mutable per-view render attachments with the live viewport.
-    static func copy(_ source: SCNTechnique) -> SCNTechnique? {
-        guard let technique = SCNTechnique(dictionary: source.dictionaryRepresentation) else { return nil }
+    static func copy(_ source: SCNTechnique, silhouetteCount: Int? = nil) -> SCNTechnique? {
+        let dictionary: [String: Any]
+        if let silhouetteCount {
+            let sequence = source.dictionaryRepresentation["sequence"] as? [String] ?? []
+            dictionary = definition(frameCompletion: sequence.contains("cadCompleted"),
+                translucentFaces: (source.value(forKey: translucentKey) as? NSNumber)?.boolValue ?? false,
+                silhouetteCount: silhouetteCount)
+        } else { dictionary = source.dictionaryRepresentation }
+        guard let technique = SCNTechnique(dictionary: dictionary) else { return nil }
         technique.library = source.library
-        for key in [heightKey, verticesKey, translucentKey] + colorKeys {
+        let symbols = source.dictionaryRepresentation["symbols"] as? [String: Any] ?? [:]
+        let boundsKeys = silhouetteCount == nil ? symbols.keys.filter { $0.hasPrefix("cadSilhouetteBounds") } : []
+        for key in [heightKey, verticesKey, translucentKey] + colorKeys + boundsKeys {
             if let value = source.value(forKey: key) { technique.setValue(value, forKey: key) }
         }
         return technique
@@ -151,26 +172,33 @@ enum CADHighlightTechnique {
         ]
         var silhouettePasses = [String]()
         for index in 0..<max(0, silhouetteCount) {
-            let projection = "cadSilhouette\(index)", contour = "cadContour\(index)"
+            let projection = "cadSilhouette\(index)", contour = "cadContour\(index)", clear = "cadSilhouetteClear\(index)"
+            let boundsKey = silhouetteBoundsKey(index)
+            symbols[boundsKey] = ["type": "vec4"]
+            passes[clear] = ["draw": "DRAW_QUAD", "samples": 4,
+                "metalVertexShader": "cad_silhouette_quad", "metalFragmentShader": "cad_silhouette_clear",
+                "inputs": ["cadMaskBounds": boundsKey], "outputs": ["color": "cadSilhouetteMask"],
+                "colorStates": ["clear": false], "blendStates": ["enable": false],
+                "depthStates": ["enableRead": false, "enableWrite": false]]
             let mask: [String: Any] = ["draw": "DRAW_NODE", "node": silhouetteNodeName(index),
                 "includeCategoryMask": silhouetteCategory, "cullMode": "none",
                 "outputs": ["color": "cadSilhouetteMask"], "samples": 4,
-                "colorStates": ["clear": true, "clearColor": "0 0 0 0"],
-                "depthStates": ["enableRead": false, "enableWrite": false],
-                "blendStates": ["enable": true, "colorSrc": "one", "colorDst": "one", "colorOp": "max",
-                                "alphaSrc": "one", "alphaDst": "one", "alphaOp": "max"]]
-            // Each item's complete projection owns its contour. Reusing the
-            // scratch mask preserves nested/overlapping item outlines without
-            // exposing any internal triangle or part edges.
-            passes[projection] = mask
-            passes[contour] = ["draw": "DRAW_QUAD", "samples": 1,
-                "metalVertexShader": "cad_highlight_quad", "metalFragmentShader": "cad_highlight_contours",
-                "inputs": ["cadSurfaces": nearest("cadSilhouetteMask")], "outputs": ["color": "cadSeedMask"],
                 "colorStates": ["clear": false],
                 "depthStates": ["enableRead": false, "enableWrite": false],
                 "blendStates": ["enable": true, "colorSrc": "one", "colorDst": "one", "colorOp": "max",
                                 "alphaSrc": "one", "alphaDst": "one", "alphaOp": "max"]]
-            silhouettePasses += [projection, contour]
+            // Disjoint items share a mask; overlapping items use another batch.
+            // Clear and inspect only its padded projected bounds. Empty retained
+            // batches have degenerate quads and never clear the whole attachment.
+            passes[projection] = mask
+            passes[contour] = ["draw": "DRAW_QUAD", "samples": 1,
+                "metalVertexShader": "cad_silhouette_quad", "metalFragmentShader": "cad_highlight_contours",
+                "inputs": ["cadSurfaces": nearest("cadSilhouetteMask"), "cadMaskBounds": boundsKey], "outputs": ["color": "cadSeedMask"],
+                "colorStates": ["clear": false],
+                "depthStates": ["enableRead": false, "enableWrite": false],
+                "blendStates": ["enable": true, "colorSrc": "one", "colorDst": "one", "colorOp": "max",
+                                "alphaSrc": "one", "alphaDst": "one", "alphaOp": "max"]]
+            silhouettePasses += [clear, projection, contour]
         }
         return [
             "sequence": (translucentFaces ? ["cadBackground", "cadVisibility", "cadAccumulate", "cadReveal"] : ["cadBase"])
@@ -199,6 +227,7 @@ enum CADHighlightTechnique {
     using namespace metal;
     struct CADQuadInput { float3 position [[attribute(0)]]; };
     struct CADQuadOutput { float4 position [[position]]; };
+    struct CADSilhouetteParameters { float4 cadMaskBounds; };
     struct CADHighlightParameters {
         float cadReferenceHeight;
         float cadVertexHighlightsEnabled;
@@ -226,6 +255,14 @@ enum CADHighlightTechnique {
         out.position = float4(in.position, 1.0);
         return out;
     }
+    vertex CADQuadOutput cad_silhouette_quad(CADQuadInput in [[stage_in]],
+        constant CADSilhouetteParameters &params [[buffer(0)]]) {
+        CADQuadOutput out;
+        float2 point = mix(params.cadMaskBounds.xy, params.cadMaskBounds.zw, (in.position.xy + 1.0f) * 0.5f);
+        out.position = float4(point, 0.0f, 1.0f);
+        return out;
+    }
+    fragment float4 cad_silhouette_clear() { return float4(0.0f); }
     fragment float4 cad_highlight_contours(
         CADQuadOutput in [[stage_in]],
         texture2d<float, access::read> cadSurfaces [[texture(0)]]) {
