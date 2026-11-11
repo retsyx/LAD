@@ -3,7 +3,6 @@ import XCTest
 
 final class PartSelectionTests: XCTestCase {
     func testRangeUsesNearestOppositeSelectionInEitherDirection() {
-        let tree = (0..<7).map { part("part-\($0)", $0) }
         let cases: [(clicked: Int, selected: Set<Int>, expected: [Int])] = [
             (4, [0, 6], [4, 5, 6]),
             (3, [0, 1, 6], [1, 2, 3]),
@@ -16,11 +15,14 @@ final class PartSelectionTests: XCTestCase {
             (0, [6], Array(0..<7)),
             (6, [0], Array(0..<7))
         ]
-        for item in cases {
-            let range = PartSelection.range(toggling: "part-\(item.clicked)", in: tree,
-                                            collapsedNodeIDs: [], selectedSolids: item.selected)
-            XCTAssertEqual(range.map(\.id), item.expected.map { "part-\($0)" },
-                           "clicked=\(item.clicked), selected=\(item.selected.sorted())")
+        for groups in [false, true] {
+            let tree = (0..<7).map { groups ? folder("row-\($0)", [part("child-\($0)", $0)]) : part("row-\($0)", $0) }
+            for item in cases {
+                let range = PartSelection.range(toggling: "row-\(item.clicked)", in: tree,
+                                                collapsedNodeIDs: [], selectedSolids: item.selected)
+                XCTAssertEqual(range.map(\.id), item.expected.map { "row-\($0)" },
+                               "folders=\(groups), clicked=\(item.clicked), selected=\(item.selected.sorted())")
+            }
         }
     }
 
@@ -35,8 +37,20 @@ final class PartSelectionTests: XCTestCase {
         XCTAssertEqual(range("before", selected: [3]), ["before", "first"])
         XCTAssertEqual(range("after", selected: [0]), ["before", "first", "second", "after"])
         XCTAssertEqual(range("before", selected: [1]), ["before"], "A collapsed child cannot anchor the range.")
-        XCTAssertEqual(range("expanded", selected: [0]), [], "Folder clicks retain their group toggle.")
+        XCTAssertEqual(range("expanded", selected: [0]), ["expanded"], "Part selection does not anchor a folder range.")
+        XCTAssertEqual(range("expanded", selected: [1]), ["collapsed", "expanded"], "A collapsed folder can anchor a folder range.")
+        XCTAssertEqual(range("nested", selected: [1]), ["collapsed", "expanded", "nested"])
         XCTAssertEqual(range("missing", selected: [0]), [])
+    }
+
+    func testFolderRangeUsesExplicitSelectionForEmptyFolders() {
+        let tree = [folder("first", []), folder("middle", []), folder("last", [])]
+        XCTAssertEqual(PartSelection.range(toggling: "last", in: tree, collapsedNodeIDs: [],
+                                          selectedSolids: [], selectedNodeIDs: ["first"]).map(\.id),
+                       ["first", "middle", "last"])
+        XCTAssertEqual(PartSelection.range(toggling: "first", in: tree, collapsedNodeIDs: [],
+                                          selectedSolids: [], selectedNodeIDs: ["first", "middle"]).map(\.id),
+                       ["first", "middle", "last"])
     }
 
     func testPartWithOnlySomeSolidsSelectedIsAnUnselectedRangeBoundary() {

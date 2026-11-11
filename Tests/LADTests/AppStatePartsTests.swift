@@ -104,6 +104,58 @@ final class AppStatePartsTests: XCTestCase {
     }
 
     @MainActor
+    func testFolderRangeSelectsDescendantsAndPreservesPartsAndFoldersOutsideRange() {
+        let state = state()
+        let folders = (0..<5).map { index in
+            PartNode(id: "folder-\(index)", name: "Folder \(index)", solidIndices: [], children: [
+                PartNode(id: "first-\(index)", name: "First", solidIndices: [index * 2]),
+                PartNode(id: "second-\(index)", name: "Second", solidIndices: [index * 2 + 1])])
+        }
+        state.revisions[0].partLayout = PartLayout(nodes: folders + [PartNode(id: "loose", name: "Loose", solidIndices: [10])],
+                                                  collapsedNodeIDs: ["folder-4"])
+        state.selectPartNodes(["folder-0", "folder-4", "loose"])
+        state.togglePartNode("folder-3", extendingRange: true)
+        XCTAssertEqual(state.selectedSolids, [0, 1, 6, 7, 8, 9, 10])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["folder-0", "folder-3", "folder-4", "loose"])
+
+        state.selectedSolids.insert(4)
+        state.togglePartNode("folder-3", extendingRange: true)
+        XCTAssertEqual(state.selectedSolids, [0, 1, 8, 9, 10], "Deselect the partial folder boundary as well as the clicked folder.")
+        XCTAssertEqual(state.selectedPartNodeIDs, ["folder-0", "folder-4", "loose"])
+    }
+
+    @MainActor
+    func testShiftClickSelectsAndDeselectsEmptyFolderRanges() {
+        let state = state()
+        state.revisions[0].partLayout = PartLayout(nodes: ["first", "middle", "last"].map {
+            PartNode(id: $0, name: $0, solidIndices: [], children: [])
+        })
+        state.selectPartNodes(["first"])
+        state.togglePartNode("last", extendingRange: true)
+        XCTAssertEqual(state.selectedPartNodeIDs, ["first", "middle", "last"])
+        state.togglePartNode("last")
+        state.togglePartNode("first", extendingRange: true)
+        XCTAssertTrue(state.selectedPartNodeIDs.isEmpty)
+        XCTAssertTrue(state.selectedSolids.isEmpty)
+    }
+
+    @MainActor
+    func testFolderRangeDeselectsSelectedEmptyDescendantsInsideCollapsedFolders() {
+        let state = state()
+        state.revisions[0].partLayout = PartLayout(nodes: [
+            PartNode(id: "parent", name: "Parent", solidIndices: [], children: [
+                PartNode(id: "empty", name: "Empty", solidIndices: [], children: []),
+                PartNode(id: "part", name: "Part", solidIndices: [0])]),
+            PartNode(id: "next", name: "Next", solidIndices: [], children: []),
+            PartNode(id: "outside", name: "Outside", solidIndices: [], children: [])],
+            collapsedNodeIDs: ["parent"])
+        state.selectPartNodes(["empty", "part", "outside"])
+        state.togglePartNode("parent", extendingRange: true)
+        XCTAssertTrue(state.selectedSolids.isEmpty)
+        XCTAssertEqual(state.selectedPartNodeIDs, ["outside"])
+    }
+
+    @MainActor
     func testViewportSelectionMapsToPhysicalPartsAndRejectsInvalidIndices() {
         let state = state()
         state.selectParts([0, 2, 999])

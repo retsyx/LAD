@@ -1413,15 +1413,16 @@ final class AppState: ObservableObject {
         let tree = partTree
         let range = PartSelection.range(toggling: id, in: tree,
                                         collapsedNodeIDs: Set(selectedPartLayout.collapsedNodeIDs),
-                                        selectedSolids: selectedSolids)
+                                        selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs)
         guard let clicked = range.first(where: { $0.id == id }) else {
             selectPartNodes([id], extending: true)
             return
         }
-        let solids = Set(range.flatMap(\.solidIndices))
+        let solids = Set(range.flatMap(\.allSolidIndices))
         let ids = Set(range.map(\.id))
-        let deselecting = Set(clicked.solidIndices).isSubset(of: selectedSolids)
-        let preferred = deselecting ? selectedPartNodeIDs.subtracting(ids) : selectedPartNodeIDs.union(ids)
+        let deselecting = PartSelectionPresentation(solidIndices: clicked.allSolidIndices, selectedSolids: selectedSolids,
+                                                   featureSelectedSolids: [], explicitlySelected: selectedPartNodeIDs.contains(id)).isFull
+        let preferred = deselecting ? selectedPartNodeIDs.subtracting(range.flatMap(\.allNodeIDs)) : selectedPartNodeIDs.union(ids)
         if deselecting { selectedSolids.subtract(solids) }
         else { selectedSolids.formUnion(solids) }
         selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: preferred, in: tree)

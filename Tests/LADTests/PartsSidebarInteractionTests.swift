@@ -113,6 +113,43 @@ final class PartsSidebarInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testShiftClickSelectsRenderedFolderRangeInEitherDirection() async throws {
+        let fixture = try Fixture(separateFolders: true)
+        defer { fixture.cleanUp() }
+        let window = makeWindow(state: fixture.state)
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+        let rowIDs = ["case", "base", "cover", "lid", "pcb", "board"]
+
+        for (selected, clicked) in [("case", "pcb"), ("pcb", "case")] {
+            fixture.state.selectPartNodes([selected])
+            try click(try await rowFrames(in: host, nodeIDs: rowIDs)[clicked], in: host, modifiers: .shift)
+            try await assertSelection([0, 1, 2], nodeIDs: ["case", "cover", "pcb"], state: fixture.state, in: host)
+            XCTAssertEqual(fixture.state.measurementReport?.solidIndices, [0, 1, 2])
+        }
+        XCTAssertTrue(fixture.state.hiddenSolids.isEmpty)
+        XCTAssertTrue(["case", "cover", "pcb"].allSatisfy(fixture.state.isPartFolderExpanded))
+    }
+
+    @MainActor
+    func testShiftClickDeselectsRenderedFolderRangeInEitherDirection() async throws {
+        let fixture = try Fixture(separateFolders: true)
+        defer { fixture.cleanUp() }
+        let window = makeWindow(state: fixture.state)
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+        let rowIDs = ["case", "base", "cover", "lid", "pcb", "board"]
+
+        for (selected, clicked) in [(Set(["case", "cover"]), "case"), (Set(["cover", "pcb"]), "pcb")] {
+            fixture.state.selectPartNodes(selected)
+            try click(try await rowFrames(in: host, nodeIDs: rowIDs)[clicked], in: host, modifiers: .shift)
+            try await assertSelection([], nodeIDs: [], state: fixture.state, in: host)
+            XCTAssertFalse(fixture.state.hasMeasurementSelection)
+            XCTAssertNil(fixture.state.measurementReport)
+        }
+    }
+
+    @MainActor
     func testNativeTextDropsMatchingPartIDsCannotReorganizeTheSidebar() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
@@ -181,7 +218,7 @@ final class PartsSidebarInteractionTests: XCTestCase {
     }
 
     @MainActor
-    private func rowFrames(in host: NSView) async throws -> [String: NSRect] {
+    private func rowFrames(in host: NSView, nodeIDs: [String] = ["case", "base", "lid", "board"]) async throws -> [String: NSRect] {
         let deadline = ContinuousClock.now + .seconds(5)
         while ContinuousClock.now < deadline {
             host.layoutSubtreeIfNeeded()
@@ -206,8 +243,8 @@ final class PartsSidebarInteractionTests: XCTestCase {
                 let buttons = rows.compactMap { $0.min { $0.width < $1.width } }.sorted {
                     host.isFlipped ? $0.midY < $1.midY : $0.midY > $1.midY
                 }
-                if buttons.count == 4 {
-                    return Dictionary(uniqueKeysWithValues: zip(["case", "base", "lid", "board"], buttons))
+                if buttons.count == nodeIDs.count {
+                    return Dictionary(uniqueKeysWithValues: zip(nodeIDs, buttons))
                 }
             }
             try await Task.sleep(for: .milliseconds(10))
@@ -216,7 +253,7 @@ final class PartsSidebarInteractionTests: XCTestCase {
             "\(String(describing: type(of: $0))) frame=\($0.frame) inHost=\(host.convert($0.bounds, from: $0)) label=\($0.accessibilityLabel() ?? "")"
         }.joined(separator: "\n")
         try? diagnostic.write(toFile: "/private/tmp/lad-parts-sidebar-native.txt", atomically: true, encoding: .utf8)
-        throw LADError.message("The native Parts pane did not expose the four rendered row buttons. See /private/tmp/lad-parts-sidebar-native.txt.")
+        throw LADError.message("The native Parts pane did not expose the expected rendered row buttons. See /private/tmp/lad-parts-sidebar-native.txt.")
     }
 
     @MainActor
@@ -297,7 +334,7 @@ final class PartsSidebarInteractionTests: XCTestCase {
         let state: AppState
         let previousPolicy: NSApplication.ActivationPolicy
 
-        init() throws {
+        init(separateFolders: Bool = false) throws {
             guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for native Parts interaction tests.") }
             let application = NSApplication.shared
             previousPolicy = application.activationPolicy()
@@ -305,7 +342,11 @@ final class PartsSidebarInteractionTests: XCTestCase {
             application.finishLaunching()
             directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-parts-interaction-\(UUID().uuidString)")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-            let parts = [PartNode(id: "case", name: "Case", solidIndices: [], children: [
+            let parts = separateFolders ? [
+                PartNode(id: "case", name: "Case", solidIndices: [], children: [PartNode(id: "base", name: "Base", solidIndices: [0])]),
+                PartNode(id: "cover", name: "Cover", solidIndices: [], children: [PartNode(id: "lid", name: "Lid", solidIndices: [1])]),
+                PartNode(id: "pcb", name: "PCB", solidIndices: [], children: [PartNode(id: "board", name: "Board", solidIndices: [2])])
+            ] : [PartNode(id: "case", name: "Case", solidIndices: [], children: [
                 PartNode(id: "base", name: "Base", solidIndices: [0]),
                 PartNode(id: "lid", name: "Lid", solidIndices: [1])]),
                 PartNode(id: "board", name: "Board", solidIndices: [2])]

@@ -1,35 +1,39 @@
 enum PartSelection {
-    /// Ranges follow the visible physical parts, without treating folder
-    /// headers as extra parts or reaching into collapsed folders.
+    /// Parts range across visible parts; folders range across visible folders.
+    /// Children of collapsed folders never serve as range boundaries.
     static func range(toggling id: String, in roots: [PartNode], collapsedNodeIDs: Set<String>,
-                      selectedSolids: Set<Int>) -> [PartNode] {
-        var parts = [PartNode]()
-        func appendParts(_ nodes: [PartNode]) {
+                      selectedSolids: Set<Int>, selectedNodeIDs: Set<String> = []) -> [PartNode] {
+        var visible = [PartNode]()
+        func appendVisible(_ nodes: [PartNode]) {
             for node in nodes {
-                if node.isGroup {
-                    if !collapsedNodeIDs.contains(node.id) { appendParts(node.children ?? []) }
-                } else if !node.solidIndices.isEmpty {
-                    parts.append(node)
+                visible.append(node)
+                if !collapsedNodeIDs.contains(node.id) {
+                    appendVisible(node.children ?? [])
                 }
             }
         }
-        appendParts(roots)
-        guard let clicked = parts.firstIndex(where: { $0.id == id }) else { return [] }
-        let selected = parts.map { Set($0.solidIndices).isSubset(of: selectedSolids) }
+        appendVisible(roots)
+        guard let clickedNode = visible.first(where: { $0.id == id }) else { return [] }
+        let rows = visible.filter { $0.isGroup == clickedNode.isGroup }
+        guard let clicked = rows.firstIndex(where: { $0.id == id }) else { return [] }
+        let selected = rows.map {
+            PartSelectionPresentation(solidIndices: $0.allSolidIndices, selectedSolids: selectedSolids,
+                                      featureSelectedSolids: [], explicitlySelected: selectedNodeIDs.contains($0.id)).isFull
+        }
         var boundary = clicked
-        for distance in 1..<parts.count {
-            // Prefer the preceding part when both boundaries are equally near.
+        for distance in 1..<rows.count {
+            // Prefer the preceding row when both boundaries are equally near.
             let before = clicked - distance, after = clicked + distance
             if before >= 0, selected[before] != selected[clicked] {
                 boundary = before
                 break
             }
-            if after < parts.count, selected[after] != selected[clicked] {
+            if after < rows.count, selected[after] != selected[clicked] {
                 boundary = after
                 break
             }
         }
-        return Array(parts[min(clicked, boundary)...max(clicked, boundary)])
+        return Array(rows[min(clicked, boundary)...max(clicked, boundary)])
     }
 
     /// Keeps complete selected folders when possible, and represents a partial
