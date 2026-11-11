@@ -24,7 +24,7 @@ final class CADAgentBridgeTests: XCTestCase {
         XCTAssertEqual(command, python)
         XCTAssertEqual(serverArgs, [server.path, "--workspace", workspace.path])
         XCTAssertEqual(values["mcp_servers.lad.required"], "true")
-        XCTAssertEqual(values["sandbox_workspace_write.network_access"], "true")
+        XCTAssertEqual(values["sandbox_workspace_write.network_access"], "false", "Network access follows allowed permission decisions.")
         XCTAssertEqual(values["sandbox_workspace_write.writable_roots"], "[]")
         XCTAssertFalse(args.contains("--dangerously-bypass-approvals-and-sandbox"))
         XCTAssertFalse(args.contains("danger-full-access"))

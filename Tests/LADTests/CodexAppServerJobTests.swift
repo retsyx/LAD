@@ -64,6 +64,42 @@ final class CodexAppServerJobTests: XCTestCase {
         XCTAssertEqual(capture.availability.last, false)
     }
 
+    func testAllowedPermissionContinuesTheSameThreadWithNetworkAccess() async throws {
+        let fixture = try AppServerFixture(onTurn: """
+        if params['sandboxPolicy']['networkAccess']:
+            finish({'network': True, 'continuation': params['input'][0]['text']})
+        """, onInterrupt: """
+        reply(rpc, {})
+        note('turn/completed', {'turn': {'id': 'turn-1', 'status': 'interrupted', 'items': []}})
+        """)
+        defer { fixture.remove() }
+        let capture = AppServerCapture()
+        let job = fixture.job(capture: capture)
+        defer { job.cancel() }
+        let task = Task { try await job.run(input: Data("initial request".utf8)) }
+        try await waitUntil { job.canSteer }
+        job.grantNetworkAccess(for: "Install an optional mesh helper")
+        job.grantNetworkAccess(for: "A second allowed operation")
+        let data = try await task.value
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["network"] as? Bool, true)
+        XCTAssertTrue((object["continuation"] as? String)?.contains("Install an optional mesh helper") == true)
+        let requests = try fixture.requests()
+        let turns = requests.filter { $0["method"] as? String == "turn/start" }.compactMap { $0["params"] as? [String: Any] }
+        XCTAssertEqual(turns.count, 2, "One allowed decision continues the task once")
+        XCTAssertEqual((turns[0]["sandboxPolicy"] as? [String: Any])?["networkAccess"] as? Bool, false)
+        XCTAssertEqual((turns[1]["sandboxPolicy"] as? [String: Any])?["networkAccess"] as? Bool, true)
+        XCTAssertEqual(turns[1]["threadId"] as? String, "thread-1")
+        XCTAssertEqual(turns[1]["model"] as? String, "captured-model")
+        XCTAssertEqual(turns[1]["effort"] as? String, "ultra")
+        XCTAssertNotNil(turns[1]["outputSchema"] as? [String: Any])
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "thread/start" }.count, 1)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "turn/interrupt" }.count, 1)
+        XCTAssertTrue(capture.events.contains { $0.title == "Network access enabled" })
+        XCTAssertFalse(capture.events.contains { $0.title == "Task finished" && $0.status == "canceled" },
+                       "Continuing with network access is not a canceled task")
+    }
+
     func testCompletionBeforeSteeringAcknowledgementStillAcceptsTheSameTurn() async throws {
         let fixture = try AppServerFixture(onSteer: """
         finish({'complete': True})

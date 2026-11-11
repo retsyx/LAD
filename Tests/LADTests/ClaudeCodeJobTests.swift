@@ -102,6 +102,38 @@ final class ClaudeCodeJobTests: XCTestCase {
         XCTAssertEqual(response["message"] as? String, "second")
     }
 
+    func testNetworkRequestsAreDeniedUntilAPermissionIsAllowed() async throws {
+        let fixture = try ClaudeFixture(scenario: """
+        init()
+        def ask(identity, tool, values):
+            send({'type': 'control_request', 'request_id': identity, 'request': {'subtype': 'can_use_tool', 'tool_name': tool, 'input': values}})
+            return read()['response']['response']['behavior']
+        first = ask('net-1', 'SandboxNetworkAccess', {'host': 'pypi.org'})
+        steer = read()
+        lifecycle(steer['uuid'], 'queued')
+        second = ask('net-2', 'SandboxNetworkAccess', {'host': 'files.pythonhosted.org'})
+        fetch = ask('net-3', 'WebFetch', {'url': 'https://example.com/doc', 'prompt': 'summarize'})
+        other = ask('net-4', 'Write', {'file_path': '/etc/hosts'})
+        lifecycle(steer['uuid'], 'completed')
+        result({'status': 'message', 'message': ','.join([first, second, fetch, other]), 'model': None, 'assetIDs': []})
+        """)
+        defer { fixture.remove() }
+        let capture = ClaudeCapture()
+        let job = fixture.job(capture: capture)
+        defer { job.cancel() }
+        let task = Task { try await job.run(input: Data("initial".utf8)) }
+        try await waitUntil { capture.events.contains { $0.title == "Network access denied" } }
+        job.grantNetworkAccess(for: "Install an optional mesh helper")
+        _ = try await job.steer(text: "Continue with the approved installation")
+        let data = try await task.value
+        let response = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(response["message"] as? String, "deny,allow,allow,deny",
+                       "Hosts and fetches need an allowed decision; other prompts stay declined")
+        let allowed = capture.events.filter { $0.title == "Network access" && $0.status == "completed" }.compactMap(\.input)
+        XCTAssertEqual(Set(allowed), ["files.pythonhosted.org", "https://example.com/doc"])
+        XCTAssertEqual(capture.events.first { $0.title == "Network access denied" }?.input, "pypi.org")
+    }
+
     func testPermissionPromptsAreDeclinedInsteadOfWaitingForAPerson() async throws {
         let fixture = try ClaudeFixture(scenario: """
         init()
@@ -198,18 +230,22 @@ final class ClaudeCodeJobTests: XCTestCase {
         XCTAssertEqual(sandbox["autoAllowBashIfSandboxed"] as? Bool, true)
         XCTAssertEqual(sandbox["allowUnsandboxedCommands"] as? Bool, false)
         let allowed = try XCTUnwrap((settings["permissions"] as? [String: Any])?["allow"] as? [String])
-        XCTAssertFalse(allowed.contains { ["Bash", "Edit", "Write"].contains($0) }, "Edits and commands are limited by the workspace and sandbox")
+        XCTAssertFalse(allowed.contains { ["Bash", "Edit", "Write", "WebFetch"].contains($0) }, "Edits, commands and fetches are limited by the workspace, sandbox and network grant")
+        XCTAssertEqual((sandbox["network"] as? [String: Any])?["allowedDomains"] as? [String], [], "No host is reachable before an allowed permission decision")
         let mcp = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(value(after: "--mcp-config")).utf8)) as? [String: Any])
         let lad = try XCTUnwrap((mcp["mcpServers"] as? [String: Any])?["lad"] as? [String: Any])
         XCTAssertEqual(lad["command"] as? String, "/runtime/bin/python3")
         XCTAssertEqual(lad["args"] as? [String], ["/app/agent_server.py", "--workspace", workspace.path])
         XCTAssertNotNil(try JSONSerialization.jsonObject(with: Data(try XCTUnwrap(value(after: "--json-schema")).utf8)) as? [String: Any])
-        for model in ["", "default"] {
-            let defaults = try ClaudeCodeJob.arguments(model: model, effort: nil, schema: schema, workspace: workspace,
-                                                       python: "/runtime/bin/python3", server: URL(fileURLWithPath: "/app/agent_server.py"))
-            XCTAssertFalse(defaults.contains("--model"))
-            XCTAssertFalse(defaults.contains("--effort"))
-        }
+        let configured = try ClaudeCodeJob.arguments(model: "", effort: "", schema: schema, workspace: workspace,
+                                                     python: "/runtime/bin/python3", server: URL(fileURLWithPath: "/app/agent_server.py"))
+        XCTAssertFalse(configured.contains("--model"))
+        XCTAssertFalse(configured.contains("--effort"))
+        // Claude Code's recommended model differs from its configured model.
+        let recommended = try ClaudeCodeJob.arguments(model: "default", effort: "", schema: schema, workspace: workspace,
+                                                      python: "/runtime/bin/python3", server: URL(fileURLWithPath: "/app/agent_server.py"))
+        XCTAssertEqual(recommended.firstIndex(of: "--model").map { recommended[$0 + 1] }, "default")
+        XCTAssertFalse(recommended.contains("--effort"))
     }
 
     func testTaskEnvironmentNeverUpdatesTheInstallationOrInheritsAnotherSession() async throws {

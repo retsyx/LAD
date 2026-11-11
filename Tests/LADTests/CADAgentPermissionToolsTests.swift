@@ -115,6 +115,39 @@ final class CADAgentPermissionToolsTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testAllowedDecisionsGrantNetworkAccessOnlyToBuiltInTasks() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let tools = try fixture.tools()
+        var granted: [String] = []
+        tools.onPermissionAllowed = { granted.append($0) }
+        let arguments = ["operation": "Install an optional mesh helper", "reason": "Convert a supplied reference"]
+        fixture.controller.policy = .alwaysDeny
+        var output = try content(try await tools.handle(name: "lad_request_permission", arguments: arguments))
+        XCTAssertEqual(output["allowed"] as? Bool, false)
+        XCTAssertNil(output["networkAccess"])
+        XCTAssertEqual(granted, [])
+        fixture.controller.policy = .alwaysAllow
+        output = try content(try await tools.handle(name: "lad_request_permission", arguments: arguments))
+        XCTAssertEqual(output["networkAccess"] as? String, "enabled for the rest of this task")
+        XCTAssertEqual(granted, ["Install an optional mesh helper"])
+        fixture.controller.policy = .ask
+        let pending = Task { try await tools.handle(name: "lad_request_permission", arguments: arguments) }
+        try await waitUntil { fixture.presenter.prompts.count == 1 }
+        XCTAssertEqual(fixture.presenter.prompts[0].consequence, "Allowing also enables network access for the rest of this design task.")
+        fixture.presenter.respond(0, .decision(allowed: true, remember: false))
+        _ = try await pending.value
+        XCTAssertEqual(granted.count, 2)
+        // External clients own their network: no grant and no network claim.
+        let external = try fixture.tools()
+        fixture.controller.policy = .alwaysAllow
+        output = try content(try await external.handle(name: "lad_request_permission", arguments: arguments))
+        XCTAssertEqual(output["allowed"] as? Bool, true)
+        XCTAssertNil(output["networkAccess"])
+        XCTAssertEqual(granted.count, 2)
+    }
+
     private func content(_ response: [String: Any]) throws -> [String: Any] {
         let blocks = try XCTUnwrap(response["content"] as? [[String: Any]])
         let text = try XCTUnwrap(blocks.first?["text"] as? String)

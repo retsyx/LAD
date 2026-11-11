@@ -208,7 +208,9 @@ final class CodexServiceTests: XCTestCase {
         let turn = try fixture.turnRequest()
         XCTAssertNil(turn["effort"])
         XCTAssertNil(turn["model"])
-        XCTAssertTrue(configurations(arguments).contains("sandbox_workspace_write.network_access=true"))
+        XCTAssertTrue(configurations(arguments).contains("sandbox_workspace_write.network_access=false"))
+        XCTAssertEqual((turn["sandboxPolicy"] as? [String: Any])?["networkAccess"] as? Bool, false,
+                       "A task has no network access before an allowed permission decision")
         XCTAssertFalse(arguments.contains(where: { $0.hasPrefix("model_reasoning_effort=") }))
         XCTAssertFalse(arguments.contains("--model"))
     }

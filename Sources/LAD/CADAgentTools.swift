@@ -45,6 +45,10 @@ final class CADAgentTools {
     private var versionTasks: [UUID: Task<CADAgentVersionFiles.Prepared, Error>] = [:]
     private var runtime: CADRuntime?
     private var permissionRequest: (id: UUID, task: Task<AgentPermissionDecision, Error>)?
+    /// A built-in design task starts without network access in its sandbox; an
+    /// allowed decision enables it for the rest of that task. External clients
+    /// own their own network and leave this unset.
+    var onPermissionAllowed: (@MainActor (_ operation: String) -> Void)?
     private var cancelled = false
     private lazy var meshSession = CADMeshSession(workspace: workspace)
     private var reconstructionPrograms = Set<String>()
@@ -292,7 +296,9 @@ final class CADAgentTools {
                 owner = window
             } else { owner = nil }
             let id = UUID()
-            let request = Task { try await controller.request(operation: operation, reason: reason, window: owner) }
+            let grantsNetwork = onPermissionAllowed != nil
+            let consequence = grantsNetwork ? "Allowing also enables network access for the rest of this design task." : nil
+            let request = Task { try await controller.request(operation: operation, reason: reason, consequence: consequence, window: owner) }
             permissionRequest = (id, request)
             defer { if permissionRequest?.id == id { permissionRequest = nil } }
             let decision = try await withTaskCancellationHandler {
@@ -301,13 +307,19 @@ final class CADAgentTools {
                 request.cancel()
             }
             try checkCancellation()
-            return try result(["allowed": decision.allowed, "source": decision.source.rawValue,
+            var values: [String: Any] = ["allowed": decision.allowed, "source": decision.source.rawValue,
                                "rememberedPolicy": decision.rememberedPolicy.map { $0.rawValue as Any } ?? NSNull(),
                                "scope": "task_workspace", "workspace": workspace.root.path,
                                "executionPerformed": false,
                                "nextStep": decision.allowed
                                    ? "Permission granted for this proposed operation inside this task workspace. Execute it yourself; LAD has not run anything. Use an isolated local environment for optional installs, keep final CAD replay dependent only on LAD's bundled dependencies, and query permission again for each new operation."
-                                   : "Permission denied. Do not perform the proposed operation or rephrase/retry it without new user direction. Continue with existing or bundled capabilities, or explain the limitation."])
+                                   : "Permission denied. Do not perform the proposed operation or rephrase/retry it without new user direction. Continue with existing or bundled capabilities, or explain the limitation."]
+            if decision.allowed, grantsNetwork, let grant = onPermissionAllowed {
+                // Grant before the agent can act on this decision.
+                grant(operation)
+                values["networkAccess"] = "enabled for the rest of this task"
+            }
+            return try result(values)
         case "lad_versions":
             try allowed(arguments, ["offset", "limit"])
             let offset = try integer("offset", arguments, fallback: 0, range: 0...1_000_000)

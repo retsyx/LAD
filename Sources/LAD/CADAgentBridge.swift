@@ -74,7 +74,8 @@ final class CADAgentBridge {
                 "--config", "mcp_servers.lad.startup_timeout_sec=30",
                 "--config", "mcp_servers.lad.tool_timeout_sec=3600",
                 "--config", "approval_policy=\"never\"",
-                "--config", "sandbox_workspace_write.network_access=true",
+                // Network access follows allowed permission decisions per task.
+                "--config", "sandbox_workspace_write.network_access=false",
                 "--config", "sandbox_workspace_write.writable_roots=[]",
                 "--config", "sandbox_workspace_write.exclude_slash_tmp=true",
                 "--config", "sandbox_workspace_write.exclude_tmpdir_env_var=true"]

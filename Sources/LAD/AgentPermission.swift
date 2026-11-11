@@ -28,11 +28,14 @@ enum AgentPermissionPromptResponse: Equatable, Sendable {
 final class AgentPermissionPrompt {
     let operation: String
     let reason: String
+    /// An additional effect of allowing, stated by the requesting task.
+    let consequence: String?
     weak var window: NSWindow?
 
-    init(operation: String, reason: String, window: NSWindow?) {
+    init(operation: String, reason: String, consequence: String? = nil, window: NSWindow?) {
         self.operation = operation
         self.reason = reason
+        self.consequence = consequence
         self.window = window
     }
 }
@@ -86,7 +89,8 @@ final class AgentPermissionController: ObservableObject {
         policy = defaults.string(forKey: Self.preferenceKey).flatMap(AgentPermissionPolicy.init(rawValue:)) ?? .ask
     }
 
-    func request(operation: String, reason: String, window: NSWindow?) async throws -> AgentPermissionDecision {
+    func request(operation: String, reason: String, consequence: String? = nil,
+                 window: NSWindow?) async throws -> AgentPermissionDecision {
         try Task.checkCancellation()
         guard !operation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -99,7 +103,7 @@ final class AgentPermissionController: ObservableObject {
         let result = try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<AgentPermissionDecision, Error>) in
-                let request = Request(id: id, operation: operation, reason: reason, window: window,
+                let request = Request(id: id, operation: operation, reason: reason, consequence: consequence, window: window,
                                       continuation: continuation, cancellation: cancellation)
                 pending[id] = request
                 queue.append(id)
@@ -210,10 +214,10 @@ final class AgentPermissionController: ObservableObject {
         let cancellation: AgentPermissionCancellation
         var closeObserver: NSObjectProtocol?
 
-        init(id: UUID, operation: String, reason: String, window: NSWindow?,
+        init(id: UUID, operation: String, reason: String, consequence: String?, window: NSWindow?,
              continuation: CheckedContinuation<AgentPermissionDecision, Error>, cancellation: AgentPermissionCancellation) {
             self.id = id
-            prompt = AgentPermissionPrompt(operation: operation, reason: reason, window: window)
+            prompt = AgentPermissionPrompt(operation: operation, reason: reason, consequence: consequence, window: window)
             hadOwner = window != nil
             ownerID = window.map(ObjectIdentifier.init)
             self.continuation = continuation
@@ -266,7 +270,8 @@ private final class AgentPermissionAlertSession: NSObject {
 
     func show() {
         alert.messageText = "Allow this agent request?"
-        alert.informativeText = "Applies only to the agent’s temporary task workspace."
+        alert.informativeText = (["Applies only to the agent’s temporary task workspace."] + [prompt.consequence].compactMap { $0 })
+            .joined(separator: " ")
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Deny")
         alert.addButton(withTitle: "Allow")

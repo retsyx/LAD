@@ -50,6 +50,10 @@ final class CodexAppServerJob: @unchecked Sendable {
     private var finished = false
     private var threadID: String?
     private var turnID: String?
+    /// Turn sandboxes start without network access until a permission grant.
+    private var networkAccess = false
+    private var networkRestartPending = false
+    private var networkOperation = ""
     private var terminal: Terminal?
     private var completedAt: Date?
     private var nextRequestID = 1
@@ -185,6 +189,30 @@ final class CodexAppServerJob: @unchecked Sendable {
             lock.lock(); let shouldStop = running && !finished && process.isRunning; lock.unlock()
             if shouldStop { process.terminate() }
         }
+    }
+
+    /// An active turn's sandbox cannot change. Once the allowed decision has
+    /// reached the agent, interrupt the turn and continue the same thread in a
+    /// turn whose sandbox has network access. Later turns keep that access.
+    func grantNetworkAccess(for operation: String) {
+        lock.lock()
+        guard !networkAccess, !cancelled, !finished, terminal == nil else { lock.unlock(); return }
+        networkAccess = true
+        networkOperation = operation
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { [self] in
+            lock.lock()
+            guard !cancelled, !finished, terminal == nil, !networkRestartPending,
+                  let currentThread = threadID, let currentTurn = turnID else { lock.unlock(); return }
+            networkRestartPending = true
+            lock.unlock()
+            publishAvailability(false)
+            try? enqueue("turn/interrupt", purpose: .interrupt, params: ["threadId": currentThread, "turnId": currentTurn])
+        }
+    }
+
+    static func networkContinuation(_ operation: String) -> String {
+        "LAD interrupted this turn only to enable network access in its sandbox, because the user allowed this operation: \(operation)\nNetwork access is available for the rest of this task. Continue the current design request from where you stopped without repeating completed work, and rerun any command that was interrupted. Finish with the final response JSON as instructed."
     }
 
     private func execute(input: Data, imagePaths: [String]) throws -> Data {
@@ -416,15 +444,8 @@ final class CodexAppServerJob: @unchecked Sendable {
             }
             lock.lock(); threadID = id; lock.unlock()
             onActivity(ProjectActivityEvent(id: "server:thread:\(id)", category: "lifecycle", title: "Session started", status: "completed", output: "Ephemeral thread \(id)"))
-            guard let schema = try JSONSerialization.jsonObject(with: schema) as? [String: Any] else { throw CodexError.resourcesMissing }
-            var params: [String: Any] = ["threadId": id, "input": Self.userInput(text: prompt, imagePaths: imagePaths),
-                "cwd": directory.path, "approvalPolicy": "never", "outputSchema": schema,
-                "sandboxPolicy": ["type": "workspaceWrite", "writableRoots": [directory.path], "networkAccess": true,
-                                  "excludeTmpdirEnvVar": true, "excludeSlashTmp": true]]
-            if !model.isEmpty { params["model"] = model }
-            if let effort, !effort.isEmpty { params["effort"] = effort }
             onProgress("Creating your design…")
-            try enqueue("turn/start", purpose: .turnStart, params: params)
+            try startTurn(threadID: id, input: Self.userInput(text: prompt, imagePaths: imagePaths))
         case .turnStart:
             guard let turn = result["turn"] as? [String: Any], let id = turn["id"] as? String else {
                 throw CodexError.failed("The task returned an unreadable turn identifier.")
@@ -439,6 +460,18 @@ final class CodexAppServerJob: @unchecked Sendable {
             request.continuation?.resume(returning: accepted)
         case .interrupt: break
         }
+    }
+
+    private func startTurn(threadID: String, input: [[String: Any]]) throws {
+        guard let outputSchema = try JSONSerialization.jsonObject(with: schema) as? [String: Any] else { throw CodexError.resourcesMissing }
+        lock.lock(); let network = networkAccess; lock.unlock()
+        var params: [String: Any] = ["threadId": threadID, "input": input,
+            "cwd": directory.path, "approvalPolicy": "never", "outputSchema": outputSchema,
+            "sandboxPolicy": ["type": "workspaceWrite", "writableRoots": [directory.path], "networkAccess": network,
+                              "excludeTmpdirEnvVar": true, "excludeSlashTmp": true]]
+        if !model.isEmpty { params["model"] = model }
+        if let effort, !effort.isEmpty { params["effort"] = effort }
+        try enqueue("turn/start", purpose: .turnStart, params: params)
     }
 
     private func activateTurn(_ id: String) {
@@ -563,10 +596,30 @@ final class CodexAppServerJob: @unchecked Sendable {
         onMessage(CodexProgressMessage(id: id, text: visible))
     }
     private func completeTurn(_ turn: [String: Any]) {
+        let status = turn["status"] as? String ?? "failed"
+        lock.lock()
+        let restart = status == "interrupted" && networkRestartPending && !cancelled && terminal == nil
+        let currentThread = threadID
+        if restart { networkRestartPending = false; turnID = nil }
+        let operation = networkOperation
+        lock.unlock()
+        if restart, let currentThread {
+            finalResponse = nil
+            onActivity(ProjectActivityEvent(id: "server:network:\(turn["id"] as? String ?? UUID().uuidString)", category: "lifecycle",
+                title: "Network access enabled", status: "completed",
+                output: "Continued the task in a turn with network access after this operation was allowed: \(operation)"))
+            do {
+                try startTurn(threadID: currentThread, input: Self.userInput(text: Self.networkContinuation(operation), imagePaths: []))
+            } catch {
+                lock.lock()
+                if terminal == nil { terminal = .failed("The task could not continue with network access."); completedAt = Date() }
+                lock.unlock()
+            }
+            return
+        }
         for item in turn["items"] as? [[String: Any]] ?? [] where item["type"] as? String == "agentMessage" {
             handleItem(item, completed: true, root: true, thread: "")
         }
-        let status = turn["status"] as? String ?? "failed"
         let ending: Terminal
         if status == "completed" {
             if let response = finalResponse, !response.isEmpty, response.utf8.count <= Self.maximumFinalBytes {

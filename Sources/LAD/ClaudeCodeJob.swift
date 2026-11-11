@@ -10,9 +10,11 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
     static let controlArguments = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                                    "--no-session-persistence", "--strict-mcp-config"]
 
-    /// File edits are accepted only inside the task workspace, Bash runs in the
-    /// CLI's OS sandbox with writes limited to that workspace, and anything that
-    /// would prompt is declined. Network access matches Codex task workspaces.
+    /// File edits are accepted only inside the task workspace, and Bash runs in
+    /// the CLI's OS sandbox with writes limited to that workspace. No host is
+    /// pre-allowed: each network connection and web fetch asks LAD, which allows
+    /// it only after an allowed permission decision in this task. Anything else
+    /// that would prompt is declined.
     static func arguments(model: String, effort: String?, schema: Data, workspace: URL, python: String,
                           server: URL) throws -> [String] {
         func json(_ value: Any) throws -> String {
@@ -23,13 +25,14 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
                                                          "args": [server.path, "--workspace", workspace.path]]]]
         let settings: [String: Any] = [
             "sandbox": ["enabled": true, "autoAllowBashIfSandboxed": true, "allowUnsandboxedCommands": false,
-                        "network": ["allowedDomains": ["*"]]],
-            "permissions": ["allow": ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "mcp__lad"]]
+                        "network": ["allowedDomains": [String]()]],
+            "permissions": ["allow": ["Read", "Glob", "Grep", "WebSearch", "mcp__lad"]]
         ]
         var arguments = controlArguments + ["--replay-user-messages", "--mcp-config", try json(mcp),
                                             "--permission-mode", "acceptEdits", "--settings", try json(settings),
                                             "--json-schema", try json(try JSONSerialization.jsonObject(with: schema))]
-        if !model.isEmpty, model != "default" { arguments += ["--model", model] }
+        // `default` is Claude Code's recommended model, not its configured one.
+        if !model.isEmpty { arguments += ["--model", model] }
         if let effort, !effort.isEmpty { arguments += ["--effort", effort] }
         return arguments
     }
@@ -84,6 +87,7 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
     /// Older CLIs without lifecycle events acknowledge by replaying injected input.
     private var replayedSteers = Set<String>()
     private var lifecycleSupported = false
+    private var networkGranted = false
     private var publishedAvailability = false
     private var nextControlID = 1
     private let onProgress: @Sendable (String) -> Void
@@ -182,6 +186,12 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
             lock.lock(); let shouldStop = running && !finished && process.isRunning; lock.unlock()
             if shouldStop { process.terminate() }
         }
+    }
+
+    /// Takes effect for the CLI's next network permission request; connections
+    /// already allowed are unaffected.
+    func grantNetworkAccess(for operation: String) {
+        lock.lock(); networkGranted = true; lock.unlock()
     }
 
     static func userMessage(text: String, id: String) -> [String: Any] {
@@ -590,12 +600,28 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
         let request = object["request"] as? [String: Any] ?? [:]
         let subtype = request["subtype"] as? String ?? ""
         let response: [String: Any]
-        if subtype == "can_use_tool" {
+        let tool = request["tool_name"] as? String ?? subtype
+        let input = request["input"] as? [String: Any] ?? [:]
+        if subtype == "can_use_tool", tool == "SandboxNetworkAccess" || tool == "WebFetch" {
+            lock.lock(); let granted = networkGranted; lock.unlock()
+            let target = input["host"] as? String ?? input["url"] as? String ?? tool
+            if granted {
+                response = ["subtype": "success", "request_id": id, "response": ["behavior": "allow", "updatedInput": input]]
+                onActivity(ProjectActivityEvent(id: "server:request:\(id)", category: "tool", title: "Network access",
+                    status: "completed", input: target, output: "Allowed by an earlier allowed permission decision in this task."))
+            } else {
+                response = ["subtype": "success", "request_id": id, "response": [
+                    "behavior": "deny",
+                    "message": "This task has no network access. Call lad_request_permission for an operation that needs the network; network access is enabled only after it returns allowed true."]]
+                onActivity(ProjectActivityEvent(id: "server:request:\(id)", category: "diagnostic", title: "Network access denied",
+                    status: "failed", input: target, output: "No permission decision in this task has allowed network access."))
+            }
+        } else if subtype == "can_use_tool" {
             response = ["subtype": "success", "request_id": id, "response": [
                 "behavior": "deny",
                 "message": "LAD does not allow this operation in design tasks. Work inside the task workspace with the available tools."]]
             onActivity(ProjectActivityEvent(id: "server:request:\(id)", category: "diagnostic", title: "Interactive request declined",
-                status: "failed", input: request["tool_name"] as? String ?? subtype,
+                status: "failed", input: tool,
                 output: "The task’s permission settings do not allow this request. \(CodexActivity.json(CodexActivity.sanitize(request)))"))
         } else {
             response = ["subtype": "error", "request_id": id, "error": "LAD does not support this interactive request."]

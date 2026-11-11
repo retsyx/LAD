@@ -30,6 +30,7 @@ INSTRUCTIONS = (
     "splines and surfaces; final results must be closed solids. External tools are user-managed. Before downloading or installing optional tools or dependencies, "
     "call lad_request_permission with the proposed operation and reason and proceed only when allowed is true. The tool returns a decision only; "
     "you execute approved installations yourself in an isolated environment inside this task workspace. Denial or cancellation never permits installation; do not rephrase or retry that same operation without new user direction. Use existing capabilities or explain the limitation. "
+    "Task commands have no network access until a permission decision is allowed; LAD then enables it for the rest of the task. "
     "Call lad_request_permission for each new proposed operation even after a prior always-allow or always-deny result; Settings can change at any time. "
     "Saved chat, audit records and earlier-turn decisions are not current permission. "
     "Keep analysis and prototyping outputs inside this task workspace without changing original sources, global settings or LAD's shared runtime. "

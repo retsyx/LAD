@@ -117,6 +117,9 @@ protocol AgentTaskJob: AnyObject, Sendable {
     func run(input: Data, imagePaths: [String]) async throws -> Data
     func steer(text: String, imagePaths: [String]) async throws -> String
     func cancel()
+    /// Task sandboxes start without network access. An allowed permission
+    /// decision enables it for the rest of the task.
+    func grantNetworkAccess(for operation: String)
 }
 
 extension CodexAppServerJob: AgentTaskJob {}
