@@ -1558,7 +1558,6 @@ final class CADSceneView: SCNView {
                 return
             }
             if let hit, let solid = solidIndex(of: hit.node) {
-                selectFeatures([])
                 select(selectedSolids.symmetricDifference([solid]))
             }
             return

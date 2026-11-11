@@ -26,28 +26,87 @@ final class AppStateFeatureSelectionTests: XCTestCase {
     }
 
     @MainActor
-    func testTreeAndWholePartSelectionClearFeaturesAndKeepCanonicalTreeSelection() throws {
+    func testTreeAndWholePartSelectionPreserveOrderedFeaturesAndCanonicalTreeSelection() throws {
         let state = try fixture()
-        state.selectFeatures([feature(.vertex, 0, 0)])
+        defer { state.clearSelections() }
+        let features = [feature(.face, 2, 0), feature(.vertex, 0, 0), feature(.edge, 1, 0)]
+        state.selectFeatures(features)
         state.selectPartNodes(["case"])
-        XCTAssertTrue(state.selectedFeatures.isEmpty)
+        XCTAssertEqual(state.selectedFeatures, features)
         XCTAssertEqual(state.selectedSolids, [0, 1])
         XCTAssertEqual(state.selectedPartNodeIDs, ["case"])
 
-        state.selectFeatures([feature(.edge, 1, 0)])
-        XCTAssertTrue(state.selectedSolids.isEmpty)
-        XCTAssertTrue(state.selectedPartNodeIDs.isEmpty)
         state.selectParts([2])
-        XCTAssertTrue(state.selectedFeatures.isEmpty)
+        XCTAssertEqual(state.selectedFeatures, features)
         XCTAssertEqual(state.selectedSolids, [2])
         XCTAssertEqual(state.selectedPartNodeIDs, ["board"])
+        XCTAssertEqual(state.measurementReport?.features, features)
+        XCTAssertEqual(state.measurementReport?.solidIndices, [2])
+        XCTAssertEqual(try values(state, "parts:count"), [1])
+        XCTAssertEqual(try values(state, "vertex:0:0:position"), [0, 0, 0])
+
+        state.selectParts([1], extending: true)
+        XCTAssertEqual(state.selectedSolids, [1, 2])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["lid", "board"])
+        XCTAssertEqual(state.selectedFeatures, features)
+        state.selectParts([2], extending: true)
+        XCTAssertEqual(state.selectedSolids, [1])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["lid"])
+        XCTAssertEqual(state.selectedFeatures, features)
+
+        state.selectPartNodes(["case"], extending: true)
+        XCTAssertEqual(state.selectedSolids, [0, 1])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["case"])
+        XCTAssertEqual(state.selectedFeatures, features)
+        state.selectPartNodes(["case"], extending: true)
+        XCTAssertTrue(state.selectedSolids.isEmpty)
+        XCTAssertTrue(state.selectedPartNodeIDs.isEmpty)
+        XCTAssertEqual(state.selectedFeatures, features, "Deselecting a folder must retain its selected features.")
+
+        state.selectParts([])
+        XCTAssertEqual(state.selectedFeatures, features, "Clearing whole-part selection must retain feature selection.")
+        XCTAssertEqual(state.measurementReport?.features, features)
+    }
+
+    @MainActor
+    func testFeatureTogglesPreserveWholePartsAndSelectedFolderIdentity() throws {
+        let state = try fixture()
+        defer { state.clearSelections() }
+        state.selectPartNodes(["case"])
+        let face = feature(.face, 2, 0), vertex = feature(.vertex, 0, 0), edge = feature(.edge, 1, 0)
+        let ordered = [face, vertex, edge]
+        state.selectFeatures(ordered + [face])
+        XCTAssertEqual(state.selectedFeatures, ordered)
+        XCTAssertEqual(state.selectedSolids, [0, 1])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["case"])
+        XCTAssertEqual(state.selectedPartSolids, [0, 1, 2])
+        XCTAssertEqual(state.measurementReport?.features, ordered)
+        XCTAssertEqual(state.measurementReport?.solidIndices, [0, 1])
+        XCTAssertEqual(try values(state, "parts:count"), [2])
+
+        // The viewport supplies the ordered result after each toggle.
+        state.selectFeatures([face, edge])
+        state.selectFeatures([face, edge, vertex])
+        XCTAssertEqual(state.selectedFeatures, [face, edge, vertex])
+        XCTAssertEqual(state.selectedSolids, [0, 1])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["case"])
+        state.selectFeatures([])
+        XCTAssertTrue(state.selectedFeatures.isEmpty)
+        XCTAssertEqual(state.selectedSolids, [0, 1], "Deselecting all features must retain whole-part selection.")
+        XCTAssertEqual(state.selectedPartNodeIDs, ["case"])
+        XCTAssertEqual(state.measurementReport?.solidIndices, [0, 1])
+
+        state.selectFeatures(ordered)
         state.clearSelections()
+        XCTAssertTrue(state.selectedFeatures.isEmpty)
+        XCTAssertTrue(state.selectedSolids.isEmpty)
+        XCTAssertTrue(state.selectedPartNodeIDs.isEmpty)
+        XCTAssertNil(state.measurementReport)
     }
 
     @MainActor
     func testFeatureSelectionIsPartialButItsOwnerCanBeExportedAndColored() throws {
         let state = try fixture()
-        state.selectPartNodes(["case"])
         state.selectFeatures([feature(.vertex, 0, 0)])
         XCTAssertTrue(state.selectedSolids.isEmpty, "A vertex must not highlight its entire owner")
         XCTAssertTrue(state.selectedPartNodeIDs.isEmpty, "A feature selection must not look like a whole tree row selection")
@@ -66,7 +125,7 @@ final class AppStateFeatureSelectionTests: XCTestCase {
     func testHideSelectedUsesTheUnionOfWholePartsAndFeatureOwnersAndClearsFeedback() throws {
         let state = try fixture()
         state.selectFeatures([feature(.vertex, 0, 0), feature(.vertex, 0, 1)])
-        state.selectedSolids = [2]
+        state.selectParts([2])
         XCTAssertEqual(state.selectedPartSolids, [0, 2])
         state.hideSelectedParts()
         XCTAssertEqual(state.hiddenSolids, [0, 2])

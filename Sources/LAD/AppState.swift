@@ -1387,14 +1387,12 @@ final class AppState: ObservableObject {
     }
 
     func selectParts(_ solids: Set<Int>, extending: Bool = false) {
-        selectedFeatures = []
         let valid = solids.intersection(Set(0..<currentSolidCount))
         selectedSolids = extending ? selectedSolids.symmetricDifference(valid) : valid
         selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: [], in: partTree)
     }
 
     func selectPartNodes(_ ids: Set<String>, extending: Bool = false) {
-        selectedFeatures = []
         let nodes = partTree.flatMap(\.flattened)
         let valid = ids.intersection(Set(nodes.map(\.id)))
         let clickedSolids = Set(nodes.filter { valid.contains($0.id) }.flatMap { $0.allSolidIndices })
@@ -1415,10 +1413,6 @@ final class AppState: ObservableObject {
         var seen = Set<CADFeatureID>()
         let valid = features.filter {
             seen.insert($0).inserted && topology.contains($0) && !hiddenSolids.contains($0.solidIndex)
-        }
-        if !valid.isEmpty {
-            selectedSolids = []
-            selectedPartNodeIDs = []
         }
         selectedFeatures = valid
     }

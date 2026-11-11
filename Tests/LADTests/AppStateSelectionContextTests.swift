@@ -104,12 +104,13 @@ final class AppStateSelectionContextTests: XCTestCase {
 
         let featureIDs = [id(.vertex, solid: 1), id(.vertex, solid: 0)]
         state.selectFeatures(featureIDs)
-        state.prompt = "Use this distance between vertices"
+        state.prompt = "Use these selected parts and vertices"
         state.submit()
         let second = try XCTUnwrap(state.queuedRequests.last)
         let secondSelection = try XCTUnwrap(second.selection)
         XCTAssertEqual(secondSelection.features.map(\.id), featureIDs)
-        XCTAssertTrue(secondSelection.parts.isEmpty)
+        XCTAssertEqual(secondSelection.parts.map(\.partID), ["base", "lid"],
+                       "Selecting features must retain explicitly selected parts in the request snapshot.")
 
         state.clearSelections()
         state.selectPartNodes(["lid"])

@@ -23,8 +23,9 @@ final class ViewportNearestHitTests: XCTestCase {
                 order.forEach { parent.addChildNode(nodes[$0]) }
                 SCNTransaction.flush()
                 for hidden in visibility {
+                    let existingPart = hidden.contains(2) ? 0 : 2
                     view.update(mesh: preview, mode: .edges, grid: false, command: nil,
-                                selectedSolids: [], hiddenSolids: hidden, projection: projection)
+                                selectedSolids: [existingPart], hiddenSolids: hidden, projection: projection)
                     SCNTransaction.flush()
                     let projected = view.projectPoint(SCNVector3(1.1, -0.15, 2.2))
                     let point = NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
@@ -34,20 +35,25 @@ final class ViewportNearestHitTests: XCTestCase {
                     let context = "projection=\(projection.rawValue), order=\(order), hidden=\(hidden.sorted())"
                     XCTAssertEqual(picked, expected,
                         "The visible lapel must win even when coat geometry was submitted first; hidden owners must still be filtered. \(context)")
-                    var clicked: [CADFeatureID] = []
-                    view.onFeatureSelectionChanged = { clicked = $0 }
+                    var featureSelections = [[CADFeatureID]]()
+                    view.onFeatureSelectionChanged = { featureSelections.append($0) }
                     view.mouseDown(with: try click(at: point))
-                    XCTAssertEqual(clicked, [expected], "Native clicks must select the same nearest face. \(context)")
+                    XCTAssertEqual(featureSelections, [[expected]], "Native clicks must select the same nearest face. \(context)")
+                    XCTAssertEqual(view.agentCaptureMetadata["selectedSolidIndices"] as? [Int], [existingPart],
+                                   "Selecting a face must preserve a distinct selected part. \(context)")
 
                     var partSelections = [Set<Int>]()
                     view.onSelectionChanged = { partSelections.append($0) }
                     view.mouseDown(with: try click(at: point, modifiers: .option))
-                    XCTAssertEqual(partSelections, [[expected.solidIndex]],
+                    XCTAssertEqual(partSelections, [[existingPart, expected.solidIndex]],
                                    "Option-click must select the nearest visible owner. \(context)")
-                    XCTAssertTrue(clicked.isEmpty, "Whole-part selection must clear the previous feature selection. \(context)")
+                    XCTAssertEqual(featureSelections, [[expected]],
+                                   "Selecting a whole part must preserve the previous feature selection. \(context)")
                     view.mouseDown(with: try click(at: point, modifiers: .option))
-                    XCTAssertEqual(partSelections, [[expected.solidIndex], []],
+                    XCTAssertEqual(partSelections, [[existingPart, expected.solidIndex], [existingPart]],
                                    "A second Option-click must deselect the owner. \(context)")
+                    XCTAssertEqual(featureSelections, [[expected]],
+                                   "Deselecting a whole part must preserve the previous feature selection. \(context)")
                 }
             }
         }

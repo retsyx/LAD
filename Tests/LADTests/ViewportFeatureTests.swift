@@ -71,12 +71,20 @@ final class ViewportFeatureTests: XCTestCase {
         var featureSelections = [[CADFeatureID]]()
         view.onSelectionChanged = { _ in partsChanged += 1 }
         view.onFeatureSelectionChanged = { featureSelections.append($0) }
-        let projected = view.projectPoint(SCNVector3(-10, -10, 0))
-        let point = NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
-        XCTAssertEqual(view.feature(at: point), vertex)
-        view.mouseDown(with: try click(at: point))
-        view.mouseDown(with: try click(at: point))
-        XCTAssertEqual(featureSelections, [[vertex], []])
+        let targets: [(SCNVector3, CADFeatureID)] = [
+            (SCNVector3(-10, -10, 0), vertex),
+            (SCNVector3(0, -10, 0), edge),
+            (SCNVector3(0, 0, 0), face)
+        ]
+        for (world, feature) in targets + targets.reversed() {
+            let projected = view.projectPoint(world)
+            let point = NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+            XCTAssertEqual(view.feature(at: point), feature)
+            view.mouseDown(with: try click(at: point))
+            XCTAssertEqual(view.agentCaptureMetadata["selectedSolidIndices"] as? [Int], [0],
+                           "Toggling a native \(feature.kind.rawValue) must preserve whole-part selection.")
+        }
+        XCTAssertEqual(featureSelections, [[vertex], [vertex, edge], [vertex, edge, face], [vertex, edge], [vertex], []])
         XCTAssertEqual(partsChanged, 0)
         XCTAssertEqual(view.feature(at: NSPoint(x: view.bounds.midX, y: view.bounds.midY)), face,
                        "An internal tessellation seam must resolve to the native CAD face.")
