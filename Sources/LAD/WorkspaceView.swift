@@ -322,7 +322,6 @@ struct WorkspaceView: View {
                 }
                 .buttonStyle(.plain).help(activityPanel.isVisible ? "Hide tool activity" : "Show tool activity")
                 .accessibilityLabel("Tool Activity").accessibilityValue(activityPanel.isVisible ? "Shown" : "Hidden")
-                SettingsLink { Image(systemName: "slider.horizontal.3").foregroundStyle(Palette.muted) }.buttonStyle(.plain).help("LAD Settings (⌘,)")
             }.padding(.horizontal, 20).padding(.vertical, 19)
             Rectangle().fill(Palette.line).frame(height: 1)
             ScrollViewReader { proxy in
