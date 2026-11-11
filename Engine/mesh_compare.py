@@ -5,7 +5,6 @@ internal numerical oracles; no recognition/fitting/assembly pipeline is exposed.
 """
 from __future__ import annotations
 
-from collections import OrderedDict
 import hashlib
 import copy
 import heapq
@@ -14,8 +13,7 @@ import json
 import math
 
 import numpy as np
-
-_CACHE=OrderedDict()
+from mesh_reference import ReferenceMesh, reference
 
 
 def _digest(value):
@@ -48,32 +46,25 @@ def _reference(context):
     delta=context.get("max_deviation")
     if isinstance(delta,bool) or not isinstance(delta,(float,int)) or not math.isfinite(delta) or delta<0:raise ValueError("Reference maximum deviation must be finite and nonnegative")
     if not isinstance(context.get("units"),str) or not context["units"] or not context.get("source_hash"):raise ValueError("Reference units and source hash are required")
-    key=hashlib.sha256(vertices.tobytes()+triangles.tobytes()).hexdigest()
-    if key in _CACHE:
-        value=_CACHE.pop(key);_CACHE[key]=value;return value
-    value=_Source(vertices,triangles,key)
-    _CACHE[key]=value
-    while len(_CACHE)>1 and (len(_CACHE)>4 or sum(len(v.triangles) for v in _CACHE.values())>250000):_CACHE.popitem(last=False)
-    return value
+    shared=reference(vertices,triangles)
+    if shared.comparison is None:
+        shared.comparison=_Source(vertices,triangles,shared.digest,shared=shared)
+    return shared.comparison
 
 
 class _Source:
-    def __init__(self,vertices,triangles,digest,build_index=True):
-        self.vertices=vertices.copy();self.triangles=triangles.copy();self.digest=digest
-        self.faces=vertices[triangles];self.centroids=self.faces.mean(axis=1)
+    def __init__(self,vertices,triangles,digest,build_index=True,shared=None):
+        shared=shared if shared is not None else ReferenceMesh(vertices,triangles,digest)
+        self.vertices,self.triangles,self.digest=shared.vertices,shared.triangles,digest
+        self.faces,self.centroids=shared.faces,shared.centroids
         cross=np.cross(self.faces[:,1]-self.faces[:,0],self.faces[:,2]-self.faces[:,0]);twice=np.linalg.norm(cross,axis=1)
         if not np.isfinite(twice).all():raise ValueError("Reference dynamic range exceeds numerical analysis")
         self.areas=twice/2;self.normals=np.divide(cross,twice[:,None],out=np.zeros_like(cross),where=twice[:,None]>0)
-        self.low=vertices.min(axis=0);self.high=vertices.max(axis=0);self.span=max(float(np.linalg.norm(self.high-self.low)),1e-12)
-        self.unique,self.welded=np.unique(vertices,axis=0,return_inverse=True);self.indexed=self.welded[triangles]
-        self.edges={};self.adjacency=[set() for _ in triangles]
-        for tid,face in enumerate(self.indexed):
-            if self.areas[tid]==0:continue
-            for a,b in zip(face,np.roll(face,-1)):
-                a,b=int(a),int(b);key=(min(a,b),max(a,b))
-                self.edges.setdefault(key,[]).append((tid,1 if a<b else -1))
-        for uses in self.edges.values():
-            for tid,_ in uses[1:]:self.adjacency[uses[0][0]].add(tid);self.adjacency[tid].add(uses[0][0])
+        self.areas.setflags(write=False);self.normals.setflags(write=False)
+        self.low,self.high,self.span=shared.low,shared.high,max(shared.scale,1e-12)
+        self.unique,_,self.welded=shared.welding;self.indexed=shared.indexed
+        incidence=shared.incidence(self.areas)
+        self.edges,self.adjacency=incidence.edges,incidence.connected
         self.components=_groups(set(np.flatnonzero(self.areas>0)),self.adjacency)
         self._tree=[];self.root=self._build(np.arange(len(triangles))) if build_index else None
         self._audit=None

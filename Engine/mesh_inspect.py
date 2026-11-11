@@ -5,7 +5,6 @@ distances are observations, not a reconstruction acceptance certificate.
 """
 from __future__ import annotations
 
-from collections import OrderedDict
 import copy
 import hashlib
 import heapq
@@ -14,9 +13,9 @@ import math
 from fractions import Fraction
 
 import numpy as np
+from mesh_reference import reference
 
 VERSION = "iterative-inspect-1"
-_CACHE = OrderedDict()
 _FULL = [[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]
 
 
@@ -82,36 +81,27 @@ def _analysis(context):
         raise EvidenceError("INVALID_CONTEXT","Reference triangles require three valid integer indices")
     if len(raw)>1_000_000:raise EvidenceError("RESOURCE_LIMIT","Reference triangle count exceeds one million")
     triangles=raw.astype(np.int64)
-    geometry_hash=hashlib.sha256(vertices.tobytes()+triangles.tobytes()).hexdigest()
-    key=(context["id"],context["source_hash"],geometry_hash)
-    if key in _CACHE:
-        _CACHE.move_to_end(key);return _CACHE[key]
-    vertices=vertices.copy();triangles=triangles.copy()
-    low,high=vertices.min(axis=0),vertices.max(axis=0);scale=float(np.linalg.norm(high-low))
+    shared=reference(vertices,triangles)
+    if shared.inspection is not None:return shared.inspection
+    vertices,triangles=shared.vertices,shared.triangles
+    low,high,scale=shared.low,shared.high,shared.scale
     if not math.isfinite(scale) or scale<=0:raise EvidenceError("INVALID_CONTEXT","Reference has no finite spatial extent")
-    normalized=(vertices-low)/scale;faces=vertices[triangles]
+    normalized=(vertices-low)/scale;faces=shared.faces
     cross=np.cross(normalized[triangles[:,1]]-normalized[triangles[:,0]],normalized[triangles[:,2]]-normalized[triangles[:,0]])
     length=np.linalg.norm(cross,axis=1)
     normals=np.divide(cross,length[:,None],out=np.zeros_like(cross),where=length[:,None]>0)
     areas=length*scale*scale/2
-    unique,representative,inverse=np.unique(vertices,axis=0,return_index=True,return_inverse=True)
-    welded=inverse[triangles];edges={};adjacency=[set() for _ in triangles];triangle_edges=[[] for _ in triangles]
-    for tid,face in enumerate(welded.tolist()):
-        if areas[tid]==0:continue
-        for a,b in zip(face,face[1:]+face[:1]):
-            edge=(min(a,b),max(a,b));edges.setdefault(edge,[]).append((tid,a<b));triangle_edges[tid].append(edge)
-    for edge,uses in edges.items():
-        if len(uses)==2:
-            a,b=uses[0][0],uses[1][0];adjacency[a].add(b);adjacency[b].add(a)
+    unique,representative,_=shared.welding
+    incidence=shared.incidence(areas)
+    edges,adjacency=incidence.edges,incidence.manifold
     components=_components(range(len(triangles)),adjacency)
-    result={"vertices":vertices,"triangles":triangles,"faces":faces,"normals":normals,"areas":areas,"centroids":faces.mean(axis=1),
-            "adjacency":adjacency,"components":components,"edges":edges,"triangle_edges":triangle_edges,"welded_vertices":unique,
-            "welded_triangles":welded,"representative_vertices":representative,"geometry_hash":geometry_hash,"scale":scale,
+    result={"vertices":vertices,"triangles":triangles,"faces":faces,"normals":normals,"areas":areas,"centroids":shared.centroids,
+            "adjacency":adjacency,"components":components,"edges":edges,"triangle_edges":incidence.triangle_edges,"welded_vertices":unique,
+            "welded_triangles":shared.indexed,"representative_vertices":representative,"geometry_hash":shared.digest,"scale":scale,
             "bounds":{"min":low.tolist(),"max":high.tolist()},"degenerate_triangles":np.flatnonzero(areas==0).tolist()}
     for value in result.values():
         if isinstance(value,np.ndarray):value.setflags(write=False)
-    _CACHE[key]=result
-    while len(_CACHE)>4:_CACHE.popitem(last=False)
+    shared.inspection=result
     return result
 
 
