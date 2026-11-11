@@ -3,8 +3,11 @@ import Foundation
 
 extension CodexModelCatalog {
     /// Decode Claude Code's `initialize` and `get_settings` control responses.
-    /// The CLI's `default` row only identifies which listed model is its default;
-    /// the configured model and effort come from the CLI's applied settings.
+    /// The CLI's `default` row is Claude Code's recommended model, which
+    /// `--model default` selects even when another model is configured. It is
+    /// offered first with its own levels plus the CLI's default level; its
+    /// resolved model also identifies which listed model is the CLI's default.
+    /// The configured model and effort come from the CLI's applied settings.
     nonisolated static func decodeClaudeCatalog(initialize: Data, settings: Data?) throws -> AgentCatalogSnapshot {
         guard initialize.count <= 4_194_304,
               let object = (try? JSONSerialization.jsonObject(with: initialize)) as? [String: Any],
@@ -20,11 +23,10 @@ extension CodexModelCatalog {
         struct Row { var descriptor: CodexModelDescriptor; var resolved: String? }
         var rows: [Row] = []
         var seen = Set<String>()
-        var defaultResolved: String?
+        var defaultRow: Row?
         for entry in entries {
             guard let id = entry["value"] as? String, validIdentifier(id) else { throw AgentCatalogError.invalidResponse }
             let resolved = (entry["resolvedModel"] as? String).flatMap { validIdentifier($0) ? $0 : nil }
-            if id == "default" { defaultResolved = resolved; continue }
             let name = entry["displayName"] as? String ?? id
             let description = entry["description"] as? String ?? ""
             guard seen.insert(id).inserted, validText(name, maximum: 256),
@@ -37,6 +39,14 @@ extension CodexModelCatalog {
                       efforts.insert(level).inserted else { throw AgentCatalogError.invalidResponse }
                 return CodexReasoningOption(id: level)
             }
+            if id == "default" {
+                // Omitting --effort leaves the level to Claude Code as well.
+                defaultRow = Row(descriptor: CodexModelDescriptor(id: id, displayName: "Default", description: description,
+                                                                  reasoningEfforts: [CodexReasoningOption(id: "")] + options,
+                                                                  defaultReasoningEffort: ""),
+                                 resolved: resolved)
+                continue
+            }
             // The CLI reports the applied effort only for its configured model.
             let configured = resolved != nil && resolved == appliedModel ? appliedEffort.flatMap { efforts.contains($0) ? $0 : nil } : nil
             let fallback = configured ?? (efforts.contains("high") ? "high" : options.first?.id)
@@ -45,8 +55,8 @@ extension CodexModelCatalog {
                             resolved: resolved))
         }
         guard !rows.isEmpty else { throw AgentCatalogError.invalidResponse }
-        let defaultID = defaultResolved.flatMap { resolved in rows.first { $0.resolved == resolved }?.descriptor.id } ?? rows[0].descriptor.id
-        let models = rows.map { row in
+        let defaultID = defaultRow?.resolved.flatMap { resolved in rows.first { $0.resolved == resolved }?.descriptor.id } ?? rows[0].descriptor.id
+        let models = (defaultRow.map { [$0.descriptor] } ?? []) + rows.map { row in
             CodexModelDescriptor(id: row.descriptor.id, displayName: row.descriptor.displayName, description: row.descriptor.description,
                                  reasoningEfforts: row.descriptor.reasoningEfforts,
                                  defaultReasoningEffort: row.descriptor.defaultReasoningEffort,

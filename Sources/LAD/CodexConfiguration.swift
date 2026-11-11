@@ -102,13 +102,15 @@ enum CodexModelSelection {
         effectiveModel(id: id, models: models, configuredModelID: configuredModelID)?.reasoningEfforts ?? []
     }
 
-    /// Return a catalog-supported explicit value, or the model's advertised
-    /// default. A model with no reasoning capability needs no override.
+    /// Return a catalog-supported value, or the model's advertised default. The
+    /// agent's own default level is kept only where the catalog offers it. A
+    /// model with no reasoning capability needs no override.
     static func normalizedEffort(_ effort: String, for model: CodexModelDescriptor) -> String? {
-        let supported = model.reasoningEfforts.map(\.id).filter { !$0.isEmpty && CodexReasoningEffort(rawValue: $0) != nil }
+        let offered = model.reasoningEfforts.map(\.id).filter { CodexReasoningEffort(rawValue: $0) != nil }
+        let supported = offered.filter { !$0.isEmpty }
         guard !supported.isEmpty else { return "" }
-        if !effort.isEmpty, supported.contains(effort) { return effort }
-        if let fallback = model.defaultReasoningEffort, supported.contains(fallback) { return fallback }
+        if offered.contains(effort) { return effort }
+        if let fallback = model.defaultReasoningEffort, offered.contains(fallback) { return fallback }
         return supported.first
     }
 
@@ -138,7 +140,7 @@ enum CodexModelSelection {
             } else { selected = "" }
         } else if let descriptor {
             let supported = Set(descriptor.reasoningEfforts.map(\.id))
-            if let remembered, !remembered.isEmpty, supported.contains(remembered), CodexReasoningEffort(rawValue: remembered) != nil {
+            if let remembered, supported.contains(remembered), CodexReasoningEffort(rawValue: remembered) != nil {
                 selected = remembered
             } else {
                 selected = normalizedEffort(currentEffort, for: descriptor) ?? ""

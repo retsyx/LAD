@@ -248,7 +248,8 @@ struct CodexModelMenu: View {
     }
 
     private func effortTitle(_ value: String) -> String {
-        CodexReasoningEffort(rawValue: value)?.title ?? value.capitalized
+        // An offered empty level is the agent's own default level.
+        value.isEmpty ? "Default" : CodexReasoningEffort(rawValue: value)?.title ?? value.capitalized
     }
 
     private var customModelEditor: some View {

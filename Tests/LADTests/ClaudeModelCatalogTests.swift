@@ -16,14 +16,14 @@ final class ClaudeModelCatalogTests: XCTestCase {
     func testCatalogUsesListedModelsTheirEffortsAndTheCLIsAppliedSettings() throws {
         let settings = Data(#"{"effective":{"model":"opus"},"applied":{"model":"claude-opus-5-5","effort":"xhigh"}}"#.utf8)
         let snapshot = try CodexModelCatalog.decodeClaudeCatalog(initialize: Data(initialize.utf8), settings: settings)
-        XCTAssertEqual(snapshot.models.map(\.id), ["opus", "sonnet", "claude-haiku-4-5-20251001"])
+        XCTAssertEqual(snapshot.models.map(\.id), ["default", "opus", "sonnet", "claude-haiku-4-5-20251001"])
         XCTAssertEqual(snapshot.models.filter(\.isDefault).map(\.id), ["opus"])
-        XCTAssertEqual(snapshot.models[0].displayName, "Opus 5.5")
-        XCTAssertEqual(snapshot.models[0].reasoningEfforts.map(\.id), ["low", "medium", "high", "xhigh", "max"])
-        XCTAssertEqual(snapshot.models[0].defaultReasoningEffort, "xhigh")
-        XCTAssertEqual(snapshot.models[1].defaultReasoningEffort, "high")
-        XCTAssertEqual(snapshot.models[2].reasoningEfforts, [])
-        XCTAssertNil(snapshot.models[2].defaultReasoningEffort)
+        XCTAssertEqual(snapshot.models[1].displayName, "Opus 5.5")
+        XCTAssertEqual(snapshot.models[1].reasoningEfforts.map(\.id), ["low", "medium", "high", "xhigh", "max"])
+        XCTAssertEqual(snapshot.models[1].defaultReasoningEffort, "xhigh")
+        XCTAssertEqual(snapshot.models[2].defaultReasoningEffort, "high")
+        XCTAssertEqual(snapshot.models[3].reasoningEfforts, [])
+        XCTAssertNil(snapshot.models[3].defaultReasoningEffort)
         XCTAssertEqual(snapshot.configuredModelID, "opus")
         XCTAssertEqual(snapshot.configuredReasoningEffort, "xhigh")
         // A new design starts from that installed configuration.
@@ -34,12 +34,53 @@ final class ClaudeModelCatalogTests: XCTestCase {
         XCTAssertEqual(initial.reasoningEffort, "xhigh")
     }
 
+    /// Claude Code's recommended model is a choice of its own, distinct from the
+    /// configured model, and can leave the reasoning level to Claude Code too.
+    @MainActor
+    func testRecommendedDefaultModelAndLevelRemainSelectable() throws {
+        let settings = Data(#"{"effective":{"model":"sonnet"},"applied":{"model":"claude-sonnet-5-5","effort":"medium"}}"#.utf8)
+        let snapshot = try CodexModelCatalog.decodeClaudeCatalog(initialize: Data(initialize.utf8), settings: settings)
+        let recommended = try XCTUnwrap(snapshot.models.first)
+        XCTAssertEqual(recommended.id, "default")
+        XCTAssertEqual(recommended.displayName, "Default")
+        XCTAssertEqual(recommended.description, "Opus 5.5")
+        XCTAssertFalse(recommended.isDefault, "New designs still start from an explicit configured or listed model")
+        XCTAssertEqual(recommended.reasoningEfforts.map(\.id), ["", "low", "medium", "high", "xhigh", "max"])
+        XCTAssertEqual(snapshot.configuredModelID, "sonnet")
+
+        var preferences: [String: String] = [:]
+        let models = snapshot.models
+        let chosen = CodexModelSelection.selectModel("default", currentModel: "sonnet", currentEffort: "medium", models: models,
+                                                     configuredModelID: snapshot.configuredModelID, preferences: &preferences)
+        XCTAssertEqual(chosen, "medium", "A supported level carries over like any other model switch")
+        CodexModelSelection.rememberEffort("", for: "default", preferences: &preferences)
+        XCTAssertEqual(CodexModelSelection.selectModel("opus", currentModel: "default", currentEffort: "", models: models,
+                                                       configuredModelID: snapshot.configuredModelID, preferences: &preferences), "high")
+        XCTAssertEqual(CodexModelSelection.selectModel("default", currentModel: "opus", currentEffort: "high", models: models,
+                                                       configuredModelID: snapshot.configuredModelID, preferences: &preferences), "",
+                       "Returning to Default restores its default level")
+
+        let saved = CodexProjectSettings(vendor: .claude, model: "default", reasoningEffort: "", reasoningByModel: ["default": ""])
+        XCTAssertEqual(AppState.normalizedCodexSettings(saved, models: models, configuredModelID: snapshot.configuredModelID,
+                                                        configuredReasoningEffort: snapshot.configuredReasoningEffort), saved)
+        XCTAssertEqual(CodexModelSelection.statusLabel(modelID: "default", effort: .defaultConfiguration, models: models,
+                                                       configuredModelID: snapshot.configuredModelID,
+                                                       configuredReasoningEffort: snapshot.configuredReasoningEffort), "Default · Default")
+        XCTAssertEqual(CodexModelSelection.statusLabel(modelID: "default", effort: .xhigh, models: models,
+                                                       configuredModelID: snapshot.configuredModelID,
+                                                       configuredReasoningEffort: snapshot.configuredReasoningEffort), "Default · Extra High")
+        // Explicit models keep explicit levels.
+        let opus = try XCTUnwrap(models.first { $0.id == "opus" })
+        XCTAssertEqual(CodexModelSelection.normalizedEffort("", for: opus), "high")
+    }
+
     func testConfiguredFullModelNamesMapToTheirListedAliasAndCustomNamesRemain() throws {
         func configured(_ model: String) throws -> String? {
             let settings = Data(#"{"effective":{"model":"\#(model)"},"applied":{"model":"\#(model)"}}"#.utf8)
             return try CodexModelCatalog.decodeClaudeCatalog(initialize: Data(initialize.utf8), settings: settings).configuredModelID
         }
         XCTAssertEqual(try configured("claude-sonnet-5-5"), "sonnet")
+        XCTAssertEqual(try configured("claude-opus-5-5"), "opus", "The recommended model row is not an alias of a configured model")
         XCTAssertEqual(try configured("opus[1m]"), "opus[1m]")
         XCTAssertNil(try configured("default"))
         let unconfigured = try CodexModelCatalog.decodeClaudeCatalog(initialize: Data(initialize.utf8), settings: nil)
@@ -89,7 +130,7 @@ final class ClaudeModelCatalogTests: XCTestCase {
         let catalog = CodexModelCatalog(vendor: .claude)
         await catalog.refresh(executable: executable.path, force: true)
         XCTAssertNil(catalog.error)
-        XCTAssertEqual(catalog.models.map(\.id), ["opus", "sonnet", "claude-haiku-4-5-20251001"])
+        XCTAssertEqual(catalog.models.map(\.id), ["default", "opus", "sonnet", "claude-haiku-4-5-20251001"])
         XCTAssertEqual(catalog.configuredModelID, "sonnet")
         XCTAssertEqual(catalog.configuredReasoningEffort, "medium")
         XCTAssertTrue(catalog.matches(executable: executable.path))
