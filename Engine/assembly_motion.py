@@ -3,11 +3,15 @@
 The construction program owns the definition. Pose solving and playback belong
 to the native app; this module never reconstructs or approximates CAD geometry.
 """
+import bisect
 import math
 
 
 MAX_CONNECTORS = 1024
 MAX_JOINTS = 256
+MAX_COUPLINGS = 256
+MAX_COUPLING_SAMPLES = 4096
+MAX_TOTAL_COUPLING_SAMPLES = 65536
 MAX_PARTS = 8192
 MAX_GROUNDED = 4096
 AXIS_TOLERANCE = 1e-6
@@ -70,10 +74,13 @@ def validate_motion(definition, parts):
 
     Connector frames are expressed in the final built geometry's world space,
     including every CadQuery Assembly location. Closed joint loops are allowed;
-    each participating component needs a grounded part. The app solves poses.
+    each participating component needs a grounded part. Optional couplings make
+    a follower joint's coordinate a function of its driver joint, so its
+    normalized position is derived. The app solves poses.
     """
-    if not isinstance(definition, dict) or set(definition) != {"grounded", "connectors", "joints"}:
-        _fail("Assembly motion requires grounded parts, connectors and joints.")
+    if (not isinstance(definition, dict) or not {"grounded", "connectors", "joints"} <= set(definition)
+            or set(definition) - {"grounded", "connectors", "joints", "couplings"}):
+        _fail("Assembly motion requires grounded parts, connectors and joints, with optional couplings.")
     physical, pending, count = set(), list(parts), 0
     while pending:
         part = pending.pop()
@@ -161,12 +168,18 @@ def validate_motion(definition, parts):
             if not isinstance(limits, (list, tuple)) or len(limits) != 2:
                 _fail("Assembly joint limits require a lower and upper value.")
             lower, upper = [_number(value, "joint limit") for value in limits]
-            if max(abs(lower), abs(upper)) > 1e9 or lower > upper or not lower <= position <= upper:
-                _fail("Assembly joint limits must contain the initial position.")
+            if max(abs(lower), abs(upper)) > 1e9 or lower > upper:
+                _fail("Assembly joint limits must be finite and ordered.")
             normalized["limits"] = [lower, upper]
         if kind == "fixed" and (position != 0 or "limits" in joint):
             _fail("Fixed assembly joints cannot have a position or limits.")
         normalized_joints.append(normalized)
+
+    normalized_couplings = _validate_couplings(definition.get("couplings", []), joints, normalized_joints)
+    for joint in normalized_joints:
+        limits = joint.get("limits")
+        if limits is not None and not limits[0] <= joint["position"] <= limits[1]:
+            _fail(f"Assembly joint limits must contain the initial position of {joint['name']}.")
 
     visited = set()
     for part in adjacency:
@@ -181,7 +194,143 @@ def validate_motion(definition, parts):
         if not component.intersection(anchors):
             _fail("Every moving assembly component requires a grounded physical part.")
         visited.update(component)
-    return {"grounded": list(grounded), "connectors": normalized_connectors, "joints": normalized_joints}
+    return {"grounded": list(grounded), "connectors": normalized_connectors, "joints": normalized_joints,
+            "couplings": normalized_couplings}
+
+
+def coupled_position(coupling, driver):
+    """Evaluate a normalized coupling exactly as the native solver does.
+
+    Linear couplings apply ratio and offset in joint units. Tables interpolate
+    linearly between samples; a periodic table repeats every period and adds
+    its advance per period, which models indexing mechanisms over many turns.
+    """
+    if coupling["type"] == "linear":
+        return coupling["ratio"] * driver + coupling["offset"]
+    xs = [sample[0] for sample in coupling["samples"]]
+    ys = [sample[1] for sample in coupling["samples"]]
+    shift = 0.0
+    if "period" in coupling:
+        period, advance = coupling["period"], coupling["advance"]
+        turns = math.floor((driver - xs[0]) / period)
+        driver -= turns * period
+        shift = turns * advance
+        if xs[-1] < xs[0] + period:
+            xs.append(xs[0] + period)
+            ys.append(ys[0] + advance)
+    driver = min(max(driver, xs[0]), xs[-1])
+    index = min(max(bisect.bisect_right(xs, driver) - 1, 0), len(xs) - 2)
+    span = xs[index + 1] - xs[index]
+    fraction = min(max((driver - xs[index]) / span, 0.0), 1.0) if span > 0 else 0.0
+    return ys[index] + fraction * (ys[index + 1] - ys[index]) + shift
+
+
+def _validate_couplings(couplings, authored_joints, joints):
+    """Normalize couplings and derive follower positions in dependency order."""
+    if not isinstance(couplings, (list, tuple)) or len(couplings) > MAX_COUPLINGS:
+        _fail("The assembly coupling list is invalid or exceeds 256 couplings.")
+    by_id = {joint["id"]: joint for joint in joints}
+    identities, driver_of, normalized_couplings, total_samples = set(), {}, [], 0
+    for coupling in couplings:
+        if not isinstance(coupling, dict) or not {"id", "type", "driver", "follower"} <= set(coupling):
+            _fail("Each assembly coupling requires an ID, type, driver joint and follower joint.")
+        kind = coupling["type"]
+        fields = {"linear": {"ratio", "offset"}, "table": {"samples", "period", "advance"}}.get(kind)
+        if fields is None:
+            _fail("Assembly couplings support linear and table relations.")
+        if set(coupling) - {"id", "type", "driver", "follower"} - fields:
+            _fail("The assembly coupling contains unsupported fields.")
+        identity = _identifier(coupling["id"], "coupling ID")
+        if identity in identities:
+            _fail("Assembly coupling IDs must be unique.")
+        identities.add(identity)
+        driver = _identifier(coupling["driver"], "coupling driver")
+        follower = _identifier(coupling["follower"], "coupling follower")
+        if driver not in by_id or follower not in by_id or driver == follower:
+            _fail("Assembly couplings must relate two different existing joints.")
+        if by_id[driver]["type"] == "fixed" or by_id[follower]["type"] == "fixed":
+            _fail("Assembly couplings must relate movable joints.")
+        if follower in driver_of:
+            _fail("Each assembly joint can follow at most one coupling.")
+        driver_of[follower] = driver
+        normalized = {"id": identity, "type": kind, "driver": driver, "follower": follower}
+        if kind == "linear":
+            if "ratio" not in coupling:
+                _fail("A linear assembly coupling requires a nonzero ratio.")
+            ratio = _number(coupling["ratio"], "coupling ratio")
+            offset = _number(coupling.get("offset", 0), "coupling offset")
+            if ratio == 0 or abs(ratio) > 1e9 or abs(offset) > 1e9:
+                _fail("A linear assembly coupling requires a nonzero ratio and offset within range.")
+            normalized.update(ratio=ratio, offset=offset)
+        else:
+            samples = coupling.get("samples")
+            if (not isinstance(samples, (list, tuple))
+                    or not 2 <= len(samples) <= MAX_COUPLING_SAMPLES):
+                _fail("A table assembly coupling requires between 2 and 4,096 samples.")
+            total_samples += len(samples)
+            if total_samples > MAX_TOTAL_COUPLING_SAMPLES:
+                _fail("The assembly couplings exceed 65,536 samples in total.")
+            points = []
+            for sample in samples:
+                if not isinstance(sample, (list, tuple)) or len(sample) != 2:
+                    _fail("Each coupling sample requires a driver and follower position.")
+                point = [_number(value, "coupling sample") for value in sample]
+                if any(abs(value) > 1e9 for value in point):
+                    _fail("A coupling sample exceeds the supported range.")
+                points.append(point)
+            if any(b[0] <= a[0] for a, b in zip(points, points[1:])):
+                _fail("Coupling sample driver positions must increase strictly.")
+            normalized["samples"] = points
+            span = points[-1][0] - points[0][0]
+            if "period" in coupling:
+                period = _number(coupling["period"], "coupling period")
+                advance = _number(coupling.get("advance", 0), "coupling advance")
+                tolerance = 1e-9 * max(1.0, period)
+                if not 0 < period <= 1e9 or abs(advance) > 1e9 or span > period + tolerance:
+                    _fail("A periodic coupling's samples must lie within one positive period.")
+                closing = points[0][1] + advance
+                if span >= period - tolerance and abs(points[-1][1] - closing) > 1e-6 * max(1.0, abs(closing)):
+                    _fail("A periodic coupling's last sample must equal its first sample plus the advance.")
+                normalized.update(period=period, advance=advance)
+            elif "advance" in coupling:
+                _fail("A coupling advance requires a period.")
+            else:
+                limits = by_id[driver].get("limits")
+                if limits is None or limits[0] < points[0][0] or limits[1] > points[-1][0]:
+                    _fail("A nonperiodic coupling's driver needs motion limits within its sample range.")
+        normalized_couplings.append(normalized)
+
+    for follower in driver_of:
+        seen, current = {follower}, driver_of[follower]
+        while current in driver_of:
+            if current in seen:
+                _fail("Assembly couplings cannot form a cycle.")
+            seen.add(current)
+            current = driver_of[current]
+
+    authored = {joint["id"]: joint for joint in authored_joints}
+    by_follower = {coupling["follower"]: coupling for coupling in normalized_couplings}
+    resolved = {}
+
+    def position(identity):
+        if identity not in by_follower:
+            return by_id[identity]["position"]
+        if identity not in resolved:
+            coupling = by_follower[identity]
+            value = coupled_position(coupling, position(coupling["driver"]))
+            if not math.isfinite(value) or abs(value) > 1e9:
+                _fail(f"The coupling {coupling['id']} places a joint outside the supported range.")
+            resolved[identity] = value
+        return resolved[identity]
+
+    for follower, coupling in by_follower.items():
+        value = position(follower)
+        joint = by_id[follower]
+        if "position" in authored[follower] and abs(joint["position"] - value) > 1e-6 * max(1.0, abs(value)):
+            _fail(f"The position of {joint['name']} must match its coupling {coupling['id']} ({value:.9g}); "
+                  "omit follower positions.")
+        joint["position"] = value
+    return normalized_couplings
 
 
 def transformed_solids(solids, records, cq):

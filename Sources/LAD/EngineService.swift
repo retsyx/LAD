@@ -362,6 +362,45 @@ final class EngineService {
         return topology
     }
 
+    struct Clearance: Decodable, Sendable, Equatable {
+        /// Exact minimum distance; zero for touching or interfering parts.
+        var distance: Double
+        /// Common volume when the distance is zero, or nil if OpenCascade could not resolve it.
+        var overlapVolume: Double?
+        var closestPoints: [[Double]]
+    }
+
+    /// Exact pairwise clearance at each supplied rigid pose, without meshing.
+    /// `pairs` lists two disjoint solid-index groups per pair; the result is
+    /// indexed by pose and then by pair.
+    func clearance(_ preview: PreviewMesh, pairs: [[[Int]]], poses: [[Int: [Double]]],
+                   python: String, threads: Int) async throws -> [[Clearance]] {
+        let records = try poses.map { try AssemblySolidTransform.validatedRecords($0, solidCount: preview.solids) }
+        let bytes = try await nativeBytes(preview)
+        // Like measurement, a clearance check never cancels a build on this service.
+        let worker = EngineService()
+        let output = try await worker.run(python: python, threads: threads, scriptMode: false, action: "check this motion") { folder in
+            try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
+            let payload: [String: Any] = ["operation": "clearance", "brepAsset": "source.brep", "pairs": pairs,
+                                          "poses": try JSONSerialization.jsonObject(with: JSONEncoder().encode(records))]
+            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+        }
+        struct Report: Decodable { var samples: [[Clearance]] }
+        let report = try await Task.detached(priority: .userInitiated) {
+            let data = try EngineArtifact.read(output.folder.appendingPathComponent("result.json"), in: output.folder, maximumBytes: 32_000_000)
+            let report = try JSONDecoder().decode(Report.self, from: data)
+            guard report.samples.count == poses.count, report.samples.allSatisfy({ sample in
+                sample.count == pairs.count && sample.allSatisfy { item in
+                    item.distance.isFinite && item.distance >= 0 && (item.overlapVolume.map { $0.isFinite && $0 >= 0 } ?? true)
+                        && item.closestPoints.count == 2 && item.closestPoints.allSatisfy { $0.count == 3 && $0.allSatisfy(\.isFinite) }
+                }
+            }) else { throw LADError.message("The CAD engine returned an invalid clearance report.") }
+            return report
+        }.value
+        try Task.checkCancellation()
+        return report.samples
+    }
+
     private struct NativeMeasurement: Decodable, Sendable {
         var metrics: [CADMeasurementMetric]
         var closestPoints: [[Double]]?

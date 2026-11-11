@@ -12,6 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from worker import (ModelError, build_shape, exact_bounds, make_preview, posed_solids,
                     run, validate_assembly_motion, write_brep)
+from assembly_motion import coupled_position
 
 
 def connector(identity, part, origin=(0, 0, 0)):
@@ -130,6 +131,103 @@ result.add(cq.Solid.makeBox(2,3,4), name='Arm', loc=cq.Location((20,0,0)), metad
             build_shape(script_spec(script))
 
 
+def coupled_definition(coupling):
+    """Two wheels on a grounded base; the link follows the arm."""
+    motion = definition()
+    motion["connectors"] += [connector("base-link", "base", (40, 0, 0)), connector("link-axis", "link", (40, 0, 0))]
+    motion["joints"].append({"id": "index", "name": "Link index", "type": "revolute",
+                             "parent": "base-link", "child": "link-axis"})
+    motion["couplings"] = [{"id": "drive", "driver": "hinge", "follower": "index", **coupling}]
+    return motion
+
+
+GENEVA_LIKE = {"type": "table", "samples": [[0, 0], [120, 0], [240, -60]], "period": 360, "advance": -60}
+
+
+class AssemblyCouplingTests(unittest.TestCase):
+    def test_linear_and_periodic_couplings_normalize_and_derive_follower_positions(self):
+        linear = coupled_definition({"type": "linear", "ratio": -0.5, "offset": 2})
+        linear["joints"][0]["position"] = 40
+        actual = validate_assembly_motion(linear, physical_parts())
+        self.assertEqual(actual["couplings"], [{"id": "drive", "type": "linear", "driver": "hinge",
+                                                "follower": "index", "ratio": -0.5, "offset": 2}])
+        self.assertEqual(actual["joints"][1]["position"], -18)
+        periodic = coupled_definition(GENEVA_LIKE)
+        periodic["joints"][0].update(position=60, limits=[-720, 720])
+        actual = validate_assembly_motion(periodic, physical_parts())
+        self.assertEqual(actual["couplings"][0]["period"], 360)
+        self.assertEqual(actual["couplings"][0]["samples"], [[0, 0], [120, 0], [240, -60]])
+        self.assertEqual(actual["joints"][1]["position"], 0)
+        plain = validate_assembly_motion(definition(), physical_parts())
+        self.assertEqual(plain["couplings"], [])
+
+    def test_coupled_positions_repeat_each_period_with_its_advance(self):
+        coupling = {"id": "drive", "driver": "hinge", "follower": "index", **GENEVA_LIKE}
+        closed = dict(coupling, samples=GENEVA_LIKE["samples"] + [[360, -60]])
+        for driver, expected in ((0, 0), (60, 0), (180, -30), (240, -60), (360, -60), (540, -90),
+                                 (720, -120), (-180, 30), (-360, 60), (1e6, coupled_position(coupling, 1e6))):
+            with self.subTest(driver=driver):
+                self.assertAlmostEqual(coupled_position(coupling, driver), expected, places=9)
+                self.assertAlmostEqual(coupled_position(closed, driver), expected, places=9)
+        bounded = {"type": "table", "samples": [[0, 0], [10, 5], [20, 0]]}
+        self.assertEqual([coupled_position(bounded, value) for value in (0, 5, 10, 15, 20)], [0, 2.5, 5, 2.5, 0])
+        self.assertEqual(coupled_position({"type": "linear", "ratio": 2, "offset": -1}, 3), 5)
+
+    def test_matching_follower_positions_are_accepted_and_contradictions_rejected(self):
+        motion = coupled_definition({"type": "linear", "ratio": 2})
+        motion["joints"][0]["position"] = 10
+        motion["joints"][1]["position"] = 20
+        self.assertEqual(validate_assembly_motion(motion, physical_parts())["joints"][1]["position"], 20)
+        motion["joints"][1]["position"] = 21
+        with self.assertRaisesRegex(ModelError, "must match its coupling"):
+            validate_assembly_motion(motion, physical_parts())
+
+    def test_invalid_couplings_fail(self):
+        invalid = []
+
+        def changed(coupling, change=None):
+            value = coupled_definition(coupling)
+            if change:
+                change(value)
+            invalid.append(value)
+
+        linear = {"type": "linear", "ratio": 1}
+        changed(linear, lambda value: value.update(couplings={}))
+        changed({"type": "gear", "ratio": 1})
+        changed({"type": "linear"})
+        changed({"type": "linear", "ratio": 0})
+        changed({"type": "linear", "ratio": float("nan")})
+        changed({"type": "linear", "ratio": 1, "samples": [[0, 0], [1, 1]]})
+        changed(linear, lambda value: value["couplings"][0].update(driver="missing"))
+        changed(linear, lambda value: value["couplings"][0].update(follower="hinge"))
+        changed(linear, lambda value: value["couplings"][0].pop("driver"))
+        changed(linear, lambda value: value["couplings"].append(dict(value["couplings"][0])))
+        changed(linear, lambda value: value["couplings"].append(dict(value["couplings"][0], id="again")))
+        changed(linear, lambda value: value["couplings"].append(
+            {"id": "back", "type": "linear", "driver": "index", "follower": "hinge", "ratio": 1}))
+        changed(linear, lambda value: (value["joints"][1].update(type="fixed"),))
+        changed({"type": "table", "samples": [[0, 0]]})
+        changed({"type": "table", "samples": [[0, 0], [0, 1]]})
+        changed({"type": "table", "samples": [[0, 0], [1]]})
+        changed({"type": "table", "samples": [[0, 0], [1, 1]] * 2049})
+        changed({"type": "table", "samples": [[0, 0], [360, 1]], "period": 360, "advance": 0})
+        changed({"type": "table", "samples": [[0, 0], [361, 1]], "period": 360})
+        changed({"type": "table", "samples": [[0, 0], [1, 1]], "period": 0})
+        changed({"type": "table", "samples": [[0, 0], [1, 1]], "advance": 1})
+        changed({"type": "table", "samples": [[0, 0], [90, 1]]})
+        changed({"type": "table", "samples": [[0, 0], [90, 1]]},
+                lambda value: value["joints"][0].update(limits=[-10, 90]))
+        changed(linear, lambda value: value["joints"][1].update(limits=[5, 10]))
+        for index, value in enumerate(invalid):
+            with self.subTest(index=index), self.assertRaises(ModelError):
+                validate_assembly_motion(value, physical_parts())
+
+    def test_nonperiodic_table_accepts_driver_limits_within_its_samples(self):
+        motion = coupled_definition({"type": "table", "samples": [[-90, 0], [0, 10], [90, 0]]})
+        motion["joints"][0].update(position=45)
+        self.assertEqual(validate_assembly_motion(motion, physical_parts())["joints"][1]["position"], 5)
+
+
 class NativePoseTests(unittest.TestCase):
     def native_operation(self, folder, shape, spec):
         write_brep(shape, folder / "source.brep")
@@ -209,6 +307,41 @@ class NativePoseTests(unittest.TestCase):
             expected = vertex.toTuple()
             self.assert_vector(item["position"], [expected[0] + 5, expected[1] + 4, expected[2]])
         self.assertEqual([item["id"] for item in report["topology"]["vertices"]], selected)
+
+    def test_clearance_separates_gaps_contact_and_interference_at_each_pose(self):
+        import cadquery as cq
+        shape = cq.Compound.makeCompound([cq.Solid.makeBox(1, 1, 1), cq.Solid.makeBox(1, 1, 1).translate((5, 0, 0)),
+                                          cq.Solid.makeBox(1, 1, 1).translate((0, 9, 0))])
+        poses = [[], [{"solid": 1, "matrix": rotation_y(0, (-4, 0, 0))}],
+                 [{"solid": 1, "matrix": rotation_y(0, (-4.5, 0, 0))}]]
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("worker._preview_mesh", side_effect=AssertionError("No clearance tessellation")):
+                report = self.native_operation(Path(directory), shape, {
+                    "operation": "clearance", "pairs": [[[0], [1]], [[0, 2], [1]]], "poses": poses})
+        gap, touching, overlapping = report["samples"]
+        self.assertAlmostEqual(gap[0]["distance"], 4)
+        self.assertNotIn("overlapVolume", gap[0])
+        self.assert_vector(gap[0]["closestPoints"][0][:1], [1])
+        self.assert_vector(gap[0]["closestPoints"][1][:1], [5])
+        self.assertAlmostEqual(touching[0]["distance"], 0)
+        self.assertAlmostEqual(touching[0]["overlapVolume"], 0)
+        self.assertAlmostEqual(overlapping[0]["distance"], 0)
+        self.assertAlmostEqual(overlapping[0]["overlapVolume"], 0.5)
+        # A grouped side measures the nearest member and its combined overlap.
+        self.assertAlmostEqual(overlapping[1]["overlapVolume"], 0.5)
+        self.assertAlmostEqual(gap[1]["distance"], 4)
+
+    def test_invalid_clearance_requests_fail_before_measuring(self):
+        import cadquery as cq
+        shape = cq.Compound.makeCompound([cq.Solid.makeBox(1, 1, 1), cq.Solid.makeBox(1, 1, 1).translate((5, 0, 0))])
+        valid = {"operation": "clearance", "pairs": [[[0], [1]]], "poses": [[]]}
+        invalid = [dict(valid, pairs=[]), dict(valid, pairs=[[[0], [1]]] * 9), dict(valid, pairs=[[[0]]]),
+                   dict(valid, pairs=[[[0], []]]), dict(valid, pairs=[[[0], [0]]]), dict(valid, pairs=[[[0], [2]]]),
+                   dict(valid, pairs=[[[0, 0], [1]]]), dict(valid, poses=[]), dict(valid, poses=[[]] * 362),
+                   dict(valid, poses=[[{"solid": 1, "matrix": [2] * 16}]]), dict(valid, extra=True)]
+        for spec in invalid:
+            with self.subTest(spec=spec), tempfile.TemporaryDirectory() as directory, self.assertRaises(ModelError):
+                self.native_operation(Path(directory), shape, spec)
 
     def test_nonrigid_ambiguous_or_nonfinite_poses_fail_before_native_transform(self):
         import cadquery as cq

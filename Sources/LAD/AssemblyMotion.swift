@@ -94,6 +94,66 @@ struct AssemblyJoint: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+/// A follower joint's coordinate as a function of its driver joint's coordinate.
+/// Linear relations cover gears, belts, racks and screws; sampled tables cover
+/// cams and intermittent indexing. Followers are never free solver variables,
+/// so a higher pair such as a Geneva pin and slot needs no contact model.
+struct AssemblyCoupling: Codable, Sendable, Equatable, Identifiable {
+    enum Kind: String, Codable, Sendable { case linear, table }
+    var id: String
+    var type: Kind
+    var driver: String
+    var follower: String
+    /// Follower units per driver unit, plus a follower offset (linear only).
+    var ratio: Double? = nil
+    var offset: Double? = nil
+    /// `[driver, follower]` pairs with strictly increasing driver values (table only).
+    var samples: [[Double]]? = nil
+    /// A periodic table repeats every `period` driver units, adding `advance`.
+    var period: Double? = nil
+    var advance: Double? = nil
+
+    static func linear(id: String, driver: String, follower: String, ratio: Double, offset: Double = 0) -> Self {
+        Self(id: id, type: .linear, driver: driver, follower: follower, ratio: ratio, offset: offset)
+    }
+
+    static func table(id: String, driver: String, follower: String, samples: [[Double]],
+                      period: Double? = nil, advance: Double? = nil) -> Self {
+        Self(id: id, type: .table, driver: driver, follower: follower, samples: samples, period: period, advance: advance)
+    }
+}
+
+/// Validated evaluation form; matches the worker's `coupled_position`.
+/// A periodic table's samples already include the closing point of its period.
+fileprivate struct CouplingLaw: Sendable {
+    var driver: Int
+    var follower: Int
+    var ratio = 1.0, offset = 0.0
+    var xs = [Double](), ys = [Double]()
+    var period: Double?
+    var advance = 0.0
+    var isLinear: Bool
+
+    func value(_ input: Double) -> Double {
+        if isLinear { return ratio * input + offset }
+        var x = input, shift = 0.0
+        if let period {
+            let turns = ((input - xs[0]) / period).rounded(.down)
+            x -= turns * period
+            shift = turns * advance
+        }
+        x = min(max(x, xs[0]), xs[xs.count - 1])
+        var low = 0, high = xs.count - 1
+        while high - low > 1 {
+            let middle = (low + high) / 2
+            if xs[middle] <= x { low = middle } else { high = middle }
+        }
+        let span = xs[high] - xs[low]
+        let fraction = span > 0 ? min(max((x - xs[low]) / span, 0), 1) : 0
+        return ys[low] + fraction * (ys[high] - ys[low]) + shift
+    }
+}
+
 struct AssemblyPose: Sendable, Equatable {
     var positions: [String: Double]
     /// Row-major homogeneous rigid transforms, relative to replayed geometry.
@@ -110,11 +170,13 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
     var grounded: [String] = []
     var connectors: [AssemblyConnector]
     var joints: [AssemblyJoint]
+    var couplings: [AssemblyCoupling] = []
 
-    private enum CodingKeys: String, CodingKey { case grounded, connectors, joints }
+    private enum CodingKeys: String, CodingKey { case grounded, connectors, joints, couplings }
 
-    init(grounded: [String] = [], connectors: [AssemblyConnector], joints: [AssemblyJoint]) {
-        self.grounded = grounded; self.connectors = connectors; self.joints = joints
+    init(grounded: [String] = [], connectors: [AssemblyConnector], joints: [AssemblyJoint],
+         couplings: [AssemblyCoupling] = []) {
+        self.grounded = grounded; self.connectors = connectors; self.joints = joints; self.couplings = couplings
     }
 
     init(from decoder: Decoder) throws {
@@ -122,9 +184,24 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
         grounded = try values.decodeIfPresent([String].self, forKey: .grounded) ?? []
         connectors = try values.decode([AssemblyConnector].self, forKey: .connectors)
         joints = try values.decode([AssemblyJoint].self, forKey: .joints)
+        couplings = try values.decodeIfPresent([AssemblyCoupling].self, forKey: .couplings) ?? []
     }
 
     func validate(parts: [PartNode]) throws { _ = try graph(parts: parts) }
+
+    /// The joint that determines a follower's coordinate, or nil for an independent joint.
+    func driver(of jointID: String) -> AssemblyJoint? {
+        guard let coupling = couplings.first(where: { $0.follower == jointID }) else { return nil }
+        return joints.first { $0.id == coupling.driver }
+    }
+
+    /// Followers take their positions from their drivers; only independent
+    /// joints can be positioned directly.
+    func requireIndependent(_ jointID: String) throws {
+        if let driver = driver(of: jointID), let joint = joints.first(where: { $0.id == jointID }) {
+            throw LADError.message("\(joint.name) follows \(driver.name) through a coupling. Position \(driver.name) instead.")
+        }
+    }
 
     /// The named driving joint keeps its requested position. Other joints in a
     /// closed mechanism may move to satisfy closure, using the supplied pose as
@@ -143,17 +220,18 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
               driving == nil || byID[driving!].map({ joints[$0].isMovable }) == true else {
             throw LADError.message("The design's assembly pose refers to an unknown or fixed joint.")
         }
-        var values = joints.map { positions[$0.id] ?? $0.position }
-        for (index, joint) in joints.enumerated() {
-            guard values[index].isFinite, abs(values[index]) <= 1e9,
-                  joint.type != .fixed || abs(values[index]) <= 1e-12,
-                  joint.limits.map({ values[index] >= $0[0] && values[index] <= $0[1] }) ?? true else {
-                throw LADError.message("The position of \(joint.name) is outside its motion limits.")
-            }
+        if let driving { try requireIndependent(driving) }
+        // Supplied follower coordinates are stale continuity data; their
+        // drivers determine them before any limit check or closure solve.
+        let supplied = joints.map { positions[$0.id] ?? $0.position }
+        guard supplied.allSatisfy({ $0.isFinite && abs($0) <= 1e9 }) else {
+            throw LADError.message("The design's assembly pose contains an invalid joint position.")
         }
+        var values = graph.resolve(supplied)
+        try checkLimits(values)
         let free = joints.indices.filter {
             joints[$0].isMovable && joints[$0].id != driving && graph.closureVariables.contains($0)
-                && (allowedFree?.contains($0) ?? true)
+                && graph.drivers[$0] == nil && (allowedFree?.contains($0) ?? true)
                 && !(joints[$0].limits.map { $0[0] == $0[1] } ?? false)
         }
         let factors = free.map { joints[$0].type == .revolute ? 180 / Double.pi : graph.scale }
@@ -220,6 +298,10 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
             guard Self.isClosed(evaluated.residual, scale: graph.scale) else { throw closureError(driving) }
         }
         for index in free.indices { values[free[index]] = x[index] * factors[index] }
+        if !graph.couplings.isEmpty {
+            values = graph.resolve(values)
+            do { try checkLimits(values) } catch { throw closureError(driving) }
+        }
         var transforms = [Int: [Double]]()
         for (part, matrix) in evaluated.poses {
             let rows = AssemblyPose.rows(matrix)
@@ -269,7 +351,8 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
 
     private func grabCoordinates(graph: Graph, solidIndex: Int) -> (part: String, indices: [Int])? {
         guard let part = graph.solids.first(where: { $0.value.contains(solidIndex) })?.key else { return nil }
-        var involved = graph.paths[part] ?? []
+        // A coupled follower moves only through its independent root driver.
+        var involved = Set((graph.paths[part] ?? []).map { graph.roots[$0] })
         var expanded = true
         while expanded {
             let previous = involved.count
@@ -404,6 +487,16 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
         return pose
     }
 
+    private func checkLimits(_ values: [Double]) throws {
+        for (index, joint) in joints.enumerated() {
+            guard values[index].isFinite, abs(values[index]) <= 1e9,
+                  joint.type != .fixed || abs(values[index]) <= 1e-12,
+                  joint.limits.map({ values[index] >= $0[0] && values[index] <= $0[1] }) ?? true else {
+                throw LADError.message("The position of \(joint.name) is outside its motion limits.")
+            }
+        }
+    }
+
     private func closureError(_ driving: String?) -> LADError {
         let joint = driving.flatMap { id in joints.first { $0.id == id } }
         return .message(joint.map { "The design cannot reach this position of \($0.name) within its joint constraints and motion limits." }
@@ -427,10 +520,24 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
         /// Only joints on closure paths can affect the nonlinear residual.
         var closureVariables: Set<Int>
         var paths: [String: Set<Int>]
+        /// Root-mapped joints whose coordinates affect each closure residual.
         var closurePaths: [Set<Int>]
         var scale: Double
+        /// Couplings in dependency order, each follower's driver, and each
+        /// joint's independent root (itself when it follows no coupling).
+        var couplings: [CouplingLaw]
+        var drivers: [Int: Int]
+        var roots: [Int]
 
-        func evaluate(joints: [AssemblyJoint], positions: [Double]) -> (poses: [String: simd_double4x4], residual: [Double]) {
+        func resolve(_ positions: [Double]) -> [Double] {
+            guard !couplings.isEmpty else { return positions }
+            var resolved = positions
+            for law in couplings { resolved[law.follower] = law.value(resolved[law.driver]) }
+            return resolved
+        }
+
+        func evaluate(joints: [AssemblyJoint], positions supplied: [Double]) -> (poses: [String: simd_double4x4], residual: [Double]) {
+            let positions = resolve(supplied)
             var poses = Dictionary(uniqueKeysWithValues: anchors.map { ($0, matrix_identity_double4x4) })
             for arc in tree {
                 let joint = joints[arc.joint]
@@ -536,6 +643,7 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
         let closures = joints.indices.filter { !treeJoints.contains($0) }
         var paths = Dictionary(uniqueKeysWithValues: anchors.map { ($0, Set<Int>()) })
         for arc in tree { paths[arc.to] = (paths[arc.from] ?? []).union([arc.joint]) }
+        let (laws, drivers, roots) = try couplingLaws()
         var closureVariables = Set<Int>()
         var closurePaths = [Set<Int>]()
         for index in closures {
@@ -543,13 +651,90 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
             let a = paths[connectorParts[joint.parent]!] ?? [], b = paths[connectorParts[joint.child]!] ?? []
             // A common prefix moves the entire loop rigidly and cancels from
             // the closure equation. Unrelated open chains also remain direct.
-            let variables = a.symmetricDifference(b).union([index])
+            let variables = Set(a.symmetricDifference(b).union([index]).map { roots[$0] })
             closurePaths.append(variables)
             closureVariables.formUnion(variables)
         }
         return Graph(solids: solids, frames: frames, connectorParts: connectorParts, anchors: anchors, tree: tree,
                      closures: closures, closureVariables: closureVariables, paths: paths,
-                     closurePaths: closurePaths, scale: scale)
+                     closurePaths: closurePaths, scale: scale, couplings: laws, drivers: drivers, roots: roots)
+    }
+
+    /// Validates couplings and orders them so every driver resolves before its followers.
+    private func couplingLaws() throws -> (laws: [CouplingLaw], drivers: [Int: Int], roots: [Int]) {
+        let byID = Dictionary(uniqueKeysWithValues: joints.enumerated().map { ($0.element.id, $0.offset) })
+        guard couplings.count <= 256, Set(couplings.map(\.id)).count == couplings.count,
+              couplings.allSatisfy({ !$0.id.isEmpty && $0.id.utf8.count <= 1024 }) else {
+            throw LADError.message("The design has invalid or duplicate assembly couplings.")
+        }
+        var drivers = [Int: Int](), unordered = [CouplingLaw](), totalSamples = 0
+        for coupling in couplings {
+            func invalid(_ reason: String) -> LADError { .message("The assembly coupling \(coupling.id) \(reason).") }
+            guard let driver = byID[coupling.driver], let follower = byID[coupling.follower], driver != follower,
+                  joints[driver].isMovable, joints[follower].isMovable else {
+                throw invalid("must relate two different movable joints")
+            }
+            guard drivers[follower] == nil else { throw invalid("names a follower that already follows another coupling") }
+            drivers[follower] = driver
+            var law = CouplingLaw(driver: driver, follower: follower, isLinear: coupling.type == .linear)
+            switch coupling.type {
+            case .linear:
+                guard let ratio = coupling.ratio, ratio.isFinite, ratio != 0, abs(ratio) <= 1e9,
+                      (coupling.offset ?? 0).isFinite, abs(coupling.offset ?? 0) <= 1e9,
+                      coupling.samples == nil, coupling.period == nil, coupling.advance == nil else {
+                    throw invalid("needs only a nonzero finite ratio and an optional offset")
+                }
+                law.ratio = ratio; law.offset = coupling.offset ?? 0
+            case .table:
+                guard coupling.ratio == nil, coupling.offset == nil, let samples = coupling.samples,
+                      (2...4096).contains(samples.count),
+                      samples.allSatisfy({ $0.count == 2 && $0.allSatisfy { $0.isFinite && abs($0) <= 1e9 } }) else {
+                    throw invalid("needs between 2 and 4,096 finite [driver, follower] samples")
+                }
+                totalSamples += samples.count
+                guard totalSamples <= 65_536 else {
+                    throw LADError.message("The design's assembly couplings exceed 65,536 samples in total.")
+                }
+                law.xs = samples.map { $0[0] }; law.ys = samples.map { $0[1] }
+                guard zip(law.xs, law.xs.dropFirst()).allSatisfy({ $0 < $1 }) else {
+                    throw invalid("needs strictly increasing driver samples")
+                }
+                let span = law.xs[law.xs.count - 1] - law.xs[0]
+                if let period = coupling.period {
+                    let advance = coupling.advance ?? 0, tolerance = 1e-9 * max(1, period)
+                    let closing = law.ys[0] + advance
+                    guard period.isFinite, period > 0, period <= 1e9, advance.isFinite, abs(advance) <= 1e9,
+                          span <= period + tolerance,
+                          span < period - tolerance || abs(law.ys[law.ys.count - 1] - closing) <= 1e-6 * max(1, abs(closing)) else {
+                        throw invalid("needs samples within one positive period that close with its advance")
+                    }
+                    law.period = period; law.advance = advance
+                    if law.xs[law.xs.count - 1] < law.xs[0] + period {
+                        law.xs.append(law.xs[0] + period); law.ys.append(closing)
+                    }
+                } else {
+                    guard coupling.advance == nil, let limits = joints[driver].limits,
+                          limits[0] >= law.xs[0], limits[1] <= law.xs[law.xs.count - 1] else {
+                        throw invalid("needs a driver with motion limits within its sample range")
+                    }
+                }
+            }
+            unordered.append(law)
+        }
+        var roots = Array(joints.indices)
+        var depth = [Int: Int]()
+        for follower in drivers.keys {
+            var visited: Set<Int> = [follower], current = follower, steps = 0
+            while let next = drivers[current] {
+                guard visited.insert(next).inserted else {
+                    throw LADError.message("The design's assembly couplings form a cycle.")
+                }
+                current = next; steps += 1
+            }
+            roots[follower] = current; depth[follower] = steps
+        }
+        let laws = unordered.sorted { depth[$0.follower]! < depth[$1.follower]! }
+        return (laws, drivers, roots)
     }
 
     private static func isClosed(_ residual: [Double], scale: Double) -> Bool {

@@ -541,6 +541,7 @@ final class CADAgentTools {
                 guard let motion = preview.assemblyMotion else {
                     throw LADError.message("The design has no assembly joints to position.")
                 }
+                for id in jointPositions.keys.sorted() { try motion.requireIndependent(id) }
                 let parts = artifact.parts
                 let positions = (preview.assemblyPose?.positions ?? [:]).merging(jointPositions) { _, requested in requested }
                 let solving = Task.detached(priority: .userInitiated) {
@@ -565,6 +566,106 @@ final class CADAgentTools {
             }
             if let pose = preview.assemblyPose { metadata["jointPositions"] = pose.positions }
             return try imageResult(url, metadata: metadata)
+        case "lad_check_motion":
+            try allowed(arguments, ["artifactID", "joint", "from", "to", "steps", "pairs", "jointPositions"])
+            let jointID = try string("joint", arguments, required: true)!
+            let from = try finite("from", arguments), to = try finite("to", arguments)
+            let steps = try integer("steps", arguments, fallback: 73, range: 2...361)
+            guard let rawPairs = arguments["pairs"] as? [Any], (1...8).contains(rawPairs.count) else {
+                throw LADError.message("Check between 1 and 8 pairs of physical part IDs.")
+            }
+            let pairIDs = try rawPairs.map { raw -> [String] in
+                guard let pair = raw as? [Any], pair.count == 2,
+                      let ids = pair as? [String], ids.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 1024 }), ids[0] != ids[1] else {
+                    throw LADError.message("Each clearance pair requires two different physical part IDs.")
+                }
+                return ids
+            }
+            let overrides = try renderJointPositions(arguments) ?? [:]
+            let artifact = try await artifact(arguments)
+            let preview = artifact.preview!
+            guard let motion = preview.assemblyMotion else { throw LADError.message("The design has no assembly joints to move.") }
+            guard let joint = motion.joints.first(where: { $0.id == jointID }), joint.isMovable else {
+                throw LADError.message("Sweep an existing movable joint of this design.")
+            }
+            try motion.requireIndependent(jointID)
+            for id in overrides.keys.sorted() { try motion.requireIndependent(id) }
+            let owners = Dictionary(artifact.parts.flatMap(\.flattened).filter { !$0.isGroup && !$0.solidIndices.isEmpty }
+                .map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let pairs = try pairIDs.map { ids -> [[Int]] in
+                try ids.map { id in
+                    guard let owner = owners[id] else { throw LADError.message("‘\(id)’ is not a physical part of this design.") }
+                    return owner.solidIndices.sorted()
+                }
+            }
+            guard pairs.allSatisfy({ Set($0[0]).isDisjoint(with: $0[1]) }) else {
+                throw LADError.message("Each clearance pair requires two different physical parts.")
+            }
+            let involved = Set(pairs.flatMap { $0.flatMap { $0 } })
+            let parts = artifact.parts
+            let start = (preview.assemblyPose?.positions ?? [:]).merging(overrides) { _, requested in requested }
+            let solving = Task.detached(priority: .userInitiated) { () throws -> [AssemblyPose?] in
+                var hint = start, poses = [AssemblyPose?]()
+                for step in 0..<steps {
+                    try Task.checkCancellation()
+                    hint[jointID] = from + (to - from) * Double(step) / Double(steps - 1)
+                    do {
+                        let pose = try motion.solve(parts: parts, positions: hint, driving: jointID)
+                        // Carry closure continuity from the last reachable pose.
+                        hint = pose.positions; poses.append(pose)
+                    } catch is CancellationError { throw CancellationError() }
+                    catch { poses.append(nil) }
+                }
+                return poses
+            }
+            let poses = try await withTaskCancellationHandler(operation: { try await solving.value }, onCancel: { solving.cancel() })
+            try checkCancellation()
+            let reachable = poses.compactMap { $0 }
+            guard !reachable.isEmpty else {
+                throw LADError.message("\(joint.name) cannot reach any position in this range within the design's joint constraints and motion limits.")
+            }
+            let measured = try await engine.clearance(preview, pairs: pairs,
+                poses: reachable.map { $0.solidTransforms.filter { involved.contains($0.key) } }, python: python, threads: threads)
+            try checkCancellation()
+            let positions = (0..<steps).map { from + (to - from) * Double($0) / Double(steps - 1) }
+            // Report only joints that actually move during the sweep.
+            let moving = motion.joints.map(\.id).filter { id in
+                let values = reachable.compactMap { $0.positions[id] }
+                return values.contains { abs($0 - values[0]) > 1e-9 }
+            }
+            var samples = [[String: Any]](), unreachable = [Double]()
+            var cursor = 0
+            for (index, pose) in poses.enumerated() {
+                guard let pose else { unreachable.append(positions[index]); continue }
+                let clearance = measured[cursor]; cursor += 1
+                samples.append(["position": positions[index],
+                                "jointPositions": Dictionary(uniqueKeysWithValues: moving.map { ($0, pose.positions[$0] ?? 0) }),
+                                "distances": clearance.map(\.distance),
+                                "overlapVolumes": clearance.map { item -> Any in
+                                    guard item.distance <= 1e-6 else { return 0.0 }
+                                    return item.overlapVolume.map { $0 as Any } ?? NSNull()
+                                }])
+            }
+            let reachedPositions = poses.indices.filter { poses[$0] != nil }.map { positions[$0] }
+            let summaries = pairIDs.indices.map { pair -> [String: Any] in
+                let values = measured.map { $0[pair] }
+                let minimum = values.indices.min { values[$0].distance < values[$1].distance }!
+                let interfering = values.indices.filter { values[$0].distance <= 1e-6 && (values[$0].overlapVolume ?? 1) > 1e-6 }
+                let touching = values.indices.filter { values[$0].distance <= 1e-6 && (values[$0].overlapVolume ?? 1) <= 1e-6 }
+                var summary: [String: Any] = [
+                    "parts": pairIDs[pair], "minimumDistance": values[minimum].distance,
+                    "minimumAt": reachedPositions[minimum], "closestPoints": values[minimum].closestPoints,
+                    "interferencePositions": interfering.map { reachedPositions[$0] },
+                    "contactPositions": touching.map { reachedPositions[$0] },
+                    "maximumOverlapVolume": interfering.compactMap { values[$0].overlapVolume }.max() ?? 0]
+                if values.contains(where: { $0.distance <= 1e-6 && $0.overlapVolume == nil }) {
+                    summary["unresolvedOverlap"] = true
+                }
+                return summary
+            }
+            return try result(["artifactID": artifact.id, "joint": jointID, "positionUnit": joint.unit, "from": from, "to": to,
+                               "steps": steps, "pairs": summaries, "samples": samples, "unreachablePositions": unreachable,
+                               "units": "mm"])
         case "lad_screenshot":
             try allowed(arguments, [])
             if let viewport {
@@ -889,6 +990,13 @@ final class CADAgentTools {
             throw LADError.message("The LAD tool argument ‘\(key)’ is outside its supported range.")
         }
         return number.intValue
+    }
+    private func finite(_ key: String, _ values: [String: Any]) throws -> Double {
+        guard let number = values[key] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, abs(number.doubleValue) <= 1e9 else {
+            throw LADError.message("The LAD tool requires ‘\(key)’ as a finite number.")
+        }
+        return number.doubleValue
     }
 
     private func renderCamera(_ values: [String: Any]) throws -> CADAgentCamera {

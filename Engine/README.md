@@ -134,6 +134,24 @@ it. Fixed joints accept only zero position and no limits. Frames need not
 coincide in the construction pose. Closed loops and multiple grounded parts
 are allowed, with at least one grounded physical part in each connected joint
 component. Definitions are bounded to 1,024 connectors and 256 joints.
+Optional `couplings` contain `{id, type, driver, follower, ...}` records that
+make the follower joint's coordinate a function of its movable driver joint. A
+`linear` coupling sets follower = `ratio` × driver + `offset` (nonzero ratio,
+offset default zero). A `table` coupling interpolates linearly between
+`samples` `[[driver, follower], ...]` with strictly increasing driver values.
+With a positive `period`, samples span at most one period from the first driver
+sample, the relation repeats every period, and each period adds `advance`
+(default zero) to the follower; a last sample at first + period must equal the
+first follower value + advance. Without a period, the driver's limits must lie
+within the sample range. Each joint follows at most one coupling, chains are
+acyclic, and definitions are bounded to 256 couplings, 4,096 samples each and
+65,536 in total. Followers are not free solver variables: the worker derives
+their normalized `position`, rejecting a contradicting authored one, and the
+app resolves them from their drivers before limit checks, closure and grabs.
+Closed loops and grabs act on each follower's independent root driver. Pose
+requests cannot drive a follower directly; supplied follower coordinates are
+recomputed.
+
 The worker validates and normalizes this metadata as preview `assemblyMotion`;
 the native app solves the rigid poses without rebuilding construction geometry.
 Definitions remain part of the complete saved Python program, while poses and
@@ -157,6 +175,16 @@ centroids and directions. It accepts up to 8,192 features, retains pair metrics
 and `closestPoints` for exactly two selections, and otherwise returns empty
 `metrics`. Without `solidTransforms`, measurement retains its two-item distance
 contract.
+
+A `clearance` request contains `pairs` (1–8 pairs of two disjoint, nonempty
+solid-index groups) and `poses` (1–361 sparse `solidTransforms` lists). For each
+pose and pair it returns the exact OpenCascade minimum distance and closest
+points; a distance within 1e-6 mm adds the common volume (`overlapVolume`,
+null if the Boolean fails), which separates contact from interference.
+`lad_check_motion` solves evenly spaced poses of one independent joint natively,
+carrying closed-loop continuity from the last reachable pose, sends only the
+paired solids' transforms, and reports reachable samples, per-pair minimum
+clearance, contact and interference positions, and the joints that moved.
 
 `lad_render` accepts optional `jointPositions` overrides and a `drivingJoint`
 whose requested coordinate remains fixed while passive joints satisfy closed
@@ -198,7 +226,7 @@ stdio MCP adapter. The native app connects it for each Codex invocation and
 serves requests through private descriptor-confined filesystem IPC. Its tools
 are `lad_runtime`, `lad_request_permission`, `lad_versions`, `lad_version`, `lad_build`, `lad_inspect`,
 `lad_get_part_colors`, `lad_set_part_colors`, `lad_measure`, `lad_validate`,
-`lad_render`, `lad_screenshot`, `lad_export_step` and `lad_import`.
+`lad_render`, `lad_check_motion`, `lad_screenshot`, `lad_export_step` and `lad_import`.
 
 `agent-tools.json` is the canonical CAD tool schema catalog shared by this
 adapter and LAD's native external-agent interface. When enabled in Settings,

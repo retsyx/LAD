@@ -1561,8 +1561,8 @@ final class AppState: ObservableObject {
     }
 
     func setJointPosition(_ id: String, to value: Double) {
-        guard !isWorking, value.isFinite,
-              mesh?.assemblyMotion?.joints.contains(where: { $0.id == id && $0.type != .fixed }) == true else { return }
+        guard !isWorking, value.isFinite, let motion = mesh?.assemblyMotion,
+              motion.joints.contains(where: { $0.id == id && $0.type != .fixed }), motion.driver(of: id) == nil else { return }
         cancelAssemblyGrab()
         var positions = requestedJointPositions
         positions[id] = value

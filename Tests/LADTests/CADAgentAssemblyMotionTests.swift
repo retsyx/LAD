@@ -137,6 +137,102 @@ final class CADAgentAssemblyMotionTests: XCTestCase {
         XCTAssertEqual(preview.assemblyPose?.positions["hinge"], 45)
     }
 
+    @MainActor
+    func testCoupledFollowersAndInvalidSweepsFailBeforeNativeWork() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var preview = try mesh()
+        let parts = (preview.parts ?? []) + [PartNode(id: "wheel", name: "Wheel", solidIndices: [2])]
+        let motion = AssemblyMotion(grounded: ["base"], connectors: [
+            .init(id: "base-pin", part: "base", origin: [0, 0, 0]), .init(id: "arm-pin", part: "arm", origin: [0, 0, 0]),
+            .init(id: "base-wheel", part: "base", origin: [0, 0, 0]), .init(id: "wheel-pin", part: "wheel", origin: [0, 0, 0])
+        ], joints: [
+            .init(id: "hinge", name: "Arm", type: .revolute, parent: "base-pin", child: "arm-pin", limits: [-180, 180]),
+            .init(id: "spin", name: "Wheel", type: .revolute, parent: "base-wheel", child: "wheel-pin")
+        ], couplings: [.linear(id: "belt", driver: "hinge", follower: "spin", ratio: 2)])
+        preview.parts = parts; preview.solids = 3
+        preview.assemblyMotion = motion
+        preview.assemblyPose = try motion.solve(parts: parts)
+        let tools = try CADAgentTools(directory: root, python: "/missing/python", threads: 1,
+            current: .bracket, currentPreview: preview, engine: EngineService())
+        let summary = try content(try await tools.handle(name: "lad_inspect", arguments: [:]))
+        let definition = try XCTUnwrap(summary["assemblyMotion"] as? [String: Any])
+        XCTAssertEqual((definition["couplings"] as? [[String: Any]])?.first?["follower"] as? String, "spin")
+        let sweep: [String: Any] = ["joint": "hinge", "from": 0, "to": 90, "pairs": [["arm", "wheel"]]]
+        let invalid: [(String, [String: Any], String)] = [
+            ("lad_render", ["jointPositions": ["spin": 10]], "follows Arm"),
+            ("lad_check_motion", sweep.merging(["joint": "spin"]) { $1 }, "follows Arm"),
+            ("lad_check_motion", sweep.merging(["jointPositions": ["spin": 1]]) { $1 }, "follows Arm"),
+            ("lad_check_motion", sweep.merging(["joint": "missing"]) { $1 }, "movable joint"),
+            ("lad_check_motion", sweep.filter { $0.key != "joint" }, "joint"),
+            ("lad_check_motion", sweep.merging(["from": Double.nan]) { $1 }, "from"),
+            ("lad_check_motion", sweep.merging(["to": true]) { $1 }, "to"),
+            ("lad_check_motion", sweep.merging(["steps": 1]) { $1 }, "range"),
+            ("lad_check_motion", sweep.merging(["steps": 362]) { $1 }, "range"),
+            ("lad_check_motion", sweep.merging(["pairs": []]) { $1 }, "pairs"),
+            ("lad_check_motion", sweep.merging(["pairs": [["arm"]]]) { $1 }, "two different"),
+            ("lad_check_motion", sweep.merging(["pairs": [["arm", "arm"]]]) { $1 }, "two different"),
+            ("lad_check_motion", sweep.merging(["pairs": [["arm", "missing"]]]) { $1 }, "not a physical part"),
+            ("lad_check_motion", sweep.merging(["extra": 1]) { $1 }, "unsupported")
+        ]
+        for (tool, arguments, expected) in invalid {
+            do {
+                _ = try await tools.handle(name: tool, arguments: arguments)
+                XCTFail("\(tool) accepted \(arguments)")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains(expected), "\(error.localizedDescription) lacks \(expected)")
+            }
+        }
+        XCTAssertNil(tools.consumeRenderedImage())
+    }
+
+    @MainActor
+    func testMotionSweepReportsExactClearanceContactInterferenceAndCoupledJoints() async throws {
+        guard ProcessInfo.processInfo.environment["LAD_RUN_ENGINE_TESTS"] == "1" else {
+            throw XCTSkip("Set LAD_RUN_ENGINE_TESTS=1 for native assembly tool integration.")
+        }
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let program = """
+        motion={'grounded':['post'],'connectors':[
+            {'id':'post-pin','part':'post','origin':[0,0,0]},{'id':'arm-pin','part':'arm','origin':[0,0,0]},
+            {'id':'post-wheel','part':'post','origin':[0,-30,0]},{'id':'wheel-pin','part':'wheel','origin':[0,-30,0]}],
+            'joints':[{'id':'hinge','name':'Arm','type':'revolute','parent':'post-pin','child':'arm-pin','limits':[0,90]},
+                      {'id':'spin','name':'Wheel','type':'revolute','parent':'post-wheel','child':'wheel-pin'}],
+            'couplings':[{'id':'belt','type':'linear','driver':'hinge','follower':'spin','ratio':-2}]}
+        result=cq.Assembly(name='Mechanism',metadata={'lad_motion':motion})
+        result.add(cq.Solid.makeBox(2,2,2).translate((10,5,0)),name='Post',metadata={'lad_id':'post'})
+        result.add(cq.Solid.makeBox(20,2,2).translate((0,-1,0)),name='Arm',metadata={'lad_id':'arm'})
+        result.add(cq.Solid.makeCylinder(3,2).translate((0,-30,0)),name='Wheel',metadata={'lad_id':'wheel'})
+        """
+        let model = ModelSpec(title: "Mechanism", summary: "Coupled sweep", units: "mm", script: program)
+        let engine = EngineService()
+        let preview = try await engine.buildPreview(model, python: EngineService.defaultPython, threads: 2)
+        XCTAssertEqual(preview.assemblyMotion?.couplings.first?.ratio, -2)
+        let tools = try CADAgentTools(directory: root, python: EngineService.defaultPython, threads: 2,
+            current: model, currentPreview: preview, engine: engine)
+        let report = try content(try await tools.handle(name: "lad_check_motion", arguments: [
+            "joint": "hinge", "from": 0, "to": 90, "steps": 19, "pairs": [["arm", "post"], ["arm", "wheel"]]]))
+        XCTAssertEqual(report["positionUnit"] as? String, "°")
+        XCTAssertEqual(report["unreachablePositions"] as? [Double], [])
+        let samples = try XCTUnwrap(report["samples"] as? [[String: Any]])
+        XCTAssertEqual(samples.count, 19)
+        let first = try XCTUnwrap(samples.first), last = try XCTUnwrap(samples.last)
+        XCTAssertEqual(try XCTUnwrap(first["distances"] as? [Double])[0], 4, accuracy: 1e-6)
+        XCTAssertEqual(try XCTUnwrap(last["distances"] as? [Double])[0], 9, accuracy: 1e-6)
+        XCTAssertEqual(try XCTUnwrap((last["jointPositions"] as? [String: Double])?["spin"]), -180, accuracy: 1e-9)
+        let pairs = try XCTUnwrap(report["pairs"] as? [[String: Any]])
+        XCTAssertEqual(pairs[0]["parts"] as? [String], ["arm", "post"])
+        XCTAssertEqual(try XCTUnwrap(pairs[0]["minimumDistance"] as? Double), 0, accuracy: 1e-9)
+        let interference = try XCTUnwrap(pairs[0]["interferencePositions"] as? [Double])
+        XCTAssertFalse(interference.isEmpty)
+        XCTAssertTrue(interference.allSatisfy { (10...50).contains($0) }, "\(interference)")
+        XCTAssertGreaterThan(try XCTUnwrap(pairs[0]["maximumOverlapVolume"] as? Double), 0)
+        XCTAssertEqual(try XCTUnwrap(pairs[1]["minimumDistance"] as? Double), 26, accuracy: 1e-6)
+        XCTAssertEqual(pairs[1]["interferencePositions"] as? [Double], [])
+        XCTAssertEqual(preview.assemblyPose?.positions["hinge"], 0)
+    }
+
     private func assertVector(_ actual: [Double], _ expected: [Double], file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertEqual(actual.count, expected.count, file: file, line: line)
         for (a, b) in zip(actual, expected) { XCTAssertEqual(a, b, accuracy: 1e-6, file: file, line: line) }

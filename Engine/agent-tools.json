@@ -491,6 +491,82 @@
     }
   },
   {
+    "name": "lad_check_motion",
+    "description": "Sweep one independent movable joint of an artifact's assembly through evenly spaced positions, solving each pose with the design's joints, closed loops and couplings, and report exact OpenCascade minimum clearance between pairs of physical parts at every reachable pose. A zero distance includes the common volume, separating surface contact from interference. Returns per-pair minimum clearance with closest points, contact and interference positions, unreachable positions and the coordinates of every joint that moves. Never changes the artifact, the live design or its pose.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by lad_build/lad_import, or current for the existing design."
+        },
+        "joint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Movable joint ID to sweep. Coupling followers move with their drivers and cannot be swept directly."
+        },
+        "from": {
+          "type": "number",
+          "minimum": -1000000000,
+          "maximum": 1000000000,
+          "description": "First swept position: degrees for revolute joints, mm for sliders."
+        },
+        "to": {
+          "type": "number",
+          "minimum": -1000000000,
+          "maximum": 1000000000,
+          "description": "Last swept position, included in the sweep."
+        },
+        "steps": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 361,
+          "default": 73,
+          "description": "Number of evenly spaced poses, including both ends."
+        },
+        "pairs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "description": "Pairs of physical part IDs (stable lad_id values) whose exact clearance is checked at each pose."
+        },
+        "jointPositions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "minimum": -1000000000,
+            "maximum": 1000000000
+          },
+          "maxProperties": 256,
+          "description": "Optional starting coordinates for other independent joints, keyed by joint ID. Other joints start from the artifact pose; passive closed-loop joints follow the sweep."
+        }
+      },
+      "required": [
+        "joint",
+        "from",
+        "to",
+        "pairs"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "lad_screenshot",
     "description": "Capture the current LAD viewport as a PNG image attachment. Uses an explicitly disclosed offscreen fallback if no live viewport is attached.",
     "inputSchema": {

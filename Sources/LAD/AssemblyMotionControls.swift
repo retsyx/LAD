@@ -15,21 +15,22 @@ struct AssemblyMotionControls: View {
                     .accessibilityLabel("Reset assembly motion")
             }
             ForEach(motion.joints.filter(\.isMovable)) { joint in
-                VStack(alignment: .leading, spacing: 3) {
+                if let driver = motion.driver(of: joint.id) {
+                    // A coupled joint moves with its driver and is not set directly.
                     HStack(spacing: 4) {
                         Text(joint.name).lineLimit(2)
                         Spacer(minLength: 4)
-                        TextField(joint.name, value: position(joint), format: .number.precision(.fractionLength(0...2)))
-                            .textFieldStyle(.roundedBorder).frame(width: 64)
-                            .accessibilityLabel("\(joint.name) position")
+                        Text(state.jointPosition(joint), format: .number.precision(.fractionLength(0...2)))
+                            .monospacedDigit()
                         Text(joint.unit).foregroundStyle(Palette.muted)
-                    }.font(.system(size: 10))
-                    if range(joint).lowerBound < range(joint).upperBound {
-                        Slider(value: position(joint), in: range(joint))
-                            .controlSize(.mini).tint(Palette.accent)
-                            .accessibilityLabel("\(joint.name) motion")
-                            .accessibilityValue("\(state.jointPosition(joint).formatted()) \(joint.unit)")
                     }
+                    .font(.system(size: 10))
+                    .help("Follows \(driver.name)")
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(joint.name) position")
+                    .accessibilityValue("\(state.jointPosition(joint).formatted()) \(joint.unit), follows \(driver.name)")
+                } else {
+                    control(joint)
                 }
             }
             if let error = state.assemblyMotionError {
@@ -40,6 +41,25 @@ struct AssemblyMotionControls: View {
         .disabled(state.isWorking)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Assembly motion")
+    }
+
+    private func control(_ joint: AssemblyJoint) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Text(joint.name).lineLimit(2)
+                Spacer(minLength: 4)
+                TextField(joint.name, value: position(joint), format: .number.precision(.fractionLength(0...2)))
+                    .textFieldStyle(.roundedBorder).frame(width: 64)
+                    .accessibilityLabel("\(joint.name) position")
+                Text(joint.unit).foregroundStyle(Palette.muted)
+            }.font(.system(size: 10))
+            if range(joint).lowerBound < range(joint).upperBound {
+                Slider(value: position(joint), in: range(joint))
+                    .controlSize(.mini).tint(Palette.accent)
+                    .accessibilityLabel("\(joint.name) motion")
+                    .accessibilityValue("\(state.jointPosition(joint).formatted()) \(joint.unit)")
+            }
+        }
     }
 
     private func position(_ joint: AssemblyJoint) -> Binding<Double> {

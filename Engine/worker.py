@@ -2831,6 +2831,74 @@ def measure_brep(spec, asset_directory, cq, threads):
     return report
 
 
+MAX_CLEARANCE_PAIRS = 8
+MAX_CLEARANCE_POSES = 361
+CONTACT_DISTANCE = 1e-6
+
+
+def clearance_brep(spec, asset_directory, cq, threads):
+    """Exact minimum separation between part groups at each rigid assembly pose.
+
+    Each pose is a sparse list of rigid world-space deltas, as in measurement.
+    A zero distance includes the common volume, which separates surface contact
+    from interference. Nothing is meshed, serialized or rebuilt.
+    """
+    if set(spec) != {"operation", "brepAsset", "pairs", "poses"}:
+        raise ModelError("The clearance request contains unsupported fields.")
+    shape = read_brep(spec, asset_directory, cq, threads)
+    solids = _shape_entities(shape, "Solid")
+    pairs, poses = spec["pairs"], spec["poses"]
+    if not isinstance(pairs, list) or not 1 <= len(pairs) <= MAX_CLEARANCE_PAIRS:
+        raise ModelError("A clearance check requires between 1 and 8 part pairs.")
+    if not isinstance(poses, list) or not 1 <= len(poses) <= MAX_CLEARANCE_POSES:
+        raise ModelError("A clearance check requires between 1 and 361 poses.")
+    groups = []
+    for pair in pairs:
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ModelError("Each clearance pair requires two groups of solid indices.")
+        selected = [selected_solids({"solidIndices": group}, solids) for group in pair]
+        if not all(selected) or set(selected[0]) & set(selected[1]):
+            raise ModelError("Each clearance pair requires two nonempty, disjoint groups of solids.")
+        groups.append(selected)
+
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+
+    def combined(posed, indices):
+        return posed[indices[0]] if len(indices) == 1 else cq.Compound.makeCompound([posed[index] for index in indices])
+
+    samples = []
+    for records in poses:
+        posed = posed_solids(solids, records, cq)
+        results = []
+        for first, second in groups:
+            a, b = combined(posed, first), combined(posed, second)
+            extrema = BRepExtrema_DistShapeShape()
+            extrema.LoadS1(a.wrapped)
+            extrema.LoadS2(b.wrapped)
+            extrema.SetMultiThread(True)
+            extrema.Perform()
+            if not extrema.IsDone() or not extrema.NbSolution():
+                raise ModelError("OpenCascade could not determine the clearance between these parts.")
+            distance = max(0.0, extrema.Value())
+            item = {"distance": distance,
+                    "closestPoints": [list(extrema.PointOnShape1(1).Coord()), list(extrema.PointOnShape2(1).Coord())]}
+            if distance <= CONTACT_DISTANCE:
+                common = BRepAlgoAPI_Common(a.wrapped, b.wrapped)
+                volume = None
+                if common.IsDone():
+                    properties = GProp_GProps()
+                    BRepGProp.VolumeProperties_s(common.Shape(), properties)
+                    if math.isfinite(properties.Mass()):
+                        volume = max(0.0, properties.Mass())
+                item["overlapVolume"] = volume
+            results.append(item)
+        samples.append(results)
+    return {"samples": samples}
+
+
 def runtime_info(cq):
     import platform
     from importlib.metadata import PackageNotFoundError, version
@@ -2896,7 +2964,7 @@ def run(request, output, threads, defer_step=False, validated_hash=None):
     is_preview = isinstance(spec, dict) and spec.get("operation") == "preview"
     is_export = isinstance(spec, dict) and spec.get("operation") == "export"
     is_parts_export = is_export and "individualParts" in spec
-    is_measurement = isinstance(spec, dict) and spec.get("operation") == "measure"
+    is_measurement = isinstance(spec, dict) and spec.get("operation") in ("measure", "clearance")
     is_runtime = spec == {"operation": "runtime"}
     if not is_preview and not is_export and not is_measurement and not is_runtime:
         if size > 2 * 1024 * 1024:
@@ -2910,6 +2978,8 @@ def run(request, output, threads, defer_step=False, validated_hash=None):
     step = (output / "model.step").resolve()
     if is_runtime:
         preview = {}
+    elif is_measurement and spec["operation"] == "clearance":
+        preview = clearance_brep(spec, request.parent.resolve(), cq, threads)
     elif is_measurement:
         preview = measure_brep(spec, request.parent.resolve(), cq, threads)
     elif is_export:

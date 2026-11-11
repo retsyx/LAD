@@ -59,7 +59,10 @@ INSTRUCTIONS = (
     "Types are fixed, revolute (degrees about connector Z), or slider (mm along Z); fixed joints have zero position and no limits. "
     "A zero-position mate aligns its connector frames even when they differ in the built geometry. Anchor every connected mechanism with a grounded part. "
     "Closed joint loops are supported when their constraints can be satisfied; use explicit finite travel limits where appropriate and inspect the resulting assemblyMotion after lad_build. "
+    "Optional lad_motion couplings [{id,type,driver,follower,...}] make a follower joint a function of its driver joint: linear {ratio,offset} for gears, belts, racks and screws; "
+    "table {samples:[[driver,follower],...],period,advance} for cams, Geneva drives and intermittent motion. Followers are derived; position their drivers instead. "
     "Use lad_render jointPositions to review isolated poses, with optional drivingJoint to hold one requested joint while passive joints satisfy closed-loop constraints; inspect the returned effective jointPositions. This never changes the artifact or live viewport. "
+    "Use lad_check_motion to sweep an independent joint and check exact clearance, contact and interference between engaging parts before the final answer. "
     "Inputs and outputs are file references, never inline complete source files. Screenshots/render tools return actual PNG image content. "
     "For geometry changes, inspect and repair as many times as needed, then return the final complete program and its required assetIDs in the response schema."
 )
