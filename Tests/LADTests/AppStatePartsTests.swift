@@ -61,6 +61,49 @@ final class AppStatePartsTests: XCTestCase {
     }
 
     @MainActor
+    func testPartClickTogglesOnlyItsGeometryAndRetainsUnrelatedFolderSelection() {
+        let state = state()
+        state.selectPartNodes(["pcb"])
+        state.togglePartNode("base")
+        XCTAssertEqual(state.selectedSolids, [0, 2])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["base", "pcb"])
+        state.togglePartNode("base")
+        XCTAssertEqual(state.selectedSolids, [2])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["pcb"])
+        state.togglePartNode("case")
+        XCTAssertEqual(state.selectedSolids, [0, 1, 2])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["case", "pcb"])
+    }
+
+    @MainActor
+    func testShiftClickUsesCurrentPaneOrderAndPreservesSelectionOutsideRange() {
+        let state = state()
+        let parts = (0..<7).map { PartNode(id: "part-\($0)", name: "Part \($0)", solidIndices: [$0]) }
+        state.revisions[0].partLayout = PartLayout(nodes: parts)
+        state.selectPartNodes(["part-0", "part-6"])
+        state.togglePartNode("part-4", extendingRange: true)
+        XCTAssertEqual(state.selectedSolids, [0, 4, 5, 6])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["part-0", "part-4", "part-5", "part-6"])
+
+        state.selectPartNodes(["part-0", "part-2", "part-3", "part-4", "part-6"])
+        state.togglePartNode("part-3", extendingRange: true)
+        XCTAssertEqual(state.selectedSolids, [0, 4, 6])
+        XCTAssertEqual(state.selectedPartNodeIDs, ["part-0", "part-4", "part-6"])
+    }
+
+    @MainActor
+    func testShiftDeselectIncludesPartiallySelectedBoundary() {
+        let state = state()
+        state.revisions[0].partLayout = PartLayout(nodes: [
+            PartNode(id: "compound", name: "Compound", solidIndices: [0, 1]),
+            PartNode(id: "board", name: "Board", solidIndices: [2])])
+        state.selectParts([0, 2])
+        state.togglePartNode("board", extendingRange: true)
+        XCTAssertTrue(state.selectedSolids.isEmpty, "The partially selected endpoint must also be deselected.")
+        XCTAssertTrue(state.selectedPartNodeIDs.isEmpty)
+    }
+
+    @MainActor
     func testViewportSelectionMapsToPhysicalPartsAndRejectsInvalidIndices() {
         let state = state()
         state.selectParts([0, 2, 999])

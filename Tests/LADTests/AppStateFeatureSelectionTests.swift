@@ -4,6 +4,23 @@ import XCTest
 
 final class AppStateFeatureSelectionTests: XCTestCase {
     @MainActor
+    func testPartRangeTreatsFeatureOnlySelectionAsUnselectedAndPreservesFeatures() throws {
+        let state = try fixture()
+        defer { state.clearSelections() }
+        let features = [feature(.vertex, 1, 0)]
+        state.selectFeatures(features)
+        state.selectPartNodes(["base"])
+        state.togglePartNode("board", extendingRange: true)
+        XCTAssertEqual(state.selectedSolids, [0, 1, 2], "A feature-selected lid must not stop the range before base.")
+        XCTAssertEqual(state.selectedFeatures, features)
+
+        state.togglePartNode("lid")
+        state.togglePartNode("base", extendingRange: true)
+        XCTAssertEqual(state.selectedSolids, [2], "The feature-selected lid is an unselected boundary.")
+        XCTAssertEqual(state.selectedFeatures, features)
+    }
+
+    @MainActor
     func testOrderedFeatureUpdatesDeduplicateAndRejectHiddenOrMissingTopology() throws {
         let state = try fixture()
         state.hiddenSolids = [1]

@@ -1408,6 +1408,25 @@ final class AppState: ObservableObject {
         selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: preferred, in: partTree)
     }
 
+    func togglePartNode(_ id: String, extendingRange: Bool = false) {
+        guard extendingRange else { selectPartNodes([id], extending: true); return }
+        let tree = partTree
+        let range = PartSelection.range(toggling: id, in: tree,
+                                        collapsedNodeIDs: Set(selectedPartLayout.collapsedNodeIDs),
+                                        selectedSolids: selectedSolids)
+        guard let clicked = range.first(where: { $0.id == id }) else {
+            selectPartNodes([id], extending: true)
+            return
+        }
+        let solids = Set(range.flatMap(\.solidIndices))
+        let ids = Set(range.map(\.id))
+        let deselecting = Set(clicked.solidIndices).isSubset(of: selectedSolids)
+        let preferred = deselecting ? selectedPartNodeIDs.subtracting(ids) : selectedPartNodeIDs.union(ids)
+        if deselecting { selectedSolids.subtract(solids) }
+        else { selectedSolids.formUnion(solids) }
+        selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: preferred, in: tree)
+    }
+
     func selectFeatures(_ features: [CADFeatureID]) {
         guard let topology = mesh?.topology else { return }
         var seen = Set<CADFeatureID>()

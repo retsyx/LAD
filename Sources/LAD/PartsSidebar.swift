@@ -187,8 +187,7 @@ private struct PartTreeItem: View {
                 Button {
                     onFinishRename(false)
                     let modifiers = NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags
-                    let extending = selection.isFull || modifiers.contains(.command) || modifiers.contains(.shift)
-                    state.selectPartNodes([node.id], extending: extending)
+                    state.togglePartNode(node.id, extendingRange: modifiers.contains(.shift))
                 } label: {
                     HStack(spacing: 7) {
                         partIcon

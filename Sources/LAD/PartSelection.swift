@@ -1,4 +1,37 @@
 enum PartSelection {
+    /// Ranges follow the visible physical parts, without treating folder
+    /// headers as extra parts or reaching into collapsed folders.
+    static func range(toggling id: String, in roots: [PartNode], collapsedNodeIDs: Set<String>,
+                      selectedSolids: Set<Int>) -> [PartNode] {
+        var parts = [PartNode]()
+        func appendParts(_ nodes: [PartNode]) {
+            for node in nodes {
+                if node.isGroup {
+                    if !collapsedNodeIDs.contains(node.id) { appendParts(node.children ?? []) }
+                } else if !node.solidIndices.isEmpty {
+                    parts.append(node)
+                }
+            }
+        }
+        appendParts(roots)
+        guard let clicked = parts.firstIndex(where: { $0.id == id }) else { return [] }
+        let selected = parts.map { Set($0.solidIndices).isSubset(of: selectedSolids) }
+        var boundary = clicked
+        for distance in 1..<parts.count {
+            // Prefer the preceding part when both boundaries are equally near.
+            let before = clicked - distance, after = clicked + distance
+            if before >= 0, selected[before] != selected[clicked] {
+                boundary = before
+                break
+            }
+            if after < parts.count, selected[after] != selected[clicked] {
+                boundary = after
+                break
+            }
+        }
+        return Array(parts[min(clicked, boundary)...max(clicked, boundary)])
+    }
+
     /// Keeps complete selected folders when possible, and represents a partial
     /// folder selection with the selected parts inside it instead.
     static func nodeIDs(for solids: Set<Int>, keeping preferred: Set<String>, in roots: [PartNode]) -> Set<String> {

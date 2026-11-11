@@ -2,6 +2,52 @@ import XCTest
 @testable import LAD
 
 final class PartSelectionTests: XCTestCase {
+    func testRangeUsesNearestOppositeSelectionInEitherDirection() {
+        let tree = (0..<7).map { part("part-\($0)", $0) }
+        let cases: [(clicked: Int, selected: Set<Int>, expected: [Int])] = [
+            (4, [0, 6], [4, 5, 6]),
+            (3, [0, 1, 6], [1, 2, 3]),
+            (3, [1, 2, 3, 4, 6], [3, 4, 5]),
+            (3, [0, 2, 3, 4, 5, 6], [1, 2, 3]),
+            (2, [0, 4], [0, 1, 2]),
+            (2, [1, 2, 3], [0, 1, 2]),
+            (2, [], [2]),
+            (2, Set(0..<7), [2]),
+            (0, [6], Array(0..<7)),
+            (6, [0], Array(0..<7))
+        ]
+        for item in cases {
+            let range = PartSelection.range(toggling: "part-\(item.clicked)", in: tree,
+                                            collapsedNodeIDs: [], selectedSolids: item.selected)
+            XCTAssertEqual(range.map(\.id), item.expected.map { "part-\($0)" },
+                           "clicked=\(item.clicked), selected=\(item.selected.sorted())")
+        }
+    }
+
+    func testRangeFollowsPaneOrderAndSkipsFolderHeadersAndCollapsedChildren() {
+        let tree = [part("before", 0), folder("collapsed", [part("hidden", 1)]),
+                    folder("expanded", [part("first", 3), folder("nested", [part("second", 2)])]),
+                    part("after", 4)]
+        func range(_ id: String, selected: Set<Int>) -> [String] {
+            PartSelection.range(toggling: id, in: tree, collapsedNodeIDs: ["collapsed"],
+                                selectedSolids: selected).map(\.id)
+        }
+        XCTAssertEqual(range("before", selected: [3]), ["before", "first"])
+        XCTAssertEqual(range("after", selected: [0]), ["before", "first", "second", "after"])
+        XCTAssertEqual(range("before", selected: [1]), ["before"], "A collapsed child cannot anchor the range.")
+        XCTAssertEqual(range("expanded", selected: [0]), [], "Folder clicks retain their group toggle.")
+        XCTAssertEqual(range("missing", selected: [0]), [])
+    }
+
+    func testPartWithOnlySomeSolidsSelectedIsAnUnselectedRangeBoundary() {
+        let tree = [part("first", 0), PartNode(id: "compound", name: "Compound", solidIndices: [1, 2]),
+                    part("third", 3), part("last", 4)]
+        XCTAssertEqual(PartSelection.range(toggling: "third", in: tree, collapsedNodeIDs: [],
+                                          selectedSolids: [0, 1, 3, 4]).map(\.id), ["compound", "third"])
+        XCTAssertEqual(PartSelection.range(toggling: "compound", in: tree, collapsedNodeIDs: [],
+                                          selectedSolids: [0, 1, 3, 4]).map(\.id), ["first", "compound"])
+    }
+
     func testPartialFolderSelectionUsesRemainingPartInsteadOfFolder() {
         let tree = [folder("case", [part("base", 0), part("lid", 1)])]
         XCTAssertEqual(PartSelection.nodeIDs(for: [0], keeping: ["case"], in: tree), ["base"])

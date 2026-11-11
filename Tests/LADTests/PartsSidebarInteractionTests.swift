@@ -23,9 +23,9 @@ final class PartsSidebarInteractionTests: XCTestCase {
         try click(try await rowFrames(in: host)["base"], in: host)
         try await assertSelection([0], nodeIDs: ["base"], state: fixture.state, in: host)
         try click(try await rowFrames(in: host)["board"], in: host)
-        try await assertSelection([2], nodeIDs: ["board"], state: fixture.state, in: host)
-        XCTAssertEqual(fixture.state.measurementReport?.solidIndices, [2],
-                       "A plain click on an unselected row must still replace the previous selection.")
+        try await assertSelection([0, 2], nodeIDs: ["base", "board"], state: fixture.state, in: host)
+        XCTAssertEqual(fixture.state.measurementReport?.solidIndices, [0, 2],
+                       "A plain click on an unselected row must preserve the previous selection.")
     }
 
     @MainActor
@@ -61,6 +61,55 @@ final class PartsSidebarInteractionTests: XCTestCase {
         try await assertSelection([1], nodeIDs: ["lid"], state: fixture.state, in: host)
         XCTAssertEqual(fixture.state.measurementReport?.solidIndices, [1])
         XCTAssertTrue(fixture.state.isPartFolderExpanded("case"), "Selecting the folder must not click its disclosure control.")
+    }
+
+    @MainActor
+    func testShiftClickSelectsRenderedPartRangeInEitherDirection() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let window = makeWindow(state: fixture.state)
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+
+        for (selected, clicked) in [("base", "board"), ("board", "base")] {
+            fixture.state.selectPartNodes([selected])
+            try click(try await rowFrames(in: host)[clicked], in: host, modifiers: .shift)
+            try await assertSelection([0, 1, 2], nodeIDs: ["base", "lid", "board"], state: fixture.state, in: host)
+            XCTAssertEqual(fixture.state.measurementReport?.solidIndices, [0, 1, 2])
+        }
+        XCTAssertTrue(fixture.state.hiddenSolids.isEmpty)
+        XCTAssertTrue(fixture.state.isPartFolderExpanded("case"))
+    }
+
+    @MainActor
+    func testShiftClickDeselectsRenderedPartRangeInEitherDirection() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let window = makeWindow(state: fixture.state)
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+
+        for (selected, clicked) in [(Set(["base", "lid"]), "base"), (Set(["lid", "board"]), "board")] {
+            fixture.state.selectPartNodes(selected)
+            try click(try await rowFrames(in: host)[clicked], in: host, modifiers: .shift)
+            try await assertSelection([], nodeIDs: [], state: fixture.state, in: host)
+            XCTAssertFalse(fixture.state.hasMeasurementSelection)
+            XCTAssertNil(fixture.state.measurementReport)
+        }
+    }
+
+    @MainActor
+    func testShiftClickPreservesSelectedPartsOutsideRenderedRange() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        fixture.state.selectPartNodes(["base", "board"])
+        let window = makeWindow(state: fixture.state)
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+
+        try click(try await rowFrames(in: host)["board"], in: host, modifiers: .shift)
+        try await assertSelection([0], nodeIDs: ["base"], state: fixture.state, in: host)
+        XCTAssertEqual(fixture.state.measurementReport?.solidIndices, [0])
     }
 
     @MainActor
@@ -171,19 +220,19 @@ final class PartsSidebarInteractionTests: XCTestCase {
     }
 
     @MainActor
-    private func click(_ frame: NSRect?, in host: NSView) throws {
+    private func click(_ frame: NSRect?, in host: NSView, modifiers: NSEvent.ModifierFlags = []) throws {
         let frame = try XCTUnwrap(frame)
         let window = try XCTUnwrap(host.window)
         window.makeKey()
         let location = host.convert(NSPoint(x: frame.midX, y: frame.midY), to: nil)
         XCTAssertNotNil(host.hitTest(host.convert(location, from: nil)), "The rendered Parts row must have a native hit target.")
         func event(_ type: NSEvent.EventType) throws -> NSEvent {
-            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: location, modifierFlags: modifiers,
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
                 context: nil, eventNumber: 1, clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0))
         }
         let down = try event(.leftMouseDown), up = try event(.leftMouseUp)
-        XCTAssertTrue(down.modifierFlags.isEmpty)
+        XCTAssertEqual(down.modifierFlags, modifiers)
         // Queue release first in case AppKit tracks the down synchronously.
         // These events stay inside this test application's native event loop.
         NSApplication.shared.postEvent(up, atStart: true)
