@@ -410,9 +410,13 @@ final class EngineService {
     }
 
     nonisolated private static func validateSTEP(_ data: Data) throws {
-        guard !data.isEmpty, data.count <= ProjectStore.maximumSTEPBytes,
-              String(decoding: data.prefix(512), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("ISO-10303-21;"),
-              String(decoding: data.suffix(512), as: UTF8.self).contains("END-ISO-10303-21;") else {
+        try validateSTEP(size: data.count, header: data.prefix(512), footer: data.suffix(512))
+    }
+
+    nonisolated private static func validateSTEP(size: Int, header: Data, footer: Data) throws {
+        guard size > 0, size <= ProjectStore.maximumSTEPBytes,
+              String(decoding: header, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("ISO-10303-21;"),
+              String(decoding: footer, as: UTF8.self).contains("END-ISO-10303-21;") else {
             throw LADError.message("The STEP design is invalid or exceeds 512 MB.")
         }
     }
@@ -537,9 +541,10 @@ final class EngineService {
                 guard path == folder.appendingPathComponent("model.brep").path else {
                     throw LADError.message("CAD engine returned an unexpected native solid path.")
                 }
-                let brep = try EngineArtifact.read(folder.appendingPathComponent("model.brep"), in: folder,
-                                                   maximumBytes: ProjectStore.maximumSTEPBytes)
-                guard brep.starts(with: Data("DBRep_DrawableShape\n".utf8)) else {
+                let marker = Data("DBRep_DrawableShape\n".utf8)
+                let brep = try EngineArtifact.boundaries(folder.appendingPathComponent("model.brep"), in: folder,
+                                                         headerBytes: marker.count)
+                guard brep.header == marker else {
                     throw LADError.message("CAD engine did not return native solid geometry.")
                 }
             }
@@ -551,8 +556,9 @@ final class EngineService {
                     throw LADError.message("CAD engine unexpectedly exported STEP while preparing a preview.")
                 }
             } else {
-                let step = try EngineArtifact.read(folder.appendingPathComponent("model.step"), in: folder, maximumBytes: ProjectStore.maximumSTEPBytes)
-                try Self.validateSTEP(step)
+                let step = try EngineArtifact.boundaries(folder.appendingPathComponent("model.step"), in: folder,
+                                                         headerBytes: 512, footerBytes: 512)
+                try Self.validateSTEP(size: step.size, header: step.header, footer: step.footer)
             }
             return result
         }
@@ -605,6 +611,28 @@ enum EngineArtifact {
         defer { try? file.close() }
         try file.seek(toOffset: UInt64(max(0, size - Int64(maximumBytes))))
         return try file.read(upToCount: maximumBytes) ?? Data()
+    }
+
+    /// Inspect format markers without retaining the native geometry payload.
+    /// Both ranges come from the same safely opened descriptor, including when
+    /// a short file's header and footer overlap.
+    static func boundaries(_ url: URL, in folder: URL, headerBytes: Int, footerBytes: Int = 0) throws
+        -> (size: Int, header: Data, footer: Data) {
+        let (file, size) = try openRegular(url, in: folder)
+        defer { try? file.close() }
+        guard size > 0, headerBytes >= 0, footerBytes >= 0 else {
+            throw LADError.message("CAD engine design asset is empty or has invalid marker ranges.")
+        }
+        let headerCount = min(headerBytes, Int(size)), footerCount = min(footerBytes, Int(size))
+        let header = try file.read(upToCount: headerCount) ?? Data()
+        try file.seek(toOffset: UInt64(size - Int64(footerCount)))
+        let footer = footerCount == 0 ? Data() : try file.read(upToCount: footerCount) ?? Data()
+        var finalInfo = stat()
+        guard header.count == headerCount, footer.count == footerCount,
+              Darwin.fstat(file.fileDescriptor, &finalInfo) == 0, finalInfo.st_size == size else {
+            throw LADError.message("The CAD engine design asset changed while it was being checked.")
+        }
+        return (Int(size), header, footer)
     }
 
     private static func openRegular(_ url: URL, in folder: URL) throws -> (FileHandle, Int64) {
