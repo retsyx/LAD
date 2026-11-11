@@ -3,6 +3,19 @@ import XCTest
 
 final class ConversationProgressTests: XCTestCase {
     @MainActor
+    func testToolOnlyFeedbackDoesNotRequirePublishingConversation() {
+        let feedback = CodexConversationFeedback()
+        var messages = [ChatMessage(role: "user", content: "Inspect the design")]
+        let original = messages
+        feedback.enqueue(ProjectActivityEvent(id: "inspect", category: "tool", title: "lad_inspect", status: "completed"), scope: "project")
+        let update = feedback.apply(to: &messages)
+        XCTAssertTrue(update.changed)
+        XCTAssertFalse(update.messagesChanged)
+        XCTAssertEqual(update.events.map(\.id), ["project:inspect"])
+        XCTAssertEqual(messages, original)
+    }
+
+    @MainActor
     func testCommentaryUpdatesOneCopyableHistoryItemWithoutChangingItsIdentity() {
         let feedback = CodexConversationFeedback()
         var messages = [ChatMessage(role: "user", content: "Create an enclosure")]

@@ -146,8 +146,15 @@ private final class ProjectActivityPanel: NSPanel {
 
 struct ProjectActivityView: View {
     @ObservedObject var state: AppState
+    @ObservedObject private var activity: ProjectActivityStore
     var onClose: () -> Void
     @State private var expandedTasks = Set<UUID>()
+
+    init(state: AppState, onClose: @escaping () -> Void) {
+        self.state = state
+        self.activity = state.projectActivity
+        self.onClose = onClose
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -157,28 +164,28 @@ struct ProjectActivityView: View {
                     Text(state.projectDisplayName).font(.caption).foregroundStyle(Palette.muted).lineLimit(1)
                 }
                 Spacer()
-                CopyButton(label: "Copy tool activity") { ProjectActivityTranscript.text(for: state.taskAudits) }
-                    .disabled(state.taskAudits.isEmpty)
+                CopyButton(label: "Copy tool activity") { ProjectActivityTranscript.text(for: activity.tasks) }
+                    .disabled(activity.tasks.isEmpty)
                 Button(action: onClose) { Image(systemName: "xmark").frame(width: 20, height: 20) }
                     .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Close tool activity")
                     .accessibilityLabel("Close tool activity")
             }.padding(16)
             Divider()
-            if state.taskAudits.isEmpty {
+            if activity.tasks.isEmpty {
                 ContentUnavailableView("No tool activity yet", systemImage: "terminal")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(state.taskAudits.reversed()) { task in taskView(task) }
+                        ForEach(activity.tasks.reversed()) { task in taskView(task) }
                     }.padding(16)
                 }
             }
         }
         .frame(minWidth: 480, minHeight: 320)
         .background(Palette.background)
-        .onAppear { if let latest = state.taskAudits.last { expandedTasks.insert(latest.id) } }
-        .onChange(of: state.taskAudits.last?.id) { _, id in if let id { expandedTasks.insert(id) } }
+        .onAppear { if let latest = activity.tasks.last { expandedTasks.insert(latest.id) } }
+        .onChange(of: activity.tasks.last?.id) { _, id in if let id { expandedTasks.insert(id) } }
         .accessibilityLabel("Tool Activity")
     }
 
@@ -192,7 +199,7 @@ struct ProjectActivityView: View {
                         .textSelection(.enabled).padding(.top, 4)
                 }
                 ForEach(task.events.reversed()) { event in
-                    ProjectActivityEventView(event: event, taskID: task.id, images: state.activityImages)
+                    ProjectActivityEventView(event: event, taskID: task.id, images: activity.images)
                 }
             }.padding(.leading, 6)
         } label: {

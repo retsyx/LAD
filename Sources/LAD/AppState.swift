@@ -5,8 +5,9 @@ import UniformTypeIdentifiers
 @MainActor
 final class AppState: ObservableObject {
     @Published var messages: [ChatMessage] = []
-    @Published private(set) var taskAudits: [ProjectTaskAudit] = []
-    let activityImages = ProjectActivityImages()
+    let projectActivity = ProjectActivityStore()
+    var taskAudits: [ProjectTaskAudit] { projectActivity.tasks }
+    var activityImages: ProjectActivityImages { projectActivity.images }
     weak var viewportView: CADSceneView?
     @Published var revisions: [ProjectRevision] = [] {
         didSet { agentStateGeneration &+= 1; projectThumbnailRevisionsChanged(from: oldValue) }
@@ -147,8 +148,6 @@ final class AppState: ObservableObject {
     private var operation: Task<Void, Never>?
     private var operationID = UUID()
     private var generationFeedback: CodexConversationFeedback?
-    private var activeTaskAuditID: UUID?
-    private var auditSaveTask: Task<Void, Never>?
     private var autosaveDebounceTask: Task<Void, Never>?
     private var steeringTask: Task<Void, Never>?
     private var queueSourceTasks: [UUID: Task<Void, Never>] = [:]
@@ -239,6 +238,12 @@ final class AppState: ObservableObject {
         runtimeOverride = python
         projectThumbnailRenderer = thumbnailRenderer
         self.assemblyGrabSolver = assemblyGrabSolver
+        projectActivity.onChange = { [weak self] in
+            guard let self else { return }
+            self.autosaveSequence += 1
+            if !self.hasUnsavedChanges { self.hasUnsavedChanges = true }
+        }
+        projectActivity.onSaveRequested = { [weak self] in self?.autosave() }
     }
 
     private static let recentProjectPathKey = "lastAutosavedProjectPath"
@@ -460,7 +465,7 @@ final class AppState: ObservableObject {
         await finishAssemblyMotion(cancelActiveGrab: true)
         cancel()
         cancelProjectThumbnail(clearImage: false)
-        auditSaveTask?.cancel(); auditSaveTask = nil
+        projectActivity.cancelPendingSave()
         autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         await waitForPromptAttachments()
         await waitForQueuedSources()
@@ -548,7 +553,6 @@ final class AppState: ObservableObject {
         onProjectAgentInvalidated?()
         cancel()
         cancelProjectThumbnail()
-        activityImages.reset()
         projectReady = false
         projectSavingEnabled = false
         saveConflict = nil
@@ -574,8 +578,7 @@ final class AppState: ObservableObject {
         displayMode = .edges
         codexSettings = normalizedCodexSettings(CodexProjectSettings())
         messages = []; revisions = []; selectedRevisionID = nil
-        auditSaveTask?.cancel(); auditSaveTask = nil
-        taskAudits = []; activeTaskAuditID = nil
+        projectActivity.restore()
         resetQueueWork()
         queuedRequests = []; queuePaused = false
         mesh = nil; builtRevisionID = nil; prompt = ""; error = nil; notice = nil; pendingAttachments = []
@@ -776,7 +779,7 @@ final class AppState: ObservableObject {
 
     func sendQueuedRequestNow(id: UUID) {
         guard canSteerQueuedRequests, codex.canSteer, !preparingQueuedRequestIDs.contains(id),
-              let request = queuedRequests.first(where: { $0.id == id }), let auditID = activeTaskAuditID else { return }
+              let request = queuedRequests.first(where: { $0.id == id }), let auditID = projectActivity.activeTaskID else { return }
         let token = operationID, session = projectSessionID
         isSendingQueuedRequestID = id
         refreshSteeringAvailability()
@@ -793,18 +796,14 @@ final class AppState: ObservableObject {
                 // final result may arrive while the steering RPC is in flight.
                 let message = ChatMessage(role: "user", content: content, date: request.date, attachments: request.attachments,
                                           selection: request.selection)
-                if let audit = self.taskAudits.first(where: { $0.id == auditID }), let userMessageID = audit.userMessageID,
+                if let audit = self.projectActivity.task(id: auditID), let userMessageID = audit.userMessageID,
                    let revision = self.revisions.last(where: { $0.userMessageID == userMessageID }),
                    let responseID = revision.responseMessageID,
                    let responseIndex = self.messages.firstIndex(where: { $0.id == responseID }) {
                     self.messages.insert(message, at: responseIndex)
                 } else { self.messages.append(message) }
-                if let index = self.taskAudits.firstIndex(where: { $0.id == auditID }) {
-                    self.taskAudits[index].additionalUserMessageIDs = (self.taskAudits[index].additionalUserMessageIDs ?? []) + [message.id]
-                    self.taskAudits[index].events.append(ProjectActivityEvent(id: "steer:\(id.uuidString)", category: "steering",
-                        title: "Additional design information sent", status: "completed", input: content,
-                        output: "Accepted by task turn \(turn)."))
-                }
+                self.projectActivity.acknowledgeSteering(taskID: auditID, requestID: id, messageID: message.id,
+                                                        content: content, turn: turn)
                 self.queuedRequests.removeAll { $0.id == id }
                 self.queuedRequestErrors.removeValue(forKey: id)
                 self.isSendingQueuedRequestID = nil
@@ -1010,9 +1009,7 @@ final class AppState: ObservableObject {
                                                           models: catalog.matches(executable: path) ? catalog.models : [],
                                                           configuredModelID: catalog.matches(executable: path) ? catalog.configuredModelID : nil,
                                                           configuredReasoningEffort: catalog.matches(executable: path) ? catalog.configuredReasoningEffort : nil)
-        let audit = ProjectTaskAudit(userMessageID: userMessage.id, model: modelName, reasoningEffort: effort.rawValue)
-        taskAudits.append(audit)
-        activeTaskAuditID = audit.id
+        projectActivity.beginCodex(userMessageID: userMessage.id, model: modelName, effort: effort.rawValue)
         autosave()
         operation = Task { [self] in
             let progress: @Sendable (String) -> Void = { [weak self] status in
@@ -1244,68 +1241,34 @@ final class AppState: ObservableObject {
 
     private func drainGenerationFeedback(_ feedback: CodexConversationFeedback, token: UUID) {
         guard operationID == token, generationFeedback === feedback else { return }
-        let update = feedback.apply(to: &messages)
-        if let latestActivity = update.activity { activity = latestActivity }
+        var conversation = messages
+        let update = feedback.apply(to: &conversation)
+        if update.messagesChanged { messages = conversation }
+        if let latestActivity = update.activity, activity != latestActivity { activity = latestActivity }
         for event in update.events { recordTaskEvent(event) }
     }
 
     private func finishGenerationFeedback() {
         runningCodexSelection = nil
         guard let feedback = generationFeedback else { return }
-        let update = feedback.apply(to: &messages)
+        var conversation = messages
+        let update = feedback.apply(to: &conversation)
+        if update.messagesChanged { messages = conversation }
         for event in update.events { recordTaskEvent(event) }
         feedback.close()
         generationFeedback = nil
     }
 
     func recordTaskEvent(_ incoming: ProjectActivityEvent) {
-        guard let id = activeTaskAuditID else { return }
-        recordTaskEvent(incoming, taskID: id)
+        projectActivity.record(incoming)
     }
 
     func recordTaskEvent(_ incoming: ProjectActivityEvent, taskID id: UUID) {
-        guard let index = taskAudits.firstIndex(where: { $0.id == id }) else { return }
-        if incoming.category == "tool", incoming.status == "completed",
-           ["lad_render", "lad_screenshot", "imageView"].contains(incoming.title), let image = incoming.imageData {
-            activityImages.store(image, for: ProjectActivityImageKey(taskID: id, eventID: incoming.id))
-        }
-        var event = incoming
-        // Keep heavy derived media separate from persistent audit state.
-        event.imageData = nil
-        if let item = taskAudits[index].events.firstIndex(where: { $0.id == event.id }) {
-            var updated = event
-            let previous = taskAudits[index].events[item]
-            updated.date = previous.date
-            if updated.input == nil { updated.input = previous.input }
-            if updated.output == nil { updated.output = previous.output }
-            if updated.files == nil { updated.files = previous.files }
-            taskAudits[index].events[item] = updated
-        } else { taskAudits[index].events.append(event) }
-        scheduleAuditSave()
+        projectActivity.record(incoming, taskID: id)
     }
 
     private func finishTaskAudit(status: String) {
-        guard let id = activeTaskAuditID, let index = taskAudits.firstIndex(where: { $0.id == id }) else { return }
-        for event in taskAudits[index].events.indices where taskAudits[index].events[event].status == "running" {
-            taskAudits[index].events[event].status = status == "completed" ? "interrupted" : status
-        }
-        taskAudits[index].status = status
-        taskAudits[index].finishedAt = Date()
-        activeTaskAuditID = nil
-    }
-
-    private func scheduleAuditSave() {
-        autosaveSequence += 1
-        hasUnsavedChanges = true
-        guard auditSaveTask == nil else { return }
-        let session = projectSessionID
-        auditSaveTask = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(1)) }
-            catch { return }
-            guard let self, self.projectSessionID == session else { return }
-            self.auditSaveTask = nil
-            self.autosave()
-        }
+        projectActivity.finishActive(status: status)
     }
 
     var isReadingPromptAttachments: Bool { isReadingDraftAttachments || isReadingQueuedAttachments }
@@ -2193,7 +2156,6 @@ final class AppState: ObservableObject {
         saveConflictPromptTask?.cancel(); saveConflictPromptTask = nil
         projectFileOrigin = project.fileOrigin
         hasUnsavedChanges = false
-        activityImages.reset()
         resetQueueWork()
         projectSessionID = UUID()
         projectID = project.projectID ?? UUID()
@@ -2206,16 +2168,7 @@ final class AppState: ObservableObject {
         projectName = project.projectName
         recentPartColors = project.recentPartColors ?? []
         partsPaneFraction = project.partsPaneFraction
-        auditSaveTask?.cancel(); auditSaveTask = nil
-        taskAudits = project.taskAudits ?? []
-        for index in taskAudits.indices where taskAudits[index].status == "running" {
-            taskAudits[index].status = "interrupted"
-            taskAudits[index].finishedAt = Date()
-            for event in taskAudits[index].events.indices where taskAudits[index].events[event].status == "running" {
-                taskAudits[index].events[event].status = "interrupted"
-            }
-        }
-        activeTaskAuditID = nil
+        projectActivity.restore(project.taskAudits ?? [])
         showGrid = project.showGrid ?? true
         projectionMode = project.projectionMode ?? .perspective
         displayMode = project.displayMode ?? .edges
@@ -2246,7 +2199,7 @@ final class AppState: ObservableObject {
         // This snapshot includes the latest draft, divider and audit edits.
         // Their pending timers would only request the same save again.
         autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
-        auditSaveTask?.cancel(); auditSaveTask = nil
+        projectActivity.cancelPendingSave()
         hasUnsavedChanges = true
         autosaveSequence += 1
         guard saveConflict == nil else { return }
@@ -2606,29 +2559,21 @@ extension AppState {
 
     func beginExternalAgentAudit(id: UUID, client: ProjectExternalAgentIdentity, request: String,
                                  model: String? = nil, effort: String? = nil) throws {
-        guard projectReady, !preserveUnreadableSession, taskAudits.count < 10_000 else {
+        guard projectReady, !preserveUnreadableSession else {
             throw LADError.message("The design is unavailable for another agent task.")
         }
-        let audit = ProjectTaskAudit(id: id, model: model, reasoningEffort: effort, externalClient: client, request: request)
-        try ProjectStore.validateTaskAudits([audit], messages: messages, revisionIDs: Set(revisions.map(\.id)))
-        taskAudits.append(audit)
+        try projectActivity.beginExternal(id: id, client: client, request: request, model: model, effort: effort)
         projectSavingEnabled = true
         autosave()
     }
 
     func finishExternalAgentAudit(id: UUID, status: String) {
-        guard let index = taskAudits.firstIndex(where: { $0.id == id }), taskAudits[index].externalClient != nil,
-              taskAudits[index].status == "running" else { return }
-        taskAudits[index].status = status
-        taskAudits[index].finishedAt = Date()
-        for item in taskAudits[index].events.indices where taskAudits[index].events[item].status == "running" {
-            taskAudits[index].events[item].status = status == "completed" ? "interrupted" : status
-        }
+        guard projectActivity.finishExternal(id: id, status: status) else { return }
         autosave()
     }
 
     func externalAgentReceipt(clientID: String, key: String) -> ProjectTaskAudit? {
-        taskAudits.first { $0.externalClient?.clientID == clientID && $0.commitKey == key }
+        projectActivity.externalReceipt(clientID: clientID, key: key)
     }
 
     func commitExternalAgent(_ candidate: ProjectAgentCandidate, taskID: UUID, artifactID: String,
@@ -2638,8 +2583,7 @@ extension AppState {
               expectedStateToken == snapshot.stateToken, !isWorking else {
             throw ProjectAgentError.conflict("The design changed or is busy. Start a new task against its current state before committing.")
         }
-        guard let index = taskAudits.firstIndex(where: { $0.id == taskID }), taskAudits[index].status == "running",
-              taskAudits[index].externalClient != nil else { throw ProjectAgentError.unavailable }
+        guard projectActivity.isRunningExternal(id: taskID) else { throw ProjectAgentError.unavailable }
         try ProjectStore.validateModel(candidate.model)
         guard revisions.count < 1_000 else { throw LADError.message("The design already has the maximum number of versions.") }
         let revisionID: UUID
@@ -2653,11 +2597,7 @@ extension AppState {
                 previousColors: Self.completePartColors(in: partTree, stored: revisions.first(where: { $0.id == selectedRevisionID })?.partColors ?? [:]),
                 colorChanges: candidate.colorChanges, startedColors: snapshot.partColors)
         }
-        taskAudits[index].committedRevisionID = revisionID
-        taskAudits[index].commitKey = key
-        taskAudits[index].commitArtifactID = artifactID
-        taskAudits[index].status = "completed"
-        taskAudits[index].finishedAt = Date()
+        projectActivity.recordExternalCommit(taskID: taskID, revisionID: revisionID, key: key, artifactID: artifactID)
         error = nil
         autosave()
         return revisionID
@@ -2670,89 +2610,5 @@ extension AppState {
         var value: [String: Any] = ["status": hasUnsavedChanges ? "pending" : (projectURL == nil ? "memory" : "saved")]
         if let saveStatus, saveStatus.hasPrefix("Not saved:") { value["status"] = "failed"; value["error"] = saveStatus }
         return value
-    }
-}
-
-/// The CLI calls back from its stream reader. Queue complete message snapshots
-/// there, then apply them on the main actor. An explicit final drain preserves
-/// ordering even when queued UI notifications run after the process finishes.
-final class CodexConversationFeedback: @unchecked Sendable {
-    struct Update {
-        var changed: Bool
-        var activity: String?
-        var events: [ProjectActivityEvent]
-    }
-
-    private let lock = NSLock()
-    private var pending: [String: String] = [:]
-    private var order: [String] = []
-    private var knownItems: Set<String> = []
-    private var messageIDs: [String: UUID] = [:]
-    private var latestActivity: String?
-    private var closed = false
-    private var pendingEvents = [String: ProjectActivityEvent]()
-    private var eventOrder = [String]()
-
-    func enqueue(_ event: ProjectActivityEvent, scope: String) {
-        var scoped = event
-        scoped.id = scope + ":" + event.id
-        lock.lock(); defer { lock.unlock() }
-        guard !closed else { return }
-        if pendingEvents[scoped.id] == nil { eventOrder.append(scoped.id) }
-        pendingEvents[scoped.id] = scoped
-    }
-
-    func enqueue(_ message: CodexProgressMessage, scope: String) {
-        let text = String(message.text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_000))
-        guard !text.isEmpty, message.id.utf8.count <= 1_024, scope.utf8.count <= 128 else { return }
-        let key = scope + "\u{1f}" + message.id
-        lock.lock(); defer { lock.unlock() }
-        guard !closed, knownItems.contains(key) || knownItems.count < 128 else { return }
-        knownItems.insert(key)
-        if pending[key] == nil { order.append(key) }
-        pending[key] = text
-    }
-
-    func enqueueActivity(_ activity: String) {
-        lock.lock(); defer { lock.unlock() }
-        guard !closed else { return }
-        latestActivity = String(activity.prefix(256))
-    }
-
-    @MainActor
-    func apply(to messages: inout [ChatMessage]) -> Update {
-        lock.lock(); defer { lock.unlock() }
-        var changed = false
-        for key in order {
-            guard let text = pending[key] else { continue }
-            if let id = messageIDs[key], let index = messages.firstIndex(where: { $0.id == id }) {
-                if messages[index].content != text {
-                    messages[index].content = text
-                    changed = true
-                }
-            } else {
-                // Repeated commentary from a new stream item adds no useful
-                // transcript entry. A later different update still gets one.
-                guard messages.last?.phase != "commentary" || messages.last?.content != text else { continue }
-                let message = ChatMessage(role: "assistant", content: text, phase: "commentary")
-                messages.append(message)
-                messageIDs[key] = message.id
-                changed = true
-            }
-        }
-        let activity = latestActivity
-        let events = eventOrder.compactMap { pendingEvents[$0] }
-        pending.removeAll(keepingCapacity: true)
-        order.removeAll(keepingCapacity: true)
-        latestActivity = nil
-        pendingEvents.removeAll(keepingCapacity: true); eventOrder.removeAll(keepingCapacity: true)
-        return Update(changed: changed || !events.isEmpty, activity: activity, events: events)
-    }
-
-    func close() {
-        lock.lock(); defer { lock.unlock() }
-        closed = true
-        pending.removeAll(); order.removeAll(); latestActivity = nil
-        pendingEvents.removeAll(); eventOrder.removeAll()
     }
 }

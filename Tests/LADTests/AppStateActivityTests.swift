@@ -1,8 +1,39 @@
+import Combine
 import Foundation
 import XCTest
 @testable import LAD
 
 final class AppStateActivityTests: XCTestCase {
+    @MainActor
+    func testToolUpdatesNotifyActivityObserversWithoutPublishingWorkspaceChanges() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let state = fixture.state()
+        state.newProject()
+        let taskID = UUID()
+        try state.beginExternalAgentAudit(id: taskID,
+            client: ProjectExternalAgentIdentity(clientID: "observer-test", name: "Observer test"), request: "Inspect geometry")
+        // Beginning the task already marks the design dirty. Tool updates must
+        // not repeatedly publish that unchanged state to the entire workspace.
+        XCTAssertTrue(state.hasUnsavedChanges)
+        var workspaceUpdates = 0, activityUpdates = 0
+        let workspace = state.objectWillChange.sink { workspaceUpdates += 1 }
+        let activity = state.projectActivity.objectWillChange.sink { activityUpdates += 1 }
+        for index in 0..<32 {
+            state.recordTaskEvent(event("call-\(index)", status: "completed"), taskID: taskID)
+        }
+        XCTAssertEqual(workspaceUpdates, 0, "A hidden Tool Activity pane must not invalidate the viewport for every event.")
+        XCTAssertEqual(activityUpdates, 32, "The visible activity pane must still receive current results.")
+        XCTAssertEqual(state.taskAudits.first?.events.count, 32)
+        withExtendedLifetime((workspace, activity)) {}
+
+        state.finishExternalAgentAudit(id: taskID, status: "completed")
+        await state.prepareToQuit()
+        let saved = try ProjectStore.read(from: XCTUnwrap(state.projectURL))
+        XCTAssertEqual(saved.taskAudits, state.taskAudits)
+        XCTAssertFalse(state.hasUnsavedChanges)
+    }
+
     @MainActor
     func testSubmissionCapturesSelectionAndUpsertsCompleteEventsWithoutChangingTheirStart() async throws {
         let fixture = try Fixture()
