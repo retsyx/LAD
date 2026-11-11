@@ -12,13 +12,13 @@ struct ProjectDetailsPane: View {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 12) {
                         if project != nil { projectInfo }
+                        if state.hasMeasurementSelection {
+                            MeasurementInfoView(state: state, contentPadding: 0)
+                        }
                         if let motion = state.mesh?.assemblyMotion, motion.joints.contains(where: \.isMovable) {
                             AssemblyMotionControls(state: state, motion: motion)
                         }
                         if let project { programDisclosure(project) }
-                        if state.hasMeasurementSelection {
-                            MeasurementInfoView(state: state, contentPadding: 0)
-                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
