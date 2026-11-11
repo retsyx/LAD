@@ -51,7 +51,7 @@ struct FakeCodex {
             configuration["bodyPath"] = bodyURL.path
         }
         let encoded = try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys]).base64EncodedString()
-        let preamble = "#!/usr/bin/env python3\nimport base64,json\nCONFIG=json.loads(base64.b64decode('\(encoded)'))\n"
+        let preamble = "#!/usr/bin/python3\nimport base64,json\nCONFIG=json.loads(base64.b64decode('\(encoded)'))\n"
         try (preamble + Self.adapter).write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
     }

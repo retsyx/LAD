@@ -247,7 +247,7 @@ private struct VersionHarness {
         reportURL = directory.appendingPathComponent("report.json")
         let markerJSON = try JSONSerialization.data(withJSONObject: [runtimeMarker.path])
         let marker = String(decoding: markerJSON, as: UTF8.self)
-        let pythonBody = "#!/usr/bin/env python3\nimport json,pathlib,sys\npathlib.Path(json.loads('\(marker)')[0]).write_text('unexpected CAD worker launch')\nsys.exit(70)\n"
+        let pythonBody = "#!/usr/bin/python3\nimport json,pathlib,sys\npathlib.Path(json.loads('\(marker)')[0]).write_text('unexpected CAD worker launch')\nsys.exit(70)\n"
         try pythonBody.write(to: python, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: python.path)
         let configuration: [String: Any] = ["queries": queries, "wait": waitsForResume, "ready": ready.path,
