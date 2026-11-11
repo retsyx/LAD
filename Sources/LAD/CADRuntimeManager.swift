@@ -77,6 +77,12 @@ final class CADRuntimeManager: ObservableObject {
             readyPython = python
             phase = .ready
             preparation = nil
+            // Reclaiming superseded runtimes never delays the first CAD request.
+            let current = URL(fileURLWithPath: python).deletingLastPathComponent().deletingLastPathComponent()
+                .deletingLastPathComponent().lastPathComponent
+            Task.detached(priority: .utility) {
+                CADRuntimeInstaller.pruneSuperseded(installationRoot: installationRoot, current: current)
+            }
             return python
         } catch {
             phase = .failed(error.localizedDescription)
@@ -120,23 +126,13 @@ enum CADRuntimeInstaller {
         let root = try EngineArtifact.canonicalDirectory(installationRoot)
         // The process-wide task coalesces windows; this lock also covers two LAD
         // processes launched together. Never publish a partially prepared venv.
-        let descriptor = Darwin.open(root.appendingPathComponent(".install.lock").path,
-                                     O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard descriptor >= 0 else { throw LADError.message("LAD could not reserve its CAD runtime directory.") }
+        let descriptor = try lockInstallation(root)
         defer { Darwin.close(descriptor) }
-        guard lockRuntimeFile(descriptor, LOCK_EX) == 0 else {
-            throw LADError.message("LAD could not reserve its CAD runtime directory.")
-        }
-        // A crash can leave an unpacked payload. Holding the cross-process lock
-        // proves that no installer still owns these private staging directories.
+        // A crash can leave an unpacked payload or a runtime being reclaimed.
+        // Holding the cross-process lock proves no installer still owns them.
         for abandoned in try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
             let name = abandoned.lastPathComponent
-            var info = stat()
-            if name.hasPrefix(".install-"), UUID(uuidString: String(name.dropFirst(9))) != nil,
-               Darwin.lstat(abandoned.path, &info) == 0, info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
-               info.st_uid == getuid() {
-                try? manager.removeItem(at: abandoned)
-            }
+            if isPrivateTemporary(name), isOwnedDirectory(abandoned) { try? manager.removeItem(at: abandoned) }
         }
         let destination = root.appendingPathComponent(payload.identifier, isDirectory: true)
         let python = destination.appendingPathComponent("venv/bin/python")
@@ -144,6 +140,7 @@ enum CADRuntimeInstaller {
         if (try? String(contentsOf: marker, encoding: .utf8)) == payload.sha256,
            manager.isExecutableFile(atPath: python.path) {
             try warmBytecode(python: python, directory: destination, payloadHash: payload.sha256)
+            RuntimeUse.shared.retain(destination)
             return python.path
         }
 
@@ -189,7 +186,72 @@ enum CADRuntimeInstaller {
         try warmBytecode(python: python, directory: destination, payloadHash: payload.sha256)
         try payload.sha256.write(to: marker, atomically: true, encoding: .utf8)
         completed = true
+        RuntimeUse.shared.retain(destination)
         return python.path
+    }
+
+    /// Removes runtimes that newer app payloads superseded. The current runtime
+    /// and the most recently used previous one stay installed, so alternating
+    /// between two app builds does not reinstall either. A runtime that any
+    /// running LAD process holds is never removed. Directories are renamed under
+    /// the installation lock and deleted after releasing it; an interrupted
+    /// deletion is finished by the next installation.
+    static func pruneSuperseded(installationRoot: URL, current: String) {
+        let manager = FileManager.default
+        var reclaimed = [URL]()
+        do {
+            let root = try EngineArtifact.canonicalDirectory(installationRoot)
+            let descriptor = try lockInstallation(root)
+            defer { Darwin.close(descriptor) }
+            let candidates = try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).filter {
+                let name = $0.lastPathComponent
+                return name != current && !name.hasPrefix(".") && isOwnedDirectory($0)
+            }.sorted { lastUsed($0) > lastUsed($1) }
+            for runtime in candidates.dropFirst() {
+                // The exclusive probe fails while any process holds its shared use lock.
+                let probe = Darwin.open(runtime.appendingPathComponent(".in-use").path,
+                                        O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                guard probe >= 0 else { continue }
+                defer { Darwin.close(probe) }
+                guard lockRuntimeFile(probe, LOCK_EX | LOCK_NB) == 0 else { continue }
+                let target = root.appendingPathComponent(".superseded-\(UUID().uuidString)", isDirectory: true)
+                if (try? manager.moveItem(at: runtime, to: target)) != nil { reclaimed.append(target) }
+            }
+        } catch {
+            return
+        }
+        for target in reclaimed { try? manager.removeItem(at: target) }
+    }
+
+    private static func lockInstallation(_ root: URL) throws -> Int32 {
+        let descriptor = Darwin.open(root.appendingPathComponent(".install.lock").path,
+                                     O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw LADError.message("LAD could not reserve its CAD runtime directory.") }
+        guard lockRuntimeFile(descriptor, LOCK_EX) == 0 else {
+            Darwin.close(descriptor)
+            throw LADError.message("LAD could not reserve its CAD runtime directory.")
+        }
+        return descriptor
+    }
+
+    private static func isPrivateTemporary(_ name: String) -> Bool {
+        for prefix in [".install-", ".superseded-"] where name.hasPrefix(prefix) {
+            return UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
+        }
+        return false
+    }
+
+    private static func isOwnedDirectory(_ url: URL) -> Bool {
+        var info = stat()
+        return Darwin.lstat(url.path, &info) == 0 && info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) && info.st_uid == getuid()
+    }
+
+    /// Runtimes from builds before use tracking fall back to their install
+    /// markers. Directory times are unsuitable: creating a use lock changes them.
+    private static func lastUsed(_ runtime: URL) -> Date {
+        [".last-used", ".bytecode-ready", ".ready"].compactMap { name -> Date? in
+            (try? FileManager.default.attributesOfItem(atPath: runtime.appendingPathComponent(name).path))?[.modificationDate] as? Date
+        }.max() ?? .distantPast
     }
 
     private static func warmBytecode(python: URL, directory: URL, payloadHash: String) throws {
@@ -251,5 +313,35 @@ enum CADRuntimeInstaller {
             let details = String(decoding: (try? Data(contentsOf: log)) ?? Data(), as: UTF8.self).suffix(2_000)
             throw LADError.message("LAD could not prepare its CAD runtime. Restart LAD and try again.\n\n\(details)")
         }
+    }
+}
+
+/// Each LAD process holds a shared lock on the runtime it uses for its lifetime,
+/// so another process never reclaims it, and records when it was last used.
+final class RuntimeUse: @unchecked Sendable {
+    static let shared = RuntimeUse()
+    private let lock = NSLock()
+    private var descriptors = [String: Int32]()
+
+    func retain(_ runtime: URL) {
+        lock.lock(); defer { lock.unlock() }
+        let key = runtime.path
+        if let descriptor = descriptors[key] {
+            var info = stat()
+            // A test or user may remove and reinstall the same identifier.
+            if fstat(descriptor, &info) == 0, info.st_nlink > 0 { touch(runtime); return }
+            Darwin.close(descriptor); descriptors[key] = nil
+        }
+        let descriptor = Darwin.open(runtime.appendingPathComponent(".in-use").path,
+                                     O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { return }
+        guard lockRuntimeFile(descriptor, LOCK_SH) == 0 else { Darwin.close(descriptor); return }
+        descriptors[key] = descriptor
+        touch(runtime)
+    }
+
+    private func touch(_ runtime: URL) {
+        try? Data(ISO8601DateFormatter().string(from: Date()).utf8)
+            .write(to: runtime.appendingPathComponent(".last-used"), options: .atomic)
     }
 }

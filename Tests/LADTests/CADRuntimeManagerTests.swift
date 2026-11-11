@@ -3,6 +3,9 @@ import Foundation
 import XCTest
 @testable import LAD
 
+@_silgen_name("flock")
+private func lockTestFile(_ descriptor: Int32, _ operation: Int32) -> Int32
+
 final class CADRuntimeManagerTests: XCTestCase {
     func testManifestRejectsTraversalAndIncompatibleArchitecture() throws {
         let folder = try temporaryFolder()
@@ -171,6 +174,70 @@ final class CADRuntimeManagerTests: XCTestCase {
         let arguments = try CADAgentBridge.codexArguments(workspace: workspace, python: python,
                                                          server: ResourcePaths.root.appendingPathComponent("Engine/agent_server.py"))
         XCTAssertTrue(arguments.contains { $0.hasPrefix("mcp_servers.lad.command=") && $0.contains("venv/bin/python") })
+    }
+
+    func testSupersededRuntimesAreReclaimedExceptCurrentPreviousAndInUse() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let root = folder.appendingPathComponent("Runtimes")
+        let now = Date()
+        for (name, age) in [("current", 0.0), ("previous", 3600.0), ("older", 7200.0), ("held", 10_800.0), ("oldest", 14_400.0)] {
+            try fakeRuntime(name, in: root, lastUsed: now.addingTimeInterval(-age))
+        }
+        let unrelated = root.appendingPathComponent(".install-user-data")
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: false)
+        // Another process using a superseded runtime holds its shared use lock.
+        let held = Darwin.open(root.appendingPathComponent("held/.in-use").path, O_RDWR | O_CREAT, 0o600)
+        XCTAssertEqual(lockTestFile(held, LOCK_SH), 0)
+        CADRuntimeInstaller.pruneSuperseded(installationRoot: root, current: "current")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).sorted(),
+                       [".install-user-data", ".install.lock", "current", "held", "previous"])
+        Darwin.close(held)
+        CADRuntimeInstaller.pruneSuperseded(installationRoot: root, current: "current")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).sorted(),
+                       [".install-user-data", ".install.lock", "current", "previous"])
+    }
+
+    func testInstallationRetainsItsRuntimeAndFinishesInterruptedReclaims() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try writeManifest(in: folder)
+        let root = folder.appendingPathComponent("Runtimes")
+        let runtime = try fakeRuntime("test-runtime", in: root, lastUsed: Date(timeIntervalSince1970: 0))
+        let interrupted = root.appendingPathComponent(".superseded-\(UUID())")
+        try FileManager.default.createDirectory(at: interrupted, withIntermediateDirectories: false)
+        let python = try CADRuntimeInstaller.install(payloadDirectory: folder, installationRoot: root)
+        XCTAssertEqual(URL(fileURLWithPath: python).resolvingSymlinksInPath(), runtime.appendingPathComponent("venv/bin/python").resolvingSymlinksInPath())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: interrupted.path))
+        let used = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: runtime.appendingPathComponent(".last-used").path)[.modificationDate] as? Date)
+        XCTAssertGreaterThan(used, Date().addingTimeInterval(-60))
+        let probe = Darwin.open(runtime.appendingPathComponent(".in-use").path, O_RDWR)
+        defer { Darwin.close(probe) }
+        XCTAssertNotEqual(lockTestFile(probe, LOCK_EX | LOCK_NB), 0, "The installing process must hold its runtime")
+        // A newer build keeps its own runtime and a more recently used one;
+        // this process's runtime survives because it is still in use.
+        try fakeRuntime("newer", in: root, lastUsed: Date())
+        try fakeRuntime("recent", in: root, lastUsed: Date().addingTimeInterval(3600))
+        CADRuntimeInstaller.pruneSuperseded(installationRoot: root, current: "newer")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: runtime.path))
+    }
+
+    @discardableResult
+    private func fakeRuntime(_ name: String, in root: URL, lastUsed: Date) throws -> URL {
+        let runtime = root.appendingPathComponent(name)
+        let bin = runtime.appendingPathComponent("venv/bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let python = bin.appendingPathComponent("python")
+        try Data("#!/bin/sh\n".utf8).write(to: python)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: python.path)
+        let hash = String(repeating: "0", count: 64)
+        for (marker, contents) in [(".ready", hash), (".bytecode-ready", "1:\(hash)")] {
+            let url = runtime.appendingPathComponent(marker)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.modificationDate: lastUsed], ofItemAtPath: url.path)
+        }
+        try FileManager.default.setAttributes([.modificationDate: lastUsed], ofItemAtPath: runtime.path)
+        return runtime
     }
 
     private func temporaryFolder() throws -> URL {

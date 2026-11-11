@@ -25,6 +25,13 @@ without the warmup marker are warmed offline on their next use. Ordinary CAD
 workers read those caches while keeping bytecode writes disabled; caches are
 not included in the downloadable payload.
 
+Each process holds a shared lock on its runtime's `.in-use` file and refreshes
+its `.last-used` marker. After the current runtime is ready, a low-priority pass
+removes superseded runtimes except the most recently used previous one, so
+alternating between two app builds does not reinstall either. A runtime any
+running process holds is never removed. Removal renames under the installation
+lock and deletes afterward; the next installation finishes an interrupted one.
+
 ```sh
 .build/cad-runtime/arm64/expanded/python/bin/python3 Engine/worker.py \
   --request Examples/mounting-bracket.json \
