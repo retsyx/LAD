@@ -12,7 +12,12 @@ final class AppState: ObservableObject {
         didSet { agentStateGeneration &+= 1; projectThumbnailRevisionsChanged(from: oldValue) }
     }
     @Published var selectedRevisionID: UUID? {
-        didSet { if selectedRevisionID != oldValue { agentStateGeneration &+= 1; scheduleProjectThumbnail() } }
+        didSet {
+            if selectedRevisionID != oldValue {
+                cancelAssemblyGrab()
+                agentStateGeneration &+= 1; scheduleProjectThumbnail()
+            }
+        }
     }
     @Published var mesh: PreviewMesh? {
         didSet {
@@ -39,7 +44,10 @@ final class AppState: ObservableObject {
     @Published private(set) var queuedRequestErrors: [UUID: String] = [:]
     @Published private(set) var queuePauseReason: String?
     @Published var isWorking = false {
-        didSet { if oldValue && !isWorking { scheduleQueueAfterBusyOperation() } }
+        didSet {
+            if isWorking && !oldValue { cancelAssemblyGrab() }
+            if oldValue && !isWorking { scheduleQueueAfterBusyOperation() }
+        }
     }
     @Published var activity = "Ready"
     @Published private(set) var runningCodexSelection: String?
@@ -57,7 +65,10 @@ final class AppState: ObservableObject {
     }
     @Published var projectionMode: ViewportProjectionMode = .perspective {
         didSet {
-            if projectionMode != oldValue { scheduleProjectThumbnail(); autosave() }
+            if projectionMode != oldValue {
+                if isGrabbingAssembly { cancelAssemblyGrab() }
+                scheduleProjectThumbnail(); autosave()
+            }
         }
     }
     @Published var showGrid = true {
@@ -65,7 +76,9 @@ final class AppState: ObservableObject {
             if showGrid != oldValue { autosave() }
         }
     }
-    @Published var viewportCommand: ViewportCommand?
+    @Published var viewportCommand: ViewportCommand? {
+        didSet { if viewportCommand != oldValue && isGrabbingAssembly { cancelAssemblyGrab() } }
+    }
     @Published var projectURL: URL?
     @Published var saveStatus: String?
     @Published private(set) var saveConflict: ProjectSaveConflict?
@@ -81,14 +94,40 @@ final class AppState: ObservableObject {
     @Published private(set) var assemblyPose: AssemblyPose?
     @Published private(set) var isSolvingAssembly = false
     @Published private(set) var assemblyMotionError: String?
+    @Published private(set) var isGrabbingAssembly = false
     private var assemblyMotionTask: Task<Void, Never>?
     private var assemblyMotionToken = UUID()
     private var requestedJointPositions: [String: Double] = [:]
+    private final class AssemblyGrabSession {
+        let ownerID: UUID
+        let revisionID: UUID
+        let projectSessionID: UUID
+        let geometryToken: UUID
+        let solidIndex: Int
+        let context: AssemblyGrabContext
+        var pendingTarget: [Double]?
+        var lastTarget: [Double]?
+        var ended = false
+
+        init(ownerID: UUID, revisionID: UUID, projectSessionID: UUID, geometryToken: UUID,
+             solidIndex: Int, context: AssemblyGrabContext) {
+            self.ownerID = ownerID; self.revisionID = revisionID; self.projectSessionID = projectSessionID
+            self.geometryToken = geometryToken; self.solidIndex = solidIndex; self.context = context
+        }
+    }
+    private var assemblyGrabSession: AssemblyGrabSession?
+    private var assemblyGrabTask: Task<Void, Never>?
+    private let assemblyGrabSolver: @Sendable (AssemblyGrabContext, [String: Double], [Double]) async throws -> AssemblyPose
     @Published private(set) var measurementError: String?
     @Published private(set) var isMeasuring = false
     @Published var selectedPartNodeIDs: Set<String> = []
     @Published var hiddenSolids: Set<Int> = [] {
-        didSet { if hiddenSolids != oldValue { agentStateGeneration &+= 1; scheduleProjectThumbnail() } }
+        didSet {
+            if hiddenSolids != oldValue {
+                if let grabbed = assemblyGrabSession?.solidIndex, hiddenSolids.contains(grabbed) { cancelAssemblyGrab() }
+                agentStateGeneration &+= 1; scheduleProjectThumbnail()
+            }
+        }
     }
     @Published var pendingAttachments: [SourceAttachment] = [] {
         didSet { if pendingAttachments != oldValue { scheduleDebouncedAutosave() } }
@@ -192,10 +231,14 @@ final class AppState: ObservableObject {
          thumbnailRenderer: @escaping @MainActor (PreviewMesh, ProjectThumbnail.Input) async throws -> Data = { preview, input in
              try await ProjectThumbnail.render(preview: preview, projection: input.projection, display: input.display,
                                                hiddenSolids: input.hiddenSolids, solidColors: input.solidColors)
+         },
+         assemblyGrabSolver: @escaping @Sendable (AssemblyGrabContext, [String: Double], [Double]) async throws -> AssemblyPose = {
+             try $0.solve(positions: $1, screenPoint: $2)
          }) {
         self.autosaveStore = autosaveStore
         runtimeOverride = python
         projectThumbnailRenderer = thumbnailRenderer
+        self.assemblyGrabSolver = assemblyGrabSolver
     }
 
     private static let recentProjectPathKey = "lastAutosavedProjectPath"
@@ -240,6 +283,9 @@ final class AppState: ObservableObject {
         return revision.preview?.solids ?? (partTree.flatMap { $0.allSolidIndices }.max().map { $0 + 1 } ?? 0)
     }
     var canExport: Bool { mesh != nil && builtRevisionID == selectedRevisionID && !isWorking && !isSolvingAssembly }
+    var canManipulateAssembly: Bool {
+        !isWorking && builtRevisionID == selectedRevisionID && mesh?.assemblyMotion != nil
+    }
     var featureSelectedSolids: Set<Int> { Set(selectedFeatures.map(\.solidIndex)) }
 
     func setPartsPaneFraction(_ fraction: Double) {
@@ -411,7 +457,7 @@ final class AppState: ObservableObject {
 
     func prepareToQuit() async {
         onProjectAgentInvalidated?()
-        await assemblyMotionTask?.value
+        await finishAssemblyMotion(cancelActiveGrab: true)
         cancel()
         cancelProjectThumbnail(clearImage: false)
         auditSaveTask?.cancel(); auditSaveTask = nil
@@ -424,7 +470,7 @@ final class AppState: ObservableObject {
 
     func flushForReplacement() async throws {
         onProjectAgentInvalidated?()
-        await assemblyMotionTask?.value
+        await finishAssemblyMotion(cancelActiveGrab: true)
         let wasGenerating = generationFeedback != nil
         cancel()
         cancelProjectThumbnail(clearImage: false)
@@ -438,7 +484,7 @@ final class AppState: ObservableObject {
     }
 
     private func flushProject() async throws {
-        await assemblyMotionTask?.value
+        await finishAssemblyMotion()
         guard canSaveProject else { return }
         if let saveConflict { throw saveConflict }
         autosaveSequence += 1
@@ -469,6 +515,7 @@ final class AppState: ObservableObject {
     /// A quit-time recovery copy preserves the complete design. Unlike the
     /// ordinary Save As action, it is awaited and does not retry cloud autosave.
     func saveProjectForQuit(to url: URL) async throws {
+        await finishAssemblyMotion(cancelActiveGrab: true)
         guard canSaveProject else { return }
         autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
         let sequence = autosaveSequence, sessionID = projectSessionID
@@ -1390,7 +1437,110 @@ final class AppState: ObservableObject {
         isMeasuring = false
     }
 
+    private func finishAssemblyMotion(cancelActiveGrab: Bool = false) async {
+        if cancelActiveGrab && isGrabbingAssembly { cancelAssemblyGrab() }
+        await assemblyMotionTask?.value
+        // One worker drains the latest queued pointer target through mouse-up.
+        await assemblyGrabTask?.value
+    }
+
+    func beginAssemblyGrab(ownerID: UUID, solidIndex: Int, point: [Double], projection: AssemblyGrabProjection) -> Bool {
+        guard canManipulateAssembly, !isSolvingAssembly, assemblyGrabSession == nil,
+              !hiddenSolids.contains(solidIndex), let preview = mesh, (0..<preview.solids).contains(solidIndex),
+              let motion = preview.assemblyMotion, let pose = assemblyPose, let revisionID = selectedRevisionID else { return false }
+        do {
+            guard let context = try motion.prepareGrab(parts: preview.parts ?? partTree, positions: pose.positions,
+                                                       solidIndex: solidIndex, point: point, projection: projection) else { return false }
+            assemblyGrabSession = AssemblyGrabSession(ownerID: ownerID, revisionID: revisionID,
+                projectSessionID: projectSessionID, geometryToken: assemblyMotionToken, solidIndex: solidIndex, context: context)
+            isGrabbingAssembly = true
+            assemblyMotionError = nil
+            return true
+        } catch {
+            assemblyMotionError = error.localizedDescription
+            return false
+        }
+    }
+
+    func moveAssemblyGrab(ownerID: UUID, screenPoint: [Double]) {
+        guard let session = assemblyGrabSession, session.ownerID == ownerID, !session.ended,
+              canManipulateAssembly, screenPoint.count == 2,
+              screenPoint.allSatisfy({ $0.isFinite && abs($0) <= 1e9 }), session.lastTarget != screenPoint else { return }
+        session.lastTarget = screenPoint
+        session.pendingTarget = screenPoint
+        if assemblyGrabTask == nil { startAssemblyGrabWorker(session) }
+    }
+
+    func endAssemblyGrab(ownerID: UUID) {
+        guard let session = assemblyGrabSession, session.ownerID == ownerID, !session.ended else { return }
+        session.ended = true
+        isGrabbingAssembly = false
+        if assemblyGrabTask == nil { assemblyGrabSession = nil }
+    }
+
+    func cancelAssemblyGrab(ownerID: UUID? = nil) {
+        guard let session = assemblyGrabSession, ownerID == nil || session.ownerID == ownerID else { return }
+        assemblyGrabSession = nil
+        assemblyGrabTask?.cancel(); assemblyGrabTask = nil
+        isGrabbingAssembly = false
+        if assemblyMotionTask == nil { isSolvingAssembly = false }
+        requestedJointPositions = assemblyPose?.positions ?? [:]
+    }
+
+    private func isCurrentAssemblyGrab(_ session: AssemblyGrabSession) -> Bool {
+        assemblyGrabSession === session && projectSessionID == session.projectSessionID &&
+            selectedRevisionID == session.revisionID && assemblyMotionToken == session.geometryToken && !isWorking
+    }
+
+    private func startAssemblyGrabWorker(_ session: AssemblyGrabSession) {
+        isSolvingAssembly = true
+        assemblyGrabTask = Task { [weak self] in
+            while let self, self.isCurrentAssemblyGrab(session), !Task.isCancelled {
+                guard let target = session.pendingTarget else {
+                    self.assemblyGrabTask = nil
+                    self.isSolvingAssembly = false
+                    if session.ended { self.assemblyGrabSession = nil }
+                    return
+                }
+                session.pendingTarget = nil
+                let context = session.context, positions = self.assemblyPose?.positions ?? [:]
+                let solver = self.assemblyGrabSolver
+                let calculation = Task.detached(priority: .userInitiated) { try await solver(context, positions, target) }
+                do {
+                    let pose = try await withTaskCancellationHandler { try await calculation.value }
+                        onCancel: { calculation.cancel() }
+                    guard self.isCurrentAssemblyGrab(session), !Task.isCancelled else { return }
+                    self.acceptAssemblyPose(pose, revisionID: session.revisionID)
+                } catch is CancellationError {
+                    if self.isCurrentAssemblyGrab(session) { self.cancelAssemblyGrab(ownerID: session.ownerID) }
+                    return
+                } catch {
+                    guard self.isCurrentAssemblyGrab(session), !Task.isCancelled else { return }
+                    self.assemblyMotionError = error.localizedDescription
+                    // Retain the last valid pose and allow the next cursor
+                    // target to recover without abandoning the grab.
+                }
+            }
+        }
+    }
+
+    private func acceptAssemblyPose(_ pose: AssemblyPose, revisionID: UUID, fit: Bool = false) {
+        assemblyMotionError = nil
+        if assemblyPose != pose {
+            assemblyPose = pose
+            requestedJointPositions = pose.positions
+            agentStateGeneration &+= 1
+            refreshMeasurements()
+        }
+        if fit { viewportCommand = ViewportCommand(.fit) }
+        if let index = revisions.firstIndex(where: { $0.id == revisionID }), revisions[index].jointPositions != pose.positions {
+            revisions[index].jointPositions = pose.positions
+            scheduleDebouncedAutosave()
+        }
+    }
+
     private func loadAssemblyPose() {
+        cancelAssemblyGrab()
         assemblyMotionTask?.cancel(); assemblyMotionTask = nil
         assemblyMotionToken = UUID()
         isSolvingAssembly = false; assemblyMotionError = nil
@@ -1413,6 +1563,7 @@ final class AppState: ObservableObject {
     func setJointPosition(_ id: String, to value: Double) {
         guard !isWorking, value.isFinite,
               mesh?.assemblyMotion?.joints.contains(where: { $0.id == id && $0.type != .fixed }) == true else { return }
+        cancelAssemblyGrab()
         var positions = requestedJointPositions
         positions[id] = value
         requestAssemblyPose(positions: positions, driving: id)
@@ -1420,6 +1571,7 @@ final class AppState: ObservableObject {
 
     func resetAssemblyMotion() {
         guard !isWorking, let motion = mesh?.assemblyMotion else { return }
+        cancelAssemblyGrab()
         requestAssemblyPose(positions: Dictionary(uniqueKeysWithValues: motion.joints.map { ($0.id, $0.position) }), driving: nil)
     }
 
@@ -1439,17 +1591,8 @@ final class AppState: ObservableObject {
                     onCancel: { calculation.cancel() }
                 guard let self, self.assemblyMotionToken == token, self.selectedRevisionID == revisionID,
                       self.mesh?.stepPath == preview.stepPath, !Task.isCancelled else { return }
-                self.assemblyPose = pose
-                self.requestedJointPositions = pose.positions
                 self.isSolvingAssembly = false; self.assemblyMotionTask = nil
-                self.agentStateGeneration &+= 1
-                self.refreshMeasurements()
-                if fit { self.viewportCommand = ViewportCommand(.fit) }
-                if let index = self.revisions.firstIndex(where: { $0.id == revisionID }),
-                   self.revisions[index].jointPositions != pose.positions {
-                    self.revisions[index].jointPositions = pose.positions
-                    self.scheduleDebouncedAutosave()
-                }
+                self.acceptAssemblyPose(pose, revisionID: revisionID, fit: fit)
             } catch is CancellationError {
             } catch {
                 guard let self, self.assemblyMotionToken == token else { return }
@@ -1681,6 +1824,7 @@ final class AppState: ObservableObject {
     }
 
     func cancel(preservingAssemblyMotion: Bool = false) {
+        if !preservingAssemblyMotion || isGrabbingAssembly { cancelAssemblyGrab() }
         if !preservingAssemblyMotion {
             assemblyMotionTask?.cancel(); assemblyMotionTask = nil
             assemblyMotionToken = UUID(); isSolvingAssembly = false

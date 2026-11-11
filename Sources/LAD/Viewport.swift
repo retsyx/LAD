@@ -98,6 +98,11 @@ struct CADViewport: NSViewRepresentable {
     var onHideSelected: (() -> Void)? = nil
     var onShowAll: (() -> Void)? = nil
     var onViewReady: ((CADSceneView) -> Void)? = nil
+    var assemblyGrabbingEnabled = false
+    var onAssemblyGrabBegan: ((Int, [Double], AssemblyGrabProjection) -> Bool)? = nil
+    var onAssemblyGrabMoved: (([Double]) -> Void)? = nil
+    var onAssemblyGrabEnded: (() -> Void)? = nil
+    var onAssemblyGrabCancelled: (() -> Void)? = nil
 
     func makeNSView(context: Context) -> CADSceneView {
         CADSceneView(frame: .zero, options: [SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue])
@@ -110,6 +115,11 @@ struct CADViewport: NSViewRepresentable {
         view.onHideSelected = onHideSelected
         view.onShowAll = onShowAll
         view.onActivated = onViewReady
+        view.onAssemblyGrabBegan = onAssemblyGrabBegan
+        view.onAssemblyGrabMoved = onAssemblyGrabMoved
+        view.onAssemblyGrabEnded = onAssemblyGrabEnded
+        view.onAssemblyGrabCancelled = onAssemblyGrabCancelled
+        view.assemblyGrabbingEnabled = assemblyGrabbingEnabled
         view.update(mesh: mesh, mode: displayMode, grid: showGrid, command: command,
                     selectedSolids: selectedSolids, hiddenSolids: hiddenSolids, projection: projectionMode,
                     solidColors: solidColors, selectedFeatures: selectedFeatures, solidTransforms: solidTransforms)
@@ -167,6 +177,14 @@ final class CADSceneView: SCNView {
     private var rightDownPoint: NSPoint?
     private var rightDragPoint: NSPoint?
     private var otherDragPoint: NSPoint?
+    private struct AssemblyGrabGesture {
+        var solid: Int
+        var start: NSPoint
+        var lastDelivered: NSPoint?
+    }
+    private var commandGrabGesture = false
+    private var assemblyGrab: AssemblyGrabGesture?
+    var isGrabbingAssembly: Bool { assemblyGrab != nil }
     private var rightDragging = false
     private var topology: CADTopology?
     private var solidTransforms: [Int: [Double]] = [:]
@@ -248,6 +266,13 @@ final class CADSceneView: SCNView {
     var onHideSelected: (() -> Void)?
     var onShowAll: (() -> Void)?
     var onActivated: ((CADSceneView) -> Void)?
+    var assemblyGrabbingEnabled = false {
+        didSet { if !assemblyGrabbingEnabled { cancelAssemblyGrab() } }
+    }
+    var onAssemblyGrabBegan: ((Int, [Double], AssemblyGrabProjection) -> Bool)?
+    var onAssemblyGrabMoved: (([Double]) -> Void)?
+    var onAssemblyGrabEnded: (() -> Void)?
+    var onAssemblyGrabCancelled: (() -> Void)?
     private(set) var gridSpacing: Double = 0
     var onGridSpacingChanged: ((Double) -> Void)? {
         didSet { onGridSpacingChanged?(gridSpacing) }
@@ -374,7 +399,11 @@ final class CADSceneView: SCNView {
         let meshChanged = mesh?.stepPath != loadedPath || mesh?.brepPath != loadedNativePath
         let visibilityChanged = self.hiddenSolids != hiddenSolids
         let modeChanged = self.mode != mode
-        if meshChanged || projectionChanged { cancelCameraTransition() }
+        if meshChanged || projectionChanged {
+            cancelAssemblyGrab()
+            cancelCameraTransition()
+        }
+        if let grab = assemblyGrab, hiddenSolids.contains(grab.solid) { cancelAssemblyGrab() }
         rig.usesOrthographicProjection = orthographic
         // Selection and visibility belong to the project state, including when
         // a sidebar selection arrives before a newly installed mesh.
@@ -1073,6 +1102,7 @@ final class CADSceneView: SCNView {
     }
 
     private func fitOrientationCubeView(_ destination: CameraRig) {
+        cancelAssemblyGrab()
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
         cancelCameraTransition()
@@ -1127,6 +1157,7 @@ final class CADSceneView: SCNView {
     /// Used only by an independent offscreen tool view. The live viewport's
     /// camera and project display preferences are never changed by rendering.
     func configureAgentView(named name: String, camera: CADAgentCamera = CADAgentCamera()) throws {
+        cancelAssemblyGrab()
         cancelCameraTransition()
         var fittingBounds = meshBounds
         if !hiddenSolids.isEmpty {
@@ -1159,6 +1190,7 @@ final class CADSceneView: SCNView {
     }
 
     private func applyCamera() {
+        cancelAssemblyGrab()
         projectedFeatures = nil
         setHoveredFeature(nil)
         let right = SIMD3<Float>(rig.right)
@@ -1187,6 +1219,7 @@ final class CADSceneView: SCNView {
         super.layout()
         let sizeChanged = projectionSize != bounds.size
         if sizeChanged {
+            cancelAssemblyGrab()
             cancelCameraTransition()
             projectionSize = bounds.size
             projectedFeatures = nil
@@ -1309,13 +1342,16 @@ final class CADSceneView: SCNView {
         addTrackingArea(area)
     }
 
-    override func cursorUpdate(with event: NSEvent) { NSCursor.arrow.set() }
+    override func cursorUpdate(with event: NSEvent) {
+        if assemblyGrab != nil { NSCursor.closedHand.set() } else { NSCursor.arrow.set() }
+    }
     override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
-        if resigned { setHoveredFeature(nil) }
+        if resigned { cancelAssemblyGrab(); setHoveredFeature(nil) }
         return resigned
     }
     override func viewWillMove(toWindow newWindow: NSWindow?) {
+        cancelAssemblyGrab()
         NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: window)
         NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: window)
         NotificationCenter.default.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: window)
@@ -1356,6 +1392,7 @@ final class CADSceneView: SCNView {
     }
 
     @objc private func windowResignedKey() {
+        cancelAssemblyGrab()
         cancelCameraTransition()
         setHoveredFeature(nil)
         resetNavigationGesture()
@@ -1372,12 +1409,14 @@ final class CADSceneView: SCNView {
             stopRedraw()
             requestRedraw()
         } else {
+            cancelAssemblyGrab()
             cancelCameraTransition()
             stopRedraw()
         }
     }
 
     @objc private func viewportEnvironmentWoke() {
+        cancelAssemblyGrab()
         guard window != nil else { return }
         // A display link can be suspended across sleep or activation while
         // its public playback flags still read true. Re-arm both edges.
@@ -1391,7 +1430,7 @@ final class CADSceneView: SCNView {
 
     private func updateHover(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard !isAnimatingCamera, rightDownPoint == nil, NSEvent.pressedMouseButtons == 0, bounds.contains(point) else {
+        guard !commandGrabGesture, !isAnimatingCamera, rightDownPoint == nil, NSEvent.pressedMouseButtons == 0, bounds.contains(point) else {
             setHoveredFeature(nil)
             return
         }
@@ -1405,9 +1444,23 @@ final class CADSceneView: SCNView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        cancelAssemblyGrab()
         cancelCameraTransition()
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
+        if assemblyGrabbingEnabled, event.modifierFlags.contains(.command) {
+            commandGrabGesture = true
+            resetNavigationGesture()
+            setHoveredFeature(nil)
+            guard bounds.contains(point), let hit = visibleHit(at: point),
+                  let solid = solidIndex(of: hit.node), let projection = assemblyGrabProjection() else { return }
+            let original = (solidMatrices[solid].map(simd_inverse) ?? matrix_identity_double4x4)
+                * SIMD4(Double(hit.worldCoordinates.x), Double(hit.worldCoordinates.y), Double(hit.worldCoordinates.z), 1)
+            guard onAssemblyGrabBegan?(solid, [original.x, original.y, original.z], projection) == true else { return }
+            assemblyGrab = AssemblyGrabGesture(solid: solid, start: point)
+            NSCursor.closedHand.set()
+            return
+        }
         let feature = feature(at: point)
         setHoveredFeature(feature)
         if event.clickCount >= 2 {
@@ -1416,9 +1469,22 @@ final class CADSceneView: SCNView {
         }
         if let feature { selectFeatures(ViewportFeaturePicking.toggling(feature, in: selectedFeatures)) }
     }
-    override func mouseUp(with event: NSEvent) { NSCursor.arrow.set() }
-    override func mouseDragged(with event: NSEvent) { setHoveredFeature(nil) }
+    override func mouseUp(with event: NSEvent) {
+        if commandGrabGesture {
+            deliverAssemblyGrab(at: convert(event.locationInWindow, from: nil))
+            let accepted = assemblyGrab != nil
+            assemblyGrab = nil
+            commandGrabGesture = false
+            if accepted { onAssemblyGrabEnded?() }
+        }
+        NSCursor.arrow.set()
+    }
+    override func mouseDragged(with event: NSEvent) {
+        setHoveredFeature(nil)
+        if commandGrabGesture { deliverAssemblyGrab(at: convert(event.locationInWindow, from: nil)) }
+    }
     override func rightMouseDown(with event: NSEvent) {
+        guard !commandGrabGesture else { return }
         cancelCameraTransition()
         window?.makeFirstResponder(self)
         setHoveredFeature(nil)
@@ -1459,6 +1525,7 @@ final class CADSceneView: SCNView {
         applyCamera()
     }
     override func otherMouseDown(with event: NSEvent) {
+        guard !commandGrabGesture else { return }
         cancelCameraTransition()
         window?.makeFirstResponder(self)
         setHoveredFeature(nil)
@@ -1466,6 +1533,7 @@ final class CADSceneView: SCNView {
         NSCursor.closedHand.set()
     }
     override func otherMouseUp(with event: NSEvent) {
+        guard !commandGrabGesture else { return }
         otherDragPoint = nil
         NSCursor.arrow.set()
     }
@@ -1479,6 +1547,47 @@ final class CADSceneView: SCNView {
         guard dx != 0 || dy != 0 else { return }
         rig.pan(dx: dx, dy: dy, height: bounds.height)
         applyCamera()
+    }
+
+    private func deliverAssemblyGrab(at point: NSPoint) {
+        guard var grab = assemblyGrab, point.x.isFinite, point.y.isFinite,
+              grab.lastDelivered != point,
+              grab.lastDelivered != nil || hypot(point.x - grab.start.x, point.y - grab.start.y) >= 3 else { return }
+        grab.lastDelivered = point
+        assemblyGrab = grab
+        onAssemblyGrabMoved?([Double(point.x), Double(point.y)])
+    }
+
+    private func cancelAssemblyGrab() {
+        let accepted = assemblyGrab != nil
+        assemblyGrab = nil
+        commandGrabGesture = false
+        if accepted { onAssemblyGrabCancelled?() }
+        if accepted { NSCursor.arrow.set() }
+    }
+
+    /// Freeze actual camera XY/w projection once for a grab. Camera-local
+    /// axes preserve custom roll as well as the ordinary orbit camera basis.
+    private func assemblyGrabProjection() -> AssemblyGrabProjection? {
+        let node = pointOfView ?? cameraNode
+        guard let camera = node.camera, bounds.width > 0, bounds.height > 0 else { return nil }
+        let transform = node.simdWorldTransform
+        let right = SIMD3<Double>(SIMD3(transform.columns.0.x, transform.columns.0.y, transform.columns.0.z))
+        let up = SIMD3<Double>(SIMD3(transform.columns.1.x, transform.columns.1.y, transform.columns.1.z))
+        let backward = SIMD3<Double>(SIMD3(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z))
+        let position = SIMD3<Double>(SIMD3(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z))
+        let vertical = camera.usesOrthographicProjection ? camera.orthographicScale
+            : tan(Double(camera.fieldOfView) * .pi / 360)
+        let horizontal = vertical * Double(bounds.width / bounds.height)
+        guard vertical.isFinite, horizontal.isFinite, vertical > 0, horizontal > 0 else { return nil }
+        let x = right / horizontal, y = up / vertical
+        let w = camera.usesOrthographicProjection ? SIMD3<Double>.zero : -backward
+        let offset = camera.usesOrthographicProjection ? 1 : simd_dot(position, backward)
+        let matrix = [x.x, x.y, x.z, -simd_dot(x, position),
+                      y.x, y.y, y.z, -simd_dot(y, position),
+                      0, 0, 0, 0, w.x, w.y, w.z, offset]
+        guard matrix.allSatisfy(\.isFinite) else { return nil }
+        return AssemblyGrabProjection(worldToClip: matrix, viewportSize: [Double(bounds.width), Double(bounds.height)])
     }
 
     private func resetNavigationGesture() {
@@ -1649,6 +1758,7 @@ final class CADSceneView: SCNView {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        cancelAssemblyGrab()
         cancelCameraTransition()
         let point = convert(event.locationInWindow, from: nil)
         if event.modifierFlags.contains(.shift) {
@@ -1661,6 +1771,7 @@ final class CADSceneView: SCNView {
     }
 
     override func magnify(with event: NSEvent) {
+        cancelAssemblyGrab()
         cancelCameraTransition()
         let point = convert(event.locationInWindow, from: nil)
         if event.phase == .began || zoomAnchor == nil { zoomAnchor = anchor(at: point) }
@@ -1671,7 +1782,7 @@ final class CADSceneView: SCNView {
 
     override func keyDown(with event: NSEvent) {
         cancelCameraTransition()
-        if event.keyCode == 53 { deselectAll(); return }
+        if event.keyCode == 53 { cancelAssemblyGrab(); deselectAll(); return }
         switch event.charactersIgnoringModifiers?.lowercased() {
         case "f": perform(.fit)
         case "0": perform(.isometric)

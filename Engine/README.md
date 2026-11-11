@@ -139,6 +139,12 @@ the native app solves the rigid poses without rebuilding construction geometry.
 Definitions remain part of the complete saved Python program, while poses and
 derived display/topology data remain separate from the native construction.
 
+Viewport grabs cache the picked point, camera projection and joint graph for
+the gesture. Inverse solving runs off the main actor and accepts poses only
+after joint closure validation. One background worker coalesces pointer targets;
+release drains the final target, while cancellation retains the last accepted
+pose. Only the resulting joint coordinates enter the revision's saved state.
+
 Native export and measurement requests accept optional
 `solidTransforms: [{solid, matrix}]`. Each matrix is a row-major 4×4 proper rigid
 world-space delta from the built pose, acting on column vectors, with translation

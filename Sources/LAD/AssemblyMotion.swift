@@ -132,6 +132,12 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
     func solve(parts: [PartNode], positions: [String: Double] = [:], driving: String? = nil) throws -> AssemblyPose {
         try Task.checkCancellation()
         let graph = try graph(parts: parts)
+        return try solve(graph: graph, positions: positions, driving: driving)
+    }
+
+    private func solve(graph: Graph, positions: [String: Double], driving: String? = nil,
+                       allowedFree: Set<Int>? = nil) throws -> AssemblyPose {
+        try Task.checkCancellation()
         let byID = Dictionary(uniqueKeysWithValues: joints.enumerated().map { ($0.element.id, $0.offset) })
         guard positions.keys.allSatisfy({ byID[$0] != nil }),
               driving == nil || byID[driving!].map({ joints[$0].isMovable }) == true else {
@@ -147,12 +153,13 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
         }
         let free = joints.indices.filter {
             joints[$0].isMovable && joints[$0].id != driving && graph.closureVariables.contains($0)
+                && (allowedFree?.contains($0) ?? true)
                 && !(joints[$0].limits.map { $0[0] == $0[1] } ?? false)
         }
         let factors = free.map { joints[$0].type == .revolute ? 180 / Double.pi : graph.scale }
         var x = zip(free, factors).map { values[$0.0] / $0.1 }
-        let lower = zip(free, factors).map { index, factor in joints[index].limits.map { $0[0] / factor } ?? -.infinity }
-        let upper = zip(free, factors).map { index, factor in joints[index].limits.map { $0[1] / factor } ?? .infinity }
+        let lower = zip(free, factors).map { index, factor in (joints[index].limits?[0] ?? -1e9) / factor }
+        let upper = zip(free, factors).map { index, factor in (joints[index].limits?[1] ?? 1e9) / factor }
 
         func evaluate(_ parameters: [Double]) -> (poses: [String: simd_double4x4], residual: [Double]) {
             var candidate = values
@@ -224,20 +231,193 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
                             solidTransforms: transforms)
     }
 
+    func canGrab(solidIndex: Int, parts: [PartNode]) -> Bool {
+        guard let graph = try? graph(parts: parts) else { return false }
+        return grabCoordinates(graph: graph, solidIndex: solidIndex) != nil
+    }
+
+    /// Cache native identities, ancestor paths and closure dependencies once at
+    /// mouse-down. The point stays in the original replayed geometry's space.
+    func prepareGrab(parts: [PartNode], positions: [String: Double] = [:], solidIndex: Int,
+                     point: [Double], projection: AssemblyGrabProjection) throws -> AssemblyGrabContext? {
+        try Task.checkCancellation()
+        try projection.validate()
+        guard point.count == 3, point.allSatisfy({ $0.isFinite && abs($0) <= 1e9 }) else {
+            throw LADError.message("The grabbed design point is invalid.")
+        }
+        let graph = try graph(parts: parts)
+        guard let coordinates = grabCoordinates(graph: graph, solidIndex: solidIndex) else { return nil }
+        let pose = try solve(graph: graph, positions: positions)
+        let builtPoint = SIMD3(point[0], point[1], point[2])
+        let values = joints.map { pose.positions[$0.id] ?? $0.position }
+        let evaluated = graph.evaluate(joints: joints, positions: values)
+        let world = evaluated.poses[coordinates.part]! * SIMD4(builtPoint, 1)
+        guard projection.screen(SIMD3(world.x, world.y, world.z)) != nil else { return nil }
+        return AssemblyGrabContext(solidIndex: solidIndex, point: point, projection: projection,
+            motion: self, graph: graph, part: coordinates.part, coordinates: coordinates.indices,
+            initialPositions: pose.positions)
+    }
+
+    func solveGrab(parts: [PartNode], positions: [String: Double] = [:], solidIndex: Int,
+                   point: [Double], screenPoint: [Double], projection: AssemblyGrabProjection) throws -> AssemblyPose {
+        guard let context = try prepareGrab(parts: parts, positions: positions, solidIndex: solidIndex,
+                                            point: point, projection: projection) else {
+            return try solve(parts: parts, positions: positions)
+        }
+        return try context.solve(positions: positions, screenPoint: screenPoint)
+    }
+
+    private func grabCoordinates(graph: Graph, solidIndex: Int) -> (part: String, indices: [Int])? {
+        guard let part = graph.solids.first(where: { $0.value.contains(solidIndex) })?.key else { return nil }
+        var involved = graph.paths[part] ?? []
+        var expanded = true
+        while expanded {
+            let previous = involved.count
+            for path in graph.closurePaths where !path.isDisjoint(with: involved) { involved.formUnion(path) }
+            expanded = involved.count != previous
+        }
+        let indices = involved.sorted().filter {
+            joints[$0].isMovable && !(joints[$0].limits.map { $0[0] == $0[1] } ?? false)
+        }
+        return indices.isEmpty ? nil : (part, indices)
+    }
+
+    fileprivate func solveGrab(context: AssemblyGrabContext, positions: [String: Double],
+                               screenPoint: [Double]) throws -> AssemblyPose {
+        try Task.checkCancellation()
+        guard screenPoint.count == 2, screenPoint.allSatisfy({ $0.isFinite && abs($0) <= 1e9 }) else {
+            throw LADError.message("The assembly drag target is invalid.")
+        }
+        let graph = context.graph, active = context.coordinates, allowed = Set(active)
+        let requested = context.initialPositions.merging(positions) { _, current in current }
+        var pose = try solve(graph: graph, positions: requested, allowedFree: allowed)
+        let target = SIMD2(screenPoint[0], screenPoint[1])
+        let point = SIMD4(context.point[0], context.point[1], context.point[2], 1)
+        let factors = active.map { joints[$0].type == .revolute ? 180 / Double.pi : graph.scale }
+        let lower = zip(active, factors).map { index, factor in (joints[index].limits?[0] ?? -1e9) / factor }
+        let upper = zip(active, factors).map { index, factor in (joints[index].limits?[1] ?? 1e9) / factor }
+        let screenScale = max(64, min(context.projection.viewportSize[0], context.projection.viewportSize[1]))
+        let closureWeight = 100.0
+        var values = joints.map { pose.positions[$0.id] ?? $0.position }
+
+        func evaluate(_ candidate: [Double]) -> (screen: SIMD2<Double>, residual: [Double])? {
+            let result = graph.evaluate(joints: joints, positions: candidate)
+            let world = result.poses[context.part]! * point
+            guard let screen = context.projection.screen(SIMD3(world.x, world.y, world.z)) else { return nil }
+            let error = (screen - target) / screenScale
+            return (screen, result.residual.map { $0 * closureWeight } + [error.x, error.y])
+        }
+        func valuesAt(_ parameters: [Double], base: [Double]) -> [Double] {
+            var candidate = base
+            for index in active.indices { candidate[active[index]] = parameters[index] * factors[index] }
+            return candidate
+        }
+        func projected(_ parameters: [Double], base: [Double]) throws -> AssemblyPose? {
+            let candidate = valuesAt(parameters, base: base)
+            let coordinates = Dictionary(uniqueKeysWithValues: joints.indices.map { (joints[$0].id, candidate[$0]) })
+            do { return try solve(graph: graph, positions: coordinates, allowedFree: allowed) }
+            catch is CancellationError { throw CancellationError() }
+            catch { return nil }
+        }
+        guard var current = evaluate(values) else { return pose }
+        var distance = simd_length_squared(current.screen - target)
+        var damping = 1e-5
+        for _ in 0..<16 {
+            try Task.checkCancellation()
+            if distance <= 0.15 * 0.15 { break }
+            let x = zip(active, factors).map { values[$0.0] / $0.1 }
+            var columns = [[Double]]()
+            for index in active.indices {
+                try Task.checkCancellation()
+                var plus = x, minus = x
+                plus[index] = min(upper[index], x[index] + 1e-5)
+                minus[index] = max(lower[index], x[index] - 1e-5)
+                let span = plus[index] - minus[index]
+                guard span > 1e-15,
+                      let high = evaluate(valuesAt(plus, base: values)),
+                      let low = evaluate(valuesAt(minus, base: values)) else {
+                    columns.append(Array(repeating: 0, count: current.residual.count)); continue
+                }
+                columns.append(zip(high.residual, low.residual).map { ($0 - $1) / span })
+            }
+            var normal = Array(repeating: Array(repeating: 0.0, count: active.count), count: active.count)
+            var rhs = Array(repeating: 0.0, count: active.count)
+            for row in active.indices {
+                try Task.checkCancellation()
+                rhs[row] = -zip(columns[row], current.residual).reduce(0) { $0 + $1.0 * $1.1 }
+                for column in 0...row {
+                    let value = zip(columns[row], columns[column]).reduce(0) { $0 + $1.0 * $1.1 }
+                    normal[row][column] = value; normal[column][row] = value
+                }
+                normal[row][row] += damping
+            }
+            var accepted = false
+            if let delta = try Self.linearSolve(normal, rhs) {
+                // A uniform trust step preserves the closure tangent direction.
+                let trust = active.indices.reduce(1.0) { fraction, index in
+                    joints[active[index]].type == .revolute
+                        ? min(fraction, 0.4 / max(1e-12, abs(delta[index]))) : fraction
+                }
+                for backtrack in 0..<7 {
+                    try Task.checkCancellation()
+                    let fraction = trust * pow(0.5, Double(backtrack))
+                    let trial = active.indices.map { min(upper[$0], max(lower[$0], x[$0] + delta[$0] * fraction)) }
+                    guard let candidate = try projected(trial, base: values) else { continue }
+                    let candidateValues = joints.map { candidate.positions[$0.id] ?? $0.position }
+                    guard let result = evaluate(candidateValues) else { continue }
+                    let cost = simd_length_squared(result.screen - target)
+                    if cost + max(1e-8, distance * 1e-12) < distance {
+                        pose = candidate; values = candidateValues; current = result; distance = cost; accepted = true; break
+                    }
+                }
+            }
+            if !accepted {
+                // At a projected turning point, the tangent can vanish while
+                // a nearby valid position still improves the grab. Probe only
+                // the strongest few screen coordinates, with a bounded step.
+                let ranked = active.indices.sorted {
+                    Self.cost(Array(columns[$0].suffix(2))) > Self.cost(Array(columns[$1].suffix(2)))
+                }.prefix(6)
+                var best: (AssemblyPose, [Double], SIMD2<Double>, [Double], Double)?
+                for index in ranked {
+                    for sign in [-1.0, 1.0] {
+                        try Task.checkCancellation()
+                        var trial = x
+                        trial[index] = min(upper[index], max(lower[index], x[index] + sign * 0.12))
+                        guard let candidate = try projected(trial, base: values) else { continue }
+                        let candidateValues = joints.map { candidate.positions[$0.id] ?? $0.position }
+                        guard let result = evaluate(candidateValues) else { continue }
+                        let cost = simd_length_squared(result.screen - target)
+                        if cost + max(1e-8, distance * 1e-12) < (best?.4 ?? distance) {
+                            best = (candidate, candidateValues, result.screen, result.residual, cost)
+                        }
+                    }
+                }
+                if let best {
+                    pose = best.0; values = best.1; current = (best.2, best.3); distance = best.4; accepted = true
+                }
+            }
+            if !accepted { break }
+            damping = max(1e-10, damping / 3)
+        }
+        try Task.checkCancellation()
+        return pose
+    }
+
     private func closureError(_ driving: String?) -> LADError {
         let joint = driving.flatMap { id in joints.first { $0.id == id } }
         return .message(joint.map { "The design cannot reach this position of \($0.name) within its joint constraints and motion limits." }
             ?? "The design's assembly constraints cannot be satisfied within its motion limits.")
     }
 
-    private struct Arc {
+    fileprivate struct Arc: Sendable {
         var joint: Int
         var from: String
         var to: String
         var forward: Bool
     }
 
-    private struct Graph {
+    fileprivate struct Graph: Sendable {
         var solids: [String: Set<Int>]
         var frames: [String: simd_double4x4]
         var connectorParts: [String: String]
@@ -246,6 +426,8 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
         var closures: [Int]
         /// Only joints on closure paths can affect the nonlinear residual.
         var closureVariables: Set<Int>
+        var paths: [String: Set<Int>]
+        var closurePaths: [Set<Int>]
         var scale: Double
 
         func evaluate(joints: [AssemblyJoint], positions: [Double]) -> (poses: [String: simd_double4x4], residual: [Double]) {
@@ -355,16 +537,19 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
         var paths = Dictionary(uniqueKeysWithValues: anchors.map { ($0, Set<Int>()) })
         for arc in tree { paths[arc.to] = (paths[arc.from] ?? []).union([arc.joint]) }
         var closureVariables = Set<Int>()
+        var closurePaths = [Set<Int>]()
         for index in closures {
             let joint = joints[index]
             let a = paths[connectorParts[joint.parent]!] ?? [], b = paths[connectorParts[joint.child]!] ?? []
             // A common prefix moves the entire loop rigidly and cancels from
             // the closure equation. Unrelated open chains also remain direct.
-            closureVariables.formUnion(a.symmetricDifference(b))
-            closureVariables.insert(index)
+            let variables = a.symmetricDifference(b).union([index])
+            closurePaths.append(variables)
+            closureVariables.formUnion(variables)
         }
         return Graph(solids: solids, frames: frames, connectorParts: connectorParts, anchors: anchors, tree: tree,
-                     closures: closures, closureVariables: closureVariables, scale: scale)
+                     closures: closures, closureVariables: closureVariables, paths: paths,
+                     closurePaths: closurePaths, scale: scale)
     }
 
     private static func isClosed(_ residual: [Double], scale: Double) -> Bool {
@@ -400,5 +585,21 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
             result[row] = value / matrix[row][row]
         }
         return result.allSatisfy(\.isFinite) ? result : nil
+    }
+}
+
+/// Immutable per-gesture setup can safely cross to a detached solve task.
+struct AssemblyGrabContext: Sendable {
+    let solidIndex: Int
+    let point: [Double]
+    let projection: AssemblyGrabProjection
+    fileprivate let motion: AssemblyMotion
+    fileprivate let graph: AssemblyMotion.Graph
+    fileprivate let part: String
+    fileprivate let coordinates: [Int]
+    fileprivate let initialPositions: [String: Double]
+
+    func solve(positions: [String: Double] = [:], screenPoint: [Double]) throws -> AssemblyPose {
+        try motion.solveGrab(context: self, positions: positions, screenPoint: screenPoint)
     }
 }

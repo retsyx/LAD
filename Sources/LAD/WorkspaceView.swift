@@ -2,6 +2,7 @@ import SwiftUI
 
 @MainActor
 private final class WorkspaceViewportReference: ObservableObject {
+    let assemblyGrabOwnerID = UUID()
     weak var view: CADSceneView?
     weak var window: NSWindow?
     private weak var cube: ViewportOrientationCube?
@@ -245,7 +246,17 @@ struct WorkspaceView: View {
                         onViewReady: { view in
                             viewportReference.bindViewport(view)
                             if view.window?.isKeyWindow == true || state.viewportView == nil { state.viewportView = view }
-                        })
+                        },
+                        assemblyGrabbingEnabled: state.canManipulateAssembly,
+                        onAssemblyGrabBegan: { solid, point, projection in
+                            state.beginAssemblyGrab(ownerID: viewportReference.assemblyGrabOwnerID, solidIndex: solid,
+                                                    point: point, projection: projection)
+                        },
+                        onAssemblyGrabMoved: { point in
+                            state.moveAssemblyGrab(ownerID: viewportReference.assemblyGrabOwnerID, screenPoint: point)
+                        },
+                        onAssemblyGrabEnded: { state.endAssemblyGrab(ownerID: viewportReference.assemblyGrabOwnerID) },
+                        onAssemblyGrabCancelled: { state.cancelAssemblyGrab(ownerID: viewportReference.assemblyGrabOwnerID) })
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
                     HStack(spacing: 8) {
