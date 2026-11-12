@@ -33,8 +33,7 @@ struct CADViewportPreparedMesh: Sendable {
     static func prepare(_ mesh: PreviewMesh) throws -> Self? {
         try Task.checkCancellation()
         let vertexCount = mesh.vertexCount, triangleCount = mesh.triangleCount
-        guard mesh.bounds.count == 6, mesh.bounds.allSatisfy({ $0.isFinite && abs($0) < 1e12 }),
-              (0..<3).allSatisfy({ mesh.bounds[$0] <= mesh.bounds[$0 + 3] }),
+        guard validBounds(mesh.bounds),
               mesh.positions.count.isMultiple(of: 3), mesh.triangleIndices.count.isMultiple(of: 3),
               (1...1_000_000).contains(vertexCount), (1...1_000_000).contains(triangleCount) else { return nil }
         for (index, value) in mesh.positions.enumerated() {
@@ -109,6 +108,32 @@ struct CADViewportPreparedMesh: Sendable {
                     solidBounds: solidBounds, edges: edges, hasOwnedEdges: owners != nil)
     }
 
+    private static func validBounds(_ bounds: [Double]) -> Bool {
+        bounds.count == 6 && bounds.allSatisfy { $0.isFinite && abs($0) < 1e12 }
+            && (0..<3).allSatisfy { bounds[$0] <= bounds[$0 + 3] }
+    }
+
+    /// These buffers presented for another copy of the same preview. Only the
+    /// fit bounds may differ, and they pass the same checks as preparation.
+    fileprivate func presenting(_ mesh: PreviewMesh) -> Self? {
+        guard Self.validBounds(mesh.bounds) else { return nil }
+        return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: vertexCount,
+                    groups: groups, faceIDsBySolid: faceIDsBySolid, faceIndices: faceIndices, faceBounds: faceBounds,
+                    solidBounds: solidBounds, edges: edges, hasOwnedEdges: hasOwnedEdges)
+    }
+
+    /// Buffers another view or capture already prepared for this preview.
+    static func shared(for mesh: PreviewMesh) -> Self? { mesh.preparedDisplay.reusable(for: mesh) }
+
+    /// Reuse this preview's buffers, or convert them here and share them.
+    static func prepareShared(_ mesh: PreviewMesh) throws -> Self? { try mesh.preparedDisplay.prepare(mesh) }
+
+    /// Reuse this preview's buffers, or join a single conversion off the main
+    /// actor. A canceled caller stops waiting immediately.
+    static func prepareSharedInBackground(_ mesh: PreviewMesh) async throws -> Self? {
+        try await mesh.preparedDisplay.prepareInBackground(mesh)
+    }
+
     private static func validOwners(_ owners: [Int]?, count: Int, solids: Int) throws -> [Int]? {
         guard let owners, owners.count == count else { return nil }
         for (index, owner) in owners.enumerated() {
@@ -149,5 +174,140 @@ struct CADViewportPreparedMesh: Sendable {
             }
         }
         return data
+    }
+}
+
+extension CADViewportPreparedMesh {
+    /// One preview's converted buffers, shared by every copy of that preview:
+    /// the live viewport, Finder thumbnails and agent images convert a build
+    /// once. Session-only, never saved, and released with the preview's last
+    /// copy, so the bounded preview retention also bounds these buffers.
+    final class Shared: @unchecked Sendable {
+        /// The storage of every array that preparation reads, except the fit
+        /// bounds. Copies of one preview share their arrays; changing a copy's
+        /// geometry gives it new storage, so it prepares its own buffers. The
+        /// retained buffers keep these addresses from being reused meanwhile.
+        private struct Inputs: Equatable {
+            private struct Storage: Equatable {
+                var address: UnsafeRawPointer?
+                var count: Int
+            }
+            private var arrays: [Storage]
+            private var solids: Int
+
+            init(_ mesh: PreviewMesh) {
+                func storage<T>(_ array: [T]?) -> Storage {
+                    guard let array else { return Storage(address: nil, count: -1) }
+                    return array.withUnsafeBufferPointer { Storage(address: UnsafeRawPointer($0.baseAddress), count: $0.count) }
+                }
+                let topology = mesh.topology
+                arrays = [storage(mesh.positions), storage(mesh.triangleIndices), storage(mesh.edgePoints),
+                          storage(mesh.vertexNormals), storage(mesh.triangleSolids), storage(mesh.edgeSolids),
+                          storage(mesh.triangleFaces), storage(mesh.edgeFeatures), storage(topology?.vertices),
+                          storage(topology?.edges), storage(topology?.faces), storage(topology?.parts)]
+                solids = mesh.solids
+            }
+        }
+
+        private struct Pending {
+            let inputs: Inputs
+            let worker: Task<Void, Never>
+            var waiters: [UUID: CheckedContinuation<CADViewportPreparedMesh?, Error>]
+        }
+
+        private let lock = NSLock()
+        private var ready: (inputs: Inputs, prepared: CADViewportPreparedMesh)?
+        private var pending: [UUID: Pending] = [:]
+        private var startedConversions = 0
+
+        /// Conversions started for this preview. Regression tests compare it,
+        /// like `AppState.projectThumbnailWork`.
+        var conversions: Int { lock.withLock { startedConversions } }
+
+        fileprivate func reusable(for mesh: PreviewMesh) -> CADViewportPreparedMesh? {
+            let inputs = Inputs(mesh)
+            guard let ready = lock.withLock({ self.ready }), ready.inputs == inputs else { return nil }
+            return ready.prepared.presenting(mesh)
+        }
+
+        fileprivate func prepare(_ mesh: PreviewMesh) throws -> CADViewportPreparedMesh? {
+            if let prepared = reusable(for: mesh) { return prepared }
+            lock.withLock { startedConversions += 1 }
+            guard let prepared = try CADViewportPreparedMesh.prepare(Self.retained(mesh)) else { return nil }
+            let inputs = Inputs(mesh)
+            lock.withLock { ready = (inputs, prepared) }
+            return prepared.presenting(mesh)
+        }
+
+        fileprivate func prepareInBackground(_ mesh: PreviewMesh) async throws -> CADViewportPreparedMesh? {
+            let inputs = Inputs(mesh), waiter = UUID()
+            let prepared = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CADViewportPreparedMesh?, Error>) in
+                    lock.lock()
+                    if let ready, ready.inputs == inputs {
+                        lock.unlock()
+                        continuation.resume(returning: ready.prepared)
+                        return
+                    }
+                    // The cancellation handler may already have found no waiter.
+                    if Task.isCancelled {
+                        lock.unlock()
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    if let id = pending.first(where: { $0.value.inputs == inputs })?.key {
+                        pending[id]?.waiters[waiter] = continuation
+                    } else {
+                        let id = UUID(), source = Self.retained(mesh)
+                        startedConversions += 1
+                        let worker = Task.detached(priority: .userInitiated) { [weak self] in
+                            let result = Result { try CADViewportPreparedMesh.prepare(source) }
+                            self?.finish(id, result)
+                        }
+                        pending[id] = Pending(inputs: inputs, worker: worker, waiters: [waiter: continuation])
+                    }
+                    lock.unlock()
+                }
+            } onCancel: {
+                leave(waiter)
+            }
+            return prepared?.presenting(mesh)
+        }
+
+        private func finish(_ id: UUID, _ result: Result<CADViewportPreparedMesh?, Error>) {
+            lock.lock()
+            let entry = pending.removeValue(forKey: id)
+            if let entry, case .success(let prepared?) = result { ready = (entry.inputs, prepared) }
+            lock.unlock()
+            for continuation in entry?.waiters.values.map({ $0 }) ?? [] { continuation.resume(with: result) }
+        }
+
+        /// The conversion continues while any other caller still waits for it.
+        private func leave(_ waiter: UUID) {
+            lock.lock()
+            var continuation: CheckedContinuation<CADViewportPreparedMesh?, Error>?
+            var abandoned: Task<Void, Never>?
+            for (id, var entry) in pending {
+                guard let found = entry.waiters.removeValue(forKey: waiter) else { continue }
+                continuation = found
+                if entry.waiters.isEmpty {
+                    pending[id] = nil
+                    abandoned = entry.worker
+                } else {
+                    pending[id] = entry
+                }
+                break
+            }
+            lock.unlock()
+            abandoned?.cancel()
+            continuation?.resume(throwing: CancellationError())
+        }
+
+        /// Retained buffers keep their source arrays, but not this slot.
+        private static func retained(_ mesh: PreviewMesh) -> PreviewMesh {
+            var source = mesh
+            source.preparedDisplay = Shared()
+            return source
+        }
     }
 }

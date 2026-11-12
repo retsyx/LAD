@@ -207,6 +207,44 @@ final class ViewportPreparationTests: XCTestCase {
     }
 
     @MainActor
+    func testViewsShareOneConversionThatContinuesWhileAnyViewWaits() async throws {
+        let first = try makeView(), second = try makeView(), preview = largeMesh("shared")
+        first.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
+        second.update(mesh: preview, mode: .shaded, grid: false, command: nil, selectedSolids: [1], hiddenSolids: [])
+        // One view leaving must neither cancel nor restart the other's conversion.
+        first.update(mesh: nil, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
+        try await waitForPreparation(second)
+        XCTAssertTrue(second.hasRenderableGeometry)
+        XCTAssertFalse(first.hasRenderableGeometry)
+        XCTAssertEqual(preview.preparedDisplay.conversions, 1)
+
+        // Returning to a prepared preview installs it without converting again.
+        first.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
+        XCTAssertTrue(first.hasRenderableGeometry)
+        try await waitForPreparation(first)
+        XCTAssertEqual(preview.preparedDisplay.conversions, 1)
+        XCTAssertEqual(try node("solid:1", in: first).geometry?.elements.first?.primitiveCount, 40_000)
+    }
+
+    @MainActor
+    func testCaptureWaitResumesWhenPreparedAndStopsAtCancellationOrDeadline() async throws {
+        let view = try makeView()
+        view.update(mesh: largeMesh("awaited"), mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [])
+        XCTAssertTrue(view.isPreparingCaptureResources)
+        let expired = try await view.waitForCaptureResources(until: .now - .seconds(1))
+        XCTAssertFalse(expired, "A passed deadline must not report prepared resources.")
+        let canceled = Task { @MainActor in try await view.waitForCaptureResources(until: .now + .seconds(30)) }
+        await Task.yield()
+        canceled.cancel()
+        do { _ = try await canceled.value; XCTFail("A canceled wait must throw.") } catch is CancellationError {}
+        let prepared = try await view.waitForCaptureResources(until: .now + .seconds(30))
+        XCTAssertTrue(prepared)
+        XCTAssertFalse(view.isPreparingCaptureResources)
+        XCTAssertTrue(view.hasRenderableGeometry)
+    }
+
+    @MainActor
     private func waitForPreparation(_ view: CADSceneView) async throws {
         let deadline = Date().addingTimeInterval(5)
         while view.isPreparingResources, Date() < deadline {

@@ -49,6 +49,7 @@ enum CADAgentRenderer {
         let surface = CADSceneView(frame: NSRect(x: 0, y: 0, width: width, height: height), options: [
             SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
         ])
+        surface.preparesRendererResources = false
         var fittingPreview = preview
         // An isolated component should fill its image rather than remaining
         // tiny inside the complete assembly's bounds. CAD coordinates stay put.
@@ -119,15 +120,9 @@ enum CADAgentRenderer {
     }
 
     private static func waitForPreparation(_ view: CADSceneView) async throws {
-        let deadline = ContinuousClock.now + .seconds(30)
-        while view.isPreparingCaptureResources {
-            try Task.checkCancellation()
-            guard ContinuousClock.now < deadline else {
-                throw LADError.message("LAD could not prepare the design image. Try rendering it again.")
-            }
-            try await Task.sleep(for: .milliseconds(10))
+        guard try await view.waitForCaptureResources(until: .now + .seconds(30)) else {
+            throw LADError.message("LAD could not prepare the design image. Try rendering it again.")
         }
-        try Task.checkCancellation()
     }
 
     private static func snapshotWithMetadata(of view: CADSceneView, width: Int, height: Int) async throws -> (png: Data, metadata: [String: Any]) {

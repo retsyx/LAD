@@ -148,6 +148,49 @@ final class CADAgentRendererTests: XCTestCase {
     }
 
     @MainActor
+    func testImagesOfAPreparedPreviewReuseItsBuffersAndMatchAFreshConversion() async throws {
+        var preview = twoParts()
+        preview.triangles = Array(repeating: preview.triangles, count: 600).flatMap { $0 }
+        preview.triangleSolids = Array(repeating: [0, 0, 1, 1], count: 600).flatMap { $0 }
+        XCTAssertTrue(CADViewportPreparedMesh.requiresBackgroundPreparation(preview))
+        let view = try makeView()
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
+        try await ready(view)
+        XCTAssertTrue(view.hasRenderableGeometry)
+        XCTAssertEqual(preview.preparedDisplay.conversions, 1)
+
+        let colors = [0: PartColor(red: 0.85, green: 0.08, blue: 0.08), 1: PartColor(red: 0.08, green: 0.85, blue: 0.08)]
+        // Isolated parts fit different bounds, and poses only move nodes; all
+        // of them, and Finder thumbnails, present the same converted buffers.
+        @MainActor func images(_ preview: PreviewMesh) async throws -> [Data] {
+            var posed = preview
+            posed.assemblyPose = AssemblyPose(positions: [:], solidTransforms: [1: [1, 0, 0, 2, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1]])
+            return [
+                try await CADAgentRenderer.renderPNG(preview: preview, view: "top", display: .shaded,
+                                                     solidColors: colors, width: 320, height: 240),
+                try await CADAgentRenderer.renderPNG(preview: preview, view: "front", projection: .perspective,
+                    display: .edges, hiddenSolids: [0], solidColors: colors, width: 320, height: 240),
+                try await CADAgentRenderer.renderPNG(preview: posed, view: "top", display: .shaded,
+                                                     solidColors: colors, width: 320, height: 240),
+                try await ProjectThumbnail.render(preview: preview, projection: .perspective, display: .edges,
+                                                  hiddenSolids: [], solidColors: colors)
+            ]
+        }
+        let shared = try await images(preview)
+        XCTAssertEqual(preview.preparedDisplay.conversions, 1, "Images of a prepared preview must not convert it again.")
+
+        var separate = preview
+        separate.preparedDisplay = .init()
+        let converted = try await images(separate)
+        XCTAssertEqual(separate.preparedDisplay.conversions, 1)
+        XCTAssertEqual(shared, converted, "Shared buffers must render the same images as a fresh conversion.")
+
+        var moved = preview
+        moved.vertices = moved.vertices.map { $0.map { $0 * 2 } }
+        XCTAssertNil(CADViewportPreparedMesh.shared(for: moved), "A copy with different geometry must prepare its own buffers.")
+    }
+
+    @MainActor
     func testImageFileAndDataAPIsAgreeAndRejectInvalidRequests() async throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-render-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)

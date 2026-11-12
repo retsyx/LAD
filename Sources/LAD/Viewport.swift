@@ -173,7 +173,7 @@ final class CADSceneView: SCNView {
     private var selectedSolids = Set<Int>()
     private var selectedFeatures = [CADFeatureID]()
     private var hoveredFeature: CADFeatureID?
-    private var hiddenSolids = Set<Int>()
+    private var hiddenSolids = Set<Int>() { didSet { resumeCaptureWaitersIfReady() } }
     private var solidColors: [Int: PartColor] = [:]
     private var ownedEdgeSolids = Set<Int>()
     private var hasOwnedEdges = false
@@ -202,12 +202,12 @@ final class CADSceneView: SCNView {
     private var faceIndices = [CADFeatureID: [Int32]]()
     private var faceBounds = [CADFeatureID: CADSilhouetteBatching.Bounds]()
     private var meshSources = [SCNGeometrySource]()
-    private var featureNodes = [CADFeatureID: SCNNode]()
+    private var featureNodes = [CADFeatureID: SCNNode]() { didSet { resumeCaptureWaitersIfReady() } }
     private var featureCreationOrder = [CADFeatureID]()
     private var featureSelectionStyles = [CADFeatureID: Bool]()
-    private var preparedFeatures = Set<CADFeatureID>()
+    private var preparedFeatures = Set<CADFeatureID>() { didSet { resumeCaptureWaitersIfReady() } }
     private var featurePreparationID = UUID()
-    private var highlightedFeatures = [CADFeatureID]()
+    private var highlightedFeatures = [CADFeatureID]() { didSet { resumeCaptureWaitersIfReady() } }
     private var highlightedSelection = Set<CADFeatureID>()
     private struct ProjectedFeatures {
         var vertices: [ViewportFeaturePicking.Vertex]
@@ -242,12 +242,56 @@ final class CADSceneView: SCNView {
     private var redrawPauseTask: Task<Void, Never>?
     private var redrawRecoveryTask: Task<Void, Never>?
     private var redrawRecoveryState = ViewportRedrawRecoveryState()
-    private(set) var isPreparingResources = false
+    private(set) var isPreparingResources = false {
+        didSet { resumeCaptureWaitersIfReady() }
+    }
+    /// A detached surface that only builds scenes for independent captures.
+    /// Each capture prepares its cloned scene on its own renderer, so this
+    /// view does not also prepare its unused renderer's resources.
+    var preparesRendererResources = true
     var hasRenderableGeometry: Bool { hasModel }
     var isPreparingCaptureResources: Bool {
         isPreparingResources || highlightedFeatures.contains {
             featureNodes[$0] != nil && !hiddenSolids.contains($0.solidIndex) && !preparedFeatures.contains($0)
         }
+    }
+    private var captureWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    /// Waits without polling until capture resources are prepared. Returns
+    /// false at the deadline, and throws if the waiting task is canceled.
+    func waitForCaptureResources(until deadline: ContinuousClock.Instant) async throws -> Bool {
+        while isPreparingCaptureResources {
+            try Task.checkCancellation()
+            guard ContinuousClock.now < deadline else { return false }
+            let waiter = UUID()
+            let timeout = Task { @MainActor [weak self] in
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                self?.resumeCaptureWaiter(waiter)
+            }
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if Task.isCancelled { continuation.resume() } else { captureWaiters[waiter] = continuation }
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in self?.resumeCaptureWaiter(waiter) }
+            }
+            timeout.cancel()
+        }
+        try Task.checkCancellation()
+        return true
+    }
+
+    private func resumeCaptureWaiter(_ waiter: UUID) {
+        captureWaiters.removeValue(forKey: waiter)?.resume()
+    }
+
+    /// Every input of `isPreparingCaptureResources` reports its changes here.
+    /// Waiters recheck when they resume, so intermediate states are harmless.
+    private func resumeCaptureWaitersIfReady() {
+        guard !captureWaiters.isEmpty, !isPreparingCaptureResources else { return }
+        let waiters = Array(captureWaiters.values)
+        captureWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
     /// Public capture facts, read directly from the camera node that will be
     /// cloned by the renderer. Reading them never changes the user's view.
@@ -463,9 +507,12 @@ final class CADSceneView: SCNView {
             edgeNode.isHidden = true
             appliedStyle = nil
             if let mesh {
-                if CADViewportPreparedMesh.requiresBackgroundPreparation(mesh) {
+                // Copies of a preview share its converted buffers, so a version
+                // or image another view already prepared installs directly.
+                let shared = CADViewportPreparedMesh.shared(for: mesh)
+                if shared == nil, CADViewportPreparedMesh.requiresBackgroundPreparation(mesh) {
                     prepareMesh(mesh)
-                } else if let prepared = try? CADViewportPreparedMesh.prepare(mesh) {
+                } else if let prepared = try? shared ?? CADViewportPreparedMesh.prepareShared(mesh) {
                     install(prepared)
                     installedModel = hasModel
                 } else { clearModel() }
@@ -655,13 +702,9 @@ final class CADSceneView: SCNView {
         pendingMesh = mesh
         isPreparingResources = true
         updateModelVisibility()
-        let worker = Task.detached(priority: .userInitiated) {
-            try CADViewportPreparedMesh.prepare(mesh)
-        }
         meshPreparationTask = Task { @MainActor [weak self] in
             do {
-                let prepared = try await withTaskCancellationHandler { try await worker.value }
-                    onCancel: { worker.cancel() }
+                let prepared = try await CADViewportPreparedMesh.prepareSharedInBackground(mesh)
                 guard !Task.isCancelled, let self, self.resourcePreparationID == token else { return }
                 self.meshPreparationTask = nil
                 self.pendingMesh = nil
@@ -695,6 +738,11 @@ final class CADSceneView: SCNView {
         guard pendingMesh == nil, hasModel, let scene else { return }
         let token = UUID()
         resourcePreparationID = token
+        guard preparesRendererResources else {
+            isPreparingResources = false
+            updateModelVisibility()
+            return
+        }
         isPreparingResources = true
         updateModelVisibility()
         // Upload geometry and prepare the material/light pipelines before the

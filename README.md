@@ -154,7 +154,7 @@ General splines and curved surfaces do not have a single radius or normal. Mass 
 
 Viewport illumination combines ambient light with camera-relative directional lights: a main light above-right and a softer fill above-left. Their directions remain fixed in the view as you orbit, pan, zoom, or switch projection. Curved surfaces produce highlights from their normals and material properties.
 
-Newly loaded preview geometry prepares its drawing resources in the background before appearing. Camera interaction reuses those resources, and unrelated conversation or save-status updates leave unchanged materials intact.
+Newly loaded preview geometry prepares its drawing resources in the background before appearing. Camera interaction reuses those resources, and unrelated conversation or save-status updates leave unchanged materials intact. Each preview's display buffers are converted once and shared by the viewport, revisited versions, Finder thumbnails and agent renders.
 
 ## Designs and history
 

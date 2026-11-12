@@ -128,6 +128,9 @@ struct PreviewMesh: Codable, Sendable {
     /// Decoding derived worker JSON never grants ownership of arbitrary paths.
     var buildArtifacts: EngineBuildArtifacts? = nil
 
+    /// Session-only viewport buffers, converted once and shared by every copy.
+    var preparedDisplay = CADViewportPreparedMesh.Shared()
+
     private enum CodingKeys: String, CodingKey {
         case bounds, volume, area, solids, faces, buildSeconds, threads, stepPath
         case parts, brepPath, runtime, topology, validatedHash, assemblyMotion
