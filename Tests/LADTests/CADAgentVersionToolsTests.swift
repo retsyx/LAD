@@ -230,9 +230,8 @@ final class CADAgentVersionToolsTests: XCTestCase {
         }
     }
 
-    private func content(_ result: [String: Any]) throws -> [String: Any] {
-        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
-        return try object(Data(try XCTUnwrap(content.first?["text"] as? String).utf8))
+    private func content(_ result: CADAgentToolResult) throws -> [String: Any] {
+        result.metadata
     }
     private func object(_ data: Data) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])

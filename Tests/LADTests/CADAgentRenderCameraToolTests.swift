@@ -24,7 +24,6 @@ final class CADAgentRenderCameraToolTests: XCTestCase {
                 XCTAssertFalse(error.localizedDescription.contains("Python"), "Validation must precede CAD work.")
             }
         }
-        XCTAssertNil(tools.consumeRenderedImage())
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("renders").path))
     }
 
@@ -51,16 +50,14 @@ final class CADAgentRenderCameraToolTests: XCTestCase {
         XCTAssertEqual(metadata["cameraTarget"] as? [Double], [0, 0, 0])
         let path = try XCTUnwrap(metadata["path"] as? String)
         let png = try Data(contentsOf: URL(fileURLWithPath: path))
-        XCTAssertEqual(tools.consumeRenderedImage(), png)
-        XCTAssertNil(tools.consumeRenderedImage())
+        XCTAssertEqual(result.image?.data, png)
+        XCTAssertEqual(result.image?.path, path)
         XCTAssertEqual(try XCTUnwrap(NSBitmapImageRep(data: png)).pixelsWide, 320)
         XCTAssertEqual(metadata["byteCount"] as? Int, png.count)
     }
 
-    private func content(_ result: [String: Any]) throws -> [String: Any] {
-        let blocks = try XCTUnwrap(result["content"] as? [[String: Any]])
-        let text = try XCTUnwrap(blocks.first?["text"] as? String)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    private func content(_ result: CADAgentToolResult) throws -> [String: Any] {
+        result.metadata
     }
 
     private func directory() throws -> URL {

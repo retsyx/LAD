@@ -66,22 +66,21 @@ final class ProjectAgentSessionTests: XCTestCase {
     }
 
     func testExternalCatalogAddsRoutingAndOpaqueFilesWithoutChangingNativeCatalog() throws {
-        let native = try AgentToolCatalog.nativeTools()
-        let external = try AgentToolCatalog.externalTools()
-        XCTAssertEqual(native.count, external.count)
-        let nativeBuild = try XCTUnwrap(native.first { $0["name"] as? String == "lad_build" })
-        let build = try XCTUnwrap(external.first { $0["name"] as? String == "lad_build" })
-        let nativeSchema = try XCTUnwrap(nativeBuild["inputSchema"] as? [String: Any])
-        let schema = try XCTUnwrap(build["inputSchema"] as? [String: Any])
+        let native = try AgentToolCatalog.native()
+        let external = try AgentToolCatalog.external()
+        XCTAssertEqual(native.tools.map(\.name), external.tools.map(\.name))
+        let nativeSchema = try XCTUnwrap(native["lad_build"]).inputSchema
+        let schema = try XCTUnwrap(external["lad_build"]).inputSchema
         XCTAssertTrue((nativeSchema["required"] as? [String] ?? []).contains("programPath"))
         XCTAssertEqual(Set(schema["required"] as? [String] ?? []), ["taskID", "programID"])
-        for tool in external {
-            let input = try XCTUnwrap(tool["inputSchema"] as? [String: Any])
-            XCTAssertTrue((input["required"] as? [String] ?? []).contains("taskID"))
-            if ["lad_export_step", "lad_mesh_export_step"].contains(tool["name"] as? String ?? "") {
-                XCTAssertNil((input["properties"] as? [String: Any])?["path"])
+        for tool in external.tools {
+            XCTAssertTrue((tool.inputSchema["required"] as? [String] ?? []).contains("taskID"))
+            XCTAssertEqual(Set(tool.descriptor.keys), ["name", "description", "inputSchema", "annotations"])
+            if let export = tool.host.exportPath {
+                XCTAssertNil((tool.inputSchema["properties"] as? [String: Any])?[export])
             }
         }
+        XCTAssertEqual(Set(native.tools.filter { $0.host.exportPath != nil }.map(\.name)), ["lad_export_step", "lad_mesh_export_step"])
     }
 
     @MainActor
@@ -195,9 +194,7 @@ final class ProjectAgentSessionTests: XCTestCase {
         try ProjectAgentSession(python: "/missing/python", threads: 1, current: nil, currentPreview: nil)
     }
 
-    private func metadata(_ result: [String: Any]) throws -> [String: Any] {
-        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
-        let text = try XCTUnwrap(content.first { $0["type"] as? String == "text" }?["text"] as? String)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    private func metadata(_ output: ProjectAgentToolResult) throws -> [String: Any] {
+        output.result.metadata
     }
 }

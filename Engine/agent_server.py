@@ -15,6 +15,7 @@ import select
 import stat
 import sys
 import time
+from typing import NamedTuple
 import uuid
 
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
@@ -69,13 +70,24 @@ INSTRUCTIONS = (
 )
 
 
+class Tool(NamedTuple):
+    """A catalog tool as agents see it. Its host properties belong to the native app."""
+    name: str
+    description: str
+    input_schema: dict
+    read_only: bool
+
+    def descriptor(self):
+        return {"name": self.name, "description": self.description, "inputSchema": self.input_schema,
+                "annotations": {"readOnlyHint": self.read_only, "destructiveHint": False, "openWorldHint": False}}
+
+
 # One canonical tool catalog is shared by the internal stdio adapter and the
-# native external MCP endpoint. It is bundled beside this adapter.
+# native external MCP endpoint. It is bundled beside this adapter and read once.
 with Path(__file__).with_name("agent-tools.json").open(encoding="utf-8") as catalog_file:
-    TOOL_CATALOG = json.load(catalog_file)
-TOOLS = [(tool["name"], tool["description"], tool["inputSchema"],
-          tool["annotations"]["readOnlyHint"]) for tool in TOOL_CATALOG]
-TOOL_NAMES = {tool[0] for tool in TOOLS}
+    TOOLS = tuple(Tool(tool["name"], tool["description"], tool["inputSchema"], tool["annotations"]["readOnlyHint"])
+                  for tool in json.load(catalog_file))
+TOOL_NAMES = frozenset(tool.name for tool in TOOLS)
 
 
 def read_regular(root, path, maximum):
@@ -247,9 +259,7 @@ def serve(workspace):
             elif method == "ping":
                 reply(identity, result={})
             elif method == "tools/list":
-                reply(identity, result={"tools": [{"name": name, "description": description, "inputSchema": input_schema,
-                    "annotations": {"readOnlyHint": read_only, "destructiveHint": False, "openWorldHint": False}}
-                    for name, description, input_schema, read_only in TOOLS]})
+                reply(identity, result={"tools": [tool.descriptor() for tool in TOOLS]})
             elif method == "tools/call":
                 try:
                     reply(identity, result=bridge.call(params.get("name"), params.get("arguments", {})))

@@ -1,8 +1,44 @@
 import Foundation
 
+/// A CAD tool's result on its way to a transport: the JSON metadata an agent
+/// reads, the exact PNG an image tool rendered, and whether the call failed in
+/// its domain. The metadata is serialized once, here; each transport wraps
+/// that text in its own envelope and consumers read `metadata` directly.
+struct CADAgentToolResult {
+    struct Image {
+        /// The PNG's file in the task workspace.
+        let path: String
+        let data: Data
+    }
+
+    let metadata: [String: Any]
+    /// `metadata` as the agent reads it.
+    let text: String
+    let image: Image?
+    let isError: Bool
+
+    init(metadata: [String: Any], image: Image? = nil, isError: Bool = false) throws {
+        let data = try JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys, .withoutEscapingSlashes])
+        self.metadata = metadata
+        text = String(decoding: data, as: UTF8.self)
+        self.image = image
+        self.isError = isError
+    }
+
+    /// The built-in bridge's response, which Engine/agent_server.py turns into
+    /// MCP content. It is also the call's activity output.
+    var envelope: [String: Any] {
+        var content: [[String: Any]] = [["type": "text", "text": text]]
+        if let image { content.append(["type": "image_path", "path": image.path, "mimeType": "image/png"]) }
+        var value: [String: Any] = ["content": content]
+        if isError { value["isError"] = true }
+        return value
+    }
+}
+
 /// One audited native tool call. The built-in agent bridge and external agent
-/// sessions share its source snapshots, activity events and the handoff of
-/// the exact PNG an image tool rendered.
+/// sessions share its source snapshots, activity events and the exact PNG an
+/// image tool rendered.
 @MainActor
 struct CADAgentToolCall {
     let tools: CADAgentTools
@@ -14,29 +50,28 @@ struct CADAgentToolCall {
     /// failures are recorded too. `checkAvailable` runs after the tool returns.
     func perform(id: String, name: String, arguments: [String: Any],
                  prepare: () throws -> (arguments: [String: Any], snapshots: [ProjectActivityFile]) = { ([:], []) },
-                 checkAvailable: () throws -> Void = {}) async throws -> (result: [String: Any], image: Data?) {
-        // Invalid, failed and canceled calls must not inherit an earlier PNG.
-        defer { _ = tools.consumeRenderedImage() }
+                 checkAvailable: () throws -> Void = {}) async throws -> CADAgentToolResult {
         let started = Date()
         let input = CADAgentBridge.json(arguments)
         var files: [ProjectActivityFile] = []
         do {
+            let tool = try AgentToolCatalog.native()[name]
             let prepared = try prepare()
             let native = prepared.arguments.isEmpty ? arguments : prepared.arguments
-            files = try sourceSnapshots(name: name, arguments: native) + prepared.snapshots
+            files = try tool.map { try sourceSnapshots(tool: $0, arguments: native) } ?? []
+            files += prepared.snapshots
             onActivity(ProjectActivityEvent(id: id, date: started, category: "tool", title: name, status: "running",
                                             input: input, files: files.isEmpty ? nil : files))
             let result = try await tools.handle(name: name, arguments: native)
             try checkAvailable()
-            if name.hasPrefix("lad_mesh_"), let program = Self.metadata(result)?["programPath"] as? String {
-                files += try sourceSnapshots(name: "lad_build", arguments: ["programPath": program])
+            if tool?.host.resultProgram == true, let program = result.metadata["programPath"] as? String {
+                files += try snapshots(programs: [program], sources: []).filter { new in !files.contains { $0.path == new.path } }
             }
-            let failed = result["isError"] as? Bool == true
-            let image = failed ? nil : tools.consumeRenderedImage()
             onActivity(ProjectActivityEvent(id: id, date: started, category: "tool", title: name,
-                status: failed ? "failed" : "completed", input: input, output: CADAgentBridge.json(result),
-                durationSeconds: Date().timeIntervalSince(started), files: files.isEmpty ? nil : files, imageData: image))
-            return (result, image)
+                status: result.isError ? "failed" : "completed", input: input, output: CADAgentBridge.json(result.envelope),
+                durationSeconds: Date().timeIntervalSince(started), files: files.isEmpty ? nil : files,
+                imageData: result.isError ? nil : result.image?.data))
+            return result
         } catch {
             let canceled = error is CancellationError
             onActivity(ProjectActivityEvent(id: id, date: started, category: "tool", title: name,
@@ -48,35 +83,36 @@ struct CADAgentToolCall {
     }
 
     /// The source files a call reads, recorded with its activity.
-    func sourceSnapshots(name: String, arguments: [String: Any]) throws -> [ProjectActivityFile] {
-        var paths: [String] = []
-        if name == "lad_build", let program = arguments["programPath"] as? String { paths.append(program) }
-        if name == "lad_import" { paths += arguments["producerPaths"] as? [String] ?? [] }
-        if name.hasPrefix("lad_mesh_") {
-            paths += ["queryPath", "constraintsPath", "editPath", "programPath", "policyPath"].compactMap { arguments[$0] as? String }
-            if let path = arguments["editPath"] as? String,
-               let edit = try JSONSerialization.jsonObject(with: workspace.read(path, maximumBytes: ProjectActivityFile.maximumBytes)) as? [String: Any],
-               let program = edit["programPath"] as? String { paths.append(program) }
+    func sourceSnapshots(tool: AgentTool, arguments: [String: Any]) throws -> [ProjectActivityFile] {
+        let programs = tool.host.programs.compactMap { arguments[$0] as? String }
+        var sources: [String] = []
+        for key in tool.host.sources {
+            if let path = arguments[key] as? String { sources.append(path) }
+            else if let paths = arguments[key] as? [String] { sources += paths }
         }
+        for key in tool.host.sourceDocuments {
+            guard let path = arguments[key] as? String,
+                  let document = try JSONSerialization.jsonObject(with: workspace.read(path, maximumBytes: ProjectActivityFile.maximumBytes)) as? [String: Any],
+                  let program = document["programPath"] as? String else { continue }
+            sources.append(program)
+        }
+        return try snapshots(programs: programs, sources: sources)
+    }
+
+    /// Programs without an extension are recorded as Python files.
+    private func snapshots(programs: [String], sources: [String]) throws -> [ProjectActivityFile] {
+        let paths = programs.map { ($0, true) } + sources.map { ($0, false) }
         guard paths.count <= 64 else { throw LADError.message("Choose at most 64 source files for the tool activity record.") }
         var seen = Set<String>()
-        return try paths.compactMap { path in
+        return try paths.compactMap { path, program in
             let url = try workspace.url(path)
             guard seen.insert(url.path).inserted else { return nil }
             var filename = url.lastPathComponent
-            if name == "lad_build", url.pathExtension.isEmpty { filename += ".py" }
+            if program, url.pathExtension.isEmpty { filename += ".py" }
             let snapshot = ProjectActivityFile(name: filename, path: url.path,
                 data: try workspace.read(path, maximumBytes: ProjectActivityFile.maximumBytes, allowEmpty: true))
             try ProjectStore.validateActivityFile(snapshot)
             return snapshot
         }
-    }
-
-    /// The JSON metadata in a tool result's first text block.
-    static func metadata(_ result: [String: Any]) -> [String: Any]? {
-        guard let content = result["content"] as? [[String: Any]],
-              let text = content.first(where: { $0["type"] as? String == "text" })?["text"] as? String,
-              let bytes = text.data(using: .utf8) else { return nil }
-        return (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any]
     }
 }

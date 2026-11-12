@@ -182,10 +182,10 @@ final class CADAgentBridge {
         }
         let call = CADAgentToolCall(tools: tools, workspace: access, onActivity: onActivity)
         do {
-            let (result, _) = try await call.perform(id: "tool:\(requestID)", name: name, arguments: arguments,
-                                                     checkAvailable: { try Task.checkCancellation() })
+            let result = try await call.perform(id: "tool:\(requestID)", name: name, arguments: arguments,
+                                                checkAvailable: { try Task.checkCancellation() })
             guard !stopped else { return }
-            try writeResponse(result, id: requestID)
+            try writeResponse(result.envelope, id: requestID)
         } catch {
             let message = error is CancellationError ? "The CAD tool call was canceled." : error.localizedDescription
             try? writeResponse(["isError": true, "content": [["type": "text", "text": message]]], id: requestID)

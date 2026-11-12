@@ -12,6 +12,9 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
     }
   },
   {
@@ -43,6 +46,10 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "requestsPermission": true
     }
   },
   {
@@ -70,6 +77,9 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
     }
   },
   {
@@ -92,6 +102,9 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
     }
   },
   {
@@ -129,6 +142,12 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "programs": [
+        "programPath"
+      ]
     }
   },
   {
@@ -176,6 +195,9 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
     }
   },
   {
@@ -207,6 +229,9 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
     }
   },
   {
@@ -282,6 +307,9 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build"
     }
   },
   {
@@ -340,6 +368,9 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
     }
   },
   {
@@ -360,6 +391,9 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
     }
   },
   {
@@ -488,6 +522,10 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "read",
+      "returnsImage": true
     }
   },
   {
@@ -564,6 +602,9 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
     }
   },
   {
@@ -579,6 +620,10 @@
       "readOnlyHint": true,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "capture",
+      "returnsImage": true
     }
   },
   {
@@ -610,6 +655,10 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "export",
+      "exportPath": "path"
     }
   },
   {
@@ -641,6 +690,15 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "sources": [
+        "producerPaths"
+      ],
+      "references": [
+        "path"
+      ]
     }
   },
   {
@@ -683,6 +741,17 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true,
+      "sources": [
+        "policyPath"
+      ],
+      "references": [
+        "path"
+      ]
     }
   },
   {
@@ -712,6 +781,14 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true,
+      "sources": [
+        "queryPath"
+      ]
     }
   },
   {
@@ -763,6 +840,14 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true,
+      "sources": [
+        "constraintsPath"
+      ]
     }
   },
   {
@@ -795,6 +880,18 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true,
+      "sources": [
+        "editPath",
+        "programPath"
+      ],
+      "sourceDocuments": [
+        "editPath"
+      ]
     }
   },
   {
@@ -841,6 +938,11 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true
     }
   },
   {
@@ -870,6 +972,11 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true
     }
   },
   {
@@ -918,6 +1025,11 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true
     }
   },
   {
@@ -942,6 +1054,11 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true
     }
   },
   {
@@ -966,6 +1083,11 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true
     }
   },
   {
@@ -991,6 +1113,11 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "build",
+      "reconstruction": true,
+      "resultProgram": true
     }
   },
   {
@@ -1023,6 +1150,12 @@
       "readOnlyHint": false,
       "destructiveHint": false,
       "openWorldHint": false
+    },
+    "host": {
+      "capability": "export",
+      "reconstruction": true,
+      "resultProgram": true,
+      "exportPath": "path"
     }
   }
 ]

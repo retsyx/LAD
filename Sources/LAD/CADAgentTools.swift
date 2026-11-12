@@ -35,9 +35,6 @@ final class CADAgentTools {
     private let hiddenSolids: Set<Int>
     private let partLayout: PartLayout?
     private let initialPartColors: [String: PartColor]
-    /// A per-call handoff of the exact PNG already returned by an image tool.
-    /// It is consumed by the trusted bridge, never added to the tool JSON.
-    private var renderedImageData: Data?
     /// Candidate previews kept per task besides the current design's.
     static let retainedCandidatePreviews = 4
     private var artifacts: [String: Artifact] = [:]
@@ -253,15 +250,9 @@ final class CADAgentTools {
 
     func cancel() {
         cancelled = true
-        renderedImageData = nil
         versionTasks.values.forEach { $0.cancel() }
         permissionRequest?.task.cancel()
         engine.cancel()
-    }
-
-    func consumeRenderedImage() -> Data? {
-        defer { renderedImageData = nil }
-        return renderedImageData
     }
 
     func bindPermissionWindow(_ window: NSWindow) throws {
@@ -277,9 +268,9 @@ final class CADAgentTools {
         hasExplicitPermissionWindow = true
     }
 
-    func handle(name: String, arguments: [String: Any]) async throws -> [String: Any] {
-        renderedImageData = nil
+    func handle(name: String, arguments: [String: Any]) async throws -> CADAgentToolResult {
         try checkCancellation()
+        guard let tool = try AgentToolCatalog.native()[name] else { throw LADError.message("Unknown LAD tool ‘\(name)’.") }
         switch name {
         case "lad_runtime":
             try allowed(arguments, [])
@@ -356,10 +347,9 @@ final class CADAgentTools {
                                    "nextStep": "Choose a candidate's stable versionID; no version was opened or rebuilt."])
             }
             return try await stageVersion(matches[0])
-        case "lad_mesh_open_reference", "lad_mesh_inspect", "lad_mesh_fit", "lad_mesh_try_edit", "lad_mesh_compare",
-             "lad_mesh_commit", "lad_mesh_undo", "lad_mesh_redo", "lad_mesh_branch", "lad_mesh_set_delivery", "lad_mesh_export_step":
+        case _ where tool.host.reconstruction:
             var meshColors: [Int: PartColor] = [:]
-            if name == "lad_mesh_export_step", let contextID = arguments["contextID"] as? String,
+            if tool.host.exportPath != nil, let contextID = arguments["contextID"] as? String,
                let revisionID = arguments["revisionID"] as? String,
                let program = try meshSession.program(contextID: contextID, revisionID: revisionID),
                let artifact = artifactOrder.reversed().compactMap({ artifacts[$0] }).first(where: { $0.model.script == program }) {
@@ -379,9 +369,7 @@ final class CADAgentTools {
                 values["artifactID"] = artifact.id
                 values["programPath"] = artifact.programURL.path
             }
-            var response = try result(values)
-            if values["status"] as? String == "error" { response["isError"] = true }
-            return response
+            return try CADAgentToolResult(metadata: values, isError: values["status"] as? String == "error")
         case "lad_build":
             try allowed(arguments, ["programPath", "title", "summary", "assetIDs", "versionID"])
             let version = try string("versionID", arguments).map { try versions.version(id: $0) }
@@ -723,7 +711,7 @@ final class CADAgentTools {
         }
     }
 
-    private func stageVersion(_ version: ProjectVersionContext.Version) async throws -> [String: Any] {
+    private func stageVersion(_ version: ProjectVersionContext.Version) async throws -> CADAgentToolResult {
         let workspace = self.workspace
         let prepared = try await versionWork { try CADAgentVersionFiles.prepare(version, workspace: workspace) }
         try checkCancellation()
@@ -940,26 +928,20 @@ final class CADAgentTools {
         return a.count == b.count && zip(a, b).allSatisfy { $0.id == $1.id && $0.format == $1.format && $0.data == $1.data }
     }
 
-    private func imageResult(_ url: URL, metadata: [String: Any]) throws -> [String: Any] {
+    private func imageResult(_ url: URL, metadata: [String: Any]) throws -> CADAgentToolResult {
         // Verify the renderer wrote a regular workspace file before the MCP
-        // adapter reads it. The trusted bridge saves these exact bytes with the
-        // call's activity event.
+        // adapter reads it. The audited call saves these exact bytes with its
+        // activity event.
         let bytes = try workspace.read(url.path, maximumBytes: 32 * 1024 * 1024)
         var info = metadata
         info["path"] = url.path
         info["byteCount"] = bytes.count
         info["sha256"] = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-        var value = try result(info)
-        var content = value["content"] as! [[String: Any]]
-        content.append(["type": "image_path", "path": url.path, "mimeType": "image/png"])
-        value["content"] = content
-        renderedImageData = bytes
-        return value
+        return try CADAgentToolResult(metadata: info, image: .init(path: url.path, data: bytes))
     }
 
-    private func result(_ object: [String: Any]) throws -> [String: Any] {
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
-        return ["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]]]
+    private func result(_ object: [String: Any]) throws -> CADAgentToolResult {
+        try CADAgentToolResult(metadata: object)
     }
     private func json<T: Encodable>(_ value: T) throws -> [String: Any] {
         try JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as! [String: Any]

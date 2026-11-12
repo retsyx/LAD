@@ -15,7 +15,7 @@ final class CADAgentPermissionToolsTests: XCTestCase {
         for (policy, allowed) in [(AgentPermissionPolicy.alwaysDeny, false), (.alwaysAllow, true), (.alwaysDeny, false)] {
             fixture.controller.policy = policy
             let response = try await tools.handle(name: "lad_request_permission", arguments: arguments)
-            XCTAssertNil(response["isError"], "Denial is a successful decision, not a tool error.")
+            XCTAssertFalse(response.isError, "Denial is a successful decision, not a tool error.")
             let output = try content(response)
             XCTAssertEqual(output["allowed"] as? Bool, allowed)
             XCTAssertEqual(output["source"] as? String, "policy")
@@ -148,10 +148,8 @@ final class CADAgentPermissionToolsTests: XCTestCase {
         XCTAssertEqual(granted.count, 2)
     }
 
-    private func content(_ response: [String: Any]) throws -> [String: Any] {
-        let blocks = try XCTUnwrap(response["content"] as? [[String: Any]])
-        let text = try XCTUnwrap(blocks.first?["text"] as? String)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    private func content(_ response: CADAgentToolResult) throws -> [String: Any] {
+        response.metadata
     }
 
     @MainActor

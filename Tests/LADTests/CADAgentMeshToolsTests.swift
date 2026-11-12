@@ -207,9 +207,7 @@ final class CADAgentMeshToolsTests: XCTestCase {
                        ["vertices": vertices, "triangles": triangles] as NSDictionary)
     }
 
-    private func object(_ result: [String: Any]) throws -> [String: Any] {
-        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
-        let text = try XCTUnwrap(content.first?["text"] as? String)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    private func object(_ result: CADAgentToolResult) throws -> [String: Any] {
+        result.metadata
     }
 }

@@ -31,7 +31,7 @@ struct ProjectActivityEvent: Codable, Sendable, Identifiable, Equatable {
     var imageData: Data? = nil
 
     /// Tools whose exact PNG results are saved with their activity event.
-    static let savedImageTools: Set<String> = ["lad_render", "lad_screenshot"]
+    static let savedImageTools: Set<String> = (try? AgentToolCatalog.native().imageToolNames) ?? []
     static let maximumImageBytes = 32 * 1024 * 1024
 
     static func isSavedImage(_ data: Data) -> Bool {

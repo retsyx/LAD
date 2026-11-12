@@ -8,6 +8,14 @@ struct ProjectAgentCandidate {
     let colorChanges: [CADPartColorChange]
 }
 
+/// A native tool result for an external client. Its metadata names task files
+/// by opaque IDs, never workspace paths, and `files` describes every file
+/// handle the task has issued.
+struct ProjectAgentToolResult {
+    let result: CADAgentToolResult
+    let files: [[String: Any]]
+}
+
 /// An external agent owns its files, CAD worker and speculative candidates.
 /// Document routing, authorization and revision publication remain with LAD.
 @MainActor
@@ -167,21 +175,24 @@ final class ProjectAgentSession {
         try tools.bindPermissionWindow(window)
     }
 
-    func call(name: String, arguments: [String: Any]) async throws -> [String: Any] {
+    func call(name: String, arguments: [String: Any]) async throws -> ProjectAgentToolResult {
         try checkAvailable()
         guard !isBusy else { throw LADError.message("A CAD operation is already running in this task.") }
         isBusy = true
         defer { isBusy = false }
+        let tool = try AgentToolCatalog.native()[name]
         let call = CADAgentToolCall(tools: tools, workspace: workspace, onActivity: onActivity)
-        let (result, _) = try await call.perform(id: "tool:\(UUID().uuidString)", name: name, arguments: arguments,
+        // The activity records the native result, with its workspace paths.
+        let native = try await call.perform(id: "tool:\(UUID().uuidString)", name: name, arguments: arguments,
             prepare: {
-                let native = try resolvedArguments(name: name, arguments: arguments)
+                let native = try resolvedArguments(tool: tool, arguments: arguments)
                 var snapshots: [ProjectActivityFile] = []
-                // An uploaded edit is staged under a task path; record the
+                // An uploaded document is staged under a task path; record the
                 // file the agent actually sent as well.
-                if name == "lad_mesh_try_edit", let identity = arguments["editPath"] as? String {
+                for key in tool?.host.sourceDocuments ?? [] {
+                    guard let identity = arguments[key] as? String else { continue }
                     let original = try file(identity)
-                    if original.path != native["editPath"] as? String {
+                    if original.path != native[key] as? String {
                         let snapshot = ProjectActivityFile(name: original.name, path: original.path,
                             data: try workspace.read(original.path, maximumBytes: ProjectActivityFile.maximumBytes))
                         try ProjectStore.validateActivityFile(snapshot)
@@ -190,8 +201,8 @@ final class ProjectAgentSession {
                 }
                 return (native, snapshots)
             }, checkAvailable: { try checkAvailable() })
-        // Audit the metadata-only native result before adding MCP image blocks.
-        return try externalResult(result)
+        let result = try CADAgentToolResult(metadata: externalized(native.metadata), image: native.image, isError: native.isError)
+        return ProjectAgentToolResult(result: result, files: files.values.sorted { $0.id < $1.id }.map(descriptor))
     }
 
     func cancel() {
@@ -202,16 +213,16 @@ final class ProjectAgentSession {
         try? FileManager.default.removeItem(at: workspaceURL)
     }
 
-    private func resolvedArguments(name: String, arguments: [String: Any]) throws -> [String: Any] {
+    private func resolvedArguments(tool: AgentTool?, arguments: [String: Any]) throws -> [String: Any] {
         var values = arguments
         guard values["taskID"] == nil else { throw LADError.message("Route this request to its chosen task before executing it.") }
         if let program = values.removeValue(forKey: "programID") {
             guard values["programPath"] == nil else { throw LADError.message("Provide one program file ID.") }
             values["programPath"] = program
         }
-        let exporting = ["lad_export_step", "lad_mesh_export_step"].contains(name)
-        if exporting {
-            guard values["path"] == nil else { throw LADError.message("LAD assigns an export file ID; do not provide an output path.") }
+        let export = tool?.host.exportPath
+        if let export {
+            guard values[export] == nil else { throw LADError.message("LAD assigns an export file ID; do not provide an output path.") }
         }
         for key in Array(values.keys) where key == "path" || key.hasSuffix("Path") || key.hasSuffix("Paths") {
             if key.hasSuffix("Paths") {
@@ -224,20 +235,21 @@ final class ProjectAgentSession {
                 let staged = try file(identity)
                 let originalReference = (staged.uploaded && staged.contentDigest.map { !generatedGeometryDigests.contains($0) } != false)
                     || staged.path.hasPrefix(workspace.root.path + "/context/versions/inputs/")
-                if name == "lad_import" || name == "lad_mesh_open_reference", key == "path", !originalReference {
+                if tool?.host.references.contains(key) == true, !originalReference {
                     throw LADError.message("Import original external reference files uploaded to this task. Generated CAD exports cannot become reference inputs.")
                 }
                 values[key] = staged.path
             }
         }
-        if exporting {
+        if let export {
             // Every download handle denotes one immutable export, including
             // exports of the same artifact before and after staged color edits.
-            values["path"] = "exports/\(UUID().uuidString).step"
+            values[export] = "exports/\(UUID().uuidString).step"
         }
         // Program replacement JSON may reference a second uploaded file. Stage
         // a resolved copy; never edit the agent's original uploaded bytes.
-        if name == "lad_mesh_try_edit", let path = values["editPath"] as? String {
+        for key in tool?.host.sourceDocuments ?? [] {
+            guard let path = values[key] as? String else { continue }
             let bytes = try workspace.read(path, maximumBytes: 2_000_000)
             guard var edit = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else {
                 throw LADError.message("Upload the mesh edit as a JSON object.")
@@ -250,30 +262,13 @@ final class ProjectAgentSession {
                 guard let identity = identity as? String else { throw LADError.message("Provide a program file ID in the mesh edit.") }
                 edit["programPath"] = try file(identity).path
             }
-            values["editPath"] = try workspace.write(JSONSerialization.data(withJSONObject: edit), path: "requests/\(UUID().uuidString).json").path
+            values[key] = try workspace.write(JSONSerialization.data(withJSONObject: edit), path: "requests/\(UUID().uuidString).json").path
         }
         return values
     }
 
-    private func externalResult(_ native: [String: Any]) throws -> [String: Any] {
-        var result = native
-        var content: [[String: Any]] = []
-        for item in native["content"] as? [[String: Any]] ?? [] {
-            if item["type"] as? String == "text", let text = item["text"] as? String,
-               let bytes = text.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: bytes) {
-                let value = try externalized(object)
-                let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
-                content.append(["type": "text", "text": String(decoding: data, as: UTF8.self)])
-            } else if item["type"] as? String == "image_path", let path = item["path"] as? String {
-                let png = try workspace.read(path, maximumBytes: 32 * 1024 * 1024)
-                content.append(["type": "image", "mimeType": "image/png", "data": png.base64EncodedString()])
-            } else if item["type"] as? String == "text" {
-                content.append(item)
-            } else { throw LADError.message("The CAD tool returned an unsupported result.") }
-        }
-        result["content"] = content
-        result["files"] = files.values.sorted { $0.id < $1.id }.map(descriptor)
-        return result
+    private func externalized(_ object: [String: Any]) throws -> [String: Any] {
+        try externalized(object as Any) as? [String: Any] ?? [:]
     }
 
     private func externalized(_ value: Any) throws -> Any {

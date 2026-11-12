@@ -20,7 +20,6 @@ final class CADAgentAssemblyMotionTests: XCTestCase {
             do { _ = try await tools.handle(name: "lad_render", arguments: arguments); XCTFail("Invalid pose accepted") }
             catch { XCTAssertTrue(error.localizedDescription.lowercased().contains("joint")) }
         }
-        XCTAssertNil(tools.consumeRenderedImage())
     }
 
     @MainActor
@@ -32,13 +31,15 @@ final class CADAgentAssemblyMotionTests: XCTestCase {
         let tools = try CADAgentTools(directory: root, python: "/missing/python", threads: 1,
             current: .bracket, currentPreview: preview, engine: EngineService())
         let arguments: [String: Any] = ["view": "top", "width": 320, "height": 256]
-        let original = try content(try await tools.handle(name: "lad_render", arguments: arguments))
-        let originalPNG = try XCTUnwrap(tools.consumeRenderedImage())
+        let originalResult = try await tools.handle(name: "lad_render", arguments: arguments)
+        let original = try content(originalResult)
+        let originalPNG = try XCTUnwrap(originalResult.image?.data)
         var positioned = arguments
         positioned["jointPositions"] = ["hinge": 90]
         positioned["drivingJoint"] = "hinge"
-        let rendered = try content(try await tools.handle(name: "lad_render", arguments: positioned))
-        let positionedPNG = try XCTUnwrap(tools.consumeRenderedImage())
+        let renderedResult = try await tools.handle(name: "lad_render", arguments: positioned)
+        let rendered = try content(renderedResult)
+        let positionedPNG = try XCTUnwrap(renderedResult.image?.data)
         XCTAssertEqual((original["jointPositions"] as? [String: Double])?["hinge"], 0)
         XCTAssertEqual((rendered["jointPositions"] as? [String: Double])?["hinge"], 90)
         XCTAssertNotEqual(originalPNG, positionedPNG)
@@ -183,7 +184,6 @@ final class CADAgentAssemblyMotionTests: XCTestCase {
                 XCTAssertTrue(error.localizedDescription.contains(expected), "\(error.localizedDescription) lacks \(expected)")
             }
         }
-        XCTAssertNil(tools.consumeRenderedImage())
     }
 
     @MainActor
@@ -238,9 +238,8 @@ final class CADAgentAssemblyMotionTests: XCTestCase {
         for (a, b) in zip(actual, expected) { XCTAssertEqual(a, b, accuracy: 1e-6, file: file, line: line) }
     }
 
-    private func content(_ result: [String: Any]) throws -> [String: Any] {
-        let text = try XCTUnwrap((result["content"] as? [[String: Any]])?.first?["text"] as? String)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    private func content(_ result: CADAgentToolResult) throws -> [String: Any] {
+        result.metadata
     }
 
     private func directory() throws -> URL {

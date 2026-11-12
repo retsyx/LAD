@@ -19,7 +19,6 @@ final class CADActivityImageTests: XCTestCase {
         let firstID = try send("lad_render", arguments: ["view": "front", "width": 320, "height": 256], in: root)
         let first = try await completed(firstID, events: events)
         let firstPNG = try assertImage(first, requestID: firstID, root: root, width: 320, height: 256)
-        XCTAssertNil(bridge.tools.consumeRenderedImage(), "The bridge must release its per-call image after delivering the event.")
 
         let secondID = try send("lad_render", arguments: ["view": "right", "width": 320, "height": 256], in: root)
         let second = try await completed(secondID, events: events)
@@ -32,7 +31,6 @@ final class CADActivityImageTests: XCTestCase {
         let failed = try await completed(invalidID, events: events)
         XCTAssertEqual(failed.status, "failed")
         XCTAssertNil(failed.imageData)
-        XCTAssertNil(bridge.tools.consumeRenderedImage())
 
         let inspectID = try send("lad_inspect", arguments: [:], in: root)
         let inspected = try await completed(inspectID, events: events)
@@ -42,7 +40,7 @@ final class CADActivityImageTests: XCTestCase {
     }
 
     @MainActor
-    func testRequestedScreenshotIsConsumableOnceAndCancellationDropsPendingImage() async throws {
+    func testScreenshotCarriesItsExactPNGInItsResultAndCanceledToolsReturnNone() async throws {
         let root = try temporary()
         defer { try? FileManager.default.removeItem(at: root) }
         let tools = try CADAgentTools(directory: root, python: "/missing/python", threads: 1,
@@ -50,14 +48,16 @@ final class CADActivityImageTests: XCTestCase {
         let screenshot = try await tools.handle(name: "lad_screenshot", arguments: [:])
         let metadata = try content(screenshot)
         let path = try XCTUnwrap(metadata["path"] as? String)
-        XCTAssertEqual(tools.consumeRenderedImage(), try Data(contentsOf: URL(fileURLWithPath: path)))
-        XCTAssertNil(tools.consumeRenderedImage())
-        _ = try await tools.handle(name: "lad_render", arguments: ["view": "top", "width": 320, "height": 256])
+        XCTAssertEqual(screenshot.image?.data, try Data(contentsOf: URL(fileURLWithPath: path)))
+        XCTAssertEqual(screenshot.image?.path, path)
+        let envelope = try XCTUnwrap(screenshot.envelope["content"] as? [[String: Any]])
+        XCTAssertEqual(envelope.count, 2)
+        XCTAssertEqual(envelope[0]["text"] as? String, screenshot.text)
+        XCTAssertEqual(envelope[1] as NSDictionary, ["type": "image_path", "path": path, "mimeType": "image/png"] as NSDictionary)
+        XCTAssertNil(screenshot.envelope["isError"])
         tools.cancel()
-        XCTAssertNil(tools.consumeRenderedImage(), "Cancellation must release a PNG not yet handed to the bridge.")
         do { _ = try await tools.handle(name: "lad_render", arguments: [:]); XCTFail("Canceled tools must not run.") }
         catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
-        XCTAssertNil(tools.consumeRenderedImage())
     }
 
     @MainActor
@@ -73,8 +73,8 @@ final class CADActivityImageTests: XCTestCase {
         let tools = try CADAgentTools(directory: root, python: "/missing/python", threads: 1,
             current: model, currentPreview: preview, engine: EngineService())
         let response = try await tools.handle(name: "lad_build", arguments: ["programPath": "program.py"])
-        XCTAssertNil(tools.consumeRenderedImage())
-        XCTAssertEqual((response["content"] as? [[String: Any]])?.count, 1)
+        XCTAssertNil(response.image)
+        XCTAssertEqual((response.envelope["content"] as? [[String: Any]])?.count, 1)
         XCTAssertNotNil(tools.validatedPreview(for: model))
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("renders").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: preview.stepPath))
@@ -152,6 +152,10 @@ final class CADActivityImageTests: XCTestCase {
         XCTAssertEqual(bitmap.pixelsWide, width)
         XCTAssertEqual(bitmap.pixelsHigh, height)
         return png
+    }
+
+    private func content(_ result: CADAgentToolResult) throws -> [String: Any] {
+        result.metadata
     }
 
     private func content(_ result: [String: Any]) throws -> [String: Any] {

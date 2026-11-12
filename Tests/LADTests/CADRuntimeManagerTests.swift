@@ -167,10 +167,7 @@ final class CADRuntimeManagerTests: XCTestCase {
         let workspace = try temporaryFolder()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let tools = try CADAgentTools(directory: workspace, python: python, threads: 2, current: nil, currentPreview: nil, engine: engine)
-        let runtime = try await tools.handle(name: "lad_runtime", arguments: [:])
-        let content = try XCTUnwrap(runtime["content"] as? [[String: Any]])
-        let text = try XCTUnwrap(content.first?["text"] as? String)
-        let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        let metadata = try await tools.handle(name: "lad_runtime", arguments: [:]).metadata
         XCTAssertEqual(metadata["pythonExecutable"] as? String, python)
         let arguments = try CADAgentBridge.codexArguments(workspace: workspace, python: python,
                                                          server: ResourcePaths.root.appendingPathComponent("Engine/agent_server.py"))

@@ -347,10 +347,7 @@ final class ExternalAgentServer: ObservableObject {
             case "ping": result = [:]
             case "tools/list":
                 guard params["cursor"] == nil else { return Self.rpcError(id, code: -32602, message: "This tool list has no continuation cursor.", legacy: !modern) }
-                result = ["tools": try (Self.controlTools + AgentToolCatalog.externalTools()).filter {
-                    guard let name = $0["name"] as? String else { return false }
-                    return client.capabilities.contains(Self.capability(for: name))
-                }]
+                result = ["tools": try Self.tools().tools.filter { client.capabilities.contains($0.host.capability) }.map(\.descriptor)]
                 if modern { result["ttlMs"] = 0; result["cacheScope"] = "private" }
             case "tools/call":
                 guard let name = params["name"] as? String,
@@ -358,10 +355,10 @@ final class ExternalAgentServer: ObservableObject {
                     return Self.rpcError(id, code: -32602, message: "Provide a tool name and argument object.", legacy: !modern)
                 }
                 let arguments = params["arguments"] as? [String: Any] ?? [:]
-                guard let tool = try (Self.controlTools + AgentToolCatalog.externalTools()).first(where: { $0["name"] as? String == name }) else {
+                guard let tool = try Self.tools()[name] else {
                     return Self.rpcError(id, code: -32602, message: "Unknown LAD tool.", legacy: !modern)
                 }
-                if let schema = tool["inputSchema"] as? [String: Any], !Self.validToolArguments(arguments, schema: schema) {
+                if !Self.validToolArguments(arguments, schema: tool.inputSchema) {
                     return Self.rpcError(id, code: -32602, message: "The tool arguments do not match its input schema.", legacy: !modern)
                 }
                 do { result = try await call(name: name, arguments: arguments, client: client) }
@@ -380,7 +377,8 @@ final class ExternalAgentServer: ObservableObject {
 
     func call(name: String, arguments: [String: Any], client: ExternalAgentClient) async throws -> [String: Any] {
         guard let current = access.current(client.id) else { throw ProjectAgentError.denied }
-        try require(current, Self.capability(for: name))
+        guard let tool = try Self.tools()[name] else { throw LADError.message("Unknown LAD tool.") }
+        try require(current, tool.host.capability)
         switch name {
         case "lad_projects":
             try only(arguments, [])
@@ -507,13 +505,11 @@ final class ExternalAgentServer: ObservableObject {
             return Self.toolResult(["projectID": state.projectDocumentID.uuidString, "revisionID": revisionID.uuidString,
                 "committed": true, "stateToken": state.agentStateToken, "persistence": state.agentPersistenceStatus])
         default:
-            guard try AgentToolCatalog.nativeTools().contains(where: { $0["name"] as? String == name }) else {
-                throw LADError.message("Unknown LAD tool.")
-            }
+            guard try AgentToolCatalog.native()[name] != nil else { throw LADError.message("Unknown LAD tool.") }
             let id = try uuid("taskID", arguments), task = try authorizedTask(id, client: current)
-            try require(current, Self.capability(for: name), projectID: task.snapshot.projectID)
+            try require(current, tool.host.capability, projectID: task.snapshot.projectID)
             try requireRunning(task)
-            if name == "lad_request_permission" {
+            if tool.host.requestsPermission {
                 guard let state = task.state,
                       let window = task.ownerWindow ?? coordinator?.agentWindow(for: state) else {
                     throw ProjectAgentError.conflict("Wait for this design's window to open before requesting an agent permission.")
@@ -533,8 +529,7 @@ final class ExternalAgentServer: ObservableObject {
             var nativeArguments = arguments
             nativeArguments.removeValue(forKey: "taskID")
             return try await withTaskCancellationHandler {
-                let result = try await task.session.call(name: name, arguments: nativeArguments)
-                return addingDownloadURLs(result, taskID: id)
+                mcpResult(try await task.session.call(name: name, arguments: nativeArguments), taskID: id)
             } onCancel: { Task { @MainActor [weak self] in self?.endTask(id, status: "canceled") } }
         }
     }
@@ -604,34 +599,27 @@ final class ExternalAgentServer: ObservableObject {
     }
     private var baseURL: String { endpoint.map { String($0.dropLast(4)) } ?? "" }
     private func downloadURL(taskID: UUID, fileID: String) -> String { baseURL + "/tasks/\(taskID.uuidString)/files/\(fileID)" }
-    private func addingDownloadURLs(_ result: [String: Any], taskID: UUID) -> [String: Any] {
-        var result = result
-        if let files = result["files"] as? [[String: Any]] {
-            let descriptors = files.map { item -> [String: Any] in
-                var item = item
-                if let id = item["fileID"] as? String { item["downloadURL"] = downloadURL(taskID: taskID, fileID: id) }
-                return item
-            }
-            result["files"] = descriptors
-            result["structuredContent"] = ["files": descriptors]
-            if !descriptors.isEmpty {
-                let fileContent = Self.toolResult(["files": descriptors])["content"] as? [[String: Any]] ?? []
-                result["content"] = (result["content"] as? [[String: Any]] ?? []) + fileContent
-            }
+    /// The MCP form of a native tool result: its text and image, then every
+    /// task file handle with its download URL.
+    private func mcpResult(_ output: ProjectAgentToolResult, taskID: UUID) -> [String: Any] {
+        let files = output.files.map { item -> [String: Any] in
+            var item = item
+            if let id = item["fileID"] as? String { item["downloadURL"] = downloadURL(taskID: taskID, fileID: id) }
+            return item
         }
+        var content: [[String: Any]] = [["type": "text", "text": output.result.text]]
+        if let image = output.result.image {
+            content.append(["type": "image", "mimeType": "image/png", "data": image.data.base64EncodedString()])
+        }
+        if !files.isEmpty { content += Self.toolResult(["files": files])["content"] as? [[String: Any]] ?? [] }
+        var result: [String: Any] = ["content": content, "files": files, "structuredContent": ["files": files]]
+        if output.result.isError { result["isError"] = true }
         return result
     }
 
-    static func capability(for name: String) -> ExternalAgentCapability {
-        switch name {
-        case "lad_project_create", "lad_project_open": return .manageProjects
-        case "lad_commit": return .commit
-        case "lad_screenshot": return .capture
-        case "lad_export_step", "lad_mesh_export_step": return .export
-        case "lad_build", "lad_import", "lad_request_permission", "lad_set_part_colors": return .build
-        default: return name.hasPrefix("lad_mesh_") ? .build : .read
-        }
-    }
+    /// Control tools and the native tools with external routing, read once.
+    private static func tools() throws -> AgentToolRegistry { try externalTools.get() }
+    private static let externalTools = Result { try AgentToolRegistry(controlTools + AgentToolCatalog.external().tools) }
     private static let serverInfo: [String: Any] = ["name": "LAD", "version": "1.0.0"]
     private static let capabilities: [String: Any] = ["tools": ["listChanged": false]]
     private func only(_ args: [String: Any], _ keys: Set<String>) throws {
@@ -734,22 +722,25 @@ final class ExternalAgentServer: ObservableObject {
         switch URL(fileURLWithPath: name).pathExtension.lowercased() { case "png": return "image/png"; case "json": return "application/json"; case "py", "md", "txt": return "text/plain; charset=utf-8"; default: return "application/octet-stream" }
     }
 
-    private static var controlTools: [[String: Any]] {
-        func tool(_ name: String, _ description: String, _ properties: [String: Any] = [:], _ required: [String] = [], readOnly: Bool = false) -> [String: Any] {
-            ["name": name, "description": description, "inputSchema": ["type": "object", "properties": properties, "required": required, "additionalProperties": false],
-             "annotations": ["readOnlyHint": readOnly, "destructiveHint": false, "openWorldHint": false]]
+    private static var controlTools: [AgentTool] {
+        func tool(_ name: String, _ description: String, _ properties: [String: Any] = [:], _ required: [String] = [],
+                  readOnly: Bool = false, capability: ExternalAgentCapability = .read) -> AgentTool {
+            AgentTool(name: name, description: description,
+                      inputSchema: ["type": "object", "properties": properties, "required": required, "additionalProperties": false],
+                      annotations: ["readOnlyHint": readOnly, "destructiveHint": false, "openWorldHint": false],
+                      host: AgentTool.Host(capability: capability))
         }
         let string: [String: Any] = ["type": "string"]
         let task = ["taskID": string]
         return [
             tool("lad_projects", "List authorized open designs and their stable projectIDs, current state tokens and persistence status.", readOnly: true),
-            tool("lad_project_create", "Open a new independent empty design window. Connecting alone never creates a design or starts CAD."),
-            tool("lad_project_open", "Ask the user to choose a LAD design in a native open dialog; list designs afterward to obtain its projectID."),
+            tool("lad_project_create", "Open a new independent empty design window. Connecting alone never creates a design or starts CAD.", capability: .manageProjects),
+            tool("lad_project_open", "Ask the user to choose a LAD design in a native open dialog; list designs afterward to obtain its projectID.", capability: .manageProjects),
             tool("lad_task_begin", "Begin an isolated task against an explicitly chosen design snapshot. Provide a concise initiating request and actual model/effort when known. Returns taskID, expectedStateToken and authenticated binary uploadURL.", ["projectID": string, "request": string, "model": string, "reasoningEffort": string], ["projectID", "request"]),
             tool("lad_task_status", "Read a task's operation and save status.", task, ["taskID"], readOnly: true),
             tool("lad_task_cancel", "Cancel only this external task and release its temporary files; committed revisions remain saved.", task, ["taskID"]),
             tool("lad_task_end", "Finish an external task and release its temporary files; committed revisions remain saved.", task, ["taskID"]),
-            tool("lad_commit", "Atomically publish an exact validated candidate as a new design version. Reject stale state; reuse idempotencyKey for a retry of the same task/artifact. Returns revision identity and separate disk persistence status. Failed saving leaves the accepted revision and receipt available to retry.", ["taskID": string, "artifactID": string, "expectedStateToken": string, "idempotencyKey": string], ["taskID", "artifactID", "expectedStateToken", "idempotencyKey"])
+            tool("lad_commit", "Atomically publish an exact validated candidate as a new design version. Reject stale state; reuse idempotencyKey for a retry of the same task/artifact. Returns revision identity and separate disk persistence status. Failed saving leaves the accepted revision and receipt available to retry.", ["taskID": string, "artifactID": string, "expectedStateToken": string, "idempotencyKey": string], ["taskID", "artifactID", "expectedStateToken", "idempotencyKey"], capability: .commit)
         ]
     }
 }

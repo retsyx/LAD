@@ -329,10 +329,8 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         var color: [Double]?
     }
 
-    private func toolContent(_ result: [String: Any]) throws -> [String: Any] {
-        let blocks = try XCTUnwrap(result["content"] as? [[String: Any]])
-        let text = try XCTUnwrap(blocks.first { $0["type"] as? String == "text" }?["text"] as? String)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    private func toolContent(_ result: CADAgentToolResult) throws -> [String: Any] {
+        result.metadata
     }
 
     private func partItem(_ id: String, in info: [String: Any]) throws -> [String: Any] {

@@ -300,6 +300,9 @@ class MCPTransportTests(unittest.TestCase):
                 self.assertIn('no CAD bootstrap', initialized['result']['instructions'])
                 tools = call({'jsonrpc':'2.0','id':2,'method':'tools/list'})['result']['tools']
                 names = {tool['name'] for tool in tools}
+                catalog = json.loads((ENGINE / 'agent-tools.json').read_text(encoding='utf-8'))
+                self.assertEqual(tools, [{key: entry[key] for key in ('name', 'description', 'inputSchema', 'annotations')}
+                                         for entry in catalog], 'Agents see the catalog without its host properties.')
                 self.assertTrue({'lad_build','lad_inspect','lad_measure','lad_render','lad_screenshot','lad_import','lad_validate','lad_export_step','lad_runtime'} <= names)
                 import_description = next(tool['description'] for tool in tools if tool['name'] == 'lad_import')
                 self.assertIn('watertight', import_description)

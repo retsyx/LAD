@@ -242,7 +242,7 @@ struct ProjectActivityEventView: View {
     private var imageKey: ProjectActivityImageKey { ProjectActivityImageKey(taskID: taskID, eventID: event.id) }
     private var hasImageResult: Bool {
         event.status == "completed" && (event.title == "imageView" ||
-            (["lad_render", "lad_screenshot"].contains(event.title) && event.output?.contains("image_path") == true))
+            (ProjectActivityEvent.savedImageTools.contains(event.title) && event.output?.contains("image_path") == true))
     }
 
     var body: some View {

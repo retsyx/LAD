@@ -88,9 +88,7 @@ final class CADAgentColorIntegrationTests: XCTestCase {
         return "result=cq.Assembly(name='Parts', metadata={'lad_id':'parts'})\n" + (reversed ? [green, red] : [red, green]).joined(separator: "\n") + "\n"
     }
 
-    private func content(_ result: [String: Any]) throws -> [String: Any] {
-        let blocks = try XCTUnwrap(result["content"] as? [[String: Any]])
-        let text = try XCTUnwrap(blocks.first { $0["type"] as? String == "text" }?["text"] as? String)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    private func content(_ result: CADAgentToolResult) throws -> [String: Any] {
+        result.metadata
     }
 }

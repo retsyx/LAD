@@ -127,10 +127,11 @@ final class CADAgentToolsTests: XCTestCase {
         let valid = try content(try await tools.handle(name: "lad_validate", arguments: ["artifactID": id]))
         XCTAssertEqual(valid["valid"] as? Bool, true)
         let image = try await tools.handle(name: "lad_render", arguments: ["artifactID": id, "view": "front", "width": 400, "height": 300])
-        let imageContent = try XCTUnwrap(image["content"] as? [[String: Any]])
         let imageMetadata = try content(image)
-        let imagePath = try XCTUnwrap(imageContent.first { $0["type"] as? String == "image_path" }?["path"] as? String)
+        let imagePath = try XCTUnwrap(image.image?.path)
+        XCTAssertEqual(imageMetadata["path"] as? String, imagePath)
         let png = try Data(contentsOf: URL(fileURLWithPath: imagePath))
+        XCTAssertEqual(image.image?.data, png)
         XCTAssertEqual(imageMetadata["byteCount"] as? Int, png.count)
         XCTAssertEqual((imageMetadata["sha256"] as? String)?.count, 64)
         let bitmap = try XCTUnwrap(NSBitmapImageRep(data: png))
@@ -196,10 +197,8 @@ final class CADAgentToolsTests: XCTestCase {
         XCTAssertEqual(preview.volume, 4, accuracy: 1e-7)
     }
 
-    private func content(_ result: [String: Any]) throws -> [String: Any] {
-        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
-        let text = try XCTUnwrap(content.first?["text"] as? String)
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    private func content(_ result: CADAgentToolResult) throws -> [String: Any] {
+        result.metadata
     }
     private func temporary() -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-agent-test-\(UUID().uuidString)")

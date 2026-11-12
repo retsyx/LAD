@@ -253,7 +253,11 @@ are `lad_runtime`, `lad_request_permission`, `lad_versions`, `lad_version`, `lad
 `lad_render`, `lad_check_motion`, `lad_screenshot`, `lad_export_step` and `lad_import`.
 
 `agent-tools.json` is the canonical CAD tool schema catalog shared by this
-adapter and LAD's native external-agent interface. When enabled in Settings,
+adapter and LAD's native external-agent interface. Each tool's `host` object
+tells the native app how to authorize, route and audit its calls: the external
+capability it requires, image results, permission prompts, recorded source
+files, original-reference arguments and assigned export paths. Agents never see
+it. When enabled in Settings,
 the app also serves MCP Streamable HTTP at `http://127.0.0.1:<port>/mcp`
 (default port 47512). The external interface uses per-client credentials,
 explicit design/task IDs, an isolated worker per task, binary file uploads,
