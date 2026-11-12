@@ -112,7 +112,7 @@ struct CodexFileContext: Sendable {
                 let url = sources.appendingPathComponent(filename)
                 let data = source.data
                 try write(data, to: url)
-                let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                let digest = SHA256.hexDigest(data)
                 let reference = CodexSourceReference(name: source.name, path: source.path, readPath: url.path, sha256: digest, byteCount: data.count)
                 references.append(reference)
             }
@@ -183,7 +183,7 @@ struct CodexFileContext: Sendable {
             var stored = [String: String]()
             var manifest = [[String: String]]()
             for (index, asset) in assets.enumerated() {
-                let digest = SHA256.hash(data: asset.data).map { String(format: "%02x", $0) }.joined()
+                let digest = SHA256.hexDigest(asset.data)
                 let readPath: String
                 if let existing = stored[digest] { readPath = existing }
                 else {
@@ -248,7 +248,7 @@ struct CodexFileContext: Sendable {
                 guard !data.isEmpty, data.count <= ProjectStore.maximumSTEPBytes else {
                     throw LADError.message("A selected design's required geometry input exceeds the storage limit.")
                 }
-                let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                let digest = SHA256.hexDigest(data)
                 let path = "context/selection-assets/\(digest).\(format)"
                 // Content addressing shares exact original inputs across all
                 // historical selections while keeping old references immutable.
@@ -279,7 +279,7 @@ struct CodexFileContext: Sendable {
                 url = try workspace.url(modelPath)
             } else { url = try workspace.write(bytes, path: modelPath) }
             modelReference = CodexSourceReference(name: "selection-origin-model.json", path: url.path, readPath: url.path,
-                sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined(), byteCount: bytes.count)
+                sha256: SHA256.hexDigest(bytes), byteCount: bytes.count)
             if !inputs.isEmpty {
                 let path = (originFolder ?? folder) + "/selection-geometry-inputs.json"
                 let data = try JSONSerialization.data(withJSONObject: inputs, options: [.sortedKeys, .withoutEscapingSlashes])

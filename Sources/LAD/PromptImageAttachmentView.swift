@@ -148,7 +148,7 @@ final class PromptImagePreviewFile: @unchecked Sendable {
         let directory = manager.temporaryDirectory.appendingPathComponent("LAD-image-preview-\(UUID().uuidString)", isDirectory: true)
         try manager.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         self.directory = directory
-        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hexDigest(data)
         let ext = attachment.fileExtension == "jpg" || attachment.fileExtension == "jpeg" ? "jpg" : "png"
         url = directory.appendingPathComponent("\(digest).\(ext)")
         do {

@@ -30,7 +30,7 @@ final class SourceImportTests: XCTestCase {
         XCTAssertEqual(result[0].path, source.resolvingSymlinksInPath().path)
         XCTAssertEqual(result[0].content, content)
         XCTAssertEqual(result[0].fileExtension, "fs")
-        XCTAssertEqual(result[0].sha256, SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined())
+        XCTAssertEqual(result[0].sha256, SHA256.hexDigest(Data(content.utf8)))
         XCTAssertEqual(try JSONDecoder().decode([SourceAttachment].self, from: JSONEncoder().encode(result)), result)
         // Source snapshot remains useful after the original file disappears.
         try FileManager.default.removeItem(at: source)

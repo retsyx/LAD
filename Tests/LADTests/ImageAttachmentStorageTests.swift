@@ -224,7 +224,7 @@ final class ImageAttachmentStorageTests: XCTestCase {
         SourceAttachment(name: name, path: "/sources/\(name)", content: content, sha256: digest(Data(content.utf8)))
     }
 
-    private func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    private func digest(_ data: Data) -> String { SHA256.hexDigest(data) }
     private func manifest(_ data: Data) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectZIP.decode(data)) as? [String: Any])
     }

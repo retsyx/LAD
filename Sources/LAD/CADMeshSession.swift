@@ -199,8 +199,8 @@ final class CADMeshSession {
                 throw LADError.message("The reconstruction returned an invalid record.")
             }
             try Task.checkCancellation()
-            let recordHash = SHA256.hash(data: workerRecordData).map { String(format: "%02x", $0) }.joined()
-            let nativeHash = nativeData.map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() }
+            let recordHash = SHA256.hexDigest(workerRecordData)
+            let nativeHash = nativeData.map { SHA256.hexDigest($0) }
             try Task.checkCancellation()
             return (values, value, recordHash, nativeHash)
         }
@@ -370,7 +370,7 @@ final class CADMeshSession {
             var revision = preview
             for key in ["quick_comparison", "base_revision", "commit_eligible", "state"] { revision.removeValue(forKey: key) }
             revision["parent_revision"] = expected
-            let id = "revision-" + SHA256.hash(data: try json(revision)).map { String(format: "%02x", $0) }.joined()
+            let id = "revision-" + SHA256.hexDigest(try json(revision))
             revision["id"] = id
             if let script = revision["script"] as? String {
                 preparedProgramPath = try workspace.write(Data(script.utf8), path: "mesh/programs/\(id).py").path
@@ -439,7 +439,7 @@ final class CADMeshSession {
     /// Keep a context's published reference geometry in the task workspace,
     /// counted against the task's file budget.
     private func retainReference(_ published: URL, contextID: String) throws -> URL {
-        let path = "mesh/references/\(SHA256.hash(data: Data(contextID.utf8)).map { String(format: "%02x", $0) }.joined()).npz"
+        let path = "mesh/references/\(SHA256.hexDigest(Data(contextID.utf8))).npz"
         let destination = try workspace.prepareOutput(path)
         try? FileManager.default.removeItem(at: destination)
         guard copyfile(published.path, destination.path, nil, copyfile_flags_t(COPYFILE_CLONE)) == 0 else {

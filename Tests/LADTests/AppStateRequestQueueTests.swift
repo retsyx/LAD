@@ -419,7 +419,7 @@ final class AppStateRequestQueueTests: XCTestCase {
 
     @MainActor
     private func attachment(_ name: String, content: String, in fixture: Fixture) -> SourceAttachment {
-        let digest = SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hexDigest(Data(content.utf8))
         return SourceAttachment(name: name, path: fixture.directory.appendingPathComponent(name).path,
                                 content: content, sha256: digest)
     }

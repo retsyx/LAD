@@ -230,7 +230,7 @@ final class ProjectQuitSaveTests: XCTestCase {
 
     private func sourceAttachment() -> SourceAttachment {
         let text = "# complete retained reference\nwidth = 23\n"
-        let digest = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hexDigest(Data(text.utf8))
         return SourceAttachment(name: "dimensions.py", path: "/original/dimensions.py", content: text, sha256: digest)
     }
 

@@ -85,7 +85,7 @@ enum SourceImport {
         let stem = (basename as NSString).deletingPathExtension
         let filename = "\(stem.isEmpty ? "Image" : stem).\(ext)"
         return SourceAttachment(id: id, name: filename, path: path ?? "clipboard://\(id.uuidString)",
-                                content: "", sha256: digest(bytes), imageData: bytes)
+                                content: "", sha256: SHA256.hexDigest(bytes), imageData: bytes)
     }
 
     static func mergeAttachments(existing: [SourceAttachment], added: [SourceAttachment]) throws -> [SourceAttachment] {
@@ -138,7 +138,7 @@ enum SourceImport {
                 guard verified == bytes else { throw LADError.message("An attachment failed its integrity check.") }
                 continue
             }
-            guard attachment.sha256 == digest(bytes) else { throw LADError.message("An attachment failed its integrity check.") }
+            guard attachment.sha256 == SHA256.hexDigest(bytes) else { throw LADError.message("An attachment failed its integrity check.") }
             if attachment.isImage {
                 let info = try imageSource(bytes)
                 let expected = attachment.fileExtension == "png" ? UTType.png.identifier : UTType.jpeg.identifier
@@ -149,10 +149,6 @@ enum SourceImport {
             }
             verifiedPayloads[key] = bytes
         }
-    }
-
-    private static func digest(_ bytes: Data) -> String {
-        SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func imageSource(_ data: Data) throws -> (source: CGImageSource, type: String, width: Int, height: Int, orientation: Int) {
@@ -265,7 +261,7 @@ enum SourceImport {
                 throw LADError.message("Source attachments exceed the 2 MiB total limit. Attach fewer files or a smaller design source.")
             }
             sourceBytes += contentBytes.count
-            let digest = SHA256.hash(data: contentBytes).map { String(format: "%02x", $0) }.joined()
+            let digest = SHA256.hexDigest(contentBytes)
             attachments.append(SourceAttachment(name: url.lastPathComponent, path: url.path, content: text, sha256: digest))
         }
         try validateAttachments(attachments)

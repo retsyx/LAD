@@ -5,7 +5,7 @@ import XCTest
 
 final class CodexFileContextTests: XCTestCase {
     private func attachment(_ name: String, path: String? = nil, content: String) -> SourceAttachment {
-        let digest = SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hexDigest(Data(content.utf8))
         return SourceAttachment(name: name, path: path ?? "/no-longer-present/\(name)", content: content, sha256: digest)
     }
 

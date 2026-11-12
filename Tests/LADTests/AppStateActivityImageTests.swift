@@ -133,7 +133,7 @@ final class AppStateActivityImageTests: XCTestCase {
         let saved = try ProjectStore.read(from: url)
         XCTAssertEqual(saved.taskAudits, state.taskAudits)
         XCTAssertEqual(saved.taskAudits?.first?.events.compactMap(\.imageData), [png, png])
-        let hash = SHA256.hash(data: png).map { String(format: "%02x", $0) }.joined()
+        let hash = SHA256.hexDigest(png)
         let asset = url.appendingPathComponent("assets/sha256/\(hash.prefix(2))/\(hash)")
         XCTAssertTrue(FileManager.default.fileExists(atPath: asset.path), "Renders are stored as package assets.")
         let snapshot = try ProjectArchive.split(saved)

@@ -76,7 +76,7 @@ final class ExternalAgentAccess: ObservableObject {
             throw LADError.message("Enter a client name of at most 256 bytes; up to 64 clients are supported.")
         }
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        let client = ExternalAgentClient(id: UUID(), name: name, credentialHash: Self.digest(token),
+        let client = ExternalAgentClient(id: UUID(), name: name, credentialHash: SHA256.hexDigest(Data(token.utf8)),
             capabilities: capabilities.union([.read]), projectIDs: projectIDs)
         clients.append(client)
         save()
@@ -89,7 +89,7 @@ final class ExternalAgentAccess: ObservableObject {
         guard let header, header.hasPrefix("Bearer ") else { return nil }
         let token = String(header.dropFirst(7))
         guard token.utf8.count == 64, token.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }) else { return nil }
-        let hash = Self.digest(token)
+        let hash = SHA256.hexDigest(Data(token.utf8))
         return clients.first { Self.equalDigest($0.credentialHash, hash) }
     }
 
@@ -98,10 +98,6 @@ final class ExternalAgentAccess: ObservableObject {
     private func save() {
         if let bytes = try? JSONEncoder().encode(clients) { defaults.set(bytes, forKey: Self.clientsKey) }
         onChange?()
-    }
-
-    private static func digest(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func equalDigest(_ left: String, _ right: String) -> Bool {

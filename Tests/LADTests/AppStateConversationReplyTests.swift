@@ -360,7 +360,7 @@ final class AppStateConversationReplyTests: XCTestCase {
 
         func attachment() -> SourceAttachment {
             let content = "# REPLY_SOURCE_SENTINEL\nletter_height = 0.8\n"
-            let digest = SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined()
+            let digest = SHA256.hexDigest(Data(content.utf8))
             return SourceAttachment(name: "lettering.py", path: codex.directory.appendingPathComponent("lettering.py").path,
                 content: content, sha256: digest)
         }

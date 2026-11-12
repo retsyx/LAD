@@ -231,7 +231,7 @@ enum ProjectPackage {
         }
 
         var digest: String {
-            get throws { ProjectPackage.digest(try ProjectPackage.encode(self)) }
+            get throws { SHA256.hexDigest(try ProjectPackage.encode(self)) }
         }
 
         /// Versions 5 and 6 hashed the same fields as JSONSerialization output.
@@ -247,7 +247,7 @@ enum ProjectPackage {
                 object["jointPositions"] = jointPositions
                 object["displayMode"] = displayMode?.rawValue
                 object["projectionMode"] = projectionMode?.rawValue
-                return ProjectPackage.digest(try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+                return SHA256.hexDigest(try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
             }
         }
     }
@@ -554,7 +554,7 @@ enum ProjectPackage {
         }
 
         func store(_ data: Data, directory: String, prefix: String) throws -> Reference {
-            let hash = digest(data)
+            let hash = SHA256.hexDigest(data)
             let path = "\(directory)/\(prefix)-\(hash).json"
             try writeImmutable(data, path: path, in: url, verified: verified, directories: &directories)
             files.insert(path)
@@ -564,7 +564,7 @@ enum ProjectPackage {
         /// Writes the inactive index slot unless the committed one holds these bytes.
         func index<Value: Encodable>(_ value: Value, directory: String, old: Reference?) throws -> Reference {
             metrics.encodedSectionIndexes += 1
-            let data = try encode(value), hash = digest(data)
+            let data = try encode(value), hash = SHA256.hexDigest(data)
             if let old, old.sha256 == hash {
                 try requireRegularFile(old.path, in: url)
                 return keep(old)
@@ -811,7 +811,7 @@ enum ProjectPackage {
                 } else {
                     metrics.thumbnailValidations += 1
                     if validThumbnail(thumbnail) {
-                        let hash = digest(thumbnail)
+                        let hash = SHA256.hexDigest(thumbnail)
                         if let retained = retain(thumbnail, Thumbnail(path: assetPath(hash), sha256: hash, byteCount: thumbnail.count)) {
                             return retained
                         }
@@ -857,7 +857,7 @@ enum ProjectPackage {
             let bytes = try readFile(path, in: url, limit: min(maximumMetadataRecordBytes, maximumMetadataBytes - metadataBytes))
             metadataBytes += bytes.count
             guard metadataBytes <= maximumMetadataBytes else { throw invalid("The design metadata exceeds its size limit.") }
-            guard digest(bytes) == hash else { throw invalid("A saved design record failed its integrity check.") }
+            guard SHA256.hexDigest(bytes) == hash else { throw invalid("A saved design record failed its integrity check.") }
             files.insert(path)
             return bytes
         }
@@ -956,7 +956,7 @@ enum ProjectPackage {
             let stored = try readFile(descriptor.path, in: url, limit: descriptor.storedByteCount)
             guard stored.count == descriptor.storedByteCount else { throw invalid("A saved asset has an inconsistent size.") }
             let bytes = try expandedAsset(stored, codec: descriptor.codec, byteCount: descriptor.byteCount)
-            guard digest(bytes) == hash else { throw invalid("A saved file asset failed its integrity check.") }
+            guard SHA256.hexDigest(bytes) == hash else { throw invalid("A saved file asset failed its integrity check.") }
             assets[hash] = bytes
             reader.files.insert(descriptor.path)
         }
@@ -989,7 +989,7 @@ enum ProjectPackage {
             let stored = try? (manifest.formatVersion == formatVersion ? identity.digest : identity.legacyDigest)
             if stored != nil, manifest.thumbnailIdentity == stored,
                let bytes = try? readFile(thumbnail.path, in: url, limit: 8_000_000),
-               validThumbnail(bytes), digest(bytes) == thumbnail.sha256 {
+               validThumbnail(bytes), SHA256.hexDigest(bytes) == thumbnail.sha256 {
                 project.thumbnailData = bytes
                 reader.files.insert(thumbnail.path)
                 thumbnailIdentity = try identity.digest
@@ -1201,7 +1201,6 @@ enum ProjectPackage {
     private static func isIndexSlot(_ path: String) -> Bool { path.hasSuffix("/index-1.json") || path.hasSuffix("/index-2.json") }
     private static func assetPath(_ hash: String) -> String { "assets/sha256/\(hash.prefix(2))/\(hash)" }
     private static func validHash(_ hash: String) -> Bool { hash.utf8.count == 64 && hash.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
-    private static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 
     /// The one encoder for every package file. Sorted keys make each record's
     /// bytes, and therefore its content hash, a function of its value.

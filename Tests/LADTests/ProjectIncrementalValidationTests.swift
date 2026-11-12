@@ -6,7 +6,7 @@ final class ProjectIncrementalValidationTests: XCTestCase {
     private func project() -> LADProject {
         let attachmentText = "print('source')\n"
         let attachment = SourceAttachment(name: "source.py", path: "/missing/source.py", content: attachmentText,
-            sha256: SHA256.hash(data: Data(attachmentText.utf8)).map { String(format: "%02x", $0) }.joined())
+            sha256: SHA256.hexDigest(Data(attachmentText.utf8)))
         let user = ChatMessage(role: "user", content: "Make a box", attachments: [attachment])
         let supplemental = ChatMessage(role: "user", content: "Keep the dimensions")
         let response = ChatMessage(role: "assistant", content: "Ready", phase: "final_answer")

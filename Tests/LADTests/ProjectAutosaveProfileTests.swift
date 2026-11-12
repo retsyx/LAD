@@ -275,7 +275,7 @@ final class ProjectAutosaveProfileTests: XCTestCase {
             let relative = String(file.resolvingSymlinksInPath().path.dropFirst(resolved.path.count + 1))
             guard includingRoot || relative != "project.json" else { continue }
             let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
-            let digest = SHA256.hash(data: try Data(contentsOf: file)).map { String(format: "%02x", $0) }.joined()
+            let digest = SHA256.hexDigest(try Data(contentsOf: file))
             result[relative] = Fingerprint(digest: digest,
                 inode: try XCTUnwrap(attributes[.systemFileNumber] as? NSNumber).uint64Value,
                 bytes: try XCTUnwrap(attributes[.size] as? NSNumber).uint64Value,

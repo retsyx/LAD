@@ -177,7 +177,7 @@ final class ProjectPackageTests: XCTestCase {
         value.revisions[0].model.sourceSTEP = bytes
         value.revisions.append(ProjectRevision(model: value.revisions[0].model, parts: value.revisions[0].parts))
         let text = String(decoding: bytes, as: UTF8.self)
-        let hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let hash = SHA256.hexDigest(bytes)
         value.messages[0].attachments = [SourceAttachment(name: "board.step", path: "/missing/board.step", content: text, sha256: hash)]
         try ProjectStore.write(value, to: url)
         let json = try root(url)
@@ -224,7 +224,7 @@ final class ProjectPackageTests: XCTestCase {
         let url = try temporaryPackage()
         var value = project()
         let bytes = Data("# Exact shared source\n".utf8)
-        let hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let hash = SHA256.hexDigest(bytes)
         let attachment = SourceAttachment(name: "source.py", path: "/missing/source.py", content: String(decoding: bytes, as: UTF8.self), sha256: hash)
         value.messages[0].attachments = [attachment]
         value.draftAttachments = [attachment]
@@ -296,7 +296,7 @@ final class ProjectPackageTests: XCTestCase {
         XCTAssertEqual(committed, try ProjectStore.readArchive(from: url))
 
         let text = "# A retained input\n"
-        let hash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let hash = SHA256.hexDigest(Data(text.utf8))
         let attachment = SourceAttachment(name: "input.py", path: "/missing/input.py", content: text, sha256: hash)
         value.queuedRequests = [ProjectQueuedRequest(content: "Refine this input", attachments: [attachment])]
         value.draftAttachments = [attachment]
@@ -512,7 +512,7 @@ final class ProjectPackageTests: XCTestCase {
         let url = try temporaryPackage()
         var value = project()
         let source = "# Shared original\n"
-        let bytes = Data(source.utf8), hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let bytes = Data(source.utf8), hash = SHA256.hexDigest(bytes)
         let attachment = SourceAttachment(name: "source.py", path: "/missing/source.py", content: source, sha256: hash)
         value.messages += [ChatMessage(role: "assistant", content: "First"), ChatMessage(role: "assistant", content: "Second")]
         value.messages[0].attachments = [attachment]

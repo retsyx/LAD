@@ -11,7 +11,7 @@ struct ProjectFileOrigin: Sendable, Equatable {
 
     init(url: URL, data: Data) {
         self.url = Self.canonicalURL(url)
-        sha256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        sha256 = SHA256.hexDigest(data)
     }
 
     func matches(_ other: URL) -> Bool {

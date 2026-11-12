@@ -48,7 +48,7 @@ enum CADAgentVersionFiles {
         }
         func input(_ data: Data, format: String, name: String, id: String? = nil) throws -> [String: Any] {
             try Task.checkCancellation()
-            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            let digest = SHA256.hexDigest(data)
             let suffix = format == "stp" ? "step" : format
             let relative = "context/versions/inputs/\(digest).\(suffix)"
             if inputSizes[relative] == nil { files.append(File(path: relative, data: data)) }

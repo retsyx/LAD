@@ -602,7 +602,7 @@ enum ProjectArchive {
 
         mutating func store(_ bytes: Data, role: AssetRole) throws -> String {
             try validateSize(bytes.count, role: role)
-            let key = digest(bytes)
+            let key = SHA256.hexDigest(bytes)
             if let existing = assets[key] {
                 guard existing == bytes else { throw invalid("File assets have conflicting integrity hashes.") }
             } else {
@@ -622,7 +622,7 @@ enum ProjectArchive {
             var total = 0
             for (key, bytes) in assets {
                 try addBytes(bytes.count, to: &total, limit: maximumAssetBytes)
-                guard validKey(key), verified || digest(bytes) == key else {
+                guard validKey(key), verified || SHA256.hexDigest(bytes) == key else {
                     throw invalid("A saved file asset failed its integrity check.")
                 }
             }
@@ -660,10 +660,6 @@ enum ProjectArchive {
     private static func addBytes(_ count: Int, to total: inout Int, limit: Int) throws {
         guard count <= limit - total else { throw invalid("Saved file assets exceed the 1,024 MB design limit.") }
         total += count
-    }
-
-    private static func digest(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func validKey(_ key: String) -> Bool {

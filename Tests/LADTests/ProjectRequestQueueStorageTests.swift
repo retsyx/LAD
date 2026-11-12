@@ -5,7 +5,7 @@ import XCTest
 final class ProjectRequestQueueStorageTests: XCTestCase {
     func testQueueOrderDraftAndCapturedChoicesRoundTripWithoutDuplicatingSourceBytes() throws {
         let text = "# complete reference source\nresult = cq.Solid.makeBox(2, 3, 4)\n"
-        let digest = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hexDigest(Data(text.utf8))
         let input = SourceAttachment(name: "reference.py", path: "/original/reference.py", content: text, sha256: digest)
         let settings = CodexProjectSettings(model: "captured-model", reasoningEffort: "high", reasoningByModel: ["captured-model": "high"])
         let first = ProjectQueuedRequest(content: "Add a lid", attachments: [input], codexSettings: settings)

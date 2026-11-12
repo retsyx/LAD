@@ -149,7 +149,7 @@ final class CodexToolContextTests: XCTestCase {
         try XCTUnwrap(FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber).intValue
     }
 
-    private func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    private func digest(_ data: Data) -> String { SHA256.hexDigest(data) }
 
     private struct Fixture {
         let directory: URL

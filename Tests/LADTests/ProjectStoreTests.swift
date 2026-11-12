@@ -234,7 +234,7 @@ final class ProjectStoreTests: XCTestCase {
 
     private func source(_ content: String = "FeatureScript 2500;\n// Source dimensions: 64 × 42 mm\n") -> SourceAttachment {
         SourceAttachment(name: "enclosure.fs", path: "/source/no-longer-present/enclosure.fs", content: content,
-                         sha256: SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined())
+                         sha256: SHA256.hexDigest(Data(content.utf8)))
     }
 
     func testSourceAttachmentRoundtripPreservesCompleteTextWithoutOriginalFile() throws {

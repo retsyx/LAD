@@ -352,7 +352,7 @@ final class CodexService {
                 let ext = attachment.isImage ? attachment.fileExtension :
                     SourceImport.supportedExtensions.contains(attachment.fileExtension) ? attachment.fileExtension : "txt"
                 let path = try workspace.write(data, path: folder + String(format: "/source-%03d.%@", index + 1, ext))
-                let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                let digest = SHA256.hexDigest(data)
                 let reference = CodexSourceReference(name: attachment.name, path: attachment.path, readPath: path.path,
                                                      sha256: digest, byteCount: data.count)
                 if attachment.isImage {

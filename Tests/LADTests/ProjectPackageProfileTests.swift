@@ -13,7 +13,7 @@ final class ProjectPackageProfileTests: XCTestCase {
         }
         let sourceURL = URL(fileURLWithPath: source)
         let sourceData = try Data(contentsOf: sourceURL)
-        let sourceDigest = SHA256.hash(data: sourceData).map { String(format: "%02x", $0) }.joined()
+        let sourceDigest = SHA256.hexDigest(sourceData)
         let original = try ProjectStore.decode(sourceData)
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-save-profile-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -56,7 +56,7 @@ final class ProjectPackageProfileTests: XCTestCase {
         XCTAssertEqual(restored.revisions.map(\.model), incremental.revisions.map(\.model))
         XCTAssertEqual(restored.showGrid, incremental.showGrid)
         XCTAssertEqual(restored.partsPaneFraction, incremental.partsPaneFraction)
-        let sourceAfter = SHA256.hash(data: try Data(contentsOf: sourceURL)).map { String(format: "%02x", $0) }.joined()
+        let sourceAfter = SHA256.hexDigest(try Data(contentsOf: sourceURL))
         XCTAssertEqual(sourceAfter, sourceDigest, "The profile must never modify its source archive")
         func median(_ samples: [Double]) -> Double { samples.sorted()[samples.count / 2] }
         let legacyMedian = median(legacySeconds), incrementalMedian = median(incrementalSeconds)
@@ -127,7 +127,7 @@ final class ProjectPackageProfileTests: XCTestCase {
             let relative = String(file.resolvingSymlinksInPath().path.dropFirst(resolved.path.count + 1))
             guard relative != "project.json" else { continue }
             let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
-            let digest = SHA256.hash(data: try Data(contentsOf: file)).map { String(format: "%02x", $0) }.joined()
+            let digest = SHA256.hexDigest(try Data(contentsOf: file))
             result[relative] = Fingerprint(digest: digest,
                 inode: try XCTUnwrap(attributes[.systemFileNumber] as? NSNumber).uint64Value,
                 bytes: try XCTUnwrap(attributes[.size] as? NSNumber).uint64Value,

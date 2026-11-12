@@ -127,7 +127,7 @@ final class ProjectAgentSession {
         let file = try file(fileID)
         var data = try workspace.read(file.path, maximumBytes: Self.maximumFileBytes, allowEmpty: true)
         if !file.uploaded, file.isGeometry, !file.path.hasPrefix(workspace.root.path + "/context/versions/inputs/") {
-            generatedGeometryDigests.insert(Self.digest(data))
+            generatedGeometryDigests.insert(SHA256.hexDigest(data))
         }
         // Native metadata files contain local references. Present their JSON
         // through the same opaque handles as tool metadata. Original uploads
@@ -147,7 +147,7 @@ final class ProjectAgentSession {
         let prepared = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             let bytes = try workspace.read(file.path, maximumBytes: maximumBytes, allowEmpty: true)
-            return (bytes, generatedGeometry ? Self.digest(bytes) : nil)
+            return (bytes, generatedGeometry ? SHA256.hexDigest(bytes) : nil)
         }
         var (bytes, digest) = try await withTaskCancellationHandler {
             try await prepared.value
@@ -344,10 +344,6 @@ final class ProjectAgentSession {
 
     nonisolated private static func geometryDigest(_ data: Data, name: String) -> String? {
         let suffix = URL(fileURLWithPath: name).pathExtension.lowercased()
-        return CADInputAsset.supportedFormats.contains(suffix) || suffix == "stp" ? digest(data) : nil
-    }
-
-    nonisolated private static func digest(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return CADInputAsset.supportedFormats.contains(suffix) || suffix == "stp" ? SHA256.hexDigest(data) : nil
     }
 }

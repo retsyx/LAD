@@ -97,7 +97,7 @@ final class CADActivityImageTests: XCTestCase {
                                      events: [event, repeated])
         let project = LADProject(messages: [user], revisions: [], selectedRevisionID: nil, taskAudits: [audit])
         let snapshot = try ProjectArchive.split(project)
-        let hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let hash = SHA256.hexDigest(bytes)
         XCTAssertEqual(snapshot.assets[hash], bytes, "The exact PNG is a content-addressed asset.")
         XCTAssertEqual(snapshot.assets.values.filter { $0 == bytes }.count, 1, "Identical images are stored once.")
         let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot.metadata) as? [String: Any])

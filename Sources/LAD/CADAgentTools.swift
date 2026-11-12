@@ -402,7 +402,7 @@ final class CADAgentTools {
                 throw LADError.message("Import STEP, BREP, STL or OBJ geometry from the task workspace.")
             }
             let data = try workspace.read(path, maximumBytes: ProjectStore.maximumSTEPBytes)
-            let id = "asset-" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            let id = "asset-" + SHA256.hexDigest(data)
             let asset = CADInputAsset(id: id, name: try boundedText("name", arguments, fallback: url.lastPathComponent, maximum: 255), format: format, data: data)
             let model = ModelSpec(title: "Imported geometry", summary: "Validated \(format.uppercased()) input geometry.", units: "mm",
                                   script: "result = imported_assets[\(String(data: try JSONEncoder().encode(id), encoding: .utf8)!)]\n",
@@ -936,7 +936,7 @@ final class CADAgentTools {
         var info = metadata
         info["path"] = url.path
         info["byteCount"] = bytes.count
-        info["sha256"] = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        info["sha256"] = SHA256.hexDigest(bytes)
         return try CADAgentToolResult(metadata: info, image: .init(path: url.path, data: bytes))
     }
 

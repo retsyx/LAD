@@ -215,7 +215,7 @@ final class CodexImageInputTests: XCTestCase {
 
     private func source(_ name: String, content: String) -> SourceAttachment {
         SourceAttachment(name: name, path: "/missing/\(name)", content: content,
-            sha256: SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined())
+            sha256: SHA256.hexDigest(Data(content.utf8)))
     }
 
     private func image(_ name: String, red: UInt8) throws -> SourceAttachment {

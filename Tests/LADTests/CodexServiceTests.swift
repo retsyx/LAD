@@ -583,7 +583,7 @@ final class CodexServiceTests: XCTestCase {
 
     private func attachment(_ name: String, content: String) -> SourceAttachment {
         SourceAttachment(name: name, path: "/tmp/LAD-test-imports/\(name)", content: content,
-                         sha256: SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined())
+                         sha256: SHA256.hexDigest(Data(content.utf8)))
     }
 
     private func jsonText(_ object: [String: Any]) throws -> String {

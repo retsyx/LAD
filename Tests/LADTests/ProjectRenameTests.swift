@@ -85,7 +85,7 @@ final class ProjectRenameTests: XCTestCase {
         wider.script = wider.script.replacingOccurrences(of: "box(80, 50, 6", with: "box(100, 50, 6")
         let second = ProjectRevision(model: wider, partLayout: layout, hiddenSolids: [], parts: parts)
         let content = "(kicad_pcb (version 20240108) (general (thickness 1.6)))\n"
-        let hash = SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined()
+        let hash = SHA256.hexDigest(Data(content.utf8))
         let source = SourceAttachment(name: "board.kicad_pcb", path: "/original/board.kicad_pcb", content: content, sha256: hash)
         return LADProject(messages: [ChatMessage(role: "user", content: "Build an enclosure", attachments: [source]),
                                      ChatMessage(role: "assistant", content: "I’ll check the board and build its enclosure.", phase: "commentary"),

@@ -274,7 +274,7 @@ enum CADRuntimeInstaller {
         defer { try? stream.close() }
         var hash = SHA256()
         while let chunk = try stream.read(upToCount: 1_048_576), !chunk.isEmpty { hash.update(data: chunk) }
-        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+        return hash.finalize().hexString
     }
 
     private static func run(_ executable: URL, _ arguments: [String], in directory: URL, allowBytecodeWrites: Bool = false) throws {
