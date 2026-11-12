@@ -440,7 +440,9 @@ and its dependencies are third-party packages; their licenses remain applicable.
 
 Saved revisions carry one optional `validated_hash` field. The worker computes
 SHA-256 over the program, units, ordered input identities/formats, exact required
-input bytes, runtime versions, and worker/assembly adapter source. Titles, summaries and input
+input bytes, runtime versions, and the worker's explicit `VALIDATION_RULES_VERSION`,
+which is bumped only when validation or the geometry it validates changes, so
+unrelated worker edits keep saved receipts. Titles, summaries and input
 display names are excluded, matching validated candidate reuse at final commit. A matching receipt skips exact BRep/shell checks
 and STEP roundtrip validation during replay. Missing or changed hashes require
 full validation; only successful builds return a new receipt. This is an

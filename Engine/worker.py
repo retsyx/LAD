@@ -19,7 +19,6 @@ import re
 import sys
 import time
 
-import assembly_motion
 from assembly_motion import AssemblyMotionError, transformed_solids, validate_motion
 
 MAX_TRIANGLES = 1_000_000
@@ -2987,6 +2986,14 @@ def runtime_info(cq):
     return {"python": platform.python_version(), "cadquery": cq.__version__, "ocp": ocp_version}
 
 
+# The validation rules a receipt certifies. A matching receipt lets replay skip
+# exact BRep/shell checks and STEP roundtrip verification, so bump this when
+# those checks change or when anything changes the geometry they validated:
+# program execution, input import, tolerance handling, assembly and motion
+# adaptation, or STEP export and readback. Other worker edits keep receipts.
+VALIDATION_RULES_VERSION = 1
+
+
 def validation_hash(spec, directory, cq):
     """Bind validation to exact replay inputs, kernel versions and worker rules.
 
@@ -2998,8 +3005,7 @@ def validation_hash(spec, directory, cq):
     def add(data):
         digest.update(len(data).to_bytes(8, "big"))
         digest.update(data)
-    add(Path(__file__).read_bytes())
-    add(Path(assembly_motion.__file__).read_bytes())
+    add(f"lad-validation-rules-{VALIDATION_RULES_VERSION}".encode())
     add(json.dumps(runtime_info(cq), sort_keys=True, separators=(",", ":")).encode())
     # Match the app's validated-preview reuse contract: display metadata can
     # change between a successful candidate and its final saved revision.

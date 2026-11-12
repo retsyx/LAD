@@ -20,7 +20,7 @@ def script_spec(script):
 
 
 class ValidationTests(unittest.TestCase):
-    def test_validation_receipt_includes_the_motion_adapter_rules(self):
+    def test_validation_receipt_ignores_unrelated_worker_and_adapter_edits(self):
         import cadquery as cq
         import worker
         spec = script_spec("result = cq.Solid.makeBox(1,2,3)")
@@ -28,14 +28,16 @@ class ValidationTests(unittest.TestCase):
             root = Path(directory)
             original = worker.validation_hash(spec, root, cq)
             read = Path.read_bytes
-            adapter = Path(worker.__file__).with_name("assembly_motion.py")
+            engine = Path(worker.__file__).resolve().parent
+            sources = {engine / "worker.py", engine / "assembly_motion.py"}
 
             def changed(path):
                 data = read(path)
-                return data + b"\n# Updated mate validation\n" if path == adapter else data
+                return data + b"\n# Unrelated edit\n" if Path(path).resolve() in sources else data
 
+            # Only VALIDATION_RULES_VERSION retires saved receipts.
             with mock.patch.object(Path, "read_bytes", changed):
-                self.assertNotEqual(worker.validation_hash(spec, root, cq), original)
+                self.assertEqual(worker.validation_hash(spec, root, cq), original)
 
     def test_validation_receipt_reuses_checks_and_invalidates_changed_program(self):
         import worker
@@ -120,7 +122,7 @@ class ValidationTests(unittest.TestCase):
                     run(request, root / str(index), 2, defer_step=True, validated_hash=receipt)
                 self.assertFalse(worker._validated_replay.get())
 
-    def test_validation_hash_covers_external_bytes_runtime_and_worker_rules(self):
+    def test_validation_hash_covers_external_bytes_runtime_and_validation_rules(self):
         import cadquery as cq
         import worker
         with tempfile.TemporaryDirectory() as directory:
@@ -141,7 +143,7 @@ class ValidationTests(unittest.TestCase):
             first = worker.validation_hash(spec, root, cq)
             with mock.patch.object(worker, 'runtime_info', return_value={'python': 'changed'}):
                 self.assertNotEqual(worker.validation_hash(spec, root, cq), first)
-            with mock.patch.object(worker, '__file__', str(source)):
+            with mock.patch.object(worker, 'VALIDATION_RULES_VERSION', worker.VALIDATION_RULES_VERSION + 1):
                 self.assertNotEqual(worker.validation_hash(spec, root, cq), first)
 
     def test_validation_hash_covers_input_presence_identity_format_and_order(self):
