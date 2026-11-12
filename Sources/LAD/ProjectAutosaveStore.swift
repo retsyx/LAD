@@ -164,6 +164,9 @@ actor ProjectAutosaveStore {
                 let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                 guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
                 do {
+                    // Compare identities from the manifest before loading a
+                    // complete history that would only be discarded.
+                    if let projectID, (try? ProjectStore.projectID(at: url)) != projectID { continue }
                     let snapshot = try Self.readSnapshot(from: url)
                     guard projectID == nil || snapshot.project.projectID == projectID else { continue }
                     let documentURL = ProjectFileOrigin.documentURL(url)
@@ -195,7 +198,7 @@ actor ProjectAutosaveStore {
                 ProjectFileOrigin.canonicalURL($0).path == ProjectFileOrigin.canonicalURL(destination).path
             } ?? false
             let matchesIdentity = sourceID.map { id in
-                (try? ProjectStore.read(from: destination).projectID) == id
+                (try? ProjectStore.projectID(at: destination)) == id
             } ?? false
             guard !matchesPath, !matchesIdentity else {
                 throw LADError.message("Choose a different filename to keep the open design’s complete history.")
@@ -212,7 +215,10 @@ actor ProjectAutosaveStore {
                 // when the destination contains a different project's identity.
                 let staging = writable.deletingLastPathComponent()
                     .appendingPathComponent(".LAD-copy-\(UUID().uuidString).lad", isDirectory: true)
-                defer { try? FileManager.default.removeItem(at: staging) }
+                defer {
+                    ProjectStore.releaseCache(for: staging)
+                    try? FileManager.default.removeItem(at: staging)
+                }
                 let manifest = try ProjectStore.write(project, to: staging, thumbnail: project.thumbnailData)
                 if FileManager.default.fileExists(atPath: writable.path) {
                     _ = try FileManager.default.replaceItemAt(writable, withItemAt: staging,
@@ -300,11 +306,7 @@ actor ProjectAutosaveStore {
                     let manifest = try ProjectStore.write(project, to: old, thumbnail: project.thumbnailData)
                     if moving {
                         coordinator.item(at: old, willMoveTo: target)
-                        // RENAME_EXCL changes filename case on APFS and makes
-                        // the final move itself refuse a newly appeared file.
-                        guard renamex_np(old.path, target.path, UInt32(RENAME_EXCL)) == 0 else {
-                            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: target.path])
-                        }
+                        try ProjectStore.rename(old, to: target)
                         coordinator.item(at: old, didMoveTo: target)
                         return try Self.receipt(at: target, manifest: manifest)
                     }
@@ -345,7 +347,8 @@ actor ProjectAutosaveStore {
         }
         // A caller without an opening baseline may adopt an identical complete
         // document, but may never infer ownership from matching geometry alone.
-        guard let existing = try? ProjectStore.read(from: url), existing.projectID == projectID else { return false }
+        guard (try? ProjectStore.projectID(at: url)) == projectID,
+              let existing = try? ProjectStore.read(from: url, caching: false), existing.projectID == projectID else { return false }
         let existingSnapshot = try ProjectArchive.split(existing)
         let proposedSnapshot = try ProjectArchive.split(project)
         guard existingSnapshot.metadata == proposedSnapshot.metadata,
@@ -367,6 +370,12 @@ actor ProjectAutosaveStore {
         }
         if let outcome { return try outcome.get() }
         throw coordinationError ?? NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError)
+    }
+
+    /// Called once this writer's design has closed or been replaced in its
+    /// window. Its files stay on disk; only parsed package histories go.
+    func releaseCachedProjects() {
+        for file in saved.values { ProjectStore.releaseCache(for: file.url) }
     }
 
     private func remember(_ receipt: WriteReceipt, projectID: UUID, sequence: Int, sourceOrigin: ProjectFileOrigin?, managesFilename: Bool) {

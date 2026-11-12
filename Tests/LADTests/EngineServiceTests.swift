@@ -28,6 +28,18 @@ final class EngineServiceTests: XCTestCase {
     }
 
     @MainActor
+    func testDecodedBuildRetainsOnlyNativeOutputs() async throws {
+        try requireRuntime()
+        let spec = ModelSpec(title: "Scratch cleanup", summary: "Imported inputs and requests are temporary.", units: "mm",
+                             script: "result = cq.Solid.makeBox(2,3,4)")
+        let preview = try await EngineService().buildPreview(spec, python: EngineService.defaultPython, threads: 2)
+        let folder = URL(fileURLWithPath: try XCTUnwrap(preview.brepPath)).deletingLastPathComponent()
+        let names = Set(try FileManager.default.contentsOfDirectory(atPath: folder.path))
+        XCTAssertEqual(names, ["model.brep", ".lad-build-lease"],
+                       "Requests, results, logs and staged inputs are not reused after decoding")
+    }
+
+    @MainActor
     func testPreviewDefersSTEPThenExportsAndReusesExactSessionBytes() async throws {
         try requireRuntime()
         let spec = ModelSpec(title: "Deferred STEP assembly", summary: "Located exact solids, retaining STEP only for export.", units: "mm", script: """

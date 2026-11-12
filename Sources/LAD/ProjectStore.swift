@@ -26,8 +26,22 @@ enum ProjectStore {
 
     /// Disk documents are directory packages only. The Data codec above is an
     /// internal snapshot codec and is never an opening compatibility fallback.
-    static func read(from url: URL) throws -> LADProject {
-        try ProjectPackage.read(from: url)
+    static func read(from url: URL, caching: Bool = true) throws -> LADProject {
+        try ProjectPackage.read(from: url, caching: caching)
+    }
+
+    /// The design identity from the package manifest alone.
+    static func projectID(at url: URL) throws -> UUID? {
+        try ProjectPackage.projectID(at: url)
+    }
+
+    static func rename(_ source: URL, to destination: URL) throws {
+        try ProjectPackage.rename(source, to: destination)
+    }
+
+    /// Releases the parsed package history kept for a design's next autosave.
+    static func releaseCache(for url: URL) {
+        ProjectPackage.discardSession(at: url)
     }
 
     /// The root is the authoritative conflict baseline, independent of caches

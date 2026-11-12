@@ -38,8 +38,13 @@ final class CADAgentTools {
     /// A per-call handoff of the exact PNG already returned by an image tool.
     /// It is consumed by the trusted bridge, never added to the tool JSON.
     private var renderedImageData: Data?
+    /// Candidate previews kept per task besides the current design's.
+    static let retainedCandidatePreviews = 4
     private var artifacts: [String: Artifact] = [:]
+    /// Creation order decides which matching construction is newest.
     private var artifactOrder: [String] = []
+    /// Build recency decides which candidates keep their previews.
+    private var previewOrder: [String] = []
     private var inputs: [String: CADInputAsset] = [:]
     private var versionInputSizes: [String: Int] = [:]
     private var versionTasks: [UUID: Task<CADAgentVersionFiles.Prepared, Error>] = [:]
@@ -167,6 +172,17 @@ final class CADAgentTools {
             return preview
         }
         return nil
+    }
+
+    /// Rebuilds a committable candidate whose display cache was evicted, then
+    /// applies the same checks as `validatedCandidate`.
+    func committableCandidate(artifactID: String) async throws -> (model: ModelSpec, preview: PreviewMesh, colorChanges: [CADPartColorChange]) {
+        try checkCancellation()
+        if let artifact = artifacts[artifactID], artifact.versionID == nil,
+           artifact.preview?.brepPath.map({ FileManager.default.fileExists(atPath: $0) }) != true {
+            _ = try await build(artifact.model, id: artifactID)
+        }
+        return try validatedCandidate(artifactID: artifactID)
     }
 
     /// External agents commit a named candidate, never arbitrary source paired
@@ -778,7 +794,12 @@ final class CADAgentTools {
         artifacts[id] = artifact
         if !artifactOrder.contains(id) { artifactOrder.append(id) }
         // Retain recipes for replay while bounding heavyweight display caches.
-        for old in artifactOrder.dropLast(16) where old != "current" { artifacts[old]?.preview = nil }
+        // An evicted candidate rebuilds when inspected or committed, and then
+        // counts as the most recently built one.
+        previewOrder.removeAll { $0 == id }
+        previewOrder.append(id)
+        for old in previewOrder.dropLast(Self.retainedCandidatePreviews) where old != "current" { artifacts[old]?.preview = nil }
+        previewOrder = previewOrder.filter { artifacts[$0]?.preview != nil }
         return artifact
     }
 

@@ -53,7 +53,10 @@ final class CodexService {
     private var validatedMesh: PreviewMesh?
     private(set) var partColorChanges: [CADPartColorChange] = []
 
+    /// Hands the final request's validated geometry to its caller once. The
+    /// service keeps no geometry after that handoff.
     func validatedPreview(for model: ModelSpec) -> PreviewMesh? {
+        defer { validatedMesh = nil }
         guard let built = validatedModel, built.script == model.script, built.units == model.units,
               built.sourceSTEP == model.sourceSTEP, built.inputAssets == model.inputAssets else { return nil }
         return validatedMesh

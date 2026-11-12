@@ -411,7 +411,7 @@ final class CADMeshSession {
 
     private func cacheDisplay(_ preview: PreviewMesh, id: String) {
         display[id] = preview; displayOrder.removeAll { $0 == id }; displayOrder.append(id)
-        while displayOrder.count > 8 { display.removeValue(forKey: displayOrder.removeFirst()) }
+        while displayOrder.count > CADAgentTools.retainedCandidatePreviews { display.removeValue(forKey: displayOrder.removeFirst()) }
     }
     private func containsInlineSource(_ value: Any) -> Bool {
         if let object = value as? [String: Any] {

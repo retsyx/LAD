@@ -15,8 +15,12 @@ enum ProjectPackage {
     static let maximumMetadataRecordBytes = 8_000_000
     static let maximumMetadataBytes = 256_000_000
     static let maximumChunkRecords = 128
+    /// Parsed sessions serve the open designs' next incremental writes. Closed
+    /// designs release theirs; the least recently used entry goes first.
+    static let maximumCachedSessions = 8
     private static let cacheLock = NSLock()
     private static var sessions: [String: Session] = [:]
+    private static var sessionOrder: [String] = []
     private static var packageLocks: [String: PackageLock] = [:]
 
     private final class PackageLock {
@@ -47,9 +51,20 @@ enum ProjectPackage {
         cacheLock.unlock()
     }
 
+    /// Session keys resolve the parent folder, so a package that was just moved
+    /// or removed still maps to the key it was cached under.
+    private static func sessionKey(_ url: URL) -> String {
+        let standardized = url.standardizedFileURL
+        return standardized.deletingLastPathComponent().resolvingSymlinksInPath()
+            .appendingPathComponent(standardized.lastPathComponent).path
+    }
+
     private static func cachedSession(_ key: String) -> Session? {
         cacheLock.lock(); defer { cacheLock.unlock() }
-        return sessions[key]
+        guard let session = sessions[key] else { return nil }
+        sessionOrder.removeAll { $0 == key }
+        sessionOrder.append(key)
+        return session
     }
 
     struct Reference: Codable, Equatable {
@@ -58,6 +73,9 @@ enum ProjectPackage {
     }
 
     struct WriteMetrics {
+        /// The previous commit had to be parsed from disk rather than reused
+        /// from this process's session cache.
+        var reloadedPrevious = false
         var historySnapshots = 0
         var rootEncodings = 0
         var thumbnailValidations = 0
@@ -113,9 +131,50 @@ enum ProjectPackage {
         return try readFile("project.json", in: url, limit: maximumRootBytes)
     }
 
-    static func read(from url: URL) throws -> LADProject {
+    /// Opening a design caches its parsed session for the next autosave.
+    /// Comparisons with other files pass `caching: false`.
+    static func read(from url: URL, caching: Bool = true) throws -> LADProject {
         let lease = acquirePackage(url); defer { releasePackage(lease) }
-        return try load(url).project
+        return try load(url, caching: caching).project
+    }
+
+    /// The identity recorded in the authoritative manifest, without loading
+    /// or caching the design's history.
+    static func projectID(at url: URL) throws -> UUID? {
+        let root = try object(rootData(from: url))
+        guard root["formatVersion"] as? Int == formatVersion else { throw invalid("Unsupported design package format.") }
+        return (root["projectID"] as? String).flatMap(UUID.init(uuidString:))
+    }
+
+    /// Renames a package without replacing an existing file, keeping its
+    /// validated session under the new path.
+    static func rename(_ source: URL, to destination: URL) throws {
+        let lease = acquirePackage(source); defer { releasePackage(lease) }
+        let sourceKey = sessionKey(source)
+        // RENAME_EXCL changes filename case on APFS and makes the move itself
+        // refuse a newly appeared file.
+        guard renamex_np(source.path, destination.path, UInt32(RENAME_EXCL)) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: destination.path])
+        }
+        let destinationKey = sessionKey(destination)
+        cacheLock.lock()
+        let moved = sessions.removeValue(forKey: sourceKey)
+        sessionOrder.removeAll { $0 == sourceKey }
+        cacheLock.unlock()
+        guard var session = moved else { return }
+        session.project.fileOrigin = ProjectFileOrigin(url: destination, data: session.rootData)
+        remember(session, key: destinationKey)
+    }
+
+    /// Releases a design's parsed history once no open window or writer needs
+    /// it. A later write reloads the package from disk.
+    static func discardSession(at url: URL) {
+        let key = sessionKey(url)
+        cacheLock.lock()
+        let discarded = sessions.removeValue(forKey: key)
+        sessionOrder.removeAll { $0 == key }
+        cacheLock.unlock()
+        withExtendedLifetime(discarded) {}
     }
 
     /// beforePublication is a fault-injection point: throwing must leave the
@@ -128,7 +187,7 @@ enum ProjectPackage {
         var metrics = WriteMetrics()
         var phaseStart = ProcessInfo.processInfo.systemUptime
         defer { didFinish?(metrics) }
-        let key = lease.key
+        let key = sessionKey(url)
         let manager = FileManager.default
         let exists = manager.fileExists(atPath: url.path)
         if !exists { try manager.createDirectory(at: url, withIntermediateDirectories: false) }
@@ -138,7 +197,7 @@ enum ProjectPackage {
         if manager.fileExists(atPath: rootURL.path) {
             let data = try readFile("project.json", in: url, limit: maximumRootBytes)
             if let cached = cachedSession(key), cached.rootData == data { previous = cached }
-            else { previous = try load(url) }
+            else { previous = try load(url, caching: false); metrics.reloadedPrevious = true }
             guard previous?.project.projectID == project.projectID else {
                 throw invalid("The destination belongs to a different design.")
             }
@@ -458,12 +517,13 @@ enum ProjectPackage {
         cacheLock.lock()
         let discarded = sessions
         sessions = [:]
+        sessionOrder = []
         cacheLock.unlock()
         // Releasing a large parsed history is not shared-cache bookkeeping.
         withExtendedLifetime(discarded) {}
     }
 
-    private static func load(_ url: URL) throws -> Session {
+    private static func load(_ url: URL, caching: Bool) throws -> Session {
         try requirePackage(url)
         let data = try readFile("project.json", in: url, limit: maximumRootBytes)
         let root = try object(data)
@@ -583,7 +643,7 @@ enum ProjectPackage {
                               rootData: data, inlineData: try json(inlineMetadata(root)),
                               sectionData: try json(sectionReferences(root)),
                               files: files, verifiedAttachments: verified, dependencies: dependencies)
-        remember(session, key: url.standardizedFileURL.resolvingSymlinksInPath().path)
+        if caching { remember(session, key: sessionKey(url)) }
         return session
     }
 
@@ -997,11 +1057,16 @@ enum ProjectPackage {
     }
 
     private static func remember(_ session: Session, key: String) {
-        var evicted: Session?
+        var evicted = [Session]()
         cacheLock.lock()
-        if sessions[key] == nil, sessions.count >= 8 { evicted = sessions.removeValue(forKey: sessions.keys.sorted().first!) }
         let replaced = sessions.updateValue(session, forKey: key)
+        sessionOrder.removeAll { $0 == key }
+        sessionOrder.append(key)
+        while sessionOrder.count > maximumCachedSessions {
+            if let oldest = sessions.removeValue(forKey: sessionOrder.removeFirst()) { evicted.append(oldest) }
+        }
         cacheLock.unlock()
+        // Releasing a large parsed history is not shared-cache bookkeeping.
         withExtendedLifetime((evicted, replaced)) {}
     }
 

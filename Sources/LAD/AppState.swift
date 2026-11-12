@@ -172,8 +172,16 @@ final class AppState: ObservableObject {
     private var projectSavingEnabled = false
     private var pendingProjectRename = false
     private var builtRevisionID: UUID? {
-        didSet { if builtRevisionID != oldValue { scheduleProjectThumbnail() } }
+        didSet {
+            if builtRevisionID != oldValue { scheduleProjectThumbnail() }
+            if let builtRevisionID { retainRecentRevisionPreviews(including: builtRevisionID) }
+        }
     }
+    /// Recently displayed revisions keep their session previews for fast
+    /// history navigation. Older ones rebuild from their saved program when
+    /// shown again; previews are never part of the saved design.
+    static let retainedRevisionPreviews = 4
+    private var recentPreviewRevisionIDs: [UUID] = []
     private var projectSessionID = UUID()
     private var projectID = UUID()
     private var autosavedProjectURL: URL?
@@ -493,6 +501,7 @@ final class AppState: ObservableObject {
         await waitForQueuedSources()
         do { try await flushProject() }
         catch { saveStatus = "Not saved: \(error.localizedDescription)" }
+        await autosaveStore.releaseCachedProjects()
     }
 
     func flushForReplacement() async throws {
@@ -508,6 +517,7 @@ final class AppState: ObservableObject {
             messages.append(ChatMessage(role: "system", content: "Generation canceled. The last validated design is still available."))
         }
         try await flushProject()
+        await autosaveStore.releaseCachedProjects()
     }
 
     private func flushProject() async throws {
@@ -599,7 +609,7 @@ final class AppState: ObservableObject {
         projectionMode = .perspective
         displayMode = .edges
         codexSettings = normalizedCodexSettings(CodexProjectSettings(vendor: AgentVendorPreference.defaultVendor))
-        messages = []; revisions = []; selectedRevisionID = nil
+        messages = []; revisions = []; selectedRevisionID = nil; recentPreviewRevisionIDs = []
         projectActivity.restore()
         resetQueueWork()
         queuedRequests = []; queuePaused = false
@@ -2196,7 +2206,7 @@ final class AppState: ObservableObject {
         projectionMode = project.projectionMode ?? .perspective
         displayMode = project.displayMode ?? .edges
         codexSettings = normalizedCodexSettings(project.codexSettings ?? CodexProjectSettings())
-        messages = project.messages; revisions = project.revisions
+        messages = project.messages; revisions = project.revisions; recentPreviewRevisionIDs = []
         selectedRevisionID = project.selectedRevisionID ?? revisions.last?.id
         mesh = nil; builtRevisionID = nil
         queuedRequests = project.queuedRequests ?? []
@@ -2362,6 +2372,23 @@ final class AppState: ObservableObject {
             }
         }
         return true
+    }
+
+    private func retainRecentRevisionPreviews(including id: UUID) {
+        recentPreviewRevisionIDs.removeAll { $0 == id }
+        recentPreviewRevisionIDs.append(id)
+        let overflow = recentPreviewRevisionIDs.count - Self.retainedRevisionPreviews
+        guard overflow > 0 else { return }
+        let evicted = Set(recentPreviewRevisionIDs.prefix(overflow))
+        recentPreviewRevisionIDs.removeFirst(overflow)
+        guard revisions.contains(where: { $0.preview != nil && evicted.contains($0.id) }) else { return }
+        // One assignment publishes the eviction. Releasing the last copy of a
+        // preview also releases its build folder.
+        var updated = revisions
+        for index in updated.indices where updated[index].preview != nil && evicted.contains(updated[index].id) {
+            updated[index].preview = nil
+        }
+        revisions = updated
     }
 
     private func cacheReplayedPreview(_ generated: PreviewMesh, at index: Int) throws {

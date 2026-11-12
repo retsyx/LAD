@@ -559,7 +559,7 @@ final class EngineService {
     }
 
     private func readPreview(_ output: RunResult, deferSTEP: Bool) async throws -> PreviewMesh {
-        let folder = output.folder
+        let folder = output.folder, artifacts = output.artifacts
         let resultURL = folder.appendingPathComponent("result.json")
         let decoding = Task.detached(priority: .userInitiated) {
             let data = try EngineArtifact.read(resultURL, in: folder, maximumBytes: 256_000_000)
@@ -599,6 +599,7 @@ final class EngineService {
                                                          headerBytes: 512, footerBytes: 512)
                 try Self.validateSTEP(size: step.size, header: step.header, footer: step.footer)
             }
+            artifacts.discardAll(except: ["model.brep", "model.step"])
             return result
         }
         var mesh = try await withTaskCancellationHandler { try await decoding.value }

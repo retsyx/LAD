@@ -153,10 +153,12 @@ final class ProjectAgentSession {
         return (bytes, file.name)
     }
 
-    func candidate(artifactID: String) throws -> ProjectAgentCandidate {
+    func candidate(artifactID: String) async throws -> ProjectAgentCandidate {
         try checkAvailable()
         guard !isBusy else { throw LADError.message("Wait for this task's running CAD operation before committing.") }
-        let value = try tools.validatedCandidate(artifactID: artifactID)
+        isBusy = true
+        defer { isBusy = false }
+        let value = try await tools.committableCandidate(artifactID: artifactID)
         return ProjectAgentCandidate(model: value.model, preview: value.preview, colorChanges: value.colorChanges)
     }
 

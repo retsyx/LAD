@@ -489,7 +489,7 @@ final class ExternalAgentServer: ObservableObject {
                 state.recordTaskEvent(ProjectActivityEvent(id: eventID, date: started, category: "tool", title: name,
                     status: "running", input: CADAgentBridge.json(arguments)), taskID: id)
                 do {
-                    let candidate = try task.session.candidate(artifactID: artifactID)
+                    let candidate = try await task.session.candidate(artifactID: artifactID)
                     revisionID = try state.commitExternalAgent(candidate, taskID: id, artifactID: artifactID,
                         expectedStateToken: expected, key: key, snapshot: task.snapshot)
                     state.recordTaskEvent(ProjectActivityEvent(id: eventID, date: started, category: "tool", title: name,

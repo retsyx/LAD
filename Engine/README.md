@@ -45,8 +45,10 @@ part's volume, surface area, analytic bounds and centroid before a preview is
 accepted. The imported verification geometry never replaces the native build.
 With `--defer-step`, builds remove the verification STEP and write `result.json`
 and a private session `model.brep`, with no retained STEP file. The native BREP excludes triangulations and
-normals; it is temporary worker IPC, never a project asset. The app retains
-display data in memory when revisiting revisions. An export request containing
+normals; it is temporary worker IPC, never a project asset. Once the app has
+decoded a build, it deletes everything in the scratch folder except `model.brep`
+(and `model.step` when present). It keeps display data in memory for the few most
+recently displayed revisions; older ones replay their program when shown again. An export request containing
 `{"operation":"export","brepAsset":"source.brep"}` converts a privately staged
 native solid to STEP without rerunning the model or tessellating it again.
 Repeated app exports reuse the exact STEP bytes in memory.

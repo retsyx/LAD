@@ -59,6 +59,17 @@ final class EngineBuildArtifacts: @unchecked Sendable {
         return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
+    /// Once a build's results are decoded, its request, staged inputs, logs,
+    /// worker scratch files and result JSON are never read again. Only the
+    /// named native outputs stay for export and measurement.
+    func discardAll(except retained: Set<String>) {
+        let manager = FileManager.default
+        guard let names = try? manager.contentsOfDirectory(atPath: folder.path) else { return }
+        for name in names where name != Self.leaseName && !retained.contains(name) {
+            try? manager.removeItem(at: folder.appendingPathComponent(name))
+        }
+    }
+
     deinit {
         let folder = folder
         try? lease.close()

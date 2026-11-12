@@ -28,7 +28,10 @@ final class ProjectAgentSessionTests: XCTestCase {
         first.cancel()
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
         XCTAssertThrowsError(try first.download(fileID: identity))
-        XCTAssertThrowsError(try first.candidate(artifactID: "current"))
+        do {
+            _ = try await first.candidate(artifactID: "current")
+            XCTFail("A canceled task must not provide a commit candidate.")
+        } catch {}
     }
 
     @MainActor
@@ -51,8 +54,9 @@ final class ProjectAgentSessionTests: XCTestCase {
         let metadataID = try XCTUnwrap(values["metadataPath"] as? String)
         let bytes = try task.download(fileID: metadataID).data
         XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains(task.workspaceURL.path))
-        XCTAssertEqual(try task.candidate(artifactID: "current").model, model)
-        XCTAssertEqual(try task.candidate(artifactID: "current").preview.brepPath, native.path)
+        let currentCandidate = try await task.candidate(artifactID: "current")
+        XCTAssertEqual(currentCandidate.model, model)
+        XCTAssertEqual(currentCandidate.preview.brepPath, native.path)
         do {
             _ = try await task.call(name: "lad_import", arguments: ["path": programID])
             XCTFail("Generated task files cannot be imported as original references.")
@@ -106,12 +110,35 @@ final class ProjectAgentSessionTests: XCTestCase {
                 ["partID": "body", "color": ["red": color.red, "green": color.green, "blue": color.blue]]
             ]])
         }
-        XCTAssertEqual(try task.candidate(artifactID: firstID).colorChanges, [CADPartColorChange(partID: "body", color: red)])
-        XCTAssertEqual(try task.candidate(artifactID: secondID).colorChanges, [CADPartColorChange(partID: "body", color: blue)])
-        XCTAssertEqual(try task.candidate(artifactID: "current").colorChanges, [CADPartColorChange(partID: "body", color: green)])
-        XCTAssertEqual(try task.candidate(artifactID: firstID).preview.brepPath,
-                       try task.candidate(artifactID: secondID).preview.brepPath,
+        let firstCandidate = try await task.candidate(artifactID: firstID)
+        let secondCandidate = try await task.candidate(artifactID: secondID)
+        let currentCandidate = try await task.candidate(artifactID: "current")
+        XCTAssertEqual(firstCandidate.colorChanges, [CADPartColorChange(partID: "body", color: red)])
+        XCTAssertEqual(secondCandidate.colorChanges, [CADPartColorChange(partID: "body", color: blue)])
+        XCTAssertEqual(currentCandidate.colorChanges, [CADPartColorChange(partID: "body", color: green)])
+        XCTAssertEqual(firstCandidate.preview.brepPath, secondCandidate.preview.brepPath,
                        "The regression must cover distinct reviewed colors on reused native geometry.")
+    }
+
+    @MainActor
+    func testEvictedCandidatePreviewRebuildsWhenCommitted() async throws {
+        guard ProcessInfo.processInfo.environment["LAD_RUN_ENGINE_TESTS"] == "1" else {
+            throw XCTSkip("Set LAD_RUN_ENGINE_TESTS=1 for the native external CAD task workflow.")
+        }
+        let task = try ProjectAgentSession(python: ProcessInfo.processInfo.environment["LAD_CAD_PYTHON"] ?? EngineService.defaultPython,
+            threads: 2, current: nil, currentPreview: nil, versions: .empty)
+        defer { task.cancel() }
+        var artifactIDs = [String]()
+        for size in 1...(CADAgentTools.retainedCandidatePreviews + 1) {
+            let source = Data("result = cq.Solid.makeBox(\(size), 1, 1)\n".utf8)
+            let uploaded = try await task.uploadFile(data: source, name: "box\(size).py")
+            let fileID = try XCTUnwrap(uploaded["fileID"] as? String)
+            let built = try metadata(try await task.call(name: "lad_build", arguments: ["programID": fileID, "title": "Box \(size)"]))
+            artifactIDs.append(try XCTUnwrap(built["artifactID"] as? String))
+        }
+        let candidate = try await task.candidate(artifactID: artifactIDs[0])
+        XCTAssertEqual(candidate.preview.volume, 1, accuracy: 1e-8)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(candidate.preview.brepPath)))
     }
 
     @MainActor
@@ -130,12 +157,15 @@ final class ProjectAgentSessionTests: XCTestCase {
         let fileID = try XCTUnwrap(uploaded["fileID"] as? String)
         let built = try metadata(try await task.call(name: "lad_build", arguments: ["programID": fileID, "title": "External box"]))
         let artifactID = try XCTUnwrap(built["artifactID"] as? String)
-        let candidate = try task.candidate(artifactID: artifactID)
+        let candidate = try await task.candidate(artifactID: artifactID)
         XCTAssertEqual(candidate.model.script, String(decoding: source, as: UTF8.self))
         XCTAssertEqual(candidate.preview.volume, 24, accuracy: 1e-8)
         let replay = try metadata(try await task.call(name: "lad_build", arguments: ["programID": fileID, "versionID": historical.id.uuidString]))
         let historicalArtifactID = try XCTUnwrap(replay["artifactID"] as? String)
-        XCTAssertThrowsError(try task.candidate(artifactID: historicalArtifactID)) { error in
+        do {
+            _ = try await task.candidate(artifactID: historicalArtifactID)
+            XCTFail("A historical build must not be committable.")
+        } catch {
             XCTAssertTrue(error.localizedDescription.contains("without versionID"))
         }
         let export = try metadata(try await task.call(name: "lad_export_step", arguments: ["artifactID": artifactID]))
