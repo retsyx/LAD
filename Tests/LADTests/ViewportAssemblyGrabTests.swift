@@ -264,7 +264,7 @@ final class ViewportAssemblyGrabTests: XCTestCase {
         defer { view.delegate = nil; window.orderOut(nil); window.contentView = nil; window.close() }
         view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
                     selectedSolids: state.selectedSolids, hiddenSolids: [], solidTransforms: state.assemblyPose?.solidTransforms ?? [:])
-        let subscription = state.$assemblyPose.dropFirst().sink { [weak state, weak view] pose in
+        let subscription = ObservationRecorder({ state.assemblyPose }) { [weak state, weak view] pose in
             guard let state, let view else { return }
             view.update(mesh: state.mesh, mode: .edges, grid: false, command: nil,
                         selectedSolids: state.selectedSolids, hiddenSolids: state.hiddenSolids,

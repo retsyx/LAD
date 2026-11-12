@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import Foundation
 import XCTest
 @testable import LAD
@@ -32,10 +31,14 @@ final class AppStateSaveConflictTests: XCTestCase {
         }
         defer { release.signal() }
         await fulfillment(of: [held], timeout: 2)
-        let saving = expectation(description: "Resolution captured its snapshot")
-        let observation = state.$saveStatus.filter { $0 == "Saving…" }.prefix(1).sink { _ in saving.fulfill() }
+        let savesBeforeResolution = state.startedSaves
         let resolving = Task { try await state.resolveSaveConflict(.overwrite) }
-        await fulfillment(of: [saving], timeout: 2)
+        // Resolution starts its save once it has captured its snapshot.
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while state.startedSaves == savesBeforeResolution, ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertGreaterThan(state.startedSaves, savesBeforeResolution, "Resolution captured its snapshot")
         state.showGrid = false // A direct autosave request while the writer is waiting.
         release.signal()
         try await resolving.value
@@ -47,7 +50,6 @@ final class AppStateSaveConflictTests: XCTestCase {
         XCTAssertEqual(try ProjectStore.read(from: url).showGrid, false)
         XCTAssertFalse(state.hasUnsavedChanges)
         XCTAssertNil(state.saveConflict)
-        withExtendedLifetime(observation) {}
     }
 
     @MainActor

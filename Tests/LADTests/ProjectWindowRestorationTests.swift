@@ -42,7 +42,10 @@ final class ProjectWindowRestorationTests: XCTestCase {
         let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { _ in XCTFail("The restored document must save to its existing local folder"); return false })
         let firstID = UUID(), secondID = UUID()
         let loaded = expectation(description: "Initial read completed")
-        let observation = state.$messages.filter { $0 == [message] }.prefix(1).sink { _ in loaded.fulfill() }
+        var didLoad = false
+        let observation = ObservationRecorder({ state.messages }) { messages in
+            if messages == [message], !didLoad { didLoad = true; loaded.fulfill() }
+        }
 
         XCTAssertTrue(coordinator.register(first, id: firstID, sourceURL: source))
         first.state.start(restoringRecent: false, opening: source)
@@ -102,7 +105,10 @@ final class ProjectWindowRestorationTests: XCTestCase {
         let source = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-missing-restoration-\(UUID()).lad")
         let first = ProjectWindowSession(), retry = ProjectWindowSession()
         let failed = expectation(description: "Initial read failed")
-        let observation = first.state.$error.compactMap { $0 }.prefix(1).sink { _ in failed.fulfill() }
+        var didFail = false
+        let observation = ObservationRecorder({ first.state.error }) { error in
+            if error != nil, !didFail { didFail = true; failed.fulfill() }
+        }
         XCTAssertTrue(coordinator.register(first, id: UUID(), sourceURL: source))
         first.state.start(restoringRecent: false, opening: source)
         await fulfillment(of: [failed], timeout: 2)

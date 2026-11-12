@@ -16,7 +16,7 @@ final class AppStateThumbnailDependencyTests: XCTestCase {
         XCTAssertEqual(try ProjectStore.read(from: fixture.url).thumbnailData, fixture.probe.firstPNG)
         let work = state.projectThumbnailWork
         var publishedURLs = [URL?]()
-        let observation = state.$projectURL.dropFirst().sink { publishedURLs.append($0) }
+        let observation = ObservationRecorder({ state.projectURL }) { publishedURLs.append($0) }
 
         state.prompt = "A draft"
         state.showGrid.toggle()

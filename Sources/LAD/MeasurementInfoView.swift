@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct MeasurementInfoView: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     var contentPadding: CGFloat = 15
 
     private var metrics: [CADMeasurementMetric] { state.measurementReport?.metrics ?? [] }

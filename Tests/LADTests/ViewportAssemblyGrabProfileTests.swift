@@ -70,7 +70,7 @@ final class ViewportAssemblyGrabProfileTests: XCTestCase {
         view.delegate = counter
         let geometry = node.geometry
         let camera = try XCTUnwrap(view.pointOfView).simdTransform
-        let subscription = state.$assemblyPose.dropFirst().sink { [weak state, weak view] pose in
+        let subscription = ObservationRecorder({ state.assemblyPose }) { [weak state, weak view] pose in
             guard let state, let view else { return }
             view.update(mesh: state.mesh, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [],
                         solidTransforms: pose?.solidTransforms ?? [:])

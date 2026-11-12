@@ -3,17 +3,20 @@ import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Observation tracks each property separately, so a view re-renders only
+/// when the state it actually reads changes.
 @MainActor
-final class AppState: ObservableObject {
-    @Published var messages: [ChatMessage] = []
+@Observable
+final class AppState {
+    var messages: [ChatMessage] = []
     let projectActivity = ProjectActivityStore()
     var taskAudits: [ProjectTaskAudit] { projectActivity.tasks }
     var activityImages: ProjectActivityImages { projectActivity.images }
-    weak var viewportView: CADSceneView?
-    @Published var revisions: [ProjectRevision] = [] {
+    @ObservationIgnored weak var viewportView: CADSceneView?
+    var revisions: [ProjectRevision] = [] {
         didSet { agentStateGeneration &+= 1; projectThumbnailRevisionsChanged(from: oldValue) }
     }
-    @Published var selectedRevisionID: UUID? {
+    var selectedRevisionID: UUID? {
         didSet {
             if selectedRevisionID != oldValue {
                 cancelAssemblyGrab()
@@ -21,7 +24,7 @@ final class AppState: ObservableObject {
             }
         }
     }
-    @Published var mesh: PreviewMesh? {
+    var mesh: PreviewMesh? {
         didSet {
             projectThumbnailMeshModel = mesh == nil ? nil : current
             loadAssemblyPose()
@@ -32,40 +35,40 @@ final class AppState: ObservableObject {
             scheduleProjectThumbnail()
         }
     }
-    @Published var prompt = "" {
+    var prompt = "" {
         didSet { if prompt != oldValue { scheduleDebouncedAutosave() } }
     }
-    @Published private(set) var queuedRequests: [ProjectQueuedRequest] = []
-    @Published private(set) var queuePaused = false
-    @Published private(set) var isSendingQueuedRequestID: UUID?
-    @Published private(set) var editingQueuedRequestID: UUID?
-    @Published private(set) var isReadingQueuedAttachments = false
-    @Published private(set) var isReadingDraftAttachments = false
-    @Published private(set) var preparingQueuedRequestIDs: Set<UUID> = []
-    @Published private(set) var canSteerQueuedRequests = false
-    @Published private(set) var queuedRequestErrors: [UUID: String] = [:]
-    @Published private(set) var queuePauseReason: String?
-    @Published var isWorking = false {
+    private(set) var queuedRequests: [ProjectQueuedRequest] = []
+    private(set) var queuePaused = false
+    private(set) var isSendingQueuedRequestID: UUID?
+    private(set) var editingQueuedRequestID: UUID?
+    private(set) var isReadingQueuedAttachments = false
+    private(set) var isReadingDraftAttachments = false
+    private(set) var preparingQueuedRequestIDs: Set<UUID> = []
+    private(set) var canSteerQueuedRequests = false
+    private(set) var queuedRequestErrors: [UUID: String] = [:]
+    private(set) var queuePauseReason: String?
+    var isWorking = false {
         didSet {
             if isWorking && !oldValue { cancelAssemblyGrab() }
             if oldValue && !isWorking { scheduleQueueAfterBusyOperation() }
         }
     }
-    @Published var activity = "Ready"
-    @Published private(set) var runningCodexSelection: String?
-    @Published private(set) var codexSettings = CodexProjectSettings()
-    @Published private(set) var projectName: String? {
+    var activity = "Ready"
+    private(set) var runningCodexSelection: String?
+    private(set) var codexSettings = CodexProjectSettings()
+    private(set) var projectName: String? {
         didSet { if projectName != oldValue { agentStateGeneration &+= 1 } }
     }
-    @Published private(set) var recentPartColors: [PartColor] = []
-    @Published private(set) var partsPaneFraction = 0.75
-    @Published var error: String?
-    @Published var displayMode: ViewportDisplayMode = .edges {
+    private(set) var recentPartColors: [PartColor] = []
+    private(set) var partsPaneFraction = 0.75
+    var error: String?
+    var displayMode: ViewportDisplayMode = .edges {
         didSet {
             if displayMode != oldValue { scheduleProjectThumbnail(); autosave() }
         }
     }
-    @Published var projectionMode: ViewportProjectionMode = .perspective {
+    var projectionMode: ViewportProjectionMode = .perspective {
         didSet {
             if projectionMode != oldValue {
                 if isGrabbingAssembly { cancelAssemblyGrab() }
@@ -73,30 +76,43 @@ final class AppState: ObservableObject {
             }
         }
     }
-    @Published var showGrid = true {
+    var showGrid = true {
         didSet {
             if showGrid != oldValue { autosave() }
         }
     }
-    @Published var viewportCommand: ViewportCommand? {
+    var viewportCommand: ViewportCommand? {
         didSet { if viewportCommand != oldValue && isGrabbingAssembly { cancelAssemblyGrab() } }
     }
-    @Published var projectURL: URL?
-    @Published var saveStatus: String?
-    @Published private(set) var saveConflict: ProjectSaveConflict?
-    @Published private(set) var hasUnsavedChanges = false
-    @Published var notice: String?
-    @Published var selectedSolids: Set<Int> = [] {
+    var projectURL: URL?
+    var saveStatus: String? {
+        didSet { if saveStatus == "Saving…" { startedSaves += 1 } }
+    }
+    /// Saves started this session, including repeated requests while a write
+    /// is pending. Regression tests compare it, like `projectThumbnailWork`.
+    @ObservationIgnored private(set) var startedSaves = 0
+    private(set) var saveConflict: ProjectSaveConflict?
+    private(set) var hasUnsavedChanges = false
+    var notice: String?
+    var selectedSolids: Set<Int> = [] {
         didSet { if selectedSolids != oldValue { refreshMeasurements() } }
     }
-    @Published private(set) var selectedFeatures: [CADFeatureID] = [] {
-        didSet { if selectedFeatures != oldValue { refreshMeasurements() } }
+    private(set) var selectedFeatures: [CADFeatureID] = [] {
+        didSet {
+            guard selectedFeatures != oldValue else { return }
+            let solids = Set(selectedFeatures.map(\.solidIndex))
+            if solids != featureSelectedSolids { featureSelectedSolids = solids }
+            refreshMeasurements()
+        }
     }
-    @Published private(set) var measurementReport: CADMeasurementReport?
-    @Published private(set) var assemblyPose: AssemblyPose?
-    @Published private(set) var isSolvingAssembly = false
-    @Published private(set) var assemblyMotionError: String?
-    @Published private(set) var isGrabbingAssembly = false
+    /// Solids owning the selected features. Kept with the selection so each
+    /// parts-tree row does not rebuild it.
+    private(set) var featureSelectedSolids: Set<Int> = []
+    private(set) var measurementReport: CADMeasurementReport?
+    private(set) var assemblyPose: AssemblyPose?
+    private(set) var isSolvingAssembly = false
+    private(set) var assemblyMotionError: String?
+    private(set) var isGrabbingAssembly = false
     private var assemblyMotionTask: Task<Void, Never>?
     private var assemblyMotionToken = UUID()
     private var requestedJointPositions: [String: Double] = [:]
@@ -120,10 +136,10 @@ final class AppState: ObservableObject {
     private var assemblyGrabSession: AssemblyGrabSession?
     private var assemblyGrabTask: Task<Void, Never>?
     private let assemblyGrabSolver: @Sendable (AssemblyGrabContext, [String: Double], [Double]) async throws -> AssemblyPose
-    @Published private(set) var measurementError: String?
-    @Published private(set) var isMeasuring = false
-    @Published var selectedPartNodeIDs: Set<String> = []
-    @Published var hiddenSolids: Set<Int> = [] {
+    private(set) var measurementError: String?
+    private(set) var isMeasuring = false
+    var selectedPartNodeIDs: Set<String> = []
+    var hiddenSolids: Set<Int> = [] {
         didSet {
             if hiddenSolids != oldValue {
                 if let grabbed = assemblyGrabSession?.solidIndex, hiddenSolids.contains(grabbed) { cancelAssemblyGrab() }
@@ -131,7 +147,7 @@ final class AppState: ObservableObject {
             }
         }
     }
-    @Published var pendingAttachments: [SourceAttachment] = [] {
+    var pendingAttachments: [SourceAttachment] = [] {
         didSet { if pendingAttachments != oldValue { scheduleDebouncedAutosave() } }
     }
     var onOpenProject: ((URL) -> Void)?
@@ -145,7 +161,7 @@ final class AppState: ObservableObject {
         isWorking || isSendingQueuedRequestID != nil || (!queuedRequests.isEmpty && !awaitingResponse)
     }
     private let codex = CodexService()
-    private var agentPreferenceSubscription: AnyCancellable?
+    @ObservationIgnored private var agentPreferenceSubscription: AnyCancellable?
     private let engine = EngineService()
     private var operation: Task<Void, Never>?
     private var operationID = UUID()
@@ -311,7 +327,6 @@ final class AppState: ObservableObject {
     var canManipulateAssembly: Bool {
         !isWorking && builtRevisionID == selectedRevisionID && mesh?.assemblyMotion != nil
     }
-    var featureSelectedSolids: Set<Int> { Set(selectedFeatures.map(\.solidIndex)) }
 
     func setPartsPaneFraction(_ fraction: Double) {
         guard fraction.isFinite, (0...1).contains(fraction), fraction != partsPaneFraction else { return }
@@ -958,7 +973,9 @@ final class AppState: ObservableObject {
         // Invalidate older in-flight writes immediately, and coalesce typing
         // or divider dragging before serializing the complete project.
         autosaveSequence += 1
-        hasUnsavedChanges = true
+        // Observation notifies on every assignment. Typing must not invalidate
+        // views that show the unchanged dirty state.
+        if !hasUnsavedChanges { hasUnsavedChanges = true }
         autosaveDebounceTask?.cancel()
         let session = projectSessionID
         autosaveDebounceTask = Task { [weak self] in
@@ -1377,6 +1394,8 @@ final class AppState: ObservableObject {
     private var selectedPartLayout: PartLayout {
         revisions.first(where: { $0.id == selectedRevisionID })?.partLayout ?? PartLayout(nodes: partTree)
     }
+
+    var collapsedPartFolderIDs: Set<String> { Set(selectedPartLayout.collapsedNodeIDs) }
 
     private var hiddenPartIDs: Set<String> {
         Set(partTree.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: hiddenSolids) }.map(\.id))

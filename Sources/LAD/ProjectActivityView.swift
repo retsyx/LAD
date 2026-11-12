@@ -145,7 +145,7 @@ private final class ProjectActivityPanel: NSPanel {
 }
 
 struct ProjectActivityView: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     @ObservedObject private var activity: ProjectActivityStore
     var onClose: () -> Void
     @State private var expandedTasks = Set<UUID>()

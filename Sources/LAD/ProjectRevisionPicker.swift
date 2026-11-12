@@ -3,7 +3,7 @@ import SwiftUI
 /// A popover keeps version names editable without turning a rename into a
 /// history selection, as a native menu action would do.
 struct ProjectRevisionPicker: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     @State private var isPresented = false
 
     private var currentName: String {
@@ -41,7 +41,7 @@ struct ProjectRevisionPicker: View {
 /// Its edit state is local to the open list; dismissal always discards an
 /// unfinished name.
 struct ProjectRevisionPickerList: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     let onSelect: (UUID) -> Void
     let onDismiss: () -> Void
     @State private var editingRevisionID: UUID?

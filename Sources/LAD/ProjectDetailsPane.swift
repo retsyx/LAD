@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct ProjectDetailsPane: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     let project: ModelSpec?
     @Binding var isProgramExpanded: Bool
     @State private var infoHeight: CGFloat = 160

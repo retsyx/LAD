@@ -103,7 +103,7 @@ struct LADSettingsView: View {
 /// composer. The agent limits the models; a model limits the reasoning levels.
 @MainActor
 struct CodexModelMenu: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     // Executables remain application preferences. Observe changes here so the
     // catalogs refresh even when the active project has not changed.
     @AppStorage(CodexExecutable.preferenceKey) private var codexPath = ""

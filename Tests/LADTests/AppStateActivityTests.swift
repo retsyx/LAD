@@ -16,16 +16,20 @@ final class AppStateActivityTests: XCTestCase {
         // Beginning the task already marks the design dirty. Tool updates must
         // not repeatedly publish that unchanged state to the entire workspace.
         XCTAssertTrue(state.hasUnsavedChanges)
-        var workspaceUpdates = 0, activityUpdates = 0
-        let workspace = state.objectWillChange.sink { workspaceUpdates += 1 }
+        var workspaceChanged = false, activityUpdates = 0
+        // The design state the workspace panes display.
+        withObservationTracking {
+            _ = (state.messages, state.revisions, state.mesh?.stepPath, state.hasUnsavedChanges, state.saveStatus,
+                 state.activity, state.isWorking, state.prompt, state.selectedSolids, state.hiddenSolids, state.error)
+        } onChange: { workspaceChanged = true }
         let activity = state.projectActivity.objectWillChange.sink { activityUpdates += 1 }
         for index in 0..<32 {
             state.recordTaskEvent(event("call-\(index)", status: "completed"), taskID: taskID)
         }
-        XCTAssertEqual(workspaceUpdates, 0, "A hidden Tool Activity pane must not invalidate the viewport for every event.")
+        XCTAssertFalse(workspaceChanged, "A hidden Tool Activity pane must not invalidate the viewport for every event.")
         XCTAssertEqual(activityUpdates, 32, "The visible activity pane must still receive current results.")
         XCTAssertEqual(state.taskAudits.first?.events.count, 32)
-        withExtendedLifetime((workspace, activity)) {}
+        withExtendedLifetime(activity) {}
 
         state.finishExternalAgentAudit(id: taskID, status: "completed")
         await state.prepareToQuit()

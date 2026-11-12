@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 /// Pending follow-ups remain next to the composer, separate from sent history.
 /// No space is reserved for this view when the queue is empty.
 struct ProjectRequestQueueView: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     @State private var contentHeight: CGFloat = 48
 
     var body: some View {
@@ -54,7 +54,7 @@ private struct ProjectQueueHeightKey: PreferenceKey {
 }
 
 private struct ProjectQueuedRequestCard: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     let request: ProjectQueuedRequest
     let nextID: UUID?
     let isNext: Bool

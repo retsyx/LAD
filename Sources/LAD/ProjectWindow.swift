@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 struct ProjectWindowRequest: Hashable, Codable {
@@ -21,29 +20,21 @@ struct ProjectWindowRequest: Hashable, Codable {
 
 /// A window can change documents while SwiftUI keeps the same window identity.
 /// Several windows may display one document, sharing its worker and autosave writer.
+/// Views observe the document's own properties; the session publishes only
+/// replacement of the document or its source.
 @MainActor
 final class ProjectWindowSession: ObservableObject {
-    @Published var state: AppState {
-        didSet { observeState() }
-    }
+    @Published var state: AppState
     @Published var sourceURL: URL?
-    private var stateObservation: AnyCancellable?
 
     init(state: AppState? = nil) {
         self.state = state ?? AppState()
-        observeState()
     }
 
     fileprivate var canReceiveInitialProject: Bool {
         state.projectURL == nil && state.projectName == nil && state.revisions.isEmpty && state.messages.isEmpty &&
             state.prompt.isEmpty && state.pendingAttachments.isEmpty && state.queuedRequests.isEmpty &&
             !state.isReadingPromptAttachments && !state.hasUnsavedChanges && !state.canSaveProject
-    }
-
-    private func observeState() {
-        stateObservation = state.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }
     }
 }
 
@@ -659,7 +650,7 @@ final class ProjectWindowCoordinator: ObservableObject {
 
 struct ProjectWindowBridge: NSViewRepresentable {
     let id: UUID
-    @ObservedObject var state: AppState
+    let state: AppState
     let coordinator: ProjectWindowCoordinator
 
     func makeNSView(context: Context) -> ProjectWindowAnchor {

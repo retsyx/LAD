@@ -4,7 +4,7 @@ import SwiftUI
 /// AppKit owns the divider and pane frames. SwiftUI content never participates
 /// in native window sizing or chooses a different split when its content changes.
 struct ProjectSidebarSplitView: NSViewRepresentable {
-    @ObservedObject var state: AppState
+    let state: AppState
     @Binding var isProgramExpanded: Bool
 
     func makeNSView(context: Context) -> ProjectSidebarNativeSplitView {

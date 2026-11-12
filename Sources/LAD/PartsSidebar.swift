@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct PartsSidebar: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     @State private var folderParentID: String?
     @State private var editedName = ""
     @State private var showingNameEditor = false
@@ -38,8 +38,9 @@ struct PartsSidebar: View {
                 // height estimates for these subtrees change during selection
                 // updates and move the scroll position.
                 VStack(alignment: .leading, spacing: 3) {
+                    let collapsed = state.collapsedPartFolderIDs
                     ForEach(state.partTree) { node in
-                        PartTreeItem(node: node, state: state, renamingNodeID: $renamingNodeID,
+                        PartTreeItem(node: node, state: state, collapsedFolderIDs: collapsed, renamingNodeID: $renamingNodeID,
                                      renameText: $renameText, onFinishRename: finishRename,
                                      onNewFolder: newFolder, onRename: rename)
                     }
@@ -97,18 +98,35 @@ struct PartsSidebar: View {
 
 private struct PartTreeItem: View {
     let node: PartNode
-    @ObservedObject var state: AppState
+    let state: AppState
+    /// Read once by the tree rather than once per folder row.
+    let collapsedFolderIDs: Set<String>
     @Binding var renamingNodeID: String?
     @Binding var renameText: String
     let onFinishRename: (Bool) -> Void
     let onNewFolder: (String?) -> Void
     let onRename: (PartNode) -> Void
+    /// Every descendant body, computed once per row instead of on each use.
+    private let solids: Set<Int>
     @State private var showingColorPicker = false
     @State private var colorRevisionID: UUID?
     @State private var colorProjectID: UUID?
     @FocusState private var renameFocused: Bool
 
-    private var solids: Set<Int> { node.allSolidIndices }
+    init(node: PartNode, state: AppState, collapsedFolderIDs: Set<String>, renamingNodeID: Binding<String?>,
+         renameText: Binding<String>, onFinishRename: @escaping (Bool) -> Void,
+         onNewFolder: @escaping (String?) -> Void, onRename: @escaping (PartNode) -> Void) {
+        self.node = node
+        self.state = state
+        self.collapsedFolderIDs = collapsedFolderIDs
+        _renamingNodeID = renamingNodeID
+        _renameText = renameText
+        self.onFinishRename = onFinishRename
+        self.onNewFolder = onNewFolder
+        self.onRename = onRename
+        solids = node.allSolidIndices
+    }
+
     private var hiddenCount: Int { solids.intersection(state.hiddenSolids).count }
     private var selection: PartSelectionPresentation {
         PartSelectionPresentation(solidIndices: solids, selectedSolids: state.selectedSolids,
@@ -123,7 +141,7 @@ private struct PartTreeItem: View {
         Group {
             if node.isGroup {
                 DisclosureGroup(isExpanded: Binding(
-                    get: { state.isPartFolderExpanded(node.id) },
+                    get: { !collapsedFolderIDs.contains(node.id) },
                     set: { expanded in
                         onFinishRename(false)
                         state.setPartFolderExpanded(node.id, isExpanded: expanded)
@@ -131,7 +149,7 @@ private struct PartTreeItem: View {
                 )) {
                     VStack(alignment: .leading, spacing: 3) {
                         ForEach(node.children ?? []) { child in
-                            PartTreeItem(node: child, state: state, renamingNodeID: $renamingNodeID,
+                            PartTreeItem(node: child, state: state, collapsedFolderIDs: collapsedFolderIDs, renamingNodeID: $renamingNodeID,
                                          renameText: $renameText, onFinishRename: onFinishRename,
                                          onNewFolder: onNewFolder, onRename: onRename)
                         }
@@ -279,7 +297,7 @@ private struct PartTreeItem: View {
 }
 
 private struct PartActionsMenu: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     var node: PartNode? = nil
     let onNewFolder: (String?) -> Void
     let onRename: (PartNode) -> Void

@@ -198,18 +198,18 @@ final class ProjectWindowTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
     }
 
+    /// Views observe a document's properties directly. The session publishes
+    /// only replacement of its document, never every document change.
     @MainActor
-    func testWindowSessionForwardsOnlyItsCurrentDocumentChanges() {
+    func testWindowSessionPublishesOnlyDocumentReplacement() {
         let first = state(prompt: "First"), second = state(prompt: "Second")
         let session = ProjectWindowSession(state: first)
         var changes = 0
         let observation = session.objectWillChange.sink { changes += 1 }
         first.prompt = "Changed first"
-        XCTAssertEqual(changes, 1)
-        session.state = second
-        changes = 0
-        first.prompt = "Detached first"
         XCTAssertEqual(changes, 0)
+        session.state = second
+        XCTAssertEqual(changes, 1)
         second.prompt = "Changed second"
         XCTAssertEqual(changes, 1)
         withExtendedLifetime(observation) {}
@@ -292,7 +292,7 @@ final class ProjectWindowTests: XCTestCase {
             return AppState()
         }, flushProject: { _ in flushes += 1 })
         coordinator.register(session, id: id, sourceURL: originalSource)
-        let observation = original.$error.compactMap { $0 }.sink { _ in failed.fulfill() }
+        let observation = ObservationRecorder({ original.error }) { if $0 != nil { failed.fulfill() } }
         coordinator.replaceProject(at: source, in: id)
         await fulfillment(of: [failed], timeout: 2)
         XCTAssertTrue(session.state === original)
@@ -321,7 +321,7 @@ final class ProjectWindowTests: XCTestCase {
         loading.isWorking = true
         coordinator.register(loading, id: loadingID, sourceURL: source)
         coordinator.register(session, id: receiverID, sourceURL: nil)
-        let observation = original.$error.compactMap { $0 }.sink { _ in failed.fulfill() }
+        let observation = ObservationRecorder({ original.error }) { if $0 != nil { failed.fulfill() } }
         coordinator.replaceProject(at: source, in: receiverID)
         await fulfillment(of: [failed], timeout: 2)
         XCTAssertTrue(session.state === original)
@@ -401,7 +401,7 @@ final class ProjectWindowTests: XCTestCase {
         coordinator.register(receiver, id: receiverID, sourceURL: nil)
         coordinator.windowClosed(loadingID)
         await fulfillment(of: [closing], timeout: 2)
-        let observation = original.$error.compactMap { $0 }.sink { _ in failed.fulfill() }
+        let observation = ObservationRecorder({ original.error }) { if $0 != nil { failed.fulfill() } }
         coordinator.replaceProject(at: source, in: receiverID)
         await Task.yield()
         XCTAssertTrue(receiver.state === original)
@@ -481,7 +481,7 @@ final class ProjectWindowTests: XCTestCase {
             return AppState()
         }, flushProject: { _ in throw LADError.message("Disk is full") })
         coordinator.register(session, id: id, sourceURL: nil)
-        let observation = original.$error.compactMap { $0 }.sink { _ in failed.fulfill() }
+        let observation = ObservationRecorder({ original.error }) { if $0 != nil { failed.fulfill() } }
         coordinator.replaceProject(at: source, in: id)
         await fulfillment(of: [failed], timeout: 2)
         XCTAssertTrue(session.state === original)

@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct AssemblyMotionControls: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     let motion: AssemblyMotion
     /// Each continuous revolute slider's current window center.
     @State private var revolutionCenters: [String: Double] = [:]

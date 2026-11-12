@@ -188,7 +188,7 @@ final class ProjectSidebarSplitViewTests: XCTestCase {
     private final class Expansion: ObservableObject { @Published var value = false }
 
     private struct Harness: View {
-        @ObservedObject var state: AppState
+        let state: AppState
         @ObservedObject var program: Expansion
         var body: some View { ProjectSidebarSplitView(state: state, isProgramExpanded: $program.value) }
     }

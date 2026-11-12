@@ -65,8 +65,11 @@ private struct ViewportOrientationCubeControl: NSViewRepresentable {
     }
 }
 
+/// Each pane is its own view, so Observation re-renders only the pane whose
+/// state changed: typing updates the composer, streamed messages the
+/// conversation, and selection the viewer.
 struct WorkspaceView: View {
-    @ObservedObject var state: AppState
+    let state: AppState
     @State private var promptFocused = false
     @FocusState private var projectNameFocused: Bool
     @State private var isRenamingProject = false
@@ -84,10 +87,13 @@ struct WorkspaceView: View {
             Rectangle().fill(Palette.line).frame(height: 1)
             HSplitView {
                 partsPanel.frame(minWidth: 180, idealWidth: 230, maxWidth: 340, maxHeight: .infinity)
-                viewer.frame(minWidth: 540, maxWidth: .infinity, maxHeight: .infinity)
-                chat.frame(minWidth: 340, idealWidth: 390, maxWidth: 520, maxHeight: .infinity)
+                WorkspaceViewer(state: state, viewportReference: viewportReference)
+                    .frame(minWidth: 540, maxWidth: .infinity, maxHeight: .infinity)
+                WorkspaceConversation(state: state, activityPanel: activityPanel, viewportReference: viewportReference,
+                                      promptFocused: $promptFocused, previewImageAttachment: $previewImageAttachment)
+                    .frame(minWidth: 340, idealWidth: 390, maxWidth: 520, maxHeight: .infinity)
             }
-            statusBar
+            WorkspaceStatusBar(state: state)
         }
         .background(Palette.background)
         .background(ProjectActivityWindowAnchor {
@@ -104,10 +110,6 @@ struct WorkspaceView: View {
         .onDisappear { activityPanel.close() }
         .onChange(of: state.canRenameProject) { _, allowed in
             if !allowed { cancelProjectRename() }
-        }
-        .onChange(of: state.editingQueuedRequestID) { _, _ in promptFocused = true }
-        .onChange(of: state.awaitingResponse, initial: true) { _, awaiting in
-            if awaiting { promptFocused = true }
         }
         .onChange(of: state.saveConflict) { _, conflict in
             if conflict != nil { state.presentSaveConflict(in: viewportReference.window) }
@@ -232,8 +234,14 @@ struct WorkspaceView: View {
         .background(Palette.panel)
         .accessibilityIdentifier("projectSidebarSplitView")
     }
+}
 
-    private var viewer: some View {
+/// The 3D view and its overlay controls.
+private struct WorkspaceViewer: View {
+    @Bindable var state: AppState
+    @ObservedObject var viewportReference: WorkspaceViewportReference
+
+    var body: some View {
         ZStack(alignment: .topLeading) {
             CADViewport(mesh: state.mesh, displayMode: state.displayMode, projectionMode: state.projectionMode, showGrid: state.showGrid,
                         command: state.viewportCommand,
@@ -309,8 +317,18 @@ struct WorkspaceView: View {
             }
         }.background(Palette.background)
     }
+}
 
-    private var chat: some View {
+/// The conversation column. Messages and the composer are separate views so
+/// typing does not re-render the message history.
+private struct WorkspaceConversation: View {
+    let state: AppState
+    @ObservedObject var activityPanel: ProjectActivityPanelController
+    @ObservedObject var viewportReference: WorkspaceViewportReference
+    @Binding var promptFocused: Bool
+    @Binding var previewImageAttachment: SourceAttachment?
+
+    var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 9) {
                 Image(systemName: "sparkle").foregroundStyle(Palette.accent)
@@ -324,36 +342,65 @@ struct WorkspaceView: View {
                 .accessibilityLabel("Tool Activity").accessibilityValue(activityPanel.isVisible ? "Shown" : "Hidden")
             }.padding(.horizontal, 20).padding(.vertical, 19)
             Rectangle().fill(Palette.line).frame(height: 1)
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 24) {
-                        HStack(spacing: 8) {
-                            Rectangle().fill(Palette.line).frame(height: 1)
-                            Text("DESIGN CONVERSATION").font(.system(size: 8, weight: .medium)).tracking(1.3).foregroundStyle(Palette.muted).fixedSize()
-                            Rectangle().fill(Palette.line).frame(height: 1)
-                        }.padding(.top, 6)
-                        ForEach(state.messages) { message in messageView(message).id(message.id) }
-                        if state.isWorking {
-                            HStack(spacing: 10) {
-                                ProgressView().controlSize(.small)
-                                Text(state.activityStatus).font(.system(size: 12)).foregroundStyle(Palette.muted)
-                            }.id("activity")
-                        }
-                        Color.clear.frame(height: 1).id("bottom")
-                    }.padding(20)
-                }
-                .onChange(of: state.messages.count) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
-                .onChange(of: state.messages.last?.content) { _, _ in
-                    if state.isWorking { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
-                }
-                .onChange(of: state.isWorking) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
-            }
+            WorkspaceMessageList(state: state, onPreview: { previewImageAttachment = $0 })
             if let error = state.error { errorPanel(error) }
             if !state.queuedRequests.isEmpty {
                 ProjectRequestQueueView(state: state).padding(.horizontal, 16).padding(.top, 6)
             }
-            composer
+            WorkspaceComposer(state: state, promptFocused: $promptFocused, previewImageAttachment: $previewImageAttachment)
         }.background(Palette.panel)
+    }
+
+    private func errorPanel(_ error: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Needs attention", systemImage: "exclamationmark.triangle").font(.system(size: 11, weight: .semibold))
+                Spacer()
+                CopyButton(text: error, label: "Copy error")
+                Button { state.error = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
+            }.foregroundStyle(Palette.accent)
+            ViewThatFits(in: .vertical) {
+                errorText(error).fixedSize(horizontal: false, vertical: true)
+                ScrollView { errorText(error) }
+            }.frame(maxHeight: 96)
+        }.padding(13).background(Palette.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 16).padding(.bottom, 10)
+    }
+
+    private func errorText(_ error: String) -> some View {
+        Text(error).font(.system(size: 10)).foregroundStyle(Palette.muted).textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct WorkspaceMessageList: View {
+    let state: AppState
+    let onPreview: (SourceAttachment) -> Void
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    HStack(spacing: 8) {
+                        Rectangle().fill(Palette.line).frame(height: 1)
+                        Text("DESIGN CONVERSATION").font(.system(size: 8, weight: .medium)).tracking(1.3).foregroundStyle(Palette.muted).fixedSize()
+                        Rectangle().fill(Palette.line).frame(height: 1)
+                    }.padding(.top, 6)
+                    ForEach(state.messages) { message in messageView(message).id(message.id) }
+                    if state.isWorking {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text(state.activityStatus).font(.system(size: 12)).foregroundStyle(Palette.muted)
+                        }.id("activity")
+                    }
+                    Color.clear.frame(height: 1).id("bottom")
+                }.padding(20)
+            }
+            .onChange(of: state.messages.count) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            .onChange(of: state.messages.last?.content) { _, _ in
+                if state.isWorking { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            }
+            .onChange(of: state.isWorking) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+        }
     }
 
     private func messageView(_ message: ChatMessage) -> some View {
@@ -376,7 +423,7 @@ struct WorkspaceView: View {
                         ScrollView(.horizontal) {
                             HStack(spacing: 4) {
                                 ForEach(images) { attachment in
-                                    PromptImageAttachmentView(attachment: attachment, onPreview: { previewImageAttachment = attachment })
+                                    PromptImageAttachmentView(attachment: attachment, onPreview: { onPreview(attachment) })
                                 }
                             }
                         }.frame(height: 124)
@@ -401,32 +448,14 @@ struct WorkspaceView: View {
         .padding(message.role == "user" ? 13 : 0)
         .background(message.role == "user" ? Palette.raised.opacity(0.65) : .clear, in: RoundedRectangle(cornerRadius: 9))
     }
+}
 
-    private func errorPanel(_ error: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("Needs attention", systemImage: "exclamationmark.triangle").font(.system(size: 11, weight: .semibold))
-                Spacer()
-                CopyButton(text: error, label: "Copy error")
-                Button { state.error = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
-            }.foregroundStyle(Palette.accent)
-            ViewThatFits(in: .vertical) {
-                errorText(error).fixedSize(horizontal: false, vertical: true)
-                ScrollView { errorText(error) }
-            }.frame(maxHeight: 96)
-        }.padding(13).background(Palette.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 16).padding(.bottom, 10)
-    }
+private struct WorkspaceComposer: View {
+    @Bindable var state: AppState
+    @Binding var promptFocused: Bool
+    @Binding var previewImageAttachment: SourceAttachment?
 
-    private func errorText(_ error: String) -> some View {
-        Text(error).font(.system(size: 10)).foregroundStyle(Palette.muted).textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var reasoningSelector: some View {
-        CodexModelMenu(state: state)
-    }
-
-    private var composer: some View {
+    var body: some View {
         let editingRequestID = state.editingQueuedRequestID
         let submissionLabel = editingRequestID != nil ? "Save queued request" :
             state.submissionWillQueue ? "Queue request" : state.awaitingResponse ? "Send reply" : "Generate design"
@@ -527,15 +556,26 @@ struct WorkspaceView: View {
                     onAttachFiles: { state.attachSourceFiles(urls: $0) }, onAttachImages: { state.attachPromptImages($0) }))
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.line, lineWidth: 1))
         }.padding(16)
+            .onChange(of: state.editingQueuedRequestID) { _, _ in promptFocused = true }
+            .onChange(of: state.awaitingResponse, initial: true) { _, awaiting in
+                if awaiting { promptFocused = true }
+            }
     }
+
+    private var reasoningSelector: some View {
+        CodexModelMenu(state: state)
+    }
+}
+
+private struct WorkspaceStatusBar: View {
+    let state: AppState
 
     private var statusText: String? {
         if let notice = state.notice, !notice.isEmpty, notice != "Design saved" { return notice }
         return state.activity.isEmpty || state.activity == "Ready" ? nil : state.activityStatus
     }
 
-    @ViewBuilder
-    private var statusBar: some View {
+    var body: some View {
         if let statusText {
             HStack(spacing: 7) {
                 Circle().fill(state.isWorking || state.error != nil ? Palette.accent : Palette.muted).frame(width: 5, height: 5)

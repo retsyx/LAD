@@ -17,6 +17,18 @@ struct LADApp: App {
     }
 }
 
+private struct ProjectStateFocusedValueKey: FocusedValueKey {
+    typealias Value = AppState
+}
+
+extension FocusedValues {
+    /// The design shown in the key window, for menu commands.
+    var projectState: AppState? {
+        get { self[ProjectStateFocusedValueKey.self] }
+        set { self[ProjectStateFocusedValueKey.self] = newValue }
+    }
+}
+
 @MainActor
 private struct ProjectWindowRoot: View {
     @Binding var request: ProjectWindowRequest?
@@ -40,7 +52,7 @@ private struct ProjectWindowRoot: View {
             .navigationTitle(state.projectDisplayName)
             .preferredColorScheme(.dark)
             .tint(Palette.accent)
-            .focusedSceneObject(state)
+            .focusedSceneValue(\.projectState, state)
             .background(ProjectWindowBridge(id: windowID, state: state, coordinator: coordinator))
             .overlay(ProjectFileDropTarget { url in coordinator.replaceProject(at: url, in: windowID) })
             .task {
@@ -120,7 +132,7 @@ private struct ProjectCommands: Commands {
     @ObservedObject var recentProjects: RecentProjects
     let helpWindow: LADHelpWindowController
     @Environment(\.openWindow) private var openWindow
-    @FocusedObject private var state: AppState?
+    @FocusedValue(\.projectState) private var state: AppState?
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {

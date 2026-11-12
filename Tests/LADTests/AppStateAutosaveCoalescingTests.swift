@@ -1,4 +1,3 @@
-import Combine
 import Foundation
 import XCTest
 @testable import LAD
@@ -13,14 +12,8 @@ final class AppStateAutosaveCoalescingTests: XCTestCase {
         try await waitForSave(state)
         let url = try XCTUnwrap(state.projectURL)
 
-        var saves = 0
-        var watchingForLateSave = false
-        let lateSave = expectation(description: "The superseded draft timer must not save again")
-        lateSave.isInverted = true
-        let observation = state.$saveStatus.filter { $0 == "Saving…" }.sink { _ in
-            saves += 1
-            if watchingForLateSave { lateSave.fulfill() }
-        }
+        let baseline = state.startedSaves
+        var saves: Int { state.startedSaves - baseline }
 
         state.prompt = "Keep this pending draft"
         state.setPartsPaneFraction(0.61)
@@ -34,10 +27,8 @@ final class AppStateAutosaveCoalescingTests: XCTestCase {
 
         // Saving… is published after snapshot creation and before the actor
         // write, so no later event proves neither is requested by the old timer.
-        watchingForLateSave = true
-        await fulfillment(of: [lateSave], timeout: 0.85)
-        watchingForLateSave = false
-        XCTAssertEqual(saves, 1)
+        try await Task.sleep(for: .milliseconds(850))
+        XCTAssertEqual(saves, 1, "The superseded draft timer must not save again")
         XCTAssertFalse(state.hasUnsavedChanges)
         XCTAssertNil(state.saveStatus)
 
@@ -46,7 +37,6 @@ final class AppStateAutosaveCoalescingTests: XCTestCase {
         try await waitForSave(state)
         XCTAssertEqual(saves, 2)
         XCTAssertEqual(try ProjectStore.read(from: url).draftPrompt, state.prompt)
-        withExtendedLifetime(observation) {}
     }
 
     @MainActor
@@ -56,14 +46,8 @@ final class AppStateAutosaveCoalescingTests: XCTestCase {
         let state = fixture.state
         state.newProject()
         state.prompt = "Synthetic request for autosave bookkeeping"
-        var saves = 0
-        var watchingForLateSave = false
-        let lateSave = expectation(description: "The superseded audit timer must not save again")
-        lateSave.isInverted = true
-        let observation = state.$saveStatus.filter { $0 == "Saving…" }.sink { _ in
-            saves += 1
-            if watchingForLateSave { lateSave.fulfill() }
-        }
+        let baseline = state.startedSaves
+        var saves: Int { state.startedSaves - baseline }
 
         state.submit()
         state.recordTaskEvent(ProjectActivityEvent(id: "command", category: "command", title: "Inspect design",
@@ -87,12 +71,10 @@ final class AppStateAutosaveCoalescingTests: XCTestCase {
         XCTAssertEqual(saved.draftPrompt, state.prompt)
         XCTAssertEqual(saved.showGrid, false)
 
-        watchingForLateSave = true
-        await fulfillment(of: [lateSave], timeout: 1.2)
-        XCTAssertEqual(saves, 3)
+        try await Task.sleep(for: .milliseconds(1_200))
+        XCTAssertEqual(saves, 3, "The superseded audit timer must not save again")
         XCTAssertFalse(state.hasUnsavedChanges)
         XCTAssertNil(state.saveStatus)
-        withExtendedLifetime(observation) {}
     }
 
     @MainActor

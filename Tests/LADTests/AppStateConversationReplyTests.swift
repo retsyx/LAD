@@ -150,7 +150,7 @@ final class AppStateConversationReplyTests: XCTestCase {
         // complete recipe that LAD's real worker must validate before commit.
         UserDefaults.standard.set(ready.executable.path, forKey: "codexPath")
         var committedRevisionsAtQueuedDispatch: Int?
-        let observation = state.$messages.sink { messages in
+        let observation = ObservationRecorder({ state.messages }) { messages in
             if messages.last?.role == "user", messages.last?.content == queuedText {
                 committedRevisionsAtQueuedDispatch = state.revisions.count
             }
