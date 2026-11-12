@@ -171,47 +171,27 @@ final class ProjectAgentSession {
         try checkAvailable()
         guard !isBusy else { throw LADError.message("A CAD operation is already running in this task.") }
         isBusy = true
-        defer { isBusy = false; _ = tools.consumeRenderedImage() }
-        let requestID = "tool:\(UUID().uuidString)"
-        let started = Date()
-        var snapshots: [ProjectActivityFile] = []
-        var nativeArguments: [String: Any] = [:]
-        do {
-            nativeArguments = try resolvedArguments(name: name, arguments: arguments)
-            snapshots = try sourceSnapshots(name: name, arguments: nativeArguments)
-            if name == "lad_mesh_try_edit", let identity = arguments["editPath"] as? String {
-                let original = try file(identity)
-                if original.path != nativeArguments["editPath"] as? String {
-                    let snapshot = ProjectActivityFile(name: original.name, path: original.path,
-                        data: try workspace.read(original.path, maximumBytes: ProjectActivityFile.maximumBytes))
-                    try ProjectStore.validateActivityFile(snapshot)
-                    snapshots.append(snapshot)
+        defer { isBusy = false }
+        let call = CADAgentToolCall(tools: tools, workspace: workspace, onActivity: onActivity)
+        let (result, _) = try await call.perform(id: "tool:\(UUID().uuidString)", name: name, arguments: arguments,
+            prepare: {
+                let native = try resolvedArguments(name: name, arguments: arguments)
+                var snapshots: [ProjectActivityFile] = []
+                // An uploaded edit is staged under a task path; record the
+                // file the agent actually sent as well.
+                if name == "lad_mesh_try_edit", let identity = arguments["editPath"] as? String {
+                    let original = try file(identity)
+                    if original.path != native["editPath"] as? String {
+                        let snapshot = ProjectActivityFile(name: original.name, path: original.path,
+                            data: try workspace.read(original.path, maximumBytes: ProjectActivityFile.maximumBytes))
+                        try ProjectStore.validateActivityFile(snapshot)
+                        snapshots.append(snapshot)
+                    }
                 }
-            }
-            onActivity(ProjectActivityEvent(id: requestID, date: started, category: "tool", title: name,
-                status: "running", input: CADAgentBridge.json(arguments), files: snapshots.isEmpty ? nil : snapshots))
-            let result = try await tools.handle(name: name, arguments: nativeArguments)
-            try checkAvailable()
-            if name.hasPrefix("lad_mesh_"), let metadata = Self.metadata(result), let program = metadata["programPath"] as? String {
-                snapshots += try sourceSnapshots(name: "lad_build", arguments: ["programPath": program])
-            }
-            let png = tools.consumeRenderedImage()
-            let external = try externalResult(result)
-            // Audit the metadata-only native result before adding MCP image
-            // blocks. The exact PNG is handed to the bounded activity cache.
-            onActivity(ProjectActivityEvent(id: requestID, date: started, category: "tool", title: name,
-                status: result["isError"] as? Bool == true ? "failed" : "completed",
-                input: CADAgentBridge.json(arguments), output: CADAgentBridge.json(result),
-                durationSeconds: Date().timeIntervalSince(started), files: snapshots.isEmpty ? nil : snapshots,
-                imageData: result["isError"] as? Bool == true ? nil : png))
-            return external
-        } catch {
-            onActivity(ProjectActivityEvent(id: requestID, date: started, category: "tool", title: name,
-                status: error is CancellationError ? "canceled" : "failed", input: CADAgentBridge.json(arguments),
-                output: error.localizedDescription, durationSeconds: Date().timeIntervalSince(started),
-                files: snapshots.isEmpty ? nil : snapshots))
-            throw error
-        }
+                return (native, snapshots)
+            }, checkAvailable: { try checkAvailable() })
+        // Audit the metadata-only native result before adding MCP image blocks.
+        return try externalResult(result)
     }
 
     func cancel() {
@@ -374,31 +354,5 @@ final class ProjectAgentSession {
 
     nonisolated private static func digest(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    private func sourceSnapshots(name: String, arguments: [String: Any]) throws -> [ProjectActivityFile] {
-        var paths: [String] = []
-        if name == "lad_build", let program = arguments["programPath"] as? String { paths.append(program) }
-        if name == "lad_import" { paths += arguments["producerPaths"] as? [String] ?? [] }
-        if name.hasPrefix("lad_mesh_") {
-            paths += ["queryPath", "constraintsPath", "editPath", "programPath", "policyPath"].compactMap { arguments[$0] as? String }
-            if let path = arguments["editPath"] as? String,
-               let object = try JSONSerialization.jsonObject(with: workspace.read(path, maximumBytes: 2_000_000)) as? [String: Any],
-               let program = object["programPath"] as? String { paths.append(program) }
-        }
-        var seen = Set<String>()
-        return try paths.filter { seen.insert($0).inserted }.map { path in
-            let snapshot = ProjectActivityFile(name: URL(fileURLWithPath: path).lastPathComponent, path: path,
-                data: try workspace.read(path, maximumBytes: ProjectActivityFile.maximumBytes, allowEmpty: true))
-            try ProjectStore.validateActivityFile(snapshot)
-            return snapshot
-        }
-    }
-
-    private static func metadata(_ result: [String: Any]) -> [String: Any]? {
-        guard let content = result["content"] as? [[String: Any]],
-              let text = content.first(where: { $0["type"] as? String == "text" })?["text"] as? String,
-              let bytes = text.data(using: .utf8) else { return nil }
-        return (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any]
     }
 }

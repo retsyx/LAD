@@ -2,18 +2,25 @@ import Foundation
 import Darwin
 
 /// A private, per-turn bridge between the stdio MCP server and LAD's native
-/// tools. No listener or global Codex configuration is installed.
+/// tools. No listener or global Codex configuration is installed. Requests
+/// and responses are files in the task's private control folder; both sides
+/// wait for directory change events rather than polling.
 @MainActor
 final class CADAgentBridge {
     let tools: CADAgentTools
     let workspace: URL
+    private let access: CADAgentWorkspace
     private let control: URL
     private let requests: URL
     private let responses: URL
     private let controlDescriptor: Int32
     private let responseDescriptor: Int32
+    private let requestEvents: Int32
     private let onActivity: @Sendable (ProjectActivityEvent) -> Void
+    private var watcher: DispatchSourceFileSystemObject?
+    private var watched = false
     private var loop: Task<Void, Never>?
+    private var rescan = false
     private var stopped = false
     private var processed = Set<String>()
 
@@ -24,6 +31,7 @@ final class CADAgentBridge {
          partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:],
          permissionController: AgentPermissionController? = nil) throws {
         self.workspace = try EngineArtifact.canonicalDirectory(workspace)
+        access = try CADAgentWorkspace(directory: self.workspace)
         control = self.workspace.appendingPathComponent(".lad-tools", isDirectory: true)
         requests = control.appendingPathComponent("requests", isDirectory: true)
         responses = control.appendingPathComponent("responses", isDirectory: true)
@@ -38,8 +46,14 @@ final class CADAgentBridge {
             Darwin.close(controlFD)
             throw LADError.message("LAD could not start its CAD tool connection.")
         }
+        let eventFD = Darwin.open(requests.path, O_EVTONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard eventFD >= 0 else {
+            Darwin.close(controlFD); Darwin.close(responseFD)
+            throw LADError.message("LAD could not start its CAD tool connection.")
+        }
         controlDescriptor = controlFD
         responseDescriptor = responseFD
+        requestEvents = eventFD
         self.onActivity = onActivity
         do {
             tools = try CADAgentTools(directory: self.workspace, python: python, threads: threads, current: current,
@@ -48,12 +62,14 @@ final class CADAgentBridge {
                                       referenceAssets: referenceAssets, versions: versions, partLayout: partLayout, partColors: partColors,
                                       permissionController: permissionController)
         } catch {
-            Darwin.close(controlFD); Darwin.close(responseFD)
+            Darwin.close(controlFD); Darwin.close(responseFD); Darwin.close(eventFD)
             throw error
         }
     }
 
     deinit {
+        // A started watcher closes its descriptor when its cancellation completes.
+        if let watcher { watcher.cancel() } else if !watched { Darwin.close(requestEvents) }
         Darwin.close(controlDescriptor)
         Darwin.close(responseDescriptor)
     }
@@ -82,9 +98,39 @@ final class CADAgentBridge {
     }
 
     func start() {
+        guard !watched, !stopped else { return }
+        let descriptor = requestEvents
+        let watcher = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.write], queue: .main)
+        watcher.setEventHandler { [weak self] in MainActor.assumeIsolated { self?.scan() } }
+        watcher.setCancelHandler { Darwin.close(descriptor) }
+        watcher.resume()
+        self.watcher = watcher
+        watched = true
+        scan()
+    }
+
+    func stop() {
+        guard !stopped else { return }
+        stopped = true
+        watcher?.cancel(); watcher = nil
+        loop?.cancel(); loop = nil
+        tools.cancel()
+        // The open directory descriptor keeps this write in the original
+        // private bridge even if a task renames its workspace directories.
+        if let data = "closed".data(using: .utf8) {
+            try? Self.write(data, named: "closed", in: controlDescriptor)
+        }
+    }
+
+    /// Handle new requests in name order, one at a time. Events arriving while
+    /// a scan runs trigger one more scan when it finishes.
+    private func scan() {
+        guard !stopped else { return }
+        guard loop == nil else { rescan = true; return }
         loop = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self, !self.stopped else { return }
+            repeat {
+                guard let self, !self.stopped, !Task.isCancelled else { return }
+                self.rescan = false
                 do {
                     // Refuse replaced directories instead of following a
                     // workspace symlink into an unrelated user directory.
@@ -101,39 +147,23 @@ final class CADAgentBridge {
                         self.processed.insert(file.lastPathComponent)
                         await self.handle(file)
                     }
-                    try await Task.sleep(for: .milliseconds(40))
-                } catch is CancellationError { return }
-                catch {
+                } catch {
                     self.onActivity(ProjectActivityEvent(id: "bridge:failure", category: "diagnostic",
                         title: "CAD tool connection failed", status: "failed", output: error.localizedDescription))
+                    self.loop = nil
                     self.stop()
                     return
                 }
-            }
-        }
-    }
-
-    func stop() {
-        guard !stopped else { return }
-        stopped = true
-        loop?.cancel(); loop = nil
-        tools.cancel()
-        // The open directory descriptor keeps this write in the original
-        // private bridge even if a task renames its workspace directories.
-        if let data = "closed".data(using: .utf8) {
-            try? Self.write(data, named: "closed", in: controlDescriptor)
+            } while self?.rescan == true
+            self?.loop = nil
         }
     }
 
     private func handle(_ file: URL) async {
-        // Invalid, failed and canceled calls must not inherit an earlier PNG.
-        defer { _ = tools.consumeRenderedImage() }
         let requestID = file.deletingPathExtension().lastPathComponent
         guard UUID(uuidString: requestID) != nil else { return }
-        let started = Date()
         var name = "CAD tool"
         var arguments: [String: Any] = [:]
-        var snapshots: [ProjectActivityFile] = []
         do {
             let data = try EngineArtifact.read(file, in: requests, maximumBytes: 1_000_000)
             guard let request = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -144,64 +174,21 @@ final class CADAgentBridge {
                 throw LADError.message("The CAD tool request is invalid.")
             }
             name = toolName; arguments = input
-            snapshots = try auditSnapshots(name: name, arguments: arguments)
-            onActivity(ProjectActivityEvent(id: "tool:\(requestID)", date: started, category: "tool",
-                title: name, status: "running", input: Self.json(arguments), files: snapshots.isEmpty ? nil : snapshots))
-            let result = try await tools.handle(name: name, arguments: arguments)
-            if name.hasPrefix("lad_mesh_"), let content = result["content"] as? [[String: Any]],
-               let text = content.first?["text"] as? String,
-               let bytes = text.data(using: .utf8),
-               let values = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-               let path = values["programPath"] as? String {
-                snapshots += try auditSnapshots(name: "lad_build", arguments: ["programPath": path])
-            }
-            try Task.checkCancellation()
+        } catch {
+            try? writeResponse(["isError": true, "content": [["type": "text", "text": error.localizedDescription]]], id: requestID)
+            onActivity(ProjectActivityEvent(id: "tool:\(requestID)", category: "tool", title: name, status: "failed",
+                                            output: error.localizedDescription))
+            return
+        }
+        let call = CADAgentToolCall(tools: tools, workspace: access, onActivity: onActivity)
+        do {
+            let (result, _) = try await call.perform(id: "tool:\(requestID)", name: name, arguments: arguments,
+                                                     checkAvailable: { try Task.checkCancellation() })
             guard !stopped else { return }
             try writeResponse(result, id: requestID)
-            onActivity(ProjectActivityEvent(id: "tool:\(requestID)", date: started, category: "tool",
-                title: name, status: result["isError"] as? Bool == true ? "failed" : "completed",
-                input: Self.json(arguments), output: Self.json(result), durationSeconds: Date().timeIntervalSince(started),
-                files: snapshots.isEmpty ? nil : snapshots,
-                imageData: result["isError"] as? Bool == true ? nil : tools.consumeRenderedImage()))
         } catch {
             let message = error is CancellationError ? "The CAD tool call was canceled." : error.localizedDescription
-            let result: [String: Any] = ["isError": true, "content": [["type": "text", "text": message]]]
-            try? writeResponse(result, id: requestID)
-            onActivity(ProjectActivityEvent(id: "tool:\(requestID)", date: started, category: "tool",
-                title: name, status: error is CancellationError ? "canceled" : "failed",
-                input: Self.json(arguments), output: message, durationSeconds: Date().timeIntervalSince(started),
-                files: snapshots.isEmpty ? nil : snapshots))
-        }
-    }
-
-    private func auditSnapshots(name: String, arguments: [String: Any]) throws -> [ProjectActivityFile] {
-        let paths: [String]
-        if name == "lad_build", let program = arguments["programPath"] as? String { paths = [program] }
-        else if name == "lad_import" { paths = arguments["producerPaths"] as? [String] ?? [] }
-        else if name.hasPrefix("lad_mesh_") {
-            var referenced = ["queryPath", "constraintsPath", "editPath", "programPath", "policyPath"].compactMap { arguments[$0] as? String }
-            if let editPath = arguments["editPath"] as? String {
-                let access = try CADAgentWorkspace(directory: workspace)
-                let bytes = try access.read(editPath, maximumBytes: 2_000_000)
-                if let edit = try JSONSerialization.jsonObject(with: bytes) as? [String: Any], let path = edit["programPath"] as? String {
-                    referenced.append(path)
-                }
-            }
-            paths = referenced
-        }
-        else { return [] }
-        guard paths.count <= 64 else { throw LADError.message("Choose at most 64 source files for the tool activity record.") }
-        let access = try CADAgentWorkspace(directory: workspace)
-        var seen = Set<String>()
-        return try paths.compactMap { path in
-            let url = try access.url(path)
-            guard seen.insert(url.path).inserted else { return nil }
-            let data = try access.read(path, maximumBytes: 2_000_000, allowEmpty: true)
-            var filename = url.lastPathComponent
-            if name == "lad_build", url.pathExtension.isEmpty { filename += ".py" }
-            let snapshot = ProjectActivityFile(name: filename, path: url.path, data: data)
-            try ProjectStore.validateActivityFile(snapshot)
-            return snapshot
+            try? writeResponse(["isError": true, "content": [["type": "text", "text": message]]], id: requestID)
         }
     }
 

@@ -11,6 +11,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import select
 import stat
 import sys
 import time
@@ -149,14 +150,17 @@ class NativeBridge:
         self.parent = os.getppid()
         base = os.open(self.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
-            private = os.open(".lad-tools", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=base)
-            try:
-                self.request_fd = os.open("requests", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=private)
-                self.response_fd = os.open("responses", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=private)
-            finally:
-                os.close(private)
+            self.bridge_fd = os.open(".lad-tools", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=base)
+            self.request_fd = os.open("requests", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.bridge_fd)
+            self.response_fd = os.open("responses", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.bridge_fd)
         finally:
             os.close(base)
+        # Wait for responses and the closed marker as directory changes rather
+        # than polling. A periodic timeout still notices a parent that exited.
+        self.events = select.kqueue()
+        self.events.control([select.kevent(descriptor, filter=select.KQ_FILTER_VNODE,
+                                           flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=select.KQ_NOTE_WRITE)
+                             for descriptor in (self.response_fd, self.bridge_fd)], 0, 0)
 
     def call(self, name, arguments):
         if name not in TOOL_NAMES or not isinstance(arguments, dict):
@@ -190,14 +194,14 @@ class NativeBridge:
             try:
                 os.kill(self.parent, 0)
             except ProcessLookupError as error:
-                raise ValueError("The Codex task has stopped.") from error
+                raise ValueError("The agent task has stopped.") from error
             except PermissionError:
                 # EPERM still means a process exists; an enclosing macOS
                 # sandbox may deny signaling the live parent even for signal 0.
                 pass
             if time.monotonic() - started > 3600:
                 raise ValueError("The native LAD tool did not return a response within its one-hour tool timeout.")
-            time.sleep(0.03)
+            self.events.control(None, 2, 1.0)
 
 
 def reply(identity, *, result=None, error=None):
