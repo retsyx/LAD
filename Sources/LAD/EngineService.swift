@@ -63,8 +63,13 @@ final class EngineService {
     private var exportedSTEPOrder: [STEPExportKey] = []
     private var exportedSTEPBytes = 0
 
+    /// Measurements, clearance checks, exports and runtime inspection share
+    /// one long-lived worker; builds keep their own sandboxed process.
+    let native: CADNativeWorker
+
     init(temporaryDirectory: URL = FileManager.default.temporaryDirectory) {
         self.temporaryDirectory = temporaryDirectory
+        native = CADNativeWorker(temporaryDirectory: temporaryDirectory)
     }
 
     deinit { job?.cancel() }
@@ -118,7 +123,7 @@ final class EngineService {
     }
 
     func runtimeInfo(python: String, threads: Int) async throws -> CADRuntime {
-        let output = try await run(python: python, threads: threads, scriptMode: false, action: "inspect the CAD runtime") { folder in
+        let output = try await runNative(python: python, threads: threads, action: "inspect the CAD runtime") { folder in
             try JSONSerialization.data(withJSONObject: ["operation": "runtime"])
                 .write(to: folder.appendingPathComponent("request.json"), options: .atomic)
         }
@@ -216,10 +221,10 @@ final class EngineService {
             let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors,
                                         arrangeFor3DPrinting: arrangeFor3DPrinting, transforms: transforms)
             if let cached = cachedSTEP(for: cacheKey) { return cached[0] }
-            let bytes = try await nativeBytes(preview)
-            let output = try await run(python: python, threads: threads, scriptMode: false, action: "export this design") { folder in
-                try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
-                var payload: [String: Any] = ["operation": "export", "brepAsset": "source.brep"]
+            let source = try nativeSource(preview)
+            let output = try await runNative(python: python, threads: threads, action: "export this design") { folder in
+                var payload = try Self.stageNative(source, into: folder)
+                payload["operation"] = "export"
                 if let selection { payload["solidIndices"] = selection }
                 if !transforms.isEmpty { payload["solidTransforms"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(transforms)) }
                 if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
@@ -232,7 +237,7 @@ final class EngineService {
                 try Self.validateSTEP(data)
                 return data
             }.value
-            guard generation == output.token, !Task.isCancelled else { throw CancellationError() }
+            try Task.checkCancellation()
             cacheSTEP([data], for: cacheKey)
             return data
         }
@@ -268,10 +273,11 @@ final class EngineService {
         let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors,
                                      arrangeFor3DPrinting: arrangeFor3DPrinting, parts: parts, transforms: transforms)
         if let cached = cachedSTEP(for: cacheKey) { return cached }
-        let bytes = try await nativeBytes(preview)
-        let output = try await run(python: python, threads: threads, scriptMode: false, action: "export these design parts") { folder in
-            try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
-            var payload: [String: Any] = ["operation": "export", "brepAsset": "source.brep", "individualParts": parts]
+        let source = try nativeSource(preview)
+        let output = try await runNative(python: python, threads: threads, action: "export these design parts") { folder in
+            var payload = try Self.stageNative(source, into: folder)
+            payload["operation"] = "export"
+            payload["individualParts"] = parts
             if let selection { payload["solidIndices"] = selection }
             if !transforms.isEmpty { payload["solidTransforms"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(transforms)) }
             if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
@@ -299,7 +305,7 @@ final class EngineService {
             }
             return result
         }.value
-        guard generation == output.token, !Task.isCancelled else { throw CancellationError() }
+        try Task.checkCancellation()
         cacheSTEP(data, for: cacheKey)
         return data
     }
@@ -376,13 +382,12 @@ final class EngineService {
     func clearance(_ preview: PreviewMesh, pairs: [[[Int]]], poses: [[Int: [Double]]],
                    python: String, threads: Int) async throws -> [[Clearance]] {
         let records = try poses.map { try AssemblySolidTransform.validatedRecords($0, solidCount: preview.solids) }
-        let bytes = try await nativeBytes(preview)
-        // Like measurement, a clearance check never cancels a build on this service.
-        let worker = EngineService()
-        let output = try await worker.run(python: python, threads: threads, scriptMode: false, action: "check this motion") { folder in
-            try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
-            let payload: [String: Any] = ["operation": "clearance", "brepAsset": "source.brep", "pairs": pairs,
-                                          "poses": try JSONSerialization.jsonObject(with: JSONEncoder().encode(records))]
+        let source = try nativeSource(preview)
+        let output = try await runNative(python: python, threads: threads, action: "check this motion") { folder in
+            var payload = try Self.stageNative(source, into: folder)
+            payload["operation"] = "clearance"
+            payload["pairs"] = pairs
+            payload["poses"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(records))
             try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
         }
         struct Report: Decodable { var samples: [[Clearance]] }
@@ -410,14 +415,12 @@ final class EngineService {
     private func nativeMeasurement(_ preview: PreviewMesh, features: [CADFeatureID], solids: Set<Int>,
                                    transforms: [Int: [Double]]?, python: String, threads: Int) async throws -> NativeMeasurement {
         let records = try transforms.map { try AssemblySolidTransform.validatedRecords($0, solidCount: preview.solids) }
-        let bytes = try await nativeBytes(preview)
-        // A measurement never cancels a build running on this service.
-        let worker = EngineService()
-        let output = try await worker.run(python: python, threads: threads, scriptMode: false, action: "measure these items") { folder in
-            try bytes.write(to: folder.appendingPathComponent("source.brep"), options: .atomic)
-            let featureData = try JSONSerialization.jsonObject(with: JSONEncoder().encode(features))
-            var payload: [String: Any] = ["operation": "measure", "brepAsset": "source.brep", "features": featureData,
-                                          "solidIndices": solids.sorted()]
+        let source = try nativeSource(preview)
+        let output = try await runNative(python: python, threads: threads, action: "measure these items") { folder in
+            var payload = try Self.stageNative(source, into: folder)
+            payload["operation"] = "measure"
+            payload["features"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(features))
+            payload["solidIndices"] = solids.sorted()
             if let records { payload["solidTransforms"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(records)) }
             try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
         }
@@ -434,18 +437,61 @@ final class EngineService {
         return exact
     }
 
-    private func nativeBytes(_ preview: PreviewMesh) async throws -> Data {
-        defer { withExtendedLifetime(preview.buildArtifacts) {} }
+    /// A build's own native solid, identified by its unique session path.
+    private struct NativeSource: Sendable {
+        let url: URL
+        let validated: Bool
+        let artifacts: EngineBuildArtifacts
+    }
+
+    private func nativeSource(_ preview: PreviewMesh) throws -> NativeSource {
         guard let path = preview.brepPath, let artifacts = preview.buildArtifacts,
               path == artifacts.folder.appendingPathComponent("model.brep").path else { throw EngineExportError.nativeArtifactUnavailable }
-        let source = URL(fileURLWithPath: path)
-        do {
-            return try await Task.detached(priority: .userInitiated) {
-                let data = try EngineArtifact.read(source, in: source.deletingLastPathComponent(), maximumBytes: ProjectStore.maximumSTEPBytes)
-                guard data.starts(with: Data("DBRep_DrawableShape\n".utf8)) else { throw EngineExportError.nativeArtifactUnavailable }
-                return data
-            }.value
-        } catch { throw EngineExportError.nativeArtifactUnavailable }
+        return NativeSource(url: URL(fileURLWithPath: path), validated: preview.validatedHash != nil, artifacts: artifacts)
+    }
+
+    /// Stage a build's solid into a request and return the request fields that
+    /// name it. An APFS clone shares the file's blocks, so staging neither reads
+    /// a large solid into memory nor duplicates it on disk. The identity lets
+    /// the long-lived worker reuse the solid it already read; a solid the worker
+    /// validated when building is not checked again.
+    nonisolated private static func stageNative(_ source: NativeSource, into folder: URL) throws -> [String: Any] {
+        try withExtendedLifetime(source.artifacts) {
+            let marker = Data("DBRep_DrawableShape\n".utf8)
+            guard let header = try? EngineArtifact.boundaries(source.url, in: source.url.deletingLastPathComponent(),
+                                                              headerBytes: marker.count),
+                  header.header == marker,
+                  copyfile(source.url.path, folder.appendingPathComponent("source.brep").path, nil,
+                           copyfile_flags_t(COPYFILE_CLONE)) == 0 else {
+                throw EngineExportError.nativeArtifactUnavailable
+            }
+        }
+        return ["brepAsset": "source.brep", "nativeIdentity": source.url.path, "validatedNative": source.validated]
+    }
+
+    /// Native requests run on the long-lived worker. They never cancel a build
+    /// running on this engine, and a build never cancels them.
+    private func runNative(python: String, threads: Int, action: String,
+                           prepare: @escaping @Sendable (URL) throws -> Void) async throws -> RunResult {
+        try Task.checkCancellation()
+        let artifacts = try EngineBuildArtifacts.create(in: temporaryDirectory, token: UUID(), containsSTEP: false)
+        let folder = artifacts.folder
+        try await Task.detached(priority: .userInitiated) { try prepare(folder) }.value
+        try Task.checkCancellation()
+        let python = try await CADRuntimeManager.resolvePython(python)
+        let reply: CADNativeWorker.Reply
+        do { reply = try await native.perform(folder: folder, threads: max(1, min(256, threads)), python: python) }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw LADError.message("The CAD engine could not \(action).\n\n\(error.localizedDescription)") }
+        try Task.checkCancellation()
+        guard reply.status == "complete" else {
+            let diagnostic = EngineFailureDiagnostic.message(in: folder, stderr: reply.message ?? "")
+            if diagnostic.contains("No module named") {
+                throw LADError.message("LAD’s CAD runtime is incomplete. Reinstall LAD and try again.\n\n\(diagnostic.suffix(1_200))")
+            }
+            throw LADError.message("The CAD engine could not \(action).\n\n\(diagnostic)")
+        }
+        return RunResult(artifacts: artifacts, token: UUID())
     }
 
     nonisolated private static func validateSTEP(_ data: Data) throws {
@@ -481,25 +527,13 @@ final class EngineService {
         guard token == generation, !Task.isCancelled else { throw CancellationError() }
         let python = try await CADRuntimeManager.resolvePython(python)
         guard token == generation, !Task.isCancelled else { throw CancellationError() }
-        let worker = ResourcePaths.root.appendingPathComponent("Engine/worker.py").resolvingSymlinksInPath()
-        guard FileManager.default.fileExists(atPath: worker.path) else {
-            throw LADError.message("LAD’s CAD engine is missing. Reinstall LAD and try again.")
-        }
-        let runtime = URL(fileURLWithPath: (python as NSString).expandingTildeInPath).standardizedFileURL
-        guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
-            throw LADError.message("LAD’s CAD runtime is missing. Restart LAD and try again.")
-        }
+        let launch = try Self.workerLaunch(python: python)
+        let worker = launch.worker, runtime = launch.runtime, actualRuntime = launch.actualRuntime, interpreter = launch.interpreter
         var arguments = [worker.path, "--request", request.path, "--output", folder.path, "--threads", String(max(1, min(256, threads)))] + (deferSTEP ? ["--defer-step"] : [])
         if let validatedHash, validatedHash.utf8.count == 64,
            validatedHash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) {
             arguments.append("--validated-hash=\(validatedHash)")
         }
-        let actualRuntime = runtime.resolvingSymlinksInPath()
-        // Homebrew/framework bin/python is a launcher that spawns Python.app.
-        // Start the interpreter directly so generated code can never fork.
-        let frameworkInterpreter = actualRuntime.deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("Resources/Python.app/Contents/MacOS/Python")
-        let interpreter = FileManager.default.isExecutableFile(atPath: frameworkInterpreter.path) ? frameworkInterpreter : actualRuntime
         let executable: URL
         let launchArguments: [String]
         if scriptMode {
@@ -520,19 +554,7 @@ final class EngineService {
             executable = runtime
             launchArguments = arguments
         }
-        // An allowlist avoids passing ambient credentials or model-service keys
-        // to generated Python. Runtime/cache locations are explicit and local.
-        let temporary = folder.appendingPathComponent("tmp")
-        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
-        var environment = [
-            "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "LC_ALL": "C",
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
-            "PYTHONUNBUFFERED": "1", "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1",
-            "MPLCONFIGDIR": folder.appendingPathComponent(".matplotlib").path,
-            "XDG_CACHE_HOME": folder.appendingPathComponent(".cache").path,
-            "TMPDIR": temporary.path, "LAD_MODEL_OUTPUT": folder.path
-        ]
-        if interpreter != actualRuntime { environment["__PYVENV_LAUNCHER__"] = runtime.path }
+        let environment = try Self.workerEnvironment(folder: folder, launch: launch)
         let task = try EngineProcessJob(executable: executable, arguments: launchArguments, artifacts: artifacts, environment: environment)
         job = task
         defer { if job === task { job = nil } }
@@ -617,6 +639,49 @@ final class EngineService {
         generation = UUID()
         job?.cancel()
         job = nil
+    }
+
+    /// The worker script and interpreter for a resolved runtime.
+    struct WorkerLaunch: Sendable {
+        let worker: URL
+        let runtime: URL
+        let actualRuntime: URL
+        let interpreter: URL
+    }
+
+    nonisolated static func workerLaunch(python: String) throws -> WorkerLaunch {
+        let worker = ResourcePaths.root.appendingPathComponent("Engine/worker.py").resolvingSymlinksInPath()
+        guard FileManager.default.fileExists(atPath: worker.path) else {
+            throw LADError.message("LAD’s CAD engine is missing. Reinstall LAD and try again.")
+        }
+        let runtime = URL(fileURLWithPath: (python as NSString).expandingTildeInPath).standardizedFileURL
+        guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
+            throw LADError.message("LAD’s CAD runtime is missing. Restart LAD and try again.")
+        }
+        let actualRuntime = runtime.resolvingSymlinksInPath()
+        // Homebrew/framework bin/python is a launcher that spawns Python.app.
+        // Start the interpreter directly so generated code can never fork.
+        let frameworkInterpreter = actualRuntime.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Resources/Python.app/Contents/MacOS/Python")
+        let interpreter = FileManager.default.isExecutableFile(atPath: frameworkInterpreter.path) ? frameworkInterpreter : actualRuntime
+        return WorkerLaunch(worker: worker, runtime: runtime, actualRuntime: actualRuntime, interpreter: interpreter)
+    }
+
+    /// An allowlist avoids passing ambient credentials or model-service keys
+    /// to the worker. Runtime/cache locations are explicit and local.
+    nonisolated static func workerEnvironment(folder: URL, launch: WorkerLaunch) throws -> [String: String] {
+        let temporary = folder.appendingPathComponent("tmp")
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        var environment = [
+            "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "LC_ALL": "C",
+            "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
+            "PYTHONUNBUFFERED": "1", "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1",
+            "MPLCONFIGDIR": folder.appendingPathComponent(".matplotlib").path,
+            "XDG_CACHE_HOME": folder.appendingPathComponent(".cache").path,
+            "TMPDIR": temporary.path, "LAD_MODEL_OUTPUT": folder.path
+        ]
+        if launch.interpreter != launch.actualRuntime { environment["__PYVENV_LAUNCHER__"] = launch.runtime.path }
+        return environment
     }
 
     private static func pythonBaseDirectory(runtime: URL, actualRuntime: URL) -> URL {

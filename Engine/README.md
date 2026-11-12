@@ -189,6 +189,17 @@ and `closestPoints` for exactly two selections, and otherwise returns empty
 `metrics`. Without `solidTransforms`, measurement retains its two-item distance
 contract.
 
+Runtime, export, measurement and clearance requests go to one long-lived
+`worker.py --serve` process per app engine, which reads one JSON request line
+(request file, output folder, thread count) at a time on stdin and answers with
+one JSON line on stdout. It loads CadQuery once and keeps the two most recently
+read solids, keyed by the app-supplied `nativeIdentity` (the build's unique
+`model.brep` path). A solid marked `validatedNative` was validated when built and
+is checked only for closed solids when read again. The serving process refuses
+generated programs, which always run in their own sandboxed process. The app
+stages each solid as an APFS clone, stops the server after two idle minutes, and
+stops it when a canceled request is still running two seconds later.
+
 A `clearance` request contains `pairs` (1–8 pairs of two disjoint, nonempty
 solid-index groups) and `poses` (1–361 sparse `solidTransforms` lists). For each
 pose and pair it returns the exact OpenCascade minimum distance and closest

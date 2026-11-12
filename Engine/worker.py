@@ -38,6 +38,14 @@ LIMIT = 100_000.0
 _validated_replay = ContextVar("validated_replay", default=False)
 _validation_scope = ContextVar("validation_scope", default="native_candidate")
 _validation_input = ContextVar("validation_input", default=None)
+# A serving worker keeps recently read native solids, keyed by the identity
+# the app assigns each build's model.brep. One-shot processes never cache.
+_serving = False
+_native_shapes = {}
+NATIVE_CACHE_SIZE = 2
+NATIVE_OPERATIONS = {"runtime", "export", "measure", "clearance"}
+# Fields every native operation accepts beside its own (see read_brep).
+NATIVE_SOURCE_FIELDS = {"brepAsset", "nativeIdentity", "validatedNative"}
 
 ROOT_KEYS = {"title", "summary", "units", "script"}
 
@@ -2305,9 +2313,23 @@ def write_brep(shape, path):
 
 
 def read_brep(spec, asset_directory, cq, threads):
-    """Read only the private, app-staged native geometry, without meshing."""
+    """Read only the private, app-staged native geometry, without meshing.
+
+    The app marks a solid `validatedNative` when this worker validated it before
+    writing it; reading it again checks only that it holds closed solids. A
+    serving worker reuses the solid for repeated requests with the same
+    `nativeIdentity`.
+    """
     if spec.get("brepAsset") != "source.brep":
         raise ModelError("Native operations require the private source.brep asset.")
+    identity = spec.get("nativeIdentity") if _serving else None
+    if identity is not None and (not isinstance(identity, str) or not 0 < len(identity) <= 4096):
+        raise ModelError("The native solid identity is invalid.")
+    if identity in _native_shapes:
+        configure_threads(threads)
+        shape = _native_shapes.pop(identity)
+        _native_shapes[identity] = shape
+        return shape
     import stat
     from OCP.BRep import BRep_Builder
     from OCP.BRepTools import BRepTools
@@ -2323,8 +2345,18 @@ def read_brep(spec, asset_directory, cq, threads):
     wrapped = TopoDS_Shape()
     if not BRepTools.Read_s(wrapped, str(source), BRep_Builder()) or wrapped.IsNull():
         raise ModelError("The native solid asset could not be read.")
-    with validation_scope("native_artifact", {"name": source.name, "format": "brep"}):
-        return validate_shape(cq.Shape.cast(wrapped))
+    shape = cq.Shape.cast(wrapped)
+    if spec.get("validatedNative") is True:
+        if shape.isNull() or not _only_solids(shape) or not 0 < len(_shape_entities(shape, "Solid")) <= 4_096:
+            raise ModelError("The native solid asset does not contain the validated solids.")
+    else:
+        with validation_scope("native_artifact", {"name": source.name, "format": "brep"}):
+            shape = validate_shape(shape)
+    if identity is not None:
+        _native_shapes[identity] = shape
+        while len(_native_shapes) > NATIVE_CACHE_SIZE:
+            _native_shapes.pop(next(iter(_native_shapes)))
+    return shape
 
 
 def selected_solids(spec, solids, required=False):
@@ -2713,7 +2745,7 @@ def arrange_print_solids(solids, cq):
 
 def export_brep(spec, asset_directory, output, cq, threads):
     """Create whole or selected STEP without replaying or tessellating."""
-    if set(spec) - {"operation", "brepAsset", "solidIndices", "solidColors", "arrangeFor3DPrinting", "individualParts", "solidTransforms"} or spec.get("brepAsset") != "source.brep":
+    if set(spec) - NATIVE_SOURCE_FIELDS - {"operation", "solidIndices", "solidColors", "arrangeFor3DPrinting", "individualParts", "solidTransforms"} or spec.get("brepAsset") != "source.brep":
         raise ModelError("STEP export requires the private source.brep asset.")
     arrange = spec.get("arrangeFor3DPrinting", False)
     if not isinstance(arrange, bool):
@@ -2773,7 +2805,7 @@ def measure_brep(spec, asset_directory, cq, threads):
     not mesh, execute programs, or serialize STEP; all closest points come from
     OpenCascade's extrema solver on the selected trimmed topology.
     """
-    if set(spec) - {"operation", "brepAsset", "features", "solidIndices", "solidTransforms"}:
+    if set(spec) - NATIVE_SOURCE_FIELDS - {"operation", "features", "solidIndices", "solidTransforms"}:
         raise ModelError("The measurement request contains unsupported fields.")
     shape = read_brep(spec, asset_directory, cq, threads)
     posed = "solidTransforms" in spec
@@ -2888,7 +2920,7 @@ def clearance_brep(spec, asset_directory, cq, threads):
     A zero distance includes the common volume, which separates surface contact
     from interference. Nothing is meshed, serialized or rebuilt.
     """
-    if set(spec) != {"operation", "brepAsset", "pairs", "poses"}:
+    if not {"operation", "brepAsset", "pairs", "poses"} <= set(spec) or set(spec) - NATIVE_SOURCE_FIELDS - {"operation", "pairs", "poses"}:
         raise ModelError("The clearance request contains unsupported fields.")
     shape = read_brep(spec, asset_directory, cq, threads)
     solids = _shape_entities(shape, "Solid")
@@ -2987,13 +3019,16 @@ def validation_hash(spec, directory, cq):
     return digest.hexdigest()
 
 
-def run(request, output, threads, defer_step=False, validated_hash=None):
+def run(request, output, threads, defer_step=False, validated_hash=None, native_only=False):
     if not 1 <= threads <= 256:
         raise ModelError("Thread count must be between 1 and 256.")
     size = request.stat().st_size
     if size > 16 * 1024 * 1024:
         raise ModelError("CAD request exceeds the 16 MiB size limit.")
     spec = json.loads(request.read_text())
+    if native_only and not (isinstance(spec, dict) and spec.get("operation") in NATIVE_OPERATIONS):
+        # The serving worker runs outside the program sandbox.
+        raise ModelError("This worker performs only native geometry operations.")
     if isinstance(spec, dict) and str(spec.get("operation", "")).startswith("mesh_"):
         from mesh_tools import execute, envelope, diagnostic, canonical
         try:
@@ -3074,15 +3109,51 @@ def run(request, output, threads, defer_step=False, validated_hash=None):
     return preview
 
 
+def serve():
+    """Answer native-geometry requests from the app, one JSON line each.
+
+    Each request names a request file, an output folder and a thread count; the
+    reply reports completion or the error, and results stay in that folder.
+    Native output and stray prints go to stderr so they cannot corrupt replies.
+    The loop ends when the app closes stdin, including when it exits.
+    """
+    global _serving
+    _serving = True
+    replies = os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8")
+    os.dup2(2, 1)
+    for line in sys.stdin:
+        message, output = None, None
+        try:
+            message = json.loads(line)
+            output = Path(message["output"])
+            run(Path(message["request"]), output, int(message["threads"]), native_only=True)
+            reply = {"id": message["id"], "status": "complete"}
+        except Exception as error:
+            if output is not None:
+                try:
+                    write_error_report(error, output)
+                except Exception:
+                    pass
+            reply = {"id": message.get("id") if isinstance(message, dict) else None, "status": "error",
+                     "message": f"LAD CAD engine: {error}"[:16_000]}
+        replies.write(json.dumps(reply) + "\n")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--request", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--serve", action="store_true", help="Answer native-geometry requests on stdin.")
+    parser.add_argument("--request", type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--threads", type=int, default=max(1, min(32, os.cpu_count() or 1)))
     parser.add_argument("--defer-step", action="store_true",
                         help="Verify a temporary STEP, then retain only the preview and private native solid.")
     parser.add_argument("--validated-hash", help="Reuse successful validation of identical replay inputs.")
     arguments = parser.parse_args()
+    if arguments.serve:
+        return serve()
+    if arguments.request is None or arguments.output is None:
+        parser.error("--request and --output are required")
     try:
         result = run(arguments.request, arguments.output, arguments.threads, arguments.defer_step, arguments.validated_hash)
         print(json.dumps({"status": "complete", "solids": result.get("solids"), "faces": result.get("faces")}))
