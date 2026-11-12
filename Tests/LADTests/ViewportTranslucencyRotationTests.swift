@@ -68,7 +68,7 @@ final class ViewportTranslucencyRotationTests: XCTestCase {
         guard let path = ProcessInfo.processInfo.environment["LAD_TRANSLUCENCY_PREVIEW"] else {
             throw XCTSkip("Set LAD_TRANSLUCENCY_PREVIEW to the current enclosure preview for its ballast regression.")
         }
-        let preview = try JSONDecoder().decode(PreviewMesh.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        let preview = try PreviewMesh.loadResult(at: URL(fileURLWithPath: path))
         guard preview.solids == 63, let part = preview.topology?.parts.first(where: { $0.solidIndex == 2 }), part.bounds.count == 6 else {
             throw XCTSkip("This opt-in regression needs the 63-part enclosure with its native ballast bounds.")
         }

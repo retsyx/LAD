@@ -10,7 +10,7 @@ final class ViewportEnclosureSurfaceTests: XCTestCase {
         guard let path = ProcessInfo.processInfo.environment["LAD_EDGE_OCCLUSION_PREVIEW"] else {
             throw XCTSkip("Set LAD_EDGE_OCCLUSION_PREVIEW to the enclosure preview for its smooth-roof regression.")
         }
-        let preview = try JSONDecoder().decode(PreviewMesh.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        let preview = try PreviewMesh.loadResult(at: URL(fileURLWithPath: path))
         guard preview.solids == 63, preview.bounds.count == 6 else {
             throw XCTSkip("This opt-in regression needs the 63-part enclosure.")
         }

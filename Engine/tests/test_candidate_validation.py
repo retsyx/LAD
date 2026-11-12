@@ -275,7 +275,7 @@ class CandidateSTEPRoundtripTests(unittest.TestCase):
                   mock.patch.object(worker, "make_preview", side_effect=AssertionError("No preview before acceptance"))):
                 with self.assertRaises(worker.ModelError):
                     worker.run(request, output, 2, defer_step=True)
-            for name in ("result.json", "result.json.tmp", "model.brep", "model.step"):
+            for name in ("result.json", "result.json.tmp", "mesh.bin", "model.brep", "model.step"):
                 self.assertFalse((output / name).exists(), f"Rejected candidate published {name}.")
 
     def test_deferred_build_checks_step_then_removes_temporary_export(self):

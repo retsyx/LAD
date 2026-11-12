@@ -6,15 +6,18 @@ import XCTest
 
 final class PreviewNormalsTests: XCTestCase {
     func testWorkerNormalPayloadDecodesAndValidates() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-normals-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
         let original = curvedPreview()
-        let decoded = try JSONDecoder().decode(PreviewMesh.self, from: JSONEncoder().encode(original))
-        XCTAssertEqual(decoded.normals, original.normals)
+        let decoded = try PreviewMesh.loadResult(at: original.writeWorkerResult(to: folder))
+        XCTAssertEqual(decoded.vertexNormals, original.vertexNormals)
+        XCTAssertEqual(decoded.positions, original.positions)
+        XCTAssertEqual(decoded.triangleIndices, original.triangleIndices)
         XCTAssertTrue(decoded.hasValidNormals)
         XCTAssertNoThrow(try ProjectStore.validatePreview(decoded))
 
-        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(original)) as? [String: Any])
-        object["normals"] = [[0.0, 0.0, 1.0]]
-        let truncated = try JSONDecoder().decode(PreviewMesh.self, from: JSONSerialization.data(withJSONObject: object))
+        let truncated = try PreviewMesh.loadResult(at: original.writeWorkerResult(to: folder, sections: ["normals": [0, 0, 1]]))
         XCTAssertThrowsError(try ProjectStore.validatePreview(truncated), "A partial normal buffer must not reach the GPU.")
     }
 

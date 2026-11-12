@@ -76,10 +76,16 @@ struct CADRuntime: Codable, Sendable, Equatable {
     var ocp: String
 }
 
+/// Display geometry for one build. Bulk arrays are packed: SceneKit uploads
+/// Float32 attributes, and the worker publishes them as binary sections beside
+/// its JSON metadata (see `PreviewMeshBuffers`). They are never encoded.
 struct PreviewMesh: Codable, Sendable {
-    var vertices: [[Double]]
-    var triangles: [[Int]]
-    var edges: [[Double]]
+    /// Vertex coordinates, xyz per vertex.
+    var positions: [Float] = []
+    /// Vertex indices, three per triangle.
+    var triangleIndices: [UInt32] = []
+    /// Edge segments, start xyz then end xyz per segment.
+    var edgePoints: [Float] = []
     var bounds: [Double]
     var volume: Double
     var area: Double
@@ -88,7 +94,9 @@ struct PreviewMesh: Codable, Sendable {
     var buildSeconds: Double
     var threads: Int
     var stepPath: String
+    /// Solid index per triangle.
     var triangleSolids: [Int]? = nil
+    /// Solid index per edge segment.
     var edgeSolids: [Int]? = nil
     var parts: [PartNode]? = nil
     /// Private session artifact used to export STEP without replaying a program.
@@ -103,10 +111,10 @@ struct PreviewMesh: Codable, Sendable {
     /// Indices into topology.edges, one per sampled edge segment.
     var edgeFeatures: [Int]? = nil
 
-    /// Exact oriented surface normals, parallel to vertices. Derived worker
-    /// output only; project archives never retain display buffers. Synthetic
-    /// previews may omit these when no native CAD surface is available.
-    var normals: [[Double]]? = nil
+    /// Exact oriented surface normals, xyz per vertex. Derived worker output
+    /// only; project archives never retain display buffers. Synthetic previews
+    /// may omit these when no native CAD surface is available.
+    var vertexNormals: [Float]? = nil
 
     /// Successful worker validation receipt, bound to complete replay inputs.
     var validatedHash: String? = nil
@@ -121,17 +129,26 @@ struct PreviewMesh: Codable, Sendable {
     var buildArtifacts: EngineBuildArtifacts? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case vertices, triangles, edges, bounds, volume, area, solids, faces, buildSeconds, threads, stepPath
-        case triangleSolids, edgeSolids, parts, brepPath, runtime, topology, triangleFaces, edgeFeatures, normals, validatedHash, assemblyMotion
+        case bounds, volume, area, solids, faces, buildSeconds, threads, stepPath
+        case parts, brepPath, runtime, topology, validatedHash, assemblyMotion
+    }
+
+    var vertexCount: Int { positions.count / 3 }
+    var triangleCount: Int { triangleIndices.count / 3 }
+    var edgeSegmentCount: Int { edgePoints.count / 6 }
+
+    func position(_ index: Int) -> SIMD3<Float> {
+        let start = index * 3
+        return SIMD3(positions[start], positions[start + 1], positions[start + 2])
     }
 
     var hasValidNormals: Bool {
-        guard let normals, normals.count == vertices.count else { return false }
-        return normals.allSatisfy { normal in
-            guard normal.count == 3, normal.allSatisfy(\.isFinite) else { return false }
-            let lengthSquared = normal.reduce(0) { $0 + $1 * $1 }
-            return abs(lengthSquared - 1) <= 0.0001
+        guard let vertexNormals, vertexNormals.count == positions.count else { return false }
+        for start in stride(from: 0, to: vertexNormals.count, by: 3) {
+            let x = vertexNormals[start], y = vertexNormals[start + 1], z = vertexNormals[start + 2]
+            guard x.isFinite, y.isFinite, z.isFinite, abs(x * x + y * y + z * z - 1) <= 0.0001 else { return false }
         }
+        return true
     }
 
     var size: [Double] {

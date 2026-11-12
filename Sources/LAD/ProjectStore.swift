@@ -241,8 +241,10 @@ enum ProjectStore {
     }
 
     static func validatePreview(_ mesh: PreviewMesh) throws {
-        guard (1...1_000_000).contains(mesh.vertices.count),
-              (1...1_000_000).contains(mesh.triangles.count), mesh.edges.count <= 250_000,
+        guard mesh.positions.count.isMultiple(of: 3), mesh.triangleIndices.count.isMultiple(of: 3),
+              mesh.edgePoints.count.isMultiple(of: 6),
+              (1...1_000_000).contains(mesh.vertexCount),
+              (1...1_000_000).contains(mesh.triangleCount), mesh.edgeSegmentCount <= 250_000,
               mesh.bounds.count == 6, mesh.bounds.allSatisfy(validCoordinate),
               (0..<3).allSatisfy({ mesh.bounds[$0] <= mesh.bounds[$0 + 3] }),
               (0..<3).contains(where: { mesh.bounds[$0] < mesh.bounds[$0 + 3] }),
@@ -252,31 +254,31 @@ enum ProjectStore {
               mesh.stepPath.utf8.count <= 16_384 else { throw invalid("Embedded preview metadata is invalid.") }
         let span = (0..<3).map { mesh.bounds[$0 + 3] - mesh.bounds[$0] }.max() ?? 0
         let tolerance = max(0.0001, span * 0.000001)
-        func inBounds(_ point: ArraySlice<Double>) -> Bool {
-            guard point.count == 3 else { return false }
-            return point.enumerated().allSatisfy { axis, value in
-                validCoordinate(value) && value >= mesh.bounds[axis] - tolerance && value <= mesh.bounds[axis + 3] + tolerance
+        // Coordinates are packed xyz; the axis is the position within each triple.
+        func inBounds(_ points: [Float]) -> Bool {
+            for (index, value) in points.enumerated() {
+                let axis = index % 3, coordinate = Double(value)
+                guard validCoordinate(coordinate), coordinate >= mesh.bounds[axis] - tolerance,
+                      coordinate <= mesh.bounds[axis + 3] + tolerance else { return false }
             }
+            return true
         }
-        guard mesh.vertices.allSatisfy({ $0.count == 3 && inBounds($0[...]) }),
-              mesh.triangles.allSatisfy({ triangle in
-                  triangle.count == 3 && triangle.allSatisfy { $0 >= 0 && $0 < mesh.vertices.count }
-              }),
-              mesh.edges.allSatisfy({ edge in
-                  edge.count == 6 && inBounds(edge.prefix(3)) && inBounds(edge.suffix(3))
-              }) else { throw invalid("Embedded preview contains invalid vertices, triangles or edges.") }
-        if mesh.normals != nil, !mesh.hasValidNormals {
+        let vertexCount = UInt32(mesh.vertexCount)
+        guard inBounds(mesh.positions), mesh.triangleIndices.allSatisfy({ $0 < vertexCount }), inBounds(mesh.edgePoints) else {
+            throw invalid("Embedded preview contains invalid vertices, triangles or edges.")
+        }
+        if mesh.vertexNormals != nil, !mesh.hasValidNormals {
             throw invalid("Preview surface normals are invalid.")
         }
         if let mapping = mesh.triangleSolids {
-            guard mapping.count == mesh.triangles.count,
+            guard mapping.count == mesh.triangleCount,
                   mapping.allSatisfy({ $0 >= 0 && $0 < mesh.solids }),
                   Set(mapping) == Set(0..<mesh.solids) else {
                 throw invalid("Embedded preview solid selection data is invalid.")
             }
         }
         if let mapping = mesh.edgeSolids {
-            guard mapping.count == mesh.edges.count, mapping.allSatisfy({ $0 >= 0 && $0 < mesh.solids }) else {
+            guard mapping.count == mesh.edgeSegmentCount, mapping.allSatisfy({ $0 >= 0 && $0 < mesh.solids }) else {
                 throw invalid("Embedded preview edge ownership is invalid.")
             }
         }

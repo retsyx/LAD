@@ -564,7 +564,11 @@ final class EngineService {
         let decoding = Task.detached(priority: .userInitiated) {
             let data = try EngineArtifact.read(resultURL, in: folder, maximumBytes: 256_000_000)
             var result = try JSONDecoder().decode(PreviewMesh.self, from: data)
-            guard result.normals != nil else {
+            guard let buffers = try PreviewMeshBuffers.manifest(in: data) else {
+                throw LADError.message("The CAD engine returned an incomplete design preview.")
+            }
+            try PreviewMeshBuffers.read(buffers, in: folder, into: &result)
+            guard result.vertexNormals != nil else {
                 throw LADError.message("The CAD engine returned an incomplete design preview.")
             }
             try ProjectStore.validatePreview(result)
@@ -675,7 +679,7 @@ enum EngineArtifact {
         return (Int(size), header, footer)
     }
 
-    private static func openRegular(_ url: URL, in folder: URL) throws -> (FileHandle, Int64) {
+    static func openRegular(_ url: URL, in folder: URL) throws -> (FileHandle, Int64) {
         guard url.deletingLastPathComponent().path == folder.path,
               try canonicalDirectory(url.deletingLastPathComponent()).path == folder.path else {
             throw LADError.message("CAD engine returned an unsafe design asset path.")

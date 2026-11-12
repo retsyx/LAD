@@ -37,7 +37,7 @@ final class ViewportSurfaceShadingTests: XCTestCase {
         guard let path = ProcessInfo.processInfo.environment["LAD_SURFACE_NORMALS_PREVIEW"] else {
             throw XCTSkip("Set LAD_SURFACE_NORMALS_PREVIEW to inspect the current pebble preview independently of the live design.")
         }
-        let preview = try JSONDecoder().decode(PreviewMesh.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        let preview = try PreviewMesh.loadResult(at: URL(fileURLWithPath: path))
         XCTAssertTrue(preview.hasValidNormals)
         XCTAssertGreaterThan(preview.solids, 1)
         var before = preview

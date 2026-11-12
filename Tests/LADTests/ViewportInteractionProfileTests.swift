@@ -21,7 +21,7 @@ final class ViewportInteractionProfileTests: XCTestCase {
         XCTAssertTrue(application.setActivationPolicy(.regular))
         defer { _ = application.setActivationPolicy(previousPolicy) }
         application.finishLaunching()
-        let preview = try JSONDecoder().decode(PreviewMesh.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        let preview = try PreviewMesh.loadResult(at: URL(fileURLWithPath: path))
         let display = ProcessInfo.processInfo.environment["LAD_VIEWPORT_PROFILE_DISPLAY"]
             .flatMap(ViewportDisplayMode.init(rawValue:)) ?? .edges
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 618, height: 770), options: [

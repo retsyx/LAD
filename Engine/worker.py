@@ -2009,6 +2009,51 @@ def make_preview(shape, preview_stats=None):
     return preview
 
 
+# Display arrays travel to the app as packed little-endian 4-byte sections in
+# mesh.bin, beside compact JSON metadata: (preview key, section, array code,
+# values per item). Float32 matches the GPU attributes the app uploads.
+PREVIEW_SECTIONS = (
+    ("vertices", "positions", "f", 3), ("normals", "normals", "f", 3), ("triangles", "triangles", "I", 3),
+    ("edges", "edges", "f", 6), ("triangleSolids", "triangleSolids", "i", 1), ("triangleFaces", "triangleFaces", "i", 1),
+    ("edgeSolids", "edgeSolids", "i", 1), ("edgeFeatures", "edgeFeatures", "i", 1),
+)
+
+
+def write_preview_result(preview, output):
+    """Publish result.json, moving any display arrays into mesh.bin first."""
+    from array import array
+    from itertools import chain
+    result = dict(preview)
+    sections, offset = {}, 0
+    mesh = output / "mesh.bin"
+    temporary = output / "mesh.bin.tmp"
+    try:
+        with temporary.open("wb") as stream:
+            for key, name, code, width in PREVIEW_SECTIONS:
+                values = result.pop(key, None)
+                if values is None:
+                    continue
+                packed = array(code, chain.from_iterable(values) if width > 1 else values)
+                if len(packed) != len(values) * width or packed.itemsize != 4:
+                    raise ModelError(f"The preview {key} data is malformed.")
+                if sys.byteorder != "little":
+                    packed.byteswap()
+                packed.tofile(stream)
+                sections[name] = {"offset": offset, "count": len(packed)}
+                offset += len(packed) * 4
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    if sections:
+        temporary.replace(mesh)
+        result["meshBuffers"] = {"path": mesh.name, "sections": sections}
+    else:
+        temporary.unlink()
+    staged = output / "result.json.tmp"
+    staged.write_text(json.dumps(result, separators=(",", ":"), allow_nan=False))
+    staged.replace(output / "result.json")
+
+
 def validate_parts(parts, solid_count):
     """Check semantic ownership independently of disposable tessellation data."""
     if not isinstance(parts, list) or len(parts) > 8192:
@@ -3025,9 +3070,7 @@ def run(request, output, threads, defer_step=False, validated_hash=None):
     preview.update(buildSeconds=time.perf_counter() - started, threads=threads, runtime=runtime_info(cq))
     if not is_parts_export:
         preview["stepPath"] = str(step)
-    temporary = output / "result.json.tmp"
-    temporary.write_text(json.dumps(preview, separators=(",", ":"), allow_nan=False))
-    temporary.replace(output / "result.json")
+    write_preview_result(preview, output)
     return preview
 
 

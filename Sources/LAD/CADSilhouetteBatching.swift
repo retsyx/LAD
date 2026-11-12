@@ -8,7 +8,10 @@ enum CADSilhouetteBatching {
         var low = SIMD3<Double>(repeating: .infinity)
         var high = SIMD3<Double>(repeating: -.infinity)
         mutating func include(_ point: [Double]) {
-            let value = SIMD3(point[0], point[1], point[2])
+            include(SIMD3(point[0], point[1], point[2]))
+        }
+        mutating func include(_ point: SIMD3<Float>) { include(SIMD3<Double>(point)) }
+        mutating func include(_ value: SIMD3<Double>) {
             low = simd_min(low, value); high = simd_max(high, value)
         }
         var values: [Double] { [low.x, low.y, low.z, high.x, high.y, high.z] }

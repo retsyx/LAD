@@ -31,17 +31,13 @@ final class ProjectOpeningProfileTests: XCTestCase {
         }
         // Repeat the consumer stages separately to explain engine time outside buildSeconds.
         // These diagnostic samples overlap engineTotal and are not additive opening stages.
+        // The worker's result files are deleted once decoded; time the
+        // validation stages again on the decoded preview.
         start = clock.systemUptime
-        let resultData = try Data(contentsOf: URL(fileURLWithPath: preview.brepPath!).deletingLastPathComponent().appendingPathComponent("result.json"))
-        timings["samplePreviewRead"] = clock.systemUptime - start
-        start = clock.systemUptime
-        let decoded = try JSONDecoder().decode(PreviewMesh.self, from: resultData)
-        timings["samplePreviewDecode"] = clock.systemUptime - start
-        start = clock.systemUptime
-        try ProjectStore.validatePreview(decoded)
+        try ProjectStore.validatePreview(preview)
         timings["samplePreviewValidation"] = clock.systemUptime - start
         start = clock.systemUptime
-        try CADMeasurements.validateTopology(decoded)
+        try CADMeasurements.validateTopology(preview)
         timings["sampleTopologyValidation"] = clock.systemUptime - start
         // Preserve only temporary profiling inputs/results, never change the source archive.
         let folder = URL(fileURLWithPath: try XCTUnwrap(preview.brepPath)).deletingLastPathComponent()

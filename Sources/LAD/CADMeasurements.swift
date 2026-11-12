@@ -173,9 +173,9 @@ enum CADMeasurements {
                   part.bounds.count == 6 && part.bounds.allSatisfy(\.isFinite) &&
                   (0..<3).allSatisfy({ part.bounds[$0] <= part.bounds[$0 + 3] }) && point(part.centroid)
               }),
-              let faces = preview.triangleFaces, faces.count == preview.triangles.count,
+              let faces = preview.triangleFaces, faces.count == preview.triangleCount,
               faces.allSatisfy({ topology.faces.indices.contains($0) }),
-              let edges = preview.edgeFeatures, edges.count == preview.edges.count,
+              let edges = preview.edgeFeatures, edges.count == preview.edgeSegmentCount,
               edges.allSatisfy({ topology.edges.indices.contains($0) }) else {
             throw LADError.message("The CAD preview contains invalid topology metadata.")
         }

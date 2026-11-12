@@ -110,82 +110,104 @@ enum CADStrokeGeometry {
         let indexCount: Int
     }
 
-    nonisolated static func prepare(_ segments: [[Double]], surfaces: [CADStrokeSurface]? = nil) throws -> Prepared {
-        try buffers(segments, surfaces: surfaces, checkCancellation: { try Task.checkCancellation() })
-    }
-
-    static func make(_ segments: [[Double]], color: NSColor, viewportHeight: CGFloat,
-                     surfaces: [CADStrokeSurface]? = nil) -> SCNGeometry {
-        make(buffers(segments, surfaces: surfaces, checkCancellation: {}), color: color, viewportHeight: viewportHeight)
-    }
-
-    nonisolated private static func buffers(_ segments: [[Double]], surfaces: [CADStrokeSurface]?,
-                                            checkCancellation: () throws -> Void) rethrows -> Prepared {
-        try checkCancellation()
-        var vertices = [Float]()
-        var directions = [Float]()
-        var coordinates = [Float]()
-        var firstNormalXY = [Float](), middleNormals = [Float](), secondNormalYZ = [Float]()
-        var indices = [Int32]()
-        vertices.reserveCapacity(segments.count * 12)
-        directions.reserveCapacity(segments.count * 12)
-        coordinates.reserveCapacity(segments.count * 8)
-        firstNormalXY.reserveCapacity(segments.count * 8)
-        middleNormals.reserveCapacity(segments.count * 8)
-        secondNormalYZ.reserveCapacity(segments.count * 8)
-        indices.reserveCapacity(segments.count * 6)
+    /// `segments` are indices into `points`, which holds six Float32 values
+    /// (start xyz, end xyz) per segment. `surfaces`, when present, is indexed
+    /// by the same segment indices.
+    nonisolated static func prepare(points: [Float], segments: [Int], surfaces: [CADStrokeSurface]? = nil) throws -> Prepared {
+        try Task.checkCancellation()
+        // Keep finite, nondegenerate segments first, so each attribute buffer is
+        // allocated once at its final size and written in place.
+        func endpoints(_ segment: Int) -> (SIMD3<Double>, SIMD3<Double>)? {
+            let base = segment * 6
+            guard segment >= 0, base + 6 <= points.count else { return nil }
+            let a = SIMD3<Double>(Double(points[base]), Double(points[base + 1]), Double(points[base + 2]))
+            let b = SIMD3<Double>(Double(points[base + 3]), Double(points[base + 4]), Double(points[base + 5]))
+            func valid(_ point: SIMD3<Double>) -> Bool {
+                point.x.isFinite && point.y.isFinite && point.z.isFinite && abs(point.x) < 1e12 && abs(point.y) < 1e12 && abs(point.z) < 1e12
+            }
+            guard valid(a), valid(b), simd_length_squared(b - a) > 1e-24 else { return nil }
+            return (a, b)
+        }
+        var accepted = [Int]()
+        accepted.reserveCapacity(segments.count)
+        for (position, segment) in segments.enumerated() {
+            if position.isMultiple(of: 256) { try Task.checkCancellation() }
+            guard accepted.count < (Int(Int32.max) - 4) / 4, endpoints(segment) != nil else { continue }
+            accepted.append(segment)
+        }
         func finiteNormal(_ normal: SIMD3<Double>) -> SIMD3<Double> {
             guard normal.x.isFinite, normal.y.isFinite, normal.z.isFinite,
                   simd_length_squared(normal) > 1e-20, simd_length_squared(normal).isFinite else { return .zero }
             return simd_normalize(normal)
         }
-        for (segmentIndex, segment) in segments.enumerated() {
-            if segmentIndex.isMultiple(of: 256) { try checkCancellation() }
-            guard segment.count == 6, segment.allSatisfy({ $0.isFinite && abs($0) < 1e12 }) else { continue }
-            let a = SIMD3(segment[0], segment[1], segment[2])
-            let b = SIMD3(segment[3], segment[4], segment[5])
-            let delta = b - a
-            let vertexCount = vertices.count / 3
-            guard simd_length_squared(delta) > 1e-24, vertexCount <= Int(Int32.max) - 4 else { continue }
-            // Direction, rather than a second point, remains valid if SceneKit
-            // normalizes this attribute before the geometry entry point.
-            let direction = simd_normalize(delta)
-            let first = Int32(vertexCount)
-            vertices.append(contentsOf: [Float(a.x), Float(a.y), Float(a.z), Float(a.x), Float(a.y), Float(a.z),
-                                         Float(b.x), Float(b.y), Float(b.z), Float(b.x), Float(b.y), Float(b.z)])
-            coordinates.append(contentsOf: [-1, -1, 1, -1, -1, 1, 1, 1])
-            let surface = surfaces.flatMap { $0.indices.contains(segmentIndex) ? $0[segmentIndex] : nil } ?? CADStrokeSurface()
-            let n0 = finiteNormal(surface.first), n1 = finiteNormal(surface.second)
-            for _ in 0..<4 {
-                directions.append(contentsOf: [Float(direction.x), Float(direction.y), Float(direction.z)])
-                firstNormalXY.append(contentsOf: [Float(n0.x), Float(n0.y)])
-                middleNormals.append(contentsOf: [Float(n0.z), Float(n1.x)])
-                secondNormalYZ.append(contentsOf: [Float(n1.y), Float(n1.z)])
-            }
-            indices.append(contentsOf: [first, first + 1, first + 2, first + 2, first + 1, first + 3])
+        func surface(_ segment: Int) -> (SIMD3<Double>, SIMD3<Double>) {
+            let value = surfaces.flatMap { $0.indices.contains(segment) ? $0[segment] : nil } ?? CADStrokeSurface()
+            return (finiteNormal(value.first), finiteNormal(value.second))
         }
-        try checkCancellation()
-        let vertexData = packed(vertices)
-        try checkCancellation()
-        let directionData = packed(directions)
-        try checkCancellation()
-        let coordinateData = packed(coordinates)
-        try checkCancellation()
-        let firstNormalData = packed(firstNormalXY)
-        try checkCancellation()
-        let middleNormalData = packed(middleNormals)
-        try checkCancellation()
-        let secondNormalData = packed(secondNormalYZ)
-        try checkCancellation()
-        let indexData = packed(indices)
-        try checkCancellation()
-        return Prepared(vertices: vertexData, directions: directionData, coordinates: coordinateData,
-                        firstNormalXY: firstNormalData, middleNormals: middleNormalData, secondNormalYZ: secondNormalData,
-                        indices: indexData, vertexCount: vertices.count / 3, indexCount: indices.count)
+        // Four ribbon corners per segment: start twice, then end twice.
+        func perCorner3(_ value: (Int, Int) -> SIMD3<Float>) throws -> Data {
+            try packed(count: accepted.count * 12) { (buffer: UnsafeMutableBufferPointer<Float>) in
+                for (index, segment) in accepted.enumerated() {
+                    if index.isMultiple(of: 256) { try Task.checkCancellation() }
+                    for corner in 0..<4 {
+                        let item = value(segment, corner), base = (index * 4 + corner) * 3
+                        buffer[base] = item.x; buffer[base + 1] = item.y; buffer[base + 2] = item.z
+                    }
+                }
+            }
+        }
+        func perCorner2(_ value: (Int, Int) -> SIMD2<Float>) throws -> Data {
+            try packed(count: accepted.count * 8) { (buffer: UnsafeMutableBufferPointer<Float>) in
+                for (index, segment) in accepted.enumerated() {
+                    if index.isMultiple(of: 256) { try Task.checkCancellation() }
+                    for corner in 0..<4 {
+                        let item = value(segment, corner), base = (index * 4 + corner) * 2
+                        buffer[base] = item.x; buffer[base + 1] = item.y
+                    }
+                }
+            }
+        }
+        let vertices = try perCorner3 { segment, corner in
+            let (a, b) = endpoints(segment)!
+            return SIMD3<Float>(corner < 2 ? a : b)
+        }
+        // Direction, rather than a second point, remains valid if SceneKit
+        // normalizes this attribute before the geometry entry point.
+        let directions = try perCorner3 { segment, _ in
+            let (a, b) = endpoints(segment)!
+            return SIMD3<Float>(simd_normalize(b - a))
+        }
+        let coordinates = try perCorner2 { _, corner in SIMD2(corner.isMultiple(of: 2) ? -1 : 1, corner < 2 ? -1 : 1) }
+        let firstNormalXY = try perCorner2 { segment, _ in
+            let (n0, _) = surface(segment)
+            return SIMD2(Float(n0.x), Float(n0.y))
+        }
+        let middleNormals = try perCorner2 { segment, _ in
+            let (n0, n1) = surface(segment)
+            return SIMD2(Float(n0.z), Float(n1.x))
+        }
+        let secondNormalYZ = try perCorner2 { segment, _ in
+            let (_, n1) = surface(segment)
+            return SIMD2(Float(n1.y), Float(n1.z))
+        }
+        let indices: Data = try packed(count: accepted.count * 6) { (buffer: UnsafeMutableBufferPointer<Int32>) in
+            for index in accepted.indices {
+                if index.isMultiple(of: 256) { try Task.checkCancellation() }
+                let first = Int32(index * 4), base = index * 6
+                buffer[base] = first; buffer[base + 1] = first + 1; buffer[base + 2] = first + 2
+                buffer[base + 3] = first + 2; buffer[base + 4] = first + 1; buffer[base + 5] = first + 3
+            }
+        }
+        try Task.checkCancellation()
+        return Prepared(vertices: vertices, directions: directions, coordinates: coordinates,
+                        firstNormalXY: firstNormalXY, middleNormals: middleNormals, secondNormalYZ: secondNormalYZ,
+                        indices: indices, vertexCount: accepted.count * 4, indexCount: accepted.count * 6)
     }
 
-    nonisolated private static func packed<T>(_ values: [T]) -> Data {
-        values.withUnsafeBufferPointer { Data(buffer: $0) }
+    nonisolated private static func packed<T>(count: Int, _ fill: (UnsafeMutableBufferPointer<T>) throws -> Void) rethrows -> Data {
+        var data = Data(count: count * MemoryLayout<T>.stride)
+        try data.withUnsafeMutableBytes { raw in try fill(raw.bindMemory(to: T.self)) }
+        return data
     }
 
     static func make(_ prepared: Prepared, color: NSColor, viewportHeight: CGFloat) -> SCNGeometry {

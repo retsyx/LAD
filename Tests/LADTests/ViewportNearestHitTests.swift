@@ -69,7 +69,7 @@ final class ViewportNearestHitTests: XCTestCase {
         struct Probe: Decodable { var worldPoint: [Double]; var featureID: CADFeatureID }
         struct Manifest: Decodable { var preview: String; var points: [Probe] }
         let manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
-        let preview = try JSONDecoder().decode(PreviewMesh.self, from: Data(contentsOf: URL(fileURLWithPath: manifest.preview)))
+        let preview = try PreviewMesh.loadResult(at: URL(fileURLWithPath: manifest.preview))
         XCTAssertFalse(manifest.points.isEmpty)
         for projection in ViewportProjectionMode.allCases {
             // Face probes need enough screen space to lie outside the

@@ -21,7 +21,7 @@ struct CADViewportPreparedMesh: Sendable {
         // Bound every collection traversed even for synthetic previews whose
         // optional topology can be much larger than their display mesh.
         var remaining = 2_048
-        for count in [mesh.vertices.count, mesh.triangles.count, mesh.edges.count, mesh.topology?.parts.count ?? 0] {
+        for count in [mesh.vertexCount, mesh.triangleCount, mesh.edgeSegmentCount, mesh.topology?.parts.count ?? 0] {
             guard count <= remaining else { return true }
             remaining -= count
         }
@@ -32,53 +32,44 @@ struct CADViewportPreparedMesh: Sendable {
     /// Cancellation is distinct from invalid input and propagates to its owner.
     static func prepare(_ mesh: PreviewMesh) throws -> Self? {
         try Task.checkCancellation()
+        let vertexCount = mesh.vertexCount, triangleCount = mesh.triangleCount
         guard mesh.bounds.count == 6, mesh.bounds.allSatisfy({ $0.isFinite && abs($0) < 1e12 }),
               (0..<3).allSatisfy({ mesh.bounds[$0] <= mesh.bounds[$0 + 3] }),
-              !mesh.vertices.isEmpty, mesh.vertices.count <= 1_000_000,
-              !mesh.triangles.isEmpty, mesh.triangles.count <= 1_000_000 else { return nil }
-        for (index, vertex) in mesh.vertices.enumerated() {
-            if index.isMultiple(of: 256) { try Task.checkCancellation() }
-            guard vertex.count == 3, vertex.allSatisfy({ $0.isFinite && abs($0) < 1e12 }) else { return nil }
+              mesh.positions.count.isMultiple(of: 3), mesh.triangleIndices.count.isMultiple(of: 3),
+              (1...1_000_000).contains(vertexCount), (1...1_000_000).contains(triangleCount) else { return nil }
+        for (index, value) in mesh.positions.enumerated() {
+            if index.isMultiple(of: 768) { try Task.checkCancellation() }
+            guard value.isFinite, abs(value) < 1e12 else { return nil }
         }
-        for (index, triangle) in mesh.triangles.enumerated() {
-            if index.isMultiple(of: 256) { try Task.checkCancellation() }
-            guard triangle.count == 3, triangle.allSatisfy({ $0 >= 0 && $0 < mesh.vertices.count }) else { return nil }
+        let maximumIndex = UInt32(vertexCount)
+        for (index, vertex) in mesh.triangleIndices.enumerated() {
+            if index.isMultiple(of: 768) { try Task.checkCancellation() }
+            guard vertex < maximumIndex else { return nil }
         }
-        if let normals = mesh.normals {
-            guard normals.count == mesh.vertices.count else { return nil }
-            for (index, normal) in normals.enumerated() {
-                if index.isMultiple(of: 256) { try Task.checkCancellation() }
-                guard normal.count == 3, normal.allSatisfy(\.isFinite),
-                      abs(normal.reduce(0) { $0 + $1 * $1 } - 1) <= 0.0001 else { return nil }
-            }
+        if mesh.vertexNormals != nil {
+            try Task.checkCancellation()
+            guard mesh.hasValidNormals else { return nil }
         }
-        let vertexData = try packedXYZ(count: mesh.vertices.count) { index in
-            let vertex = mesh.vertices[index]
-            return SIMD3(vertex[0], vertex[1], vertex[2])
-        }
-        let normalData: Data
-        if let normals = mesh.normals {
-            normalData = try packedXYZ(count: normals.count) { index in
-                let normal = normals[index]
-                return SIMD3(normal[0], normal[1], normal[2])
-            }
-        } else {
-            normalData = try smoothNormals(vertices: mesh.vertices, triangles: mesh.triangles)
-        }
+        // SceneKit uploads Float32 attributes; the packed arrays already match.
+        let vertexData = mesh.positions.withUnsafeBufferPointer { Data(buffer: $0) }
+        let normalData = try mesh.vertexNormals.map { normals in normals.withUnsafeBufferPointer { Data(buffer: $0) } }
+            ?? smoothNormals(mesh)
 
-        let solidMap = try validOwners(mesh.triangleSolids, count: mesh.triangles.count, solids: mesh.solids)
+        let solidMap = try validOwners(mesh.triangleSolids, count: triangleCount, solids: mesh.solids)
         var groups = [Int: [Int32]](), faceIDsBySolid = [Int: [CADFeatureID?]]()
         var faceIndices = [CADFeatureID: [Int32]](), faceBounds = [CADFeatureID: CADSilhouetteBatching.Bounds]()
-        for (index, triangle) in mesh.triangles.enumerated() {
+        for index in 0..<triangleCount {
             if index.isMultiple(of: 256) { try Task.checkCancellation() }
             let solid = solidMap?[index] ?? 0
-            let indices = triangle.map(Int32.init)
-            groups[solid, default: []].append(contentsOf: indices)
+            let base = index * 3
+            let corners: [Int32] = [Int32(mesh.triangleIndices[base]), Int32(mesh.triangleIndices[base + 1]),
+                                    Int32(mesh.triangleIndices[base + 2])]
+            groups[solid, default: []].append(contentsOf: corners)
             let feature = faceID(forTriangle: index, in: mesh, solid: solid)
             faceIDsBySolid[solid, default: []].append(feature)
             if let feature {
-                faceIndices[feature, default: []].append(contentsOf: indices)
-                for vertex in triangle { faceBounds[feature, default: .init()].include(mesh.vertices[vertex]) }
+                faceIndices[feature, default: []].append(contentsOf: corners)
+                for vertex in corners { faceBounds[feature, default: .init()].include(mesh.position(Int(vertex))) }
             }
         }
 
@@ -93,27 +84,27 @@ struct CADViewportPreparedMesh: Sendable {
             var bounds = CADSilhouetteBatching.Bounds()
             for (index, vertex) in indices.enumerated() {
                 if index.isMultiple(of: 256) { try Task.checkCancellation() }
-                bounds.include(mesh.vertices[Int(vertex)])
+                bounds.include(mesh.position(Int(vertex)))
             }
             solidBounds[solid] = bounds.values
         }
 
-        let owners = try validOwners(mesh.edgeSolids, count: mesh.edges.count, solids: mesh.solids)
+        let segmentCount = mesh.edgePoints.count.isMultiple(of: 6) ? min(mesh.edgeSegmentCount, 250_000) : 0
+        let owners = try validOwners(mesh.edgeSolids, count: mesh.edgeSegmentCount, solids: mesh.solids)
         let surfaces = try CADStrokeSurface.matchingCancellable(mesh)
-        var edgeGroups = [Int: [[Double]]](), surfaceGroups = [Int: [CADStrokeSurface]]()
-        for (index, segment) in mesh.edges.prefix(250_000).enumerated() {
+        // Group segment indices by owner; the stroke buffers read the packed
+        // points directly.
+        var edgeGroups = [Int: [Int]]()
+        for index in 0..<segmentCount {
             if index.isMultiple(of: 256) { try Task.checkCancellation() }
-            guard segment.count == 6, segment.allSatisfy({ $0.isFinite && abs($0) < 1e12 }) else { continue }
-            let solid = owners?[index] ?? -1
-            edgeGroups[solid, default: []].append(segment)
-            surfaceGroups[solid, default: []].append(surfaces[index])
+            edgeGroups[owners?[index] ?? -1, default: []].append(index)
         }
         var edges = [Int: CADStrokeGeometry.Prepared]()
         for (solid, segments) in edgeGroups {
-            edges[solid] = try CADStrokeGeometry.prepare(segments, surfaces: surfaceGroups[solid])
+            edges[solid] = try CADStrokeGeometry.prepare(points: mesh.edgePoints, segments: segments, surfaces: surfaces)
         }
         try Task.checkCancellation()
-        return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: mesh.vertices.count,
+        return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: vertexCount,
                     groups: groups, faceIDsBySolid: faceIDsBySolid, faceIndices: faceIndices, faceBounds: faceBounds,
                     solidBounds: solidBounds, edges: edges, hasOwnedEdges: owners != nil)
     }
@@ -129,39 +120,34 @@ struct CADViewportPreparedMesh: Sendable {
 
     private static func faceID(forTriangle index: Int, in mesh: PreviewMesh, solid: Int) -> CADFeatureID? {
         guard let topology = mesh.topology, let faces = mesh.triangleFaces,
-              faces.count == mesh.triangles.count, topology.faces.indices.contains(faces[index]) else { return nil }
+              faces.count == mesh.triangleCount, topology.faces.indices.contains(faces[index]) else { return nil }
         let id = topology.faces[faces[index]].id
         return id.kind == .face && id.solidIndex == solid ? id : nil
     }
 
-    private static func packedXYZ(count: Int, value: (Int) -> SIMD3<Double>) throws -> Data {
-        // SceneKit's convenience vector sources use Float32 GPU attributes.
-        // Finish the existing Double calculations before narrowing once here.
-        var data = Data(count: count * 3 * MemoryLayout<Float>.size)
+    /// Synthetic previews without native normals use area-weighted smooth
+    /// normals, finished in Double before narrowing to SceneKit's Float32.
+    private static func smoothNormals(_ mesh: PreviewMesh) throws -> Data {
+        var sums = [SIMD3<Double>](repeating: .zero, count: mesh.vertexCount)
+        for index in 0..<mesh.triangleCount {
+            if index.isMultiple(of: 256) { try Task.checkCancellation() }
+            let first = Int(mesh.triangleIndices[index * 3]), second = Int(mesh.triangleIndices[index * 3 + 1])
+            let third = Int(mesh.triangleIndices[index * 3 + 2])
+            let a = SIMD3<Double>(mesh.position(first)), b = SIMD3<Double>(mesh.position(second))
+            let c = SIMD3<Double>(mesh.position(third))
+            let normal = simd_cross(b - a, c - a)
+            sums[first] += normal; sums[second] += normal; sums[third] += normal
+        }
+        var data = Data(count: sums.count * 3 * MemoryLayout<Float>.size)
         try data.withUnsafeMutableBytes { raw in
             let components = raw.bindMemory(to: Float.self)
-            for index in 0..<count {
+            for (index, sum) in sums.enumerated() {
                 if index.isMultiple(of: 256) { try Task.checkCancellation() }
-                let point = value(index), start = index * 3
-                components[start] = Float(point.x); components[start + 1] = Float(point.y); components[start + 2] = Float(point.z)
+                let normal = simd_length_squared(sum) > 1e-24 ? simd_normalize(sum) : SIMD3(0, 0, 1)
+                components[index * 3] = Float(normal.x); components[index * 3 + 1] = Float(normal.y)
+                components[index * 3 + 2] = Float(normal.z)
             }
         }
         return data
-    }
-
-    private static func smoothNormals(vertices: [[Double]], triangles: [[Int]]) throws -> Data {
-        var sums = [SIMD3<Double>](repeating: .zero, count: vertices.count)
-        for (index, triangle) in triangles.enumerated() {
-            if index.isMultiple(of: 256) { try Task.checkCancellation() }
-            let a = SIMD3(vertices[triangle[0]][0], vertices[triangle[0]][1], vertices[triangle[0]][2])
-            let b = SIMD3(vertices[triangle[1]][0], vertices[triangle[1]][1], vertices[triangle[1]][2])
-            let c = SIMD3(vertices[triangle[2]][0], vertices[triangle[2]][1], vertices[triangle[2]][2])
-            let normal = simd_cross(b - a, c - a)
-            for vertex in triangle { sums[vertex] += normal }
-        }
-        return try packedXYZ(count: sums.count) { index in
-            let normal = sums[index]
-            return simd_length_squared(normal) > 1e-24 ? simd_normalize(normal) : SIMD3(0, 0, 1)
-        }
     }
 }

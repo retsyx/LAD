@@ -68,10 +68,12 @@ final class CADStrokeSurfaceTests: XCTestCase {
         XCTAssertEqual(surfaces[1].first, .zero)
     }
 
+    /// Packed arrays have fixed strides, so rows of the wrong width cannot
+    /// occur; malformed values and indices still fall back to zero planes.
     func testMalformedCoordinatesTrianglesAndDegenerateGeometryHaveZeroFallbacks() {
-        let mesh = makeMesh(vertices: [[0, 0, 0], [1, 0, 0], [0, 1, 0], [.nan, 1, 0], [0, 0], [0, 0, 0, 1]],
-            triangles: [[-1, 1, 2], [0, 1, 99], [0, 1], [0, 0, 0], [0, 1, 3], [0, 1, 4], [0, 1, 5], [0, 1, 2]], edges: [
-                [0, 0, 0, 1, 0, 0], [0, 0, 0, 1, 0], [.infinity, 0, 0, 1, 0, 0],
+        let mesh = makeMesh(vertices: [[0, 0, 0], [1, 0, 0], [0, 1, 0], [.nan, 1, 0]],
+            triangles: [[-1, 1, 2], [0, 1, 99], [0, 0, 0], [0, 1, 3], [0, 1, 2]], edges: [
+                [0, 0, 0, 1, 0, 0], [.infinity, 0, 0, 1, 0, 0],
                 [0, 0, 0, 0, 0, 0], [Double.greatestFiniteMagnitude, 0, 0, 1, 0, 0], [.nan, 0, 0, 1, 0, 0]
             ])
         let surfaces = CADStrokeSurface.matching(mesh)

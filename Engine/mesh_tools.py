@@ -293,7 +293,7 @@ def execute(spec,directory,output,threads=1):
                     worker.write_brep(shape,output/"model.brep")
                     preview["geometry_hash"]=hashlib.sha256((output/"model.brep").read_bytes()).hexdigest()
                     display.update(stepPath=str((output/"model.step").resolve()),brepPath=str((output/"model.brep").resolve()),runtime=worker.runtime_info(cq),threads=threads,buildSeconds=0)
-                    (output/"result.json").write_bytes(canonical(display));native_preview=True
+                    worker.write_preview_result(display,output);native_preview=True
                 staged={**preview,"shape":shape,"state":plan.get("state",{})}
                 preview["quick_comparison"]={"before":compare(context,target,quality="preview"),"after":compare(context,staged,quality="preview"),
                                               "paired_source_sampling":True,"cache_reuse":"none; both states refreshed"}

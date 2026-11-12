@@ -86,12 +86,16 @@ same native curve adaptor and integrator as CadQuery, with indexed extraction
 for single-edge wires.
 
 Without `--defer-step`, the standalone CLI still writes `model.step` and
-`result.json`. The preview JSON contains
-vertices, indexed triangles, analytic edge line segments, six bounding-box
-coordinates, volume (mm³), area (mm²), solid/face counts, build duration, the
+`result.json`. The preview JSON contains six bounding-box coordinates, volume
+(mm³), area (mm²), solid/face counts, topology metadata, build duration, the
 configured thread count, CAD runtime versions, and the expected absolute STEP
-path. Deferred builds also include the native solid path. Errors exit nonzero and
-write an actionable description to stderr.
+path. Deferred builds also include the native solid path. Display arrays travel
+separately in `mesh.bin`, described by the JSON's `meshBuffers`: one
+little-endian section each for vertex positions, normals and edge segment
+endpoints (Float32), triangle indices (UInt32), and per-triangle and
+per-segment owners (Int32). Float32 matches the attributes the app uploads to
+the GPU, and the app copies each section straight into its packed array.
+Errors exit nonzero and write an actionable description to stderr.
 
 `triangleSolids` maps every triangle to a zero-based solid index, and
 `edgeSolids` maps each analytic edge segment to the same index space. Edges are

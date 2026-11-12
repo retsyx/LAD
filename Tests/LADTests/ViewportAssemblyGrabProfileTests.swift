@@ -13,7 +13,7 @@ final class ViewportAssemblyGrabProfileTests: XCTestCase {
             throw XCTSkip("Set LAD_ASSEMBLY_GRAB_PROFILE_PREVIEW to the native 64-part moving-assembly fixture.")
         }
         guard !NSScreen.screens.isEmpty else { throw XCTSkip("Live assembly profiling requires an awake display.") }
-        var preview = try JSONDecoder().decode(PreviewMesh.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        var preview = try PreviewMesh.loadResult(at: URL(fileURLWithPath: path))
         let request = URL(fileURLWithPath: path).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("request.json")
         let model = try JSONDecoder().decode(ModelSpec.self, from: Data(contentsOf: request))
         let motion = try XCTUnwrap(preview.assemblyMotion)
