@@ -78,11 +78,38 @@ struct CameraRig {
 
     /// Pixel coordinates with a bottom-left origin, used to verify anchored zoom.
     func project(_ point: SIMD3<Double>, width: Double, height: Double) -> SIMD2<Double> {
-        let delta = point - position
-        let depth = -simd_dot(delta, backward)
-        let extent = usesOrthographicProjection ? orthographicScale : depth * tangent
-        let units = 2 * extent / max(height, 1)
-        return SIMD2(width / 2 + simd_dot(delta, right) / units,
-                     height / 2 + simd_dot(delta, up) / units)
+        projection(width: width, height: height).project(point).screen
+    }
+
+    /// Snapshot of this pose's projection. Evaluating the trigonometric basis
+    /// once keeps repeated projection of many points cheap.
+    func projection(width: Double, height: Double) -> Projection {
+        Projection(position: position, right: right, up: up, backward: backward, tangent: tangent,
+                   orthographic: usesOrthographicProjection, orthographicScale: orthographicScale,
+                   width: width, height: height)
+    }
+
+    struct Projection {
+        let position: SIMD3<Double>
+        let right: SIMD3<Double>
+        let up: SIMD3<Double>
+        let backward: SIMD3<Double>
+        let tangent: Double
+        let orthographic: Bool
+        let orthographicScale: Double
+        let width: Double
+        let height: Double
+
+        /// Pixel coordinates with a bottom-left origin, and the point's
+        /// distance in front of the eye. Points at or behind the eye have a
+        /// nonpositive depth and no meaningful perspective screen position.
+        func project(_ point: SIMD3<Double>) -> (screen: SIMD2<Double>, depth: Double) {
+            let delta = point - position
+            let depth = -simd_dot(delta, backward)
+            let extent = orthographic ? orthographicScale : depth * tangent
+            let units = 2 * extent / max(height, 1)
+            return (SIMD2(width / 2 + simd_dot(delta, right) / units,
+                          height / 2 + simd_dot(delta, up) / units), depth)
+        }
     }
 }

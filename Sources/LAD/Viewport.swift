@@ -1998,23 +1998,14 @@ final class CADSceneView: SCNView {
     private func projectFeatures(_ topology: CADTopology) -> ProjectedFeatures {
         // Snapshot the camera once. Recomputing its trigonometric basis for
         // every polyline endpoint stalls the first hover after navigation.
-        let cameraPosition = rig.position, backward = rig.backward, right = rig.right, up = rig.up
-        let tangent = rig.tangent, orthographic = rig.usesOrthographicProjection
-        let orthographicScale = rig.orthographicScale
-        let width = Double(bounds.width), height = max(Double(bounds.height), 1)
+        let projection = rig.projection(width: Double(bounds.width), height: max(Double(bounds.height), 1))
         func projected(_ position: [Double], id: CADFeatureID) -> ViewportFeaturePicking.Vertex? {
             guard validFeaturePoint(position), !hiddenSolids.contains(id.solidIndex) else { return nil }
             let original = SIMD4(position[0], position[1], position[2], 1)
             let transformed = solidMatrices[id.solidIndex].map { $0 * original } ?? original
             let world = SIMD3(transformed.x, transformed.y, transformed.z)
-            let delta = world - cameraPosition
-            let depth = -simd_dot(delta, backward)
-            guard depth > 0 else { return nil }
-            let extent = orthographic ? orthographicScale : depth * tangent
-            let units = 2 * extent / height
-            let screen = SIMD2(width / 2 + simd_dot(delta, right) / units,
-                               height / 2 + simd_dot(delta, up) / units)
-            guard screen.x.isFinite, screen.y.isFinite else { return nil }
+            let (screen, depth) = projection.project(world)
+            guard depth > 0, screen.x.isFinite, screen.y.isFinite else { return nil }
             return .init(id: id, world: world, screen: screen, depth: depth)
         }
         let vertices = topology.vertices.compactMap { projected($0.position, id: $0.id) }

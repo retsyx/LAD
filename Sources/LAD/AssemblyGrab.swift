@@ -22,15 +22,20 @@ struct AssemblyGrabProjection: Sendable, Equatable {
 
     func screen(_ point: SIMD3<Double>) -> SIMD2<Double>? {
         guard worldToClip.count == 16, viewportSize.count == 2 else { return nil }
-        let v = SIMD4(point, 1)
-        func row(_ offset: Int) -> Double {
-            worldToClip[offset] * v.x + worldToClip[offset + 1] * v.y
-                + worldToClip[offset + 2] * v.z + worldToClip[offset + 3]
-        }
-        let w = row(12)
-        guard w.isFinite, w > 1e-12 else { return nil }
-        let result = SIMD2((row(0) / w + 1) * viewportSize[0] / 2,
-                           (row(4) / w + 1) * viewportSize[1] / 2)
+        let clipped = clip(point)
+        guard clipped.w.isFinite, clipped.w > 1e-12 else { return nil }
+        let result = SIMD2((clipped.x / clipped.w + 1) * viewportSize[0] / 2,
+                           (clipped.y / clipped.w + 1) * viewportSize[1] / 2)
         return result.x.isFinite && result.y.isFinite ? result : nil
+    }
+
+    /// Homogeneous clip X, Y and W of a world point; the caller checks that
+    /// the matrix has 16 entries. W is not positive at or behind the eye.
+    func clip(_ point: SIMD3<Double>) -> (x: Double, y: Double, w: Double) {
+        func row(_ offset: Int) -> Double {
+            worldToClip[offset] * point.x + worldToClip[offset + 1] * point.y
+                + worldToClip[offset + 2] * point.z + worldToClip[offset + 3]
+        }
+        return (row(0), row(4), row(12))
     }
 }

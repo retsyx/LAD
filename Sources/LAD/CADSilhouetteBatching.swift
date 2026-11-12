@@ -39,7 +39,6 @@ enum CADSilhouetteBatching {
                         pixels: SIMD2<Double>) -> Rect? {
         guard bounds.count == 6, projection.worldToClip.count == 16,
               pixels.x > 0, pixels.y > 0 else { return .full }
-        let matrix = projection.worldToClip
         var low = SIMD2<Double>(repeating: .infinity), high = SIMD2<Double>(repeating: -.infinity)
         var behind = 0
         for corner in 0..<8 {
@@ -47,11 +46,10 @@ enum CADSilhouetteBatching {
                                      Float(bounds[corner & 2 == 0 ? 1 : 4]),
                                      Float(bounds[corner & 4 == 0 ? 2 : 5]), 1)
             let world = SIMD4<Double>(transform * local)
-            let w = matrix[12] * world.x + matrix[13] * world.y + matrix[14] * world.z + matrix[15]
-            guard w.isFinite else { return .full }
-            if w <= 1e-8 { behind += 1; continue }
-            let point = SIMD2((matrix[0] * world.x + matrix[1] * world.y + matrix[2] * world.z + matrix[3]) / w,
-                              (matrix[4] * world.x + matrix[5] * world.y + matrix[6] * world.z + matrix[7]) / w)
+            let clip = projection.clip(SIMD3(world.x, world.y, world.z))
+            guard clip.w.isFinite else { return .full }
+            if clip.w <= 1e-8 { behind += 1; continue }
+            let point = SIMD2(clip.x / clip.w, clip.y / clip.w)
             guard point.x.isFinite, point.y.isFinite else { return .full }
             low = simd_min(low, point); high = simd_max(high, point)
         }
