@@ -9,30 +9,107 @@ enum EngineExportError: LocalizedError {
     }
 }
 
+/// A sandboxed CAD program run that failed: a design build or a mesh
+/// reconstruction step. `kind` records why, so callers act on the failure
+/// itself rather than on the wording of its message.
+struct EngineBuildFailure: LocalizedError {
+    enum Kind: Sendable, Equatable {
+        /// The worker ran the program and reported that the design failed: a
+        /// program error, invalid geometry or failed validation.
+        case design
+        /// The CAD runtime, its native libraries or its file access failed.
+        case runtime
+        /// The macOS sandbox could not start the program.
+        case sandbox
+        /// The program exceeded the engine's time limit.
+        case timeout
+        /// The engine stopped without reporting why.
+        case engine
+    }
+
+    let kind: Kind
+    /// The user-facing description.
+    let message: String
+    /// The worker's own report of the failure, when it made one.
+    let report: String?
+
+    var errorDescription: String? { message }
+
+    /// Only a design the worker ran and rejected can be fixed by changing its program.
+    var isRepairable: Bool { kind == .design }
+
+    init(kind: Kind, message: String, report: String? = nil) {
+        self.kind = kind; self.message = message; self.report = report
+    }
+
+    /// Classify a worker that exited unsuccessfully while performing `action`.
+    init(action: String, sandboxed: Bool, diagnostic: EngineFailureDiagnostic.Diagnostic) {
+        let text = diagnostic.text
+        if text.contains("No module named") {
+            self.init(kind: .runtime, message: "LAD’s CAD runtime is incomplete. Reinstall LAD and try again.\n\n\(text.suffix(1_200))",
+                      report: diagnostic.report)
+        } else if sandboxed, text.contains("sandbox_apply") || text.contains("sandbox-exec:") {
+            self.init(kind: .sandbox, message: "The macOS sandbox could not start this design. Restart LAD outside an enclosing sandbox and try again.\n\n\(text.suffix(1_200))",
+                      report: diagnostic.report)
+        } else {
+            // The worker states whether the design or its runtime failed.
+            let kind: Kind = switch diagnostic.kind {
+            case "design": .design
+            case "runtime": .runtime
+            default: .engine
+            }
+            self.init(kind: kind, message: "The CAD engine could not \(action).\n\n\(text)", report: diagnostic.report)
+        }
+    }
+}
+
 /// Worker failures remain bounded data from the private build directory.
 /// A separate report keeps native validation details clear of stderr noise.
 enum EngineFailureDiagnostic {
+    struct Diagnostic: Sendable {
+        /// The bounded failure text shown to the user.
+        var text: String
+        /// The worker's own report, when it made one.
+        var report: String?
+        /// The worker's classification of a reported failure: "design" or "runtime".
+        var kind: String?
+    }
+
     private struct Report: Decodable {
         var formatVersion: Int
         var message: String
+        var failureKind: String?
     }
 
-    static func message(in folder: URL, stderr: String) -> String {
+    private static let marker = "LAD CAD engine:"
+
+    static func read(in folder: URL, stderr: String) -> Diagnostic {
         if let data = try? EngineArtifact.read(folder.appendingPathComponent("error.json"), in: folder,
                                                maximumBytes: 65_536),
            let report = try? JSONDecoder().decode(Report.self, from: data),
            report.formatVersion == 1, report.message.utf8.count <= 48_000,
            !report.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "LAD CAD engine: \(report.message)"
+            return Diagnostic(text: "\(marker) \(report.message)",
+                              report: report.message.trimmingCharacters(in: .whitespacesAndNewlines), kind: report.failureKind)
         }
-        return String(stderr.suffix(3_000))
+        // Without a report file, the worker's last words on stderr are its report.
+        let text = String(stderr.suffix(3_000))
+        let report = text.range(of: marker, options: .backwards).map {
+            String(text[$0.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return Diagnostic(text: text, report: report)
     }
 
+    static func message(in folder: URL, stderr: String) -> String { read(in: folder, stderr: stderr).text }
+
+    /// The failure as the agent and conversation see it: the worker's own
+    /// report when it made one.
     static func repairText(for failure: Error) -> String {
+        if let failure = failure as? EngineBuildFailure { return String((failure.report ?? failure.message).prefix(16_000)) }
         let description = failure.localizedDescription
         let diagnostic: String
-        if let marker = description.range(of: "LAD CAD engine:", options: .backwards) {
-            diagnostic = String(description[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let found = description.range(of: marker, options: .backwards) {
+            diagnostic = String(description[found.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
             diagnostic = description
         }
@@ -539,14 +616,8 @@ final class EngineService {
         guard status == 0 else {
             let logData = try? EngineArtifact.tail(folder.appendingPathComponent("stderr.log"), in: folder, maximumBytes: 65_536)
             let log = logData.map { String(decoding: $0, as: UTF8.self) } ?? ""
-            let diagnostic = EngineFailureDiagnostic.message(in: folder, stderr: log)
-            if diagnostic.contains("No module named") {
-                throw LADError.message("LAD’s CAD runtime is incomplete. Reinstall LAD and try again.\n\n\(diagnostic.suffix(1_200))")
-            }
-            if scriptMode, diagnostic.contains("sandbox_apply") || diagnostic.contains("sandbox-exec:") {
-                throw LADError.message("The macOS sandbox could not start this design. Restart LAD outside an enclosing sandbox and try again.\n\n\(diagnostic.suffix(1_200))")
-            }
-            throw LADError.message("The CAD engine could not \(action).\n\n\(diagnostic)")
+            throw EngineBuildFailure(action: action, sandboxed: scriptMode,
+                                     diagnostic: EngineFailureDiagnostic.read(in: folder, stderr: log))
         }
         return RunResult(artifacts: artifacts, token: token)
     }
@@ -789,7 +860,9 @@ private final class EngineProcessJob: @unchecked Sendable {
                     finished = true
                     let didCancel = cancelled, didTimeOut = timedOut
                     lock.unlock()
-                    if didTimeOut { throw LADError.message("The CAD engine exceeded its 10-minute limit. Simplify the design and try again.") }
+                    if didTimeOut {
+                        throw EngineBuildFailure(kind: .timeout, message: "The CAD engine exceeded its 10-minute limit. Simplify the design and try again.")
+                    }
                     if didCancel { throw CancellationError() }
                     continuation.resume(returning: process.terminationStatus)
                 } catch { continuation.resume(throwing: error) }

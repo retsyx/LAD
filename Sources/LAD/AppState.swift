@@ -1154,15 +1154,12 @@ final class AppState {
                 } catch {
                     guard operationID == token else { return }
                     try Task.checkCancellation()
-                    let description = error.localizedDescription
-                    let lower = description.lowercased()
-                    let runtimeErrors = ["no module named", "missing dependencies", "runtime not found", "engine missing", "dlopen", "library not loaded", "symbol not found", "incompatible architecture", "bad cpu type", "permission denied", "operation not permitted", "no such file or directory", "thread count must"]
-                    guard description.hasPrefix("The CAD engine could not build this design."),
-                          description.contains("LAD CAD engine:"),
-                          !runtimeErrors.contains(where: lower.contains) else { throw error }
-                    let diagnostic = briefDiagnostic(error)
+                    // Repair only a design the worker ran and rejected; runtime,
+                    // sandbox, time-limit and engine failures stand as they are.
+                    guard let failure = error as? EngineBuildFailure, failure.isRepairable else { throw error }
+                    let diagnostic = briefDiagnostic(failure)
                     recordTaskEvent(ProjectActivityEvent(id: "final:validation", category: "validation",
-                        title: "Final CAD validation failed", status: "failed", output: description))
+                        title: "Final CAD validation failed", status: "failed", output: failure.message))
                     messages.append(ChatMessage(role: "system", content: "CAD validation failed: \(diagnostic)\nRepairing the design (one attempt)."))
                     activity = "Repairing the geometry…"
                     autosave()

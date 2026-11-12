@@ -57,6 +57,21 @@ class ModelError(ValueError):
         self.diagnostic = diagnostic
 
 
+class HostError(RuntimeError):
+    """The app's request or the CAD runtime is at fault, not the design."""
+
+
+def failure_kind(error):
+    """Report "design" when changing the program could fix the failure.
+
+    Program exceptions arrive wrapped in ModelError, so an OSError or
+    ImportError reaching here comes from the runtime or its file access.
+    """
+    if isinstance(error, (HostError, ImportError, OSError)):
+        return "runtime"
+    return "design"
+
+
 def validate_assembly_motion(definition, parts):
     try:
         return validate_motion(definition, parts)
@@ -366,6 +381,7 @@ def write_error_report(error, output):
     """Publish bounded failure details independently of diagnostic log tails."""
     import tempfile
     report = {"formatVersion": 1, "stage": "worker", **(getattr(error, "diagnostic", None) or {}),
+              "failureKind": failure_kind(error),
               "message": str(error).encode("utf-8")[:32_000].decode("utf-8", errors="ignore")}
     data = json.dumps(report, separators=(",", ":"), allow_nan=False, ensure_ascii=False).encode("utf-8")
     if len(data) > 65_536:
@@ -3027,7 +3043,7 @@ def validation_hash(spec, directory, cq):
 
 def run(request, output, threads, defer_step=False, validated_hash=None, native_only=False):
     if not 1 <= threads <= 256:
-        raise ModelError("Thread count must be between 1 and 256.")
+        raise HostError("Thread count must be between 1 and 256.")
     size = request.stat().st_size
     if size > 16 * 1024 * 1024:
         raise ModelError("CAD request exceeds the 16 MiB size limit.")

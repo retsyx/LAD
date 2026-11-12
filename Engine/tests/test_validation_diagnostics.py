@@ -254,6 +254,19 @@ class ValidationDiagnosticTests(unittest.TestCase):
                     self.assertEqual(set(report['message']), {character})
                     self.assertEqual(list(folder.glob('.error-*')), [])
 
+    def test_error_report_states_whether_the_design_or_its_runtime_failed(self):
+        cases = [(worker.ModelError('Python design at line 2: PermissionError: denied'), 'design'),
+                 (ValueError('BRep_API: command not done'), 'design'),
+                 (worker.HostError('Thread count must be between 1 and 256.'), 'runtime'),
+                 (PermissionError(1, 'Operation not permitted'), 'runtime'),
+                 (ImportError('dlopen(libTKernel.dylib): Library not loaded'), 'runtime')]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            for error, kind in cases:
+                with self.subTest(error=repr(error)):
+                    worker.write_error_report(error, folder)
+                    self.assertEqual(json.loads((folder / 'error.json').read_bytes())['failureKind'], kind)
+
     def test_cli_publishes_complete_step_failure_report_without_a_success_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)

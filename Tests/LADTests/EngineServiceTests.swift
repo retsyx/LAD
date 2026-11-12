@@ -271,6 +271,7 @@ final class EngineServiceTests: XCTestCase {
                 XCTAssertTrue(diagnostic.contains(required), diagnostic)
             }
             XCTAssertFalse(diagnostic.contains("Geometry scope: native_candidate"), diagnostic)
+            XCTAssertEqual((error as? EngineBuildFailure)?.kind, .design, "A rejected STEP readback is a repairable design failure.")
             let repair = EngineFailureDiagnostic.repairText(for: error)
             XCTAssertTrue(repair.contains("Geometry scope: step_readback"), repair)
             XCTAssertTrue(repair.contains("max curve-on-surface discrepancy:"), repair)
