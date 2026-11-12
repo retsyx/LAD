@@ -85,11 +85,10 @@ final class AppState {
         didSet { if viewportCommand != oldValue && isGrabbingAssembly { cancelAssemblyGrab() } }
     }
     var projectURL: URL?
-    var saveStatus: String? {
-        didSet { if saveStatus == "Saving…" { startedSaves += 1 } }
-    }
-    /// Saves started this session, including repeated requests while a write
-    /// is pending. Regression tests compare it, like `projectThumbnailWork`.
+    var saveStatus: String?
+    /// Saves started this session. Changes made while an autosave is being
+    /// written share one follow-up save rather than starting their own.
+    /// Regression tests compare it, like `projectThumbnailWork`.
     @ObservationIgnored private(set) var startedSaves = 0
     private(set) var saveConflict: ProjectSaveConflict?
     private(set) var hasUnsavedChanges = false
@@ -235,6 +234,13 @@ final class AppState {
     private var saveConflictPromptTask: Task<Void, Never>?
     private var presentedSaveConflict: ProjectSaveConflict?
     private var autosaveSequence = 0
+    /// The design session whose autosave is being written, and whether a
+    /// change arrived while it was. Shared windows share this one writer.
+    private struct AutosaveWrite {
+        var session: UUID
+        var followUp = false
+    }
+    private var autosaveWrite: AutosaveWrite?
     private var preserveUnreadableSession = false
     private let autosaveStore: ProjectAutosaveStore
     private let runtimeOverride: String?
@@ -539,6 +545,8 @@ final class AppState {
         await finishAssemblyMotion()
         guard canSaveProject else { return }
         if let saveConflict { throw saveConflict }
+        // This snapshot supersedes any follow-up of an autosave in progress.
+        if autosaveWrite?.session == projectSessionID { autosaveWrite?.followUp = false }
         autosaveSequence += 1
         let sequence = autosaveSequence, sessionID = projectSessionID
         hasUnsavedChanges = true
@@ -1980,6 +1988,7 @@ final class AppState {
         panel.nameFieldStringValue = "\(safeName(title)).lad"
         guard SavePanelPresentation.runModal(panel) == .OK, let target = panel.url else { return }
         let snapshot = projectSnapshot(), sessionID = projectSessionID
+        startedSaves += 1
         saveStatus = "Saving…"
         Task {
             do {
@@ -2259,27 +2268,43 @@ final class AppState {
         hasUnsavedChanges = true
         autosaveSequence += 1
         guard saveConflict == nil else { return }
+        // One autosave is written at a time. However many changes arrive
+        // meanwhile, a single follow-up then writes the latest snapshot.
+        if autosaveWrite?.session == projectSessionID {
+            autosaveWrite?.followUp = true
+            if saveStatus == nil { saveStatus = "Saving…" }
+            return
+        }
         let snapshot = projectSnapshot(), sequence = autosaveSequence, sessionID = projectSessionID
         let documentID = projectID, name = autosaveTitle, preferredURL = autosavedProjectURL
         let preferExactName = pendingProjectRename
+        autosaveWrite = AutosaveWrite(session: sessionID)
+        startedSaves += 1
         saveStatus = "Saving…"
         Task {
             do {
                 let url = try await autosaveStore.write(project: snapshot, projectID: documentID, title: name,
                                                        sequence: sequence, preferredURL: preferredURL,
                                                        preferExactName: preferExactName)
-                guard projectSessionID == sessionID, autosaveSequence == sequence else { return }
-                if projectURL != url { projectURL = url }
-                autosavedProjectURL = url
-                rememberAutosavedProject(url)
-                pendingProjectRename = false
-                hasUnsavedChanges = false
-                saveStatus = nil
+                if projectSessionID == sessionID, autosaveSequence == sequence {
+                    if projectURL != url { projectURL = url }
+                    autosavedProjectURL = url
+                    rememberAutosavedProject(url)
+                    pendingProjectRename = false
+                    hasUnsavedChanges = false
+                    saveStatus = nil
+                }
             } catch {
-                guard projectSessionID == sessionID, autosaveSequence == sequence else { return }
-                recordSaveFailure(error)
+                if projectSessionID == sessionID, autosaveSequence == sequence { recordSaveFailure(error) }
             }
+            finishAutosaveWrite(session: sessionID)
         }
+    }
+
+    private func finishAutosaveWrite(session: UUID) {
+        guard let write = autosaveWrite, write.session == session else { return }
+        autosaveWrite = nil
+        if write.followUp, projectSessionID == session { autosave() }
     }
 
     private func recordSaveFailure(_ failure: Error) {
@@ -2315,6 +2340,7 @@ final class AppState {
         autosaveSequence += 1
         let sequence = autosaveSequence, session = projectSessionID
         var snapshot = projectSnapshot()
+        startedSaves += 1
         saveStatus = "Saving…"; hasUnsavedChanges = true
         do {
             switch choice {
