@@ -41,21 +41,34 @@ struct ViewportRedrawState: Sendable {
 /// report active. Bound recovery attempts without restarting healthy rendering
 /// on every input event, or confusing an old frame with the latest request.
 struct ViewportRedrawRecoveryState: Sendable {
+    static let maximumAttempts = 3
     private var observedFrameCount: UInt64?
     private var lastProgressTime: TimeInterval = 0
     private(set) var restartAttempts = 0
 
-    mutating func shouldRestart(at time: TimeInterval, finalFrameCount: UInt64,
-                                timeout: TimeInterval = 0.35, maximumAttempts: Int = 3) -> Bool {
+    var canRestart: Bool { restartAttempts < Self.maximumAttempts }
+
+    mutating func shouldRestart(at time: TimeInterval, finalFrameCount: UInt64, timeout: TimeInterval = 0.35) -> Bool {
         guard observedFrameCount == finalFrameCount else {
             observedFrameCount = finalFrameCount
             lastProgressTime = time
             restartAttempts = 0
             return false
         }
-        guard restartAttempts < maximumAttempts, time - lastProgressTime >= timeout else { return false }
+        guard canRestart, time - lastProgressTime >= timeout else { return false }
         restartAttempts += 1
         lastProgressTime = time
+        return true
+    }
+
+    /// A stalled burst stays armed after its automatic attempts run out, so a
+    /// display link that resumes by itself still renders it. New input then
+    /// restarts playback with a fresh bounded budget; otherwise every later
+    /// request would join the dead burst and the viewport would never redraw.
+    mutating func shouldRestartForNewRequest(at time: TimeInterval, finalFrameCount: UInt64) -> Bool {
+        guard !canRestart, observedFrameCount == finalFrameCount else { return false }
+        stop()
+        _ = shouldRestart(at: time, finalFrameCount: finalFrameCount)
         return true
     }
 

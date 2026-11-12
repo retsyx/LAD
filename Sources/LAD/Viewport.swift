@@ -1438,6 +1438,8 @@ final class CADSceneView: SCNView {
             redrawRecoveryState.stop()
             _ = redrawRecoveryState.shouldRestart(at: now, finalFrameCount: redrawDriver.finalFrameCount)
             refreshRedrawDelegate()
+        } else if redrawRecoveryState.shouldRestartForNewRequest(at: now, finalFrameCount: redrawDriver.finalFrameCount) {
+            restartRedrawPlayback()
         }
         if !rendersContinuously { rendersContinuously = true }
         if !isPlaying { isPlaying = true }
@@ -1454,19 +1456,23 @@ final class CADSceneView: SCNView {
             guard self.canDrawViewport, self.redrawDriver.isActive else { self.stopRedraw(); return }
             if self.redrawRecoveryState.shouldRestart(at: ProcessInfo.processInfo.systemUptime,
                                                      finalFrameCount: self.redrawDriver.finalFrameCount) {
-                // SceneKit can retain true playback flags after its display link
-                // stops. Rearm only a stalled burst, preserving its generation
-                // and external delegate; ordinary navigation does no extra work.
-                self.isPlaying = false
-                self.rendersContinuously = false
-                self.refreshRedrawDelegate()
-                SCNTransaction.flush()
-                self.rendersContinuously = true
-                self.isPlaying = true
-                self.needsDisplay = true
+                self.restartRedrawPlayback()
             }
-            if self.redrawRecoveryState.restartAttempts < 3 { self.scheduleRedrawRecovery() }
+            if self.redrawRecoveryState.canRestart { self.scheduleRedrawRecovery() }
         }
+    }
+
+    /// SceneKit can retain true playback flags after its display link stops.
+    /// Rearm only a stalled burst, preserving its generation and external
+    /// delegate; ordinary navigation does no extra work.
+    private func restartRedrawPlayback() {
+        isPlaying = false
+        rendersContinuously = false
+        refreshRedrawDelegate()
+        SCNTransaction.flush()
+        rendersContinuously = true
+        isPlaying = true
+        needsDisplay = true
     }
 
     private var canDrawViewport: Bool {

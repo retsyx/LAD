@@ -49,6 +49,32 @@ final class ViewportRedrawDriverTests: XCTestCase {
         XCTAssertFalse(recovery.shouldRestart(at: 100, finalFrameCount: 5), "A broken renderer must not cause an unbounded restart loop.")
     }
 
+    func testNewRequestRestartsAStalledBurstAfterAutomaticRecoveryGivesUp() {
+        var recovery = ViewportRedrawRecoveryState()
+        XCTAssertFalse(recovery.shouldRestart(at: 10, finalFrameCount: 5))
+        XCTAssertFalse(recovery.shouldRestartForNewRequest(at: 10.1, finalFrameCount: 5),
+                       "Input during automatic recovery joins it rather than restarting playback.")
+        for time in [10.36, 10.72, 11.08] { XCTAssertTrue(recovery.shouldRestart(at: time, finalFrameCount: 5)) }
+        XCTAssertFalse(recovery.canRestart)
+        XCTAssertFalse(recovery.shouldRestart(at: 100, finalFrameCount: 5))
+
+        // Long after the display link stalled, new input must still redraw.
+        XCTAssertTrue(recovery.shouldRestartForNewRequest(at: 600, finalFrameCount: 5))
+        XCTAssertEqual(recovery.restartAttempts, 0)
+        XCTAssertFalse(recovery.shouldRestartForNewRequest(at: 600.01, finalFrameCount: 5),
+                       "Each new budget restarts once for input; later attempts wait for the recovery deadline.")
+        XCTAssertFalse(recovery.shouldRestart(at: 600.3, finalFrameCount: 5))
+        XCTAssertTrue(recovery.shouldRestart(at: 600.36, finalFrameCount: 5))
+    }
+
+    func testNewRequestDoesNotRestartABurstThatResumedAfterRecoveryGaveUp() {
+        var recovery = ViewportRedrawRecoveryState()
+        XCTAssertFalse(recovery.shouldRestart(at: 10, finalFrameCount: 5))
+        for time in [10.36, 10.72, 11.08] { XCTAssertTrue(recovery.shouldRestart(at: time, finalFrameCount: 5)) }
+        XCTAssertFalse(recovery.shouldRestartForNewRequest(at: 20, finalFrameCount: 6),
+                       "A display link that resumed by itself is healthy and must not be restarted.")
+    }
+
     func testRecoveryResetsItsDeadlineAndBudgetAfterFinalFrameProgress() {
         var recovery = ViewportRedrawRecoveryState()
         XCTAssertFalse(recovery.shouldRestart(at: 10, finalFrameCount: 5))
