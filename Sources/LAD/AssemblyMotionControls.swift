@@ -3,8 +3,8 @@ import SwiftUI
 struct AssemblyMotionControls: View {
     @ObservedObject var state: AppState
     let motion: AssemblyMotion
-    /// The turn a continuous revolute slider is centered on while it is dragged.
-    @State private var heldTurns: [String: Double] = [:]
+    /// Each continuous revolute slider's current window center.
+    @State private var revolutionCenters: [String: Double] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -12,7 +12,7 @@ struct AssemblyMotionControls: View {
                 Text("MOTION").font(.system(size: 9, weight: .semibold)).tracking(1.8).foregroundStyle(Palette.muted)
                 Spacer()
                 if state.isSolvingAssembly { ProgressView().controlSize(.mini) }
-                Button("Reset") { state.resetAssemblyMotion() }
+                Button("Reset") { state.resetAssemblyMotion(); revolutionCenters.removeAll() }
                     .buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(Palette.muted)
                     .accessibilityLabel("Reset assembly motion")
             }
@@ -55,10 +55,12 @@ struct AssemblyMotionControls: View {
                     .accessibilityLabel("\(joint.name) position")
                 Text(joint.unit).foregroundStyle(Palette.muted)
             }.font(.system(size: 10))
-            let bounds = Self.sliderRange(joint, current: state.jointPosition(joint), heldTurn: heldTurns[joint.id])
+            let bounds = Self.sliderRange(joint, current: state.jointPosition(joint), center: revolutionCenters[joint.id])
             if bounds.lowerBound < bounds.upperBound {
                 Slider(value: position(joint), in: bounds, onEditingChanged: { editing in
-                    heldTurns[joint.id] = editing ? Self.turn(state.jointPosition(joint)) : nil
+                    guard joint.type == .revolute, joint.limits == nil else { return }
+                    revolutionCenters[joint.id] = Self.revolutionCenter(current: state.jointPosition(joint),
+                        held: revolutionCenters[joint.id], released: !editing)
                 })
                     .controlSize(.mini).tint(Palette.accent)
                     .accessibilityLabel("\(joint.name) motion")
@@ -74,15 +76,22 @@ struct AssemblyMotionControls: View {
     /// The nearest whole-turn angle to a revolute coordinate.
     static func turn(_ degrees: Double) -> Double { (degrees / 360).rounded() * 360 }
 
-    /// Text entry remains unbounded when the joint has no travel limits. A
-    /// continuous revolute slider spans one revolution around the current turn,
-    /// while the coordinate itself keeps counting turns for couplings. The
-    /// window holds during a drag so the thumb does not jump, unless the
-    /// position has moved outside it by other means.
-    static func sliderRange(_ joint: AssemblyJoint, current: Double, heldTurn: Double?) -> ClosedRange<Double> {
+    /// A continuous revolute slider spans one revolution, while the coordinate
+    /// itself keeps counting turns for couplings. Its window stays put while it
+    /// contains the position, so the thumb does not jump. Releasing a drag at
+    /// either end recenters it on the position, so the joint can keep turning
+    /// either way. A position that leaves the window by other means shows
+    /// within its nearest whole turn.
+    static func revolutionCenter(current: Double, held: Double?, released: Bool = false) -> Double {
+        guard let held, abs(current - held) <= 180 else { return turn(current) }
+        return released && abs(current - held) >= 180 - 1e-6 ? current : held
+    }
+
+    /// Text entry remains unbounded when the joint has no travel limits.
+    static func sliderRange(_ joint: AssemblyJoint, current: Double, center: Double?) -> ClosedRange<Double> {
         if let limits = joint.limits, limits.count == 2 { return limits[0]...limits[1] }
         if joint.type == .revolute {
-            let center = heldTurn.flatMap { abs(current - $0) <= 180 ? $0 : nil } ?? turn(current)
+            let center = revolutionCenter(current: current, held: center)
             return center - 180...center + 180
         }
         let extent = 100.0
