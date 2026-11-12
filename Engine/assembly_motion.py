@@ -204,6 +204,7 @@ def coupled_position(coupling, driver):
     Linear couplings apply ratio and offset in joint units. Tables interpolate
     linearly between samples; a periodic table repeats every period and adds
     its advance per period, which models indexing mechanisms over many turns.
+    Both implementations are tested against tests/assembly-coupling-cases.json.
     """
     if coupling["type"] == "linear":
         return coupling["ratio"] * driver + coupling["offset"]

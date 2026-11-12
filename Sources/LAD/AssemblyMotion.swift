@@ -123,7 +123,9 @@ struct AssemblyCoupling: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
-/// Validated evaluation form; matches the worker's `coupled_position`.
+/// Validated evaluation form of the worker's `coupled_position`, which derives
+/// follower positions when a build is validated. Both test suites check the
+/// golden cases in Engine/tests/assembly-coupling-cases.json.
 /// A periodic table's samples already include the closing point of its period.
 fileprivate struct CouplingLaw: Sendable {
     var driver: Int

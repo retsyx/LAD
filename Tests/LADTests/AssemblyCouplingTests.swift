@@ -82,6 +82,54 @@ final class AssemblyCouplingTests: XCTestCase {
         }
     }
 
+    /// The worker validates and positions couplings with Engine/assembly_motion.py;
+    /// its tests check the same golden cases.
+    func testSharedCouplingCasesMatchTheWorker() throws {
+        struct Sample: Decodable { var drivers: [String: Double]; var expected: [String: Double] }
+        struct Case: Decodable {
+            var name: String
+            var joints: [AssemblyJoint]
+            var couplings: [AssemblyCoupling]
+            var initial: [String: Double]
+            var samples: [Sample]
+        }
+        struct Invalid: Decodable { var name: String; var couplings: [AssemblyCoupling]; var driverLimits: [Double]? }
+        struct Cases: Decodable {
+            var parts: [PartNode]
+            var grounded: [String]
+            var connectors: [AssemblyConnector]
+            var cases: [Case]
+            var invalid: [Invalid]
+            var invalidJoints: [AssemblyJoint]
+        }
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Engine/tests/assembly-coupling-cases.json")
+        let shared = try JSONDecoder().decode(Cases.self, from: Data(contentsOf: url))
+        XCTAssertFalse(shared.cases.isEmpty)
+        XCTAssertFalse(shared.invalid.isEmpty)
+        func assertPositions(_ actual: [String: Double], _ expected: [String: Double], _ message: String) {
+            for (id, value) in expected {
+                XCTAssertEqual(actual[id] ?? .nan, value, accuracy: 1e-9 * max(1, abs(value)), "\(message): \(id)")
+            }
+        }
+        for test in shared.cases {
+            let motion = AssemblyMotion(grounded: shared.grounded, connectors: shared.connectors, joints: test.joints,
+                                        couplings: test.couplings)
+            assertPositions(try motion.solve(parts: shared.parts).positions, test.initial, test.name)
+            for sample in test.samples {
+                let pose = try motion.solve(parts: shared.parts, positions: sample.drivers)
+                assertPositions(pose.positions, sample.drivers.merging(sample.expected) { $1 }, "\(test.name) at \(sample.drivers)")
+            }
+        }
+        for test in shared.invalid {
+            var joints = shared.invalidJoints
+            if let limits = test.driverLimits { joints[0].limits = limits }
+            let motion = AssemblyMotion(grounded: shared.grounded, connectors: shared.connectors, joints: joints,
+                                        couplings: test.couplings)
+            XCTAssertThrowsError(try motion.validate(parts: shared.parts), test.name)
+        }
+    }
+
     func testFollowerInAClosedLoopIsDrivenThroughItsIndependentRoot() throws {
         var (motion, parts) = fourBar()
         parts.append(.init(id: "motor", name: "Motor", solidIndices: [4]))

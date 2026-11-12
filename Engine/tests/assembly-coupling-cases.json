@@ -1,0 +1,187 @@
+{
+  "about": "Shared golden cases for joint couplings. Engine/assembly_motion.py derives follower positions when it validates a build; Sources/LAD/AssemblyMotion.swift evaluates them while posing. Both test suites check these cases, so the two implementations cannot drift apart. Each case is an authored lad_motion definition over the shared parts and connectors, follower positions omitted. 'initial' is every joint's position at the authored driver positions; each sample gives driver positions and the expected follower positions.",
+  "parts": [
+    {"id": "base", "name": "Base", "solidIndices": [0]},
+    {"id": "driver", "name": "Driver", "solidIndices": [1]},
+    {"id": "follower", "name": "Follower", "solidIndices": [2]},
+    {"id": "third", "name": "Third", "solidIndices": [3]}
+  ],
+  "grounded": ["base"],
+  "connectors": [
+    {"id": "x", "part": "base", "origin": [0, 0, 0]},
+    {"id": "y", "part": "driver", "origin": [0, 0, 0]},
+    {"id": "z", "part": "base", "origin": [10, 0, 0]},
+    {"id": "w", "part": "follower", "origin": [10, 0, 0]},
+    {"id": "u", "part": "base", "origin": [20, 0, 0]},
+    {"id": "v", "part": "third", "origin": [20, 0, 0]}
+  ],
+  "cases": [
+    {
+      "name": "linear ratio and offset",
+      "joints": [
+        {"id": "a", "name": "Driver", "type": "revolute", "parent": "x", "child": "y", "position": 0},
+        {"id": "b", "name": "Follower", "type": "revolute", "parent": "z", "child": "w"}
+      ],
+      "couplings": [{"id": "mesh", "type": "linear", "driver": "a", "follower": "b", "ratio": -0.5, "offset": 2}],
+      "initial": {"a": 0, "b": 2},
+      "samples": [
+        {"drivers": {"a": 40}, "expected": {"b": -18}},
+        {"drivers": {"a": -123.25}, "expected": {"b": 63.625}},
+        {"drivers": {"a": 1000000}, "expected": {"b": -499998}}
+      ]
+    },
+    {
+      "name": "chained linear couplings listed follower first",
+      "joints": [
+        {"id": "a", "name": "Driver", "type": "revolute", "parent": "x", "child": "y", "position": 10},
+        {"id": "b", "name": "Follower", "type": "revolute", "parent": "z", "child": "w"},
+        {"id": "c", "name": "Third", "type": "slider", "parent": "u", "child": "v"}
+      ],
+      "couplings": [
+        {"id": "second", "type": "linear", "driver": "b", "follower": "c", "ratio": 3},
+        {"id": "first", "type": "linear", "driver": "a", "follower": "b", "ratio": -0.5, "offset": 1}
+      ],
+      "initial": {"a": 10, "b": -4, "c": -12},
+      "samples": [
+        {"drivers": {"a": -30}, "expected": {"b": 16, "c": 48}},
+        {"drivers": {"a": 0.5}, "expected": {"b": 0.75, "c": 2.25}}
+      ]
+    },
+    {
+      "name": "periodic index with a dwell, open last period",
+      "joints": [
+        {"id": "a", "name": "Driver", "type": "revolute", "parent": "x", "child": "y", "position": 180},
+        {"id": "b", "name": "Follower", "type": "revolute", "parent": "z", "child": "w"}
+      ],
+      "couplings": [{"id": "index", "type": "table", "driver": "a", "follower": "b",
+                     "samples": [[0, 0], [120, 0], [240, -60]], "period": 360, "advance": -60}],
+      "initial": {"a": 180, "b": -30},
+      "samples": [
+        {"drivers": {"a": 0}, "expected": {"b": 0}},
+        {"drivers": {"a": 60}, "expected": {"b": 0}},
+        {"drivers": {"a": 240}, "expected": {"b": -60}},
+        {"drivers": {"a": 300}, "expected": {"b": -60}},
+        {"drivers": {"a": 360}, "expected": {"b": -60}},
+        {"drivers": {"a": 540}, "expected": {"b": -90}},
+        {"drivers": {"a": 720}, "expected": {"b": -120}},
+        {"drivers": {"a": -180}, "expected": {"b": 30}},
+        {"drivers": {"a": -360}, "expected": {"b": 60}},
+        {"drivers": {"a": 1000000}, "expected": {"b": -166680}}
+      ]
+    },
+    {
+      "name": "periodic index whose samples close the period",
+      "joints": [
+        {"id": "a", "name": "Driver", "type": "revolute", "parent": "x", "child": "y", "position": 0},
+        {"id": "b", "name": "Follower", "type": "revolute", "parent": "z", "child": "w"}
+      ],
+      "couplings": [{"id": "index", "type": "table", "driver": "a", "follower": "b",
+                     "samples": [[0, 0], [120, 0], [240, -60], [360, -60]], "period": 360, "advance": -60}],
+      "initial": {"a": 0, "b": 0},
+      "samples": [
+        {"drivers": {"a": 180}, "expected": {"b": -30}},
+        {"drivers": {"a": 540}, "expected": {"b": -90}},
+        {"drivers": {"a": -180}, "expected": {"b": 30}}
+      ]
+    },
+    {
+      "name": "periodic cam starting below zero",
+      "joints": [
+        {"id": "a", "name": "Driver", "type": "revolute", "parent": "x", "child": "y", "position": 0},
+        {"id": "b", "name": "Follower", "type": "slider", "parent": "z", "child": "w"}
+      ],
+      "couplings": [{"id": "cam", "type": "table", "driver": "a", "follower": "b",
+                     "samples": [[-30, 10], [60, 40], [150, 10]], "period": 180}],
+      "initial": {"a": 0, "b": 20},
+      "samples": [
+        {"drivers": {"a": 165}, "expected": {"b": 15}},
+        {"drivers": {"a": -200}, "expected": {"b": 13.333333333333334}},
+        {"drivers": {"a": 60}, "expected": {"b": 40}}
+      ]
+    },
+    {
+      "name": "periodic table that advances and closes with an appended sample",
+      "joints": [
+        {"id": "a", "name": "Driver", "type": "revolute", "parent": "x", "child": "y", "position": 100},
+        {"id": "b", "name": "Follower", "type": "slider", "parent": "z", "child": "w"}
+      ],
+      "couplings": [{"id": "feed", "type": "table", "driver": "a", "follower": "b",
+                     "samples": [[-30, 10], [60, 40]], "period": 180, "advance": 5}],
+      "initial": {"a": 100, "b": 28.88888888888889},
+      "samples": [
+        {"drivers": {"a": 400}, "expected": {"b": 43.333333333333336}},
+        {"drivers": {"a": 150}, "expected": {"b": 15}},
+        {"drivers": {"a": -210}, "expected": {"b": 5}}
+      ]
+    },
+    {
+      "name": "bounded cam within its driver limits",
+      "joints": [
+        {"id": "a", "name": "Driver", "type": "revolute", "parent": "x", "child": "y", "position": 45, "limits": [-90, 90]},
+        {"id": "b", "name": "Follower", "type": "slider", "parent": "z", "child": "w"}
+      ],
+      "couplings": [{"id": "cam", "type": "table", "driver": "a", "follower": "b", "samples": [[-90, 0], [0, 10], [90, 0]]}],
+      "initial": {"a": 45, "b": 5},
+      "samples": [
+        {"drivers": {"a": -90}, "expected": {"b": 0}},
+        {"drivers": {"a": 0}, "expected": {"b": 10}},
+        {"drivers": {"a": 30}, "expected": {"b": 6.666666666666667}},
+        {"drivers": {"a": 90}, "expected": {"b": 0}}
+      ]
+    },
+    {
+      "name": "linear coupling driven by a periodic follower",
+      "joints": [
+        {"id": "a", "name": "Driver", "type": "revolute", "parent": "x", "child": "y", "position": 540},
+        {"id": "b", "name": "Follower", "type": "revolute", "parent": "z", "child": "w"},
+        {"id": "c", "name": "Third", "type": "revolute", "parent": "u", "child": "v"}
+      ],
+      "couplings": [
+        {"id": "index", "type": "table", "driver": "a", "follower": "b",
+         "samples": [[0, 0], [120, 0], [240, -60]], "period": 360, "advance": -60},
+        {"id": "gear", "type": "linear", "driver": "b", "follower": "c", "ratio": 2, "offset": 1}
+      ],
+      "initial": {"a": 540, "b": -90, "c": -179},
+      "samples": [
+        {"drivers": {"a": 60}, "expected": {"b": 0, "c": 1}},
+        {"drivers": {"a": -180}, "expected": {"b": 30, "c": 61}}
+      ]
+    }
+  ],
+  "invalid": [
+    {"name": "zero linear ratio", "couplings": [{"id": "k", "type": "linear", "driver": "a", "follower": "b", "ratio": 0}]},
+    {"name": "linear coupling with table samples",
+     "couplings": [{"id": "k", "type": "linear", "driver": "a", "follower": "b", "ratio": 1, "samples": [[0, 0], [1, 1]]}]},
+    {"name": "one table sample", "couplings": [{"id": "k", "type": "table", "driver": "a", "follower": "b", "samples": [[0, 0]], "period": 360}]},
+    {"name": "repeated driver sample",
+     "couplings": [{"id": "k", "type": "table", "driver": "a", "follower": "b", "samples": [[0, 0], [0, 1]], "period": 360}]},
+    {"name": "samples longer than the period",
+     "couplings": [{"id": "k", "type": "table", "driver": "a", "follower": "b", "samples": [[0, 0], [361, 1]], "period": 360}]},
+    {"name": "closing sample disagrees with the advance",
+     "couplings": [{"id": "k", "type": "table", "driver": "a", "follower": "b", "samples": [[0, 0], [360, 1]], "period": 360}]},
+    {"name": "nonpositive period",
+     "couplings": [{"id": "k", "type": "table", "driver": "a", "follower": "b", "samples": [[0, 0], [1, 1]], "period": 0}]},
+    {"name": "advance without a period",
+     "couplings": [{"id": "k", "type": "table", "driver": "a", "follower": "b", "samples": [[0, 0], [1, 1]], "advance": 1}]},
+    {"name": "bounded table driver without limits",
+     "couplings": [{"id": "k", "type": "table", "driver": "a", "follower": "b", "samples": [[0, 0], [90, 1]]}]},
+    {"name": "bounded table driver limits beyond its samples", "driverLimits": [-10, 90],
+     "couplings": [{"id": "k", "type": "table", "driver": "a", "follower": "b", "samples": [[0, 0], [90, 1]]}]},
+    {"name": "follower of two couplings",
+     "couplings": [{"id": "k", "type": "linear", "driver": "a", "follower": "b", "ratio": 1},
+                   {"id": "l", "type": "linear", "driver": "c", "follower": "b", "ratio": 1}]},
+    {"name": "coupling cycle",
+     "couplings": [{"id": "k", "type": "linear", "driver": "a", "follower": "b", "ratio": 1},
+                   {"id": "l", "type": "linear", "driver": "b", "follower": "a", "ratio": 1}]},
+    {"name": "coupling a joint to itself", "couplings": [{"id": "k", "type": "linear", "driver": "a", "follower": "a", "ratio": 1}]},
+    {"name": "unknown driver", "couplings": [{"id": "k", "type": "linear", "driver": "missing", "follower": "b", "ratio": 1}]},
+    {"name": "duplicate coupling IDs",
+     "couplings": [{"id": "k", "type": "linear", "driver": "a", "follower": "b", "ratio": 1},
+                   {"id": "k", "type": "linear", "driver": "a", "follower": "c", "ratio": 1}]}
+  ],
+  "invalidJoints": [
+    {"id": "a", "name": "Driver", "type": "revolute", "parent": "x", "child": "y"},
+    {"id": "b", "name": "Follower", "type": "revolute", "parent": "z", "child": "w"},
+    {"id": "c", "name": "Third", "type": "revolute", "parent": "u", "child": "v"}
+  ]
+}

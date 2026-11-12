@@ -161,6 +161,8 @@ acyclic, and definitions are bounded to 256 couplings, 4,096 samples each and
 65,536 in total. Followers are not free solver variables: the worker derives
 their normalized `position`, rejecting a contradicting authored one, and the
 app resolves them from their drivers before limit checks, closure and grabs.
+Both implementations are tested against the golden cases in
+`tests/assembly-coupling-cases.json`.
 Closed loops and grabs act on each follower's independent root driver. Pose
 requests cannot drive a follower directly; supplied follower coordinates are
 recomputed.
