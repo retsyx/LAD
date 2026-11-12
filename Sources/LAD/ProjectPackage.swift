@@ -9,7 +9,11 @@ import zlib
 /// Calls are coordinated by the document writer. In-process package locks also
 /// protect direct readers and multiple writers without blocking other designs.
 enum ProjectPackage {
-    static let formatVersion = 5
+    /// Version 6 keeps the asset catalog in its own section. Version 5
+    /// packages, which inline it in project.json, still open with their full
+    /// history and are rewritten as version 6 by their next save.
+    static let formatVersion = 6
+    private static let inlineCatalogFormatVersion = 5
     static let maximumRootBytes = 32_000_000
     static let maximumChunkBytes = 512_000
     static let maximumMetadataRecordBytes = 8_000_000
@@ -86,6 +90,7 @@ enum ProjectPackage {
         var encodedRevisionParts = 0
         var encodedTaskRecords = 0
         var compressedAssets = 0
+        var encodedCatalogBuckets = 0
         var phaseSeconds: [String: TimeInterval] = [:]
     }
 
@@ -103,6 +108,10 @@ enum ProjectPackage {
         var events = [String: [Chunk]]()
         var recordData = [String: Data]()
         var assetReferences = [String: Set<String>]()
+        /// Asset descriptors by hash, and the catalog file holding each
+        /// two-character hash prefix. A save rewrites only changed prefixes.
+        var catalog = [String: [String: Any]]()
+        var catalogBuckets = [String: [String: Any]]()
     }
 
     private struct MetadataSnapshot {
@@ -142,7 +151,9 @@ enum ProjectPackage {
     /// or caching the design's history.
     static func projectID(at url: URL) throws -> UUID? {
         let root = try object(rootData(from: url))
-        guard root["formatVersion"] as? Int == formatVersion else { throw invalid("Unsupported design package format.") }
+        guard let version = root["formatVersion"] as? Int, [inlineCatalogFormatVersion, formatVersion].contains(version) else {
+            throw invalid("Unsupported design package format.")
+        }
         return (root["projectID"] as? String).flatMap(UUID.init(uuidString:))
     }
 
@@ -213,6 +224,7 @@ enum ProjectPackage {
         var verified = previous?.verifiedAttachments ?? [:]
         let historyChanged = previous.map { !sameHistory(portable, $0.project) } ?? true
         let reuseDependencies = previous.map {
+            $0.root["catalog"] != nil &&
             !historyChanged && sameQueuedAttachments(portable.queuedRequests, $0.project.queuedRequests) &&
                 portable.draftAttachments == $0.project.draftAttachments
         } ?? false
@@ -250,6 +262,7 @@ enum ProjectPackage {
         root.removeValue(forKey: "messages")
         root.removeValue(forKey: "revisions")
         root.removeValue(forKey: "taskAudits")
+        root.removeValue(forKey: "assets")
         root["formatVersion"] = formatVersion
         var files = Set<String>()
         var directories = Set<String>()
@@ -327,7 +340,7 @@ enum ProjectPackage {
         }
 
         if reuseDependencies, let previous {
-            for field in ["revisions", "conversation", "activity", "assets"] { root[field] = previous.root[field] }
+            for field in ["revisions", "conversation", "activity", "catalog"] { root[field] = previous.root[field] }
             files = previous.files
         } else {
         let oldRevisions = Dictionary(uniqueKeysWithValues: (previous?.project.revisions ?? []).map { ($0.id.uuidString, $0) })
@@ -412,11 +425,12 @@ enum ProjectPackage {
             root["activity"] = try index(["tasks": taskEntries], directory: "activity", old: previous?.root["activity"])
         }
 
-        var assetEntries = [String: Any]()
-        let previousAssets = previous?.root["assets"] as? [String: Any] ?? [:]
+        var assetEntries = [String: [String: Any]]()
+        let previousAssets = previous?.dependencies.catalog ?? [:]
+        var changedBuckets = Set<String>()
         for (hash, bytes) in assets {
             let path = assetPath(hash)
-            if let old = previousAssets[hash] as? [String: Any],
+            if let old = previousAssets[hash],
                old["byteCount"] as? Int == bytes.count, old["path"] as? String == path {
                 // These exact bytes already belong to the verified committed
                 // session. A transcript append need not stat every CAD input.
@@ -427,16 +441,34 @@ enum ProjectPackage {
                 try writeImmutable(stored.bytes, path: path, in: url, verified: previous?.files ?? [], directories: &directories)
                 assetEntries[hash] = ["path": path, "sha256": hash, "byteCount": bytes.count,
                                       "storedByteCount": stored.bytes.count, "codec": stored.codec]
+                changedBuckets.insert(String(hash.prefix(2)))
             }
             files.insert(path)
         }
-        root["assets"] = assetEntries
+        for hash in previousAssets.keys where assetEntries[hash] == nil { changedBuckets.insert(String(hash.prefix(2))) }
+        var bucketReferences = [String: [String: Any]]()
+        for (bucket, members) in Dictionary(grouping: assetEntries, by: { String($0.key.prefix(2)) }) {
+            if !changedBuckets.contains(bucket), let old = previous?.dependencies.catalogBuckets[bucket] {
+                bucketReferences[bucket] = try reuse(old)
+            } else {
+                metrics.encodedCatalogBuckets += 1
+                bucketReferences[bucket] = try store(Dictionary(uniqueKeysWithValues: members.map { ($0.key, $0.value) }),
+                                                     directory: "catalog", prefix: "assets-\(bucket)")
+            }
+        }
+        dependencies.catalog = assetEntries
+        dependencies.catalogBuckets = bucketReferences
+        if changedBuckets.isEmpty, let prior = previous?.root["catalog"] as? [String: Any] {
+            root["catalog"] = try reuse(prior)
+        } else {
+            root["catalog"] = try index(["buckets": bucketReferences], directory: "catalog", old: previous?.root["catalog"])
+        }
         }
         metrics.phaseSeconds["dependencies"] = ProcessInfo.processInfo.systemUptime - phaseStart
         phaseStart = ProcessInfo.processInfo.systemUptime
         let thumbnailKey = try thumbnailIdentity(metadata)
         if let old = previous?.root["thumbnail"] as? [String: Any], let path = old["path"] as? String,
-           let hash = old["sha256"] as? String, (root["assets"] as? [String: Any])?[hash] == nil {
+           let hash = old["sha256"] as? String, dependencies.catalog[hash] == nil {
             files.remove(path)
         }
         var savedThumbnail: Data?
@@ -472,13 +504,12 @@ enum ProjectPackage {
         metrics.phaseSeconds["thumbnail"] = ProcessInfo.processInfo.systemUptime - phaseStart
         phaseStart = ProcessInfo.processInfo.systemUptime
         // Do not create a new commit for a byte-identical authoritative state.
-        // The immutable asset catalog need not be encoded to compare a state edit.
+        // The catalog section's reference covers every asset descriptor.
         let inlineData = try json(inlineMetadata(root))
         let sectionData: Data
         if reuseDependencies, let previous { sectionData = previous.sectionData }
         else { sectionData = try json(sectionReferences(root)) }
-        if let previous, inlineData == previous.inlineData, sectionData == previous.sectionData,
-           reuseDependencies || assets == previous.assets {
+        if let previous, inlineData == previous.inlineData, sectionData == previous.sectionData {
             metrics.phaseSeconds["manifest"] = ProcessInfo.processInfo.systemUptime - phaseStart
             return previous.rootData
         }
@@ -527,7 +558,7 @@ enum ProjectPackage {
         try requirePackage(url)
         let data = try readFile("project.json", in: url, limit: maximumRootBytes)
         let root = try object(data)
-        guard root["formatVersion"] as? Int == formatVersion,
+        guard let version = root["formatVersion"] as? Int, [inlineCatalogFormatVersion, formatVersion].contains(version),
               let commitID = root["commitID"] as? String, UUID(uuidString: commitID) != nil else {
             throw invalid("Unsupported design package format.")
         }
@@ -606,7 +637,27 @@ enum ProjectPackage {
         }
         if !tasks.isEmpty { metadata["taskAudits"] = tasks }
         else { metadata.removeValue(forKey: "taskAudits") }
-        guard let descriptors = root["assets"] as? [String: Any], descriptors.count <= 32_768 else { throw invalid("The asset catalog is invalid.") }
+        let descriptors: [String: Any]
+        if version == formatVersion {
+            guard root["assets"] == nil, let catalog = root["catalog"] else { throw invalid("The asset catalog is invalid.") }
+            let index = try object(readReference(catalog, prefix: "catalog/index-"))
+            guard let buckets = index["buckets"] as? [String: Any], buckets.count <= 256 else { throw invalid("The asset catalog is invalid.") }
+            var merged = [String: Any]()
+            for (bucket, value) in buckets {
+                guard bucket.utf8.count == 2, bucket.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+                      let reference = value as? [String: Any] else { throw invalid("The asset catalog is invalid.") }
+                for (hash, descriptor) in try object(readReference(reference, prefix: "catalog/assets-\(bucket)-")) {
+                    guard hash.hasPrefix(bucket), merged[hash] == nil else { throw invalid("The asset catalog is invalid.") }
+                    merged[hash] = descriptor
+                }
+                dependencies.catalogBuckets[bucket] = reference
+            }
+            descriptors = merged
+        } else {
+            // A version 5 package inlines its catalog in project.json.
+            guard root["catalog"] == nil, let inline = root["assets"] as? [String: Any] else { throw invalid("The asset catalog is invalid.") }
+            descriptors = inline
+        }
         var assets = [String: Data](), total = 0
         for (hash, value) in descriptors {
             guard validHash(hash), let descriptor = value as? [String: Any],
@@ -622,6 +673,7 @@ enum ProjectPackage {
             let bytes = try expandedAsset(stored, codec: codec, byteCount: count)
             guard digest(bytes) == hash else { throw invalid("A saved file asset failed its integrity check.") }
             assets[hash] = bytes; files.insert(path)
+            dependencies.catalog[hash] = descriptor
         }
         metadata["assets"] = [String: Any]()
         let snapshot = ProjectArchive.Snapshot(metadata: try json(metadata), assets: assets)
@@ -694,7 +746,7 @@ enum ProjectPackage {
 
     private static func inlineMetadata(_ root: [String: Any]) -> [String: Any] {
         var inline = root
-        for field in ["assets", "revisions", "conversation", "activity", "commitID", "parentCommitID"] {
+        for field in ["assets", "catalog", "revisions", "conversation", "activity", "commitID", "parentCommitID"] {
             inline.removeValue(forKey: field)
         }
         return inline
@@ -702,7 +754,7 @@ enum ProjectPackage {
 
     private static func sectionReferences(_ root: [String: Any]) -> [String: Any] {
         var references = [String: Any]()
-        for field in ["revisions", "conversation", "activity"] { references[field] = root[field] }
+        for field in ["revisions", "conversation", "activity", "catalog"] { references[field] = root[field] }
         return references
     }
 
@@ -935,7 +987,6 @@ enum ProjectPackage {
         let required = dependencies.assetReferences.values.reduce(into: Set<String>()) { $0.formUnion($1) }
         let assets = candidates.filter { required.contains($0.key) }
         guard assets.count == required.count else { throw invalid("A saved asset reference is missing.") }
-        guard assets.count <= 32_768 else { throw invalid("The asset catalog contains too many payloads.") }
         var assetBytes = 0
         for bytes in assets.values {
             guard bytes.count <= ProjectStore.maximumFileBytes - assetBytes else { throw invalid("Saved assets exceed the design size limit.") }

@@ -6,7 +6,6 @@ import Foundation
 /// from the saved CAD program and never belongs to the archive.
 enum ProjectArchive {
     static let formatVersion = 4
-    private static let maximumAssetCount = 32_768
     private static let maximumAssetBytes = ProjectStore.maximumFileBytes
 
     struct Snapshot {
@@ -514,7 +513,6 @@ enum ProjectArchive {
             if let existing = assets[key] {
                 guard existing == bytes else { throw invalid("File assets have conflicting integrity hashes.") }
             } else {
-                guard assets.count < maximumAssetCount else { throw invalid("The design contains too many file assets.") }
                 try addBytes(bytes.count, to: &totalAssetBytes, limit: maximumAssetBytes)
                 assets[key] = bytes
             }
@@ -528,7 +526,6 @@ enum ProjectArchive {
         private var decodedText: [String: String] = [:]
 
         init(assets: [String: Data]) throws {
-            guard assets.count <= maximumAssetCount else { throw invalid("The design contains too many file assets.") }
             var total = 0
             for (key, bytes) in assets {
                 try addBytes(bytes.count, to: &total, limit: maximumAssetBytes)
