@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import XCTest
 @testable import LAD
@@ -79,26 +80,43 @@ final class CADActivityImageTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: preview.stepPath))
     }
 
-    func testImageHandoffIsExcludedFromGenericCodableAndProjectArchives() throws {
-        let bytes = Data("unique-rendered-image-payload".utf8)
+    @MainActor
+    func testRenderImageIsArchivedAsOneAssetReferenceAndExcludedFromGenericCodable() throws {
+        let bytes = try ImageAttachmentTestImage.png(.red, width: 40, height: 30)
         let event = ProjectActivityEvent(id: "tool:one", category: "tool", title: "lad_render", status: "completed",
             input: "{\"view\":\"front\"}", output: "Image result metadata", imageData: bytes)
         let encoded = try JSONEncoder().encode(event)
         XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("imageData"))
         XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains(bytes.base64EncodedString()))
-        let decoded = try JSONDecoder().decode(ProjectActivityEvent.self, from: encoded)
-        XCTAssertNil(decoded.imageData)
-        XCTAssertEqual(decoded.id, event.id)
-        XCTAssertEqual(decoded.input, event.input)
-        XCTAssertEqual(decoded.output, event.output)
+        XCTAssertNil(try JSONDecoder().decode(ProjectActivityEvent.self, from: encoded).imageData)
 
         let user = ChatMessage(role: "user", content: "Review the design")
-        let audit = ProjectTaskAudit(userMessageID: user.id, model: "test", reasoningEffort: "high", status: "completed", events: [event])
+        var repeated = event
+        repeated.id = "tool:two"
+        let audit = ProjectTaskAudit(userMessageID: user.id, model: "test", reasoningEffort: "high", status: "completed",
+                                     events: [event, repeated])
         let project = LADProject(messages: [user], revisions: [], selectedRevisionID: nil, taskAudits: [audit])
-        let archive = try ProjectStore.encode(project)
-        let json = try ProjectZIP.decode(archive)
-        XCTAssertFalse(String(decoding: json, as: UTF8.self).contains(bytes.base64EncodedString()))
-        XCTAssertNil(try ProjectStore.decode(archive).taskAudits?.first?.events.first?.imageData)
+        let snapshot = try ProjectArchive.split(project)
+        let hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(snapshot.assets[hash], bytes, "The exact PNG is a content-addressed asset.")
+        XCTAssertEqual(snapshot.assets.values.filter { $0 == bytes }.count, 1, "Identical images are stored once.")
+        let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot.metadata) as? [String: Any])
+        let rows = try XCTUnwrap((metadata["taskAudits"] as? [[String: Any]])?.first?["events"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["imageAsset"] as? String }, [hash, hash])
+        XCTAssertTrue(rows.allSatisfy { $0["imageData"] == nil })
+        XCTAssertEqual(try ProjectStore.decode(ProjectStore.encode(project)).taskAudits?.first?.events.map(\.imageData), [bytes, bytes])
+    }
+
+    @MainActor
+    func testSavedImagesMustBePNGResultsOfImageTools() throws {
+        let png = try ImageAttachmentTestImage.png(.blue)
+        let user = ChatMessage(role: "user", content: "Review the design")
+        for (title, image) in [("lad_measure", png), ("lad_render", Data("not a PNG".utf8))] {
+            let event = ProjectActivityEvent(id: "tool:one", category: "tool", title: title, status: "completed", imageData: image)
+            let audit = ProjectTaskAudit(userMessageID: user.id, model: "test", reasoningEffort: "high", status: "completed", events: [event])
+            XCTAssertThrowsError(try ProjectStore.validate(LADProject(messages: [user], revisions: [], selectedRevisionID: nil,
+                                                                      taskAudits: [audit])), title)
+        }
     }
 
     private func send(_ name: String, arguments: [String: Any], in root: URL) throws -> String {

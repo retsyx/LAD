@@ -272,7 +272,7 @@ struct ProjectActivityEventView: View {
     private var result: some View {
             VStack(alignment: .leading, spacing: 10) {
                 if let input = event.input, !input.isEmpty { detail("Input", text: input) }
-                if let reference = images.images[imageKey] {
+                if let reference = images.reference(for: imageKey, savedImage: event.imageData) {
                     ProjectActivityImagePreview(reference: reference, images: images)
                 } else if hasImageResult {
                     Text("Preview unavailable").font(.caption).foregroundStyle(Palette.muted)

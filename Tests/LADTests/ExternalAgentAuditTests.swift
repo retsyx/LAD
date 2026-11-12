@@ -29,8 +29,7 @@ final class ExternalAgentAuditTests: XCTestCase {
     func testExternalTaskRoundTripsWithoutInventingChatOrModelMetadata() throws {
         var value = project()
         value.taskAudits![0].events = [ProjectActivityEvent(id: "call-1", category: "tool", title: "lad_build", status: "completed",
-            input: request, files: [ProjectActivityFile(name: "candidate.py", path: "/removed/candidate.py", data: Data(ModelSpec.bracket.script.utf8))],
-            imageData: Data("temporary PNG".utf8))]
+            input: request, files: [ProjectActivityFile(name: "candidate.py", path: "/removed/candidate.py", data: Data(ModelSpec.bracket.script.utf8))])]
         let snapshot = try ProjectArchive.split(value)
         let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot.metadata) as? [String: Any])
         let row = try XCTUnwrap((metadata["taskAudits"] as? [[String: Any]])?.first)
@@ -49,7 +48,6 @@ final class ExternalAgentAuditTests: XCTestCase {
         XCTAssertEqual(restored.taskAudits?.first?.externalClient, value.taskAudits?.first?.externalClient)
         XCTAssertEqual(restored.taskAudits?.first?.request, request)
         XCTAssertEqual(restored.taskAudits?.first?.events.first?.files, value.taskAudits?.first?.events.first?.files)
-        XCTAssertNil(restored.taskAudits?.first?.events.first?.imageData)
         XCTAssertNil(restored.taskAudits?.first?.model)
         XCTAssertNil(restored.taskAudits?.first?.reasoningEffort)
         XCTAssertEqual(try ProjectStore.decode(ProjectStore.encode(restored)).taskAudits, restored.taskAudits)

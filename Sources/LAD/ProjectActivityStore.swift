@@ -36,18 +36,23 @@ final class ProjectActivityStore: ObservableObject {
 
     func record(_ incoming: ProjectActivityEvent, taskID: UUID? = nil) {
         guard let id = taskID ?? activeTaskID, let index = tasks.firstIndex(where: { $0.id == id }) else { return }
-        if incoming.category == "tool", incoming.status == "completed",
-           ["lad_render", "lad_screenshot", "imageView"].contains(incoming.title), let image = incoming.imageData {
-            images.store(image, for: ProjectActivityImageKey(taskID: id, eventID: incoming.id))
-        }
         var event = incoming
         event.imageData = nil
+        if incoming.category == "tool", incoming.status == "completed", let image = incoming.imageData {
+            if ProjectActivityEvent.savedImageTools.contains(incoming.title) {
+                if ProjectActivityEvent.isSavedImage(image) { event.imageData = image }
+            } else if incoming.title == "imageView" {
+                images.store(image, for: ProjectActivityImageKey(taskID: id, eventID: incoming.id))
+            }
+        }
         if let item = tasks[index].events.firstIndex(where: { $0.id == event.id }) {
             let previous = tasks[index].events[item]
             event.date = previous.date
             if event.input == nil { event.input = previous.input }
             if event.output == nil { event.output = previous.output }
             if event.files == nil { event.files = previous.files }
+            if event.imageData == nil, event.category == "tool",
+               ProjectActivityEvent.savedImageTools.contains(event.title) { event.imageData = previous.imageData }
             guard previous != event else { return }
             tasks[index].events[item] = event
         } else { tasks[index].events.append(event) }

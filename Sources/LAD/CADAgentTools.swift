@@ -942,7 +942,8 @@ final class CADAgentTools {
 
     private func imageResult(_ url: URL, metadata: [String: Any]) throws -> [String: Any] {
         // Verify the renderer wrote a regular workspace file before the MCP
-        // adapter reads it. The image itself remains a session-only artifact.
+        // adapter reads it. The trusted bridge saves these exact bytes with the
+        // call's activity event.
         let bytes = try workspace.read(url.path, maximumBytes: 32 * 1024 * 1024)
         var info = metadata
         info["path"] = url.path

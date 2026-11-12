@@ -19,13 +19,16 @@ struct ProjectActivityImageReference: Identifiable, Sendable {
 
 }
 
-/// Derived images remain available after the agent's private task directory is
-/// removed, without saving screenshots in the design or later agent context.
-/// Original encoded bytes are retained here; views downsample expanded rows
-/// without replacing the full-resolution image used by external viewers.
+/// Presents activity images. Saved render and screenshot PNGs belong to their
+/// events; images an agent only viewed stay in a bounded session cache after
+/// its private task directory is removed. Original encoded bytes are retained;
+/// views downsample expanded rows without replacing the full-resolution image
+/// used by external viewers.
 @MainActor
 final class ProjectActivityImages: ObservableObject {
     @Published private(set) var images: [ProjectActivityImageKey: ProjectActivityImageReference] = [:]
+    /// Display metadata for saved event images, created only for expanded rows.
+    private var saved: [ProjectActivityImageKey: ProjectActivityImageReference] = [:]
     private var order: [ProjectActivityImageKey] = []
     private let maximumImages: Int
     private let maximumBytes: Int
@@ -63,6 +66,15 @@ final class ProjectActivityImages: ObservableObject {
         if !removedIDs.isEmpty { Task { await files.remove(removedIDs) } }
     }
 
+    /// The image for one activity row: its saved PNG, otherwise a session image.
+    func reference(for key: ProjectActivityImageKey, savedImage: Data?) -> ProjectActivityImageReference? {
+        guard let savedImage else { return images[key] }
+        if let existing = saved[key], existing.data == savedImage { return existing }
+        guard let reference = Self.reference(for: savedImage) else { return nil }
+        saved[key] = reference
+        return reference
+    }
+
     func open(_ reference: ProjectActivityImageReference) async throws {
         guard contains(reference) else { throw LADError.message("This image is no longer available.") }
         try Task.checkCancellation()
@@ -77,14 +89,14 @@ final class ProjectActivityImages: ObservableObject {
     }
 
     func reset() {
-        order = []; images = [:]
+        order = []; images = [:]; saved = [:]
         let previous = files
         files = ProjectActivityImageFiles(in: temporaryDirectory)
         Task { await previous.removeAll() }
     }
 
     private func contains(_ reference: ProjectActivityImageReference) -> Bool {
-        images.values.contains { $0.id == reference.id }
+        images.values.contains { $0.id == reference.id } || saved.values.contains { $0.id == reference.id }
     }
 
     private static func reference(for data: Data) -> ProjectActivityImageReference? {

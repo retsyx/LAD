@@ -60,6 +60,26 @@ final class ProjectActivityImageViewTests: XCTestCase {
     }
 
     @MainActor
+    func testSavedRenderImageShowsAndOpensWithoutASessionImage() async throws {
+        try requireWindowServer()
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        var opened = [URL]()
+        let images = ProjectActivityImages(opener: { opened.append($0); return true })
+        defer { images.reset() }
+        let png = try ImageAttachmentTestImage.png(.red, width: 400, height: 300)
+        var event = renderEvent()
+        event.imageData = png
+        XCTAssertTrue(images.images.isEmpty, "A reopened design has no session images.")
+        let hosted = fixture(ProjectActivityEventView(event: event, taskID: UUID(), images: images, initiallyExpanded: true))
+        defer { close(hosted) }
+        try await waitForColor(.red, in: hosted)
+        try click(try coloredFrame(.red, in: hosted), count: 2, in: hosted)
+        let deadline = ContinuousClock.now + .seconds(3)
+        while opened.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(try opened.first.map { try Data(contentsOf: $0) }, png)
+    }
+
+    @MainActor
     func testLargeImageViewPreviewsFitThePaneAndDecodeOnlyABoundedBitmap() async throws {
         try requireWindowServer()
         for (width, height, orientation) in [(6_000, 2_000, 1), (3_000, 2_000, 6)] {

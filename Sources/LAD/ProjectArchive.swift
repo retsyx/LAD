@@ -200,6 +200,7 @@ enum ProjectArchive {
         var status: String
         var inputAsset: String?
         var outputAsset: String?
+        var imageAsset: String?
         var durationSeconds: Double?
         var files: [ArchivedActivityFile]?
 
@@ -208,11 +209,12 @@ enum ProjectArchive {
             title = event.title; status = event.status; durationSeconds = event.durationSeconds
             inputAsset = try event.input.map { try writer.store(Data($0.utf8), role: .activity) }
             outputAsset = try event.output.map { try writer.store(Data($0.utf8), role: .activity) }
+            imageAsset = try event.imageData.map { try writer.store($0, role: .activityImage) }
             files = try event.files?.map { try ArchivedActivityFile($0, writer: &writer) }
         }
 
         private enum CodingKeys: String, CodingKey {
-            case id, date, category, title, status, inputAsset, outputAsset, durationSeconds, files
+            case id, date, category, title, status, inputAsset, outputAsset, imageAsset, durationSeconds, files
         }
 
         init(from decoder: Decoder) throws {
@@ -225,6 +227,7 @@ enum ProjectArchive {
             status = try values.decode(String.self, forKey: .status)
             inputAsset = try values.decodeIfPresent(String.self, forKey: .inputAsset)
             outputAsset = try values.decodeIfPresent(String.self, forKey: .outputAsset)
+            imageAsset = try values.decodeIfPresent(String.self, forKey: .imageAsset)
             durationSeconds = try values.decodeIfPresent(Double.self, forKey: .durationSeconds)
             files = try values.decodeIfPresent([ArchivedActivityFile].self, forKey: .files)
         }
@@ -234,7 +237,8 @@ enum ProjectArchive {
                                  input: try inputAsset.map { try reader.text($0, role: .activity) },
                                  output: try outputAsset.map { try reader.text($0, role: .activity) },
                                  durationSeconds: durationSeconds,
-                                 files: try files?.map { try $0.restored(reader: &reader) })
+                                 files: try files?.map { try $0.restored(reader: &reader) },
+                                 imageData: try imageAsset.map { try reader.data($0, role: .activityImage) })
         }
     }
 
@@ -488,7 +492,7 @@ enum ProjectArchive {
     }
 
     private enum AssetRole: Equatable {
-        case attachment, image, script, step, input, activity, activityFile
+        case attachment, image, script, step, input, activity, activityFile, activityImage
 
         var maximumBytes: Int {
             switch self {
@@ -499,6 +503,7 @@ enum ProjectArchive {
             case .input: return ProjectStore.maximumSTEPBytes
             case .activity: return ProjectStore.maximumActivityTextBytes
             case .activityFile: return ProjectActivityFile.maximumBytes
+            case .activityImage: return ProjectActivityEvent.maximumImageBytes
             }
         }
     }

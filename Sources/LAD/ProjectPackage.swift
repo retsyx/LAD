@@ -851,6 +851,7 @@ enum ProjectPackage {
                     var fields = Set<String>()
                     if event.input == old.input { value.input = nil; fields.insert("inputAsset") }
                     if event.output == old.output { value.output = nil; fields.insert("outputAsset") }
+                    if event.imageData == old.imageData { value.imageData = nil; fields.insert("imageAsset") }
                     if event.files == old.files { value.files = nil; fields.insert("files") }
                     reusedEventFields["\(task.id.uuidString)/\(event.id)"] = fields
                 }
@@ -1006,11 +1007,6 @@ enum ProjectPackage {
             }
             if result.revisions[index].preview != nil { result.revisions[index].preview = nil }
         }
-        for task in result.taskAudits?.indices ?? 0..<0 {
-            for event in result.taskAudits![task].events.indices where result.taskAudits![task].events[event].imageData != nil {
-                result.taskAudits![task].events[event].imageData = nil
-            }
-        }
         return result
     }
 
@@ -1040,7 +1036,8 @@ enum ProjectPackage {
     }
 
     private static func assetReferences(_ value: Any) -> Set<String> {
-        let fields: Set<String> = ["scriptAsset", "sourceSTEPAsset", "dataAsset", "contentAsset", "inputAsset", "outputAsset", "requestAsset"]
+        let fields: Set<String> = ["scriptAsset", "sourceSTEPAsset", "dataAsset", "contentAsset", "inputAsset", "outputAsset",
+                                   "imageAsset", "requestAsset"]
         var result = Set<String>()
         func visit(_ value: Any) {
             if let object = value as? [String: Any] {

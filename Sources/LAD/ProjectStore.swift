@@ -421,7 +421,9 @@ enum ProjectStore {
                       event.date.timeIntervalSinceReferenceDate.isFinite,
                       event.durationSeconds.map({ $0.isFinite && $0 >= 0 }) ?? true,
                       event.input.map({ $0.utf8.count <= maximumActivityTextBytes }) ?? true,
-                      event.output.map({ $0.utf8.count <= maximumActivityTextBytes }) ?? true else {
+                      event.output.map({ $0.utf8.count <= maximumActivityTextBytes }) ?? true,
+                      event.imageData.map({ ProjectActivityEvent.isSavedImage($0) && event.category == "tool" &&
+                          ProjectActivityEvent.savedImageTools.contains(event.title) }) ?? true else {
                     throw invalid("A saved tool activity event is invalid.")
                 }
                 if let files = event.files {

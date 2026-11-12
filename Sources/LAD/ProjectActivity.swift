@@ -24,11 +24,21 @@ struct ProjectActivityEvent: Codable, Sendable, Identifiable, Equatable {
     var durationSeconds: Double? = nil
     /// Exact candidate and producer instructions, stored once by content hash.
     var files: [ProjectActivityFile]? = nil
-    /// Transient exact image bytes for this completed image tool call, moved
-    /// into a bounded session cache before retaining the text audit record.
-    /// Generated render bytes must never enter a project archive or a prompt.
+    /// The exact PNG a completed `lad_render` or `lad_screenshot` call returned.
+    /// It is part of the design's permanent activity log, stored once as a
+    /// package asset, and never enters a later prompt. Other tools' media stays
+    /// out of the log.
     var imageData: Data? = nil
 
+    /// Tools whose exact PNG results are saved with their activity event.
+    static let savedImageTools: Set<String> = ["lad_render", "lad_screenshot"]
+    static let maximumImageBytes = 32 * 1024 * 1024
+
+    static func isSavedImage(_ data: Data) -> Bool {
+        !data.isEmpty && data.count <= maximumImageBytes && data.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    }
+
+    /// Archives store the image as an asset reference rather than inline bytes.
     private enum CodingKeys: String, CodingKey {
         case id, date, category, title, status, input, output, durationSeconds, files
     }
