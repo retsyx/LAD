@@ -21,6 +21,10 @@ import uuid
 VERSION = "iterative-mesh-1"
 MAX_FILE = 512_000_000  # Match the app's geometry-file admission limit.
 MAX_SOURCE_TRIANGLES = 1_000_000
+# Reference coordinates travel once, as binary arrays beside the context; the
+# context JSON keeps only metadata and the geometry's identity.
+REFERENCE_ASSET = "mesh-reference.npz"
+REFERENCE_ARRAYS = ("vertices", "triangles", "original_vertices")
 UNIT_RATIOS = {"mm":(1,1), "cm":(10,1), "m":(1000,1), "um":(1,1000),
                "µm":(1,1000), "in":(127,5), "inch":(127,5), "ft":(1524,5)}
 
@@ -62,10 +66,10 @@ def envelope(context,payload,status="ok",diagnostics=(),dependencies=()):
                           "seed":context.get("seed",0)}}
 
 
-def _mesh(path):
+def _mesh(path,data):
     import numpy as np
     if path.suffix.lower()==".json":
-        data=json.loads(path.read_text())
+        data=json.loads(data.decode("utf-8"))
         if not isinstance(data,dict) or set(data)!={"vertices","triangles"}:
             raise ValueError("Mesh JSON requires vertices and zero-based triangles")
         vertices=np.asarray(data["vertices"],dtype=float)
@@ -73,11 +77,12 @@ def _mesh(path):
         if raw.dtype.kind not in "iu":raise ValueError("Triangle indices must be integers")
         triangles=raw.astype(np.int64)
     elif path.suffix.lower()==".stl":
-        data=path.read_bytes();count=struct.unpack_from("<I",data,80)[0] if len(data)>=84 else 0
+        count=struct.unpack_from("<I",data,80)[0] if len(data)>=84 else 0
         if count and 84+50*count==len(data):
             if count>MAX_SOURCE_TRIANGLES:raise ValueError("Source triangle budget exceeded")
-            vertices=np.asarray([list(values[i:i+3]) for values in
-                       (struct.unpack_from("<12fH",data,84+50*j) for j in range(count)) for i in (3,6,9)],float)
+            facets=np.frombuffer(data,dtype=np.dtype([("normal","<f4",3),("corners","<f4",(3,3)),("attribute","<u2")]),
+                                 count=count,offset=84)
+            vertices=facets["corners"].reshape(-1,3).astype(float)
         else:
             text=data.decode("utf-8")
             values=re.findall(r"(?im)^\s*vertex\s+(\S+)\s+(\S+)\s+(\S+)\s*$",text)
@@ -108,7 +113,8 @@ def open_reference(path,*,units,max_deviation,source_kind="unknown",policy=None)
     for key in ("reference_interpretation","fit_policy","query_policy","compare_policy"):
         if not isinstance(policy.get(key,{}),dict):raise ValueError("Policy fields must be JSON objects")
     if type(policy.get("seed",0)) is not int or not 0<=policy.get("seed",0)<=2**32-1:raise ValueError("Invalid deterministic seed")
-    vertices,triangles=_mesh(path)
+    data=path.read_bytes()
+    vertices,triangles=_mesh(path,data)
     n,d=UNIT_RATIOS[units];factor=n/d
     normalized=vertices*factor
     if not np.isfinite(normalized).all() or np.max(np.abs(normalized))>1_000_000:
@@ -132,10 +138,13 @@ def open_reference(path,*,units,max_deviation,source_kind="unknown",policy=None)
     allowance=float(exact_allowance)
     if not math.isfinite(allowance):raise ValueError("Deviation exceeds the working range")
     if Fraction.from_float(allowance)>exact_allowance:allowance=math.nextafter(allowance,-math.inf)
-    source_hash=hashlib.sha256(path.read_bytes()).hexdigest()
+    from mesh_reference import geometry_digest
+    source_hash=hashlib.sha256(data).hexdigest()
     context={"source_hash":source_hash,"units":"mm","source_units":units,
              "max_deviation":allowance,"source_max_deviation":float(max_deviation),
-             "source_kind":source_kind,"vertices":normalized.tolist(),"triangles":triangles.tolist(),
+             "source_kind":source_kind,
+             "geometry":{"vertex_count":len(normalized),"triangle_count":len(triangles),
+                         "digest":geometry_digest(normalized,triangles),"original_vertices":(n,d)!=(1,1)},
              "source_transform":{"scale_ratio":[n,d],"working_frame":"original axes and origin in millimeters"},
              "conversion_arithmetic_margin":conversion_error,"policy":policy,"seed":policy.get("seed",0),
              "bounds":{"min":normalized.min(axis=0).tolist(),"max":normalized.max(axis=0).tolist(),
@@ -143,14 +152,68 @@ def open_reference(path,*,units,max_deviation,source_kind="unknown",policy=None)
              "algorithm_version":VERSION,"completion_obligations":policy.get("completion_obligations",[]),
              "active_invariants":policy.get("active_invariants",[])}
     for key in ("fit_policy","query_policy","compare_policy"):context[key]=policy.get(key,{})
-    if (n,d)!=(1,1):context["original_vertices"]=vertices.tolist()
-    context["id"]=identity("context",{k:v for k,v in context.items() if k not in {"vertices","original_vertices","triangles"}})
+    context["id"]=identity("context",context)
+    # The returned context carries the arrays in memory; publishing moves them
+    # into the binary reference asset.
+    context["vertices"]=normalized;context["triangles"]=triangles
+    if (n,d)!=(1,1):context["original_vertices"]=vertices
     revision={"id":identity("revision",{"context":context["id"],"empty":True}),"context_ref":context["id"],
               "source_hash":source_hash,"script":None,"body_ids":[],"constructions":{},"parameter_bindings":{},
               "constraints":[],"active_invariants":copy.deepcopy(context["active_invariants"]),
               "completion_obligations":copy.deepcopy(context["completion_obligations"]),
               "geometry_hash":None,"dependencies":[],"representation":{"status":"empty"}}
     return context,revision
+
+
+def write_reference(context,output):
+    """Move a context's arrays into the binary reference asset; return metadata."""
+    import numpy as np
+    arrays={"vertices":np.ascontiguousarray(context["vertices"],dtype=np.float64),
+            "triangles":np.ascontiguousarray(context["triangles"],dtype=np.int32)}
+    if "original_vertices" in context:arrays["original_vertices"]=np.ascontiguousarray(context["original_vertices"],dtype=np.float64)
+    with (Path(output)/REFERENCE_ASSET).open("wb") as stream:np.savez(stream,**arrays)
+    return {key:value for key,value in context.items() if key not in REFERENCE_ARRAYS}
+
+
+def attach_reference(context,directory,name):
+    """Load the staged binary reference into an in-memory context."""
+    import numpy as np
+    from mesh_reference import geometry_digest
+    geometry=context.get("geometry")
+    if not isinstance(geometry,dict):raise ValueError("The reference context has no geometry record")
+    with np.load(read_asset(directory,name),allow_pickle=False) as arrays:
+        names=set(arrays.files)
+        expected={"vertices","triangles"}|({"original_vertices"} if geometry.get("original_vertices") else set())
+        if names!=expected:raise ValueError("The reference geometry file is invalid")
+        vertices=np.asarray(arrays["vertices"],dtype=np.float64)
+        triangles=np.asarray(arrays["triangles"])
+        original=np.asarray(arrays["original_vertices"],dtype=np.float64) if "original_vertices" in names else None
+    if triangles.dtype.kind not in "iu":raise ValueError("The reference triangle indices are invalid")
+    triangles=triangles.astype(np.int64)
+    if (geometry.get("vertex_count")!=len(vertices) or geometry.get("triangle_count")!=len(triangles)
+            or geometry.get("digest")!=geometry_digest(vertices,triangles)):
+        raise ValueError("The reference geometry does not match its context")
+    context.update(vertices=vertices,triangles=triangles)
+    if original is not None:context["original_vertices"]=original
+    return context
+
+
+def _base_comparison(directory,spec,context,revision):
+    """A stored preview comparison of the unchanged base revision, if supplied.
+
+    Comparisons sample deterministically, so a matching report equals a fresh
+    one and later edits of the same revision need not recompute it. The
+    trusted session re-encodes records, so identity fields, not a hash of the
+    report, establish the match.
+    """
+    if not spec.get("baseComparisonAsset"):return None
+    base=read_json(directory,spec["baseComparisonAsset"])
+    if (base.get("model_ref")!=revision["id"] or base.get("context_revision")!=context["id"]
+            or base.get("source_hash")!=context["source_hash"] or base.get("geometry_hash")!=revision.get("geometry_hash")
+            or base.get("quality_requested")!="preview" or base.get("scope_requested")!="all"
+            or not isinstance(base.get("comparison_id"),str)):
+        return None
+    return base
 
 
 def _target(context,revision,directory,spec):
@@ -226,9 +289,10 @@ def execute(spec,directory,output,threads=1):
     if operation=="mesh_open_reference":
         policy=read_json(directory,spec["policyAsset"]) if spec.get("policyAsset") else None
         context,revision=open_reference(read_asset(directory,spec["sourceAsset"]),policy=policy,**options)
+        context=write_reference(context,output)
         result=envelope(context,{"context":context,"revision":revision})
     else:
-        context=read_json(directory,spec["contextAsset"])
+        context=attach_reference(read_json(directory,spec["contextAsset"]),directory,spec.get("referenceAsset"))
         revision=read_json(directory,spec["revisionAsset"]) if spec.get("revisionAsset") else {}
         if revision and (revision.get("context_ref")!=context["id"] or revision.get("source_hash")!=context["source_hash"]):
             raise ValueError("Revision belongs to another reference context")
@@ -295,8 +359,13 @@ def execute(spec,directory,output,threads=1):
                     display.update(stepPath=str((output/"model.step").resolve()),brepPath=str((output/"model.brep").resolve()),runtime=worker.runtime_info(cq),threads=threads,buildSeconds=0)
                     worker.write_preview_result(display,output);native_preview=True
                 staged={**preview,"shape":shape,"state":plan.get("state",{})}
-                preview["quick_comparison"]={"before":compare(context,target,quality="preview"),"after":compare(context,staged,quality="preview"),
-                                              "paired_source_sampling":True,"cache_reuse":"none; both states refreshed"}
+                # The base revision's report is stored once by the session and
+                # referenced by ID; edits of the same revision reuse it.
+                before=_base_comparison(directory,spec,context,revision)
+                reused=before is not None
+                if not reused:before=compare(context,target,quality="preview");preview["base_comparison"]=before
+                preview["quick_comparison"]={"before_comparison_id":before["comparison_id"],"after":compare(context,staged,quality="preview"),
+                                              "paired_source_sampling":True,"cache_reuse":"base comparison reused" if reused else "base comparison computed"}
                 preview["representation_checks"]=preview["quick_comparison"]["after"]["representation_checks"]
                 if shape is not None:
                     preview["commit_eligible"] &= all(check.get("status")=="pass" for check in preview["representation_checks"])

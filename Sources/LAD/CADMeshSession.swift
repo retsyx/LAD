@@ -24,7 +24,13 @@ final class CADMeshSession {
     }
     private let workspace: CADAgentWorkspace
     private var contexts: [String: Data] = [:]
+    /// Binary reference geometry per context, in the task workspace. Calls
+    /// stage it as a clone; the context JSON holds only its metadata.
+    private var referenceFiles: [String: URL] = [:]
     private var contextSourceHashes: [String: String] = [:]
+    /// The stored preview comparison of each unchanged revision, reused as
+    /// the base report of later edits from that revision.
+    private var baseComparisons: [String: String] = [:]
     private var revisions: [String: Record] = [:]
     private var previews: [String: Record] = [:]
     private var evidence: [String: Record] = [:]
@@ -97,6 +103,7 @@ final class CADMeshSession {
             return try transaction(name, arguments)
         }
         var assets: [String: Data] = [:]
+        var clones: [String: URL] = [:]
         var request: [String: Any] = ["operation": String(name.dropFirst(4))]
         var options: [String: Any] = [:]
         let contextID: String?
@@ -110,16 +117,9 @@ final class CADMeshSession {
                   CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite, number.doubleValue >= 0 else {
                 throw LADError.message("Declare a finite nonnegative maximum deviation in the source units.")
             }
-            let access = workspace
-            let reading = Task.detached(priority: .userInitiated) {
-                try Task.checkCancellation()
-                let data = try access.read(path, maximumBytes: ProjectStore.maximumSTEPBytes)
-                try Task.checkCancellation()
-                return data
-            }
-            assets["source." + suffix] = try await withTaskCancellationHandler { try await reading.value }
-                onCancel: { reading.cancel() }
-            try Task.checkCancellation()
+            // The worker reads the source; staging it never loads it here.
+            _ = try workspace.fileSize(path, maximumBytes: ProjectStore.maximumSTEPBytes)
+            clones["source." + suffix] = try workspace.url(path)
             request["sourceAsset"] = "source." + suffix
             options = ["units": try text("units", arguments), "max_deviation": number.doubleValue,
                        "source_kind": arguments["sourceKind"] ?? "unknown"]
@@ -127,8 +127,11 @@ final class CADMeshSession {
             contextID = nil; targetID = nil
         } else {
             let context = try text("contextID", arguments)
-            guard let data = contexts[context] else { throw LADError.message("This reference context is unavailable in the current task.") }
+            guard let data = contexts[context], let reference = referenceFiles[context] else {
+                throw LADError.message("This reference context is unavailable in the current task.")
+            }
             contextID = context; assets["context.json"] = data; request["contextAsset"] = "context.json"
+            clones["reference.npz"] = reference; request["referenceAsset"] = "reference.npz"
             let id = try text(name == "lad_mesh_compare" ? "targetID" : "revisionID", arguments)
             let record = try resolve(id, context: context, previewsAllowed: name == "lad_mesh_compare")
             targetID = id; assets["revision.json"] = record.data; request["revisionAsset"] = "revision.json"
@@ -165,6 +168,9 @@ final class CADMeshSession {
                 assets["edit.json"] = try json(edit)
                 let records = try referencedRecords(edit, pool: fits, context: context)
                 assets["fits.json"] = try await encodedRecords(records); request["fitsAsset"] = "fits.json"
+                if let base = baseComparisons[id], let report = comparisons[base], report.contextID == context {
+                    assets["base-comparison.json"] = report.data; request["baseComparisonAsset"] = "base-comparison.json"
+                }
             case "lad_mesh_compare":
                 try allowed(arguments, ["contextID", "targetID", "scope", "quality"])
                 options = ["scope": arguments["scope"] ?? "all", "quality": arguments["quality"] ?? "preview"]
@@ -183,7 +189,7 @@ final class CADMeshSession {
             }
         }
         request["options"] = options
-        let output = try await engine.meshOperation(request: json(request), files: assets, python: python, threads: threads)
+        let output = try await engine.meshOperation(request: json(request), files: assets, clones: clones, python: python, threads: threads)
         try Task.checkCancellation()
         let metadata = output.metadata, workerRecordData = output.record, nativeData = output.native
         let preparation = Task.detached(priority: .userInitiated) {
@@ -217,6 +223,8 @@ final class CADMeshSession {
             let contextBytes = try await encoded(context)
             let revisionBytes = try await encoded(revision)
             try Task.checkCancellation()
+            guard let published = output.reference else { throw LADError.message("The reconstruction reference geometry is missing.") }
+            if referenceFiles[identity] == nil { referenceFiles[identity] = try retainReference(published, contextID: identity) }
             try retainContext(identity, data: contextBytes)
             contextSourceHashes[identity] = sourceHash
             try retain(revisionID, data: revisionBytes, context: identity, pool: &revisions)
@@ -244,8 +252,15 @@ final class CADMeshSession {
                 }
                 for (id, data) in prepared { try retain(id, data: data, context: contextID, pool: &fits) }
             case "lad_mesh_try_edit":
-                if let payload = full["payload"] as? [String: Any] {
+                if var payload = full["payload"] as? [String: Any] {
                     let id = try text("id", payload)
+                    // A newly computed base report is kept once, as the
+                    // revision's comparison, rather than in every edit preview.
+                    if let base = payload.removeValue(forKey: "base_comparison") as? [String: Any],
+                       let baseID = base["comparison_id"] as? String, let targetID, revisions[targetID] != nil {
+                        try retain(baseID, data: try await encoded(base), context: contextID, pool: &comparisons)
+                        baseComparisons[targetID] = baseID
+                    }
                     let data = try await encoded(payload)
                     if let bytes = output.native, let hash = payload["geometry_hash"] as? String {
                         guard nativeHash == hash else { throw LADError.message("The reconstruction native geometry identity is invalid.") }
@@ -286,6 +301,8 @@ final class CADMeshSession {
                     }
                     try retain(id, data: data, context: contextID, pool: &comparisons)
                     if let acceptedRevision { acceptedRevisions.insert(acceptedRevision) }
+                    if let targetID, revisions[targetID] != nil, payload["quality_requested"] as? String == "preview",
+                       payload["scope_requested"] as? String == "all" { baseComparisons[targetID] = id }
                     values["comparisonID"] = id
                 }
             case "lad_mesh_export_step":
@@ -419,6 +436,24 @@ final class CADMeshSession {
         }
         return (value as? [Any])?.contains(where: containsInlineSource) ?? false
     }
+    /// Keep a context's published reference geometry in the task workspace,
+    /// counted against the task's file budget.
+    private func retainReference(_ published: URL, contextID: String) throws -> URL {
+        let path = "mesh/references/\(SHA256.hash(data: Data(contextID.utf8)).map { String(format: "%02x", $0) }.joined()).npz"
+        let destination = try workspace.prepareOutput(path)
+        try? FileManager.default.removeItem(at: destination)
+        guard copyfile(published.path, destination.path, nil, copyfile_flags_t(COPYFILE_CLONE)) == 0 else {
+            throw LADError.message("The reconstruction reference geometry could not be kept.")
+        }
+        let size = try workspace.fileSize(path, maximumBytes: maximumBytes)
+        guard size <= maximumBytes - fileBytes else {
+            try? FileManager.default.removeItem(at: destination)
+            throw LADError.message("Reconstruction files exceed this task's 256 MB limit.")
+        }
+        fileBytes += size
+        return destination
+    }
+
     private func retainContext(_ id: String, data: Data) throws {
         if contexts[id] == nil { try reserve(data.count); contexts[id] = data }
     }

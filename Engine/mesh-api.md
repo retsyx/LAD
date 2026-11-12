@@ -22,6 +22,9 @@ physical allowance. Source normals are recomputed from triangle coordinates.
    returns alternative geometric explanations with stable candidate/member IDs.
 3. `lad_mesh_try_edit(contextID, revisionID, editPath, programPath?)` stages an
    explicit construction and gives automatic before/after preview comparison.
+   `quick_comparison.after` reports the edited state; `before_comparison_id`
+   names the base revision's preview report, computed once and reused for
+   later edits of that revision.
 4. Inspect and render the returned ordinary `artifactID`, then use
    `lad_mesh_commit(contextID, previewID, expectedRevisionID)` to keep an eligible
    intermediate body. Continue with the returned revision and new evidence.
@@ -100,6 +103,8 @@ a sketch. `measure` gives area, bounds, centroid and conditioning. An empty CAD
 revision supports source inspection normally; distances to absent CAD are null.
 Discrepancies refresh against the exact requested revision and expose unknown
 or unprocessed scope. A truncated result does not mark omitted regions explained.
+Processed and unprocessed source triangles are reported as counts plus inclusive
+`[first, last]` triangle ID ranges.
 
 ## Fits and material decisions
 

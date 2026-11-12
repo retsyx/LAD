@@ -12,6 +12,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mesh_reference
 from mesh_compare import _reference
+from mesh_tools import REFERENCE_ASSET, attach_reference
 from mesh_inspect import _analysis
 from test_mesh_inspect import box_context, context
 from test_mesh_tools import WorkerCalls, box_mesh
@@ -31,8 +32,8 @@ class SharedReferenceTests(unittest.TestCase):
     def test_discrepancy_worker_uses_one_reference_and_shared_manifold_graph(self):
         with tempfile.TemporaryDirectory() as directory:
             calls = WorkerCalls(directory)
-            _, opened, _ = calls.call("open_reference", options={"units": "mm", "max_deviation": .03},
-                                      sourceAsset=box_mesh())
+            _, opened, opened_folder = calls.call("open_reference", options={"units": "mm", "max_deviation": .03},
+                                                  sourceAsset=box_mesh())
             reference = opened["payload"]["context"]
             revision = opened["payload"]["revision"]
             with mock.patch.object(mesh_reference, "ReferenceMesh", wraps=mesh_reference.ReferenceMesh) as construction:
@@ -41,6 +42,9 @@ class SharedReferenceTests(unittest.TestCase):
                 self.assertEqual(construction.call_count, 1)
             self.assertEqual(result["status"], "partial")
             self.assertEqual(result["payload"]["source_selection"]["triangle_ids"], list(range(12)))
+            # The published context carries metadata only; its arrays live in
+            # the binary reference the worker staged beside it.
+            reference = attach_reference(copy.deepcopy(reference), opened_folder, REFERENCE_ASSET)
             source, analysis = _reference(reference), _analysis(reference)
             self.assert_shared(source, analysis)
             self.assertIs(source.adjacency, analysis["adjacency"])

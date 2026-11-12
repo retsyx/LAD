@@ -31,6 +31,25 @@ def geometry_digest(vertices, triangles):
     return digest.hexdigest()
 
 
+def triangle_ranges(ids):
+    """Sorted original triangle IDs as inclusive [first, last] runs.
+
+    Exact and compact: a whole or mostly contiguous scope needs a few runs
+    instead of one entry per triangle.
+    """
+    values = np.unique(np.fromiter((int(value) for value in ids), dtype=np.int64))
+    if not len(values):
+        return []
+    breaks = np.flatnonzero(np.diff(values) != 1)
+    starts = np.concatenate(([values[0]], values[breaks + 1]))
+    ends = np.concatenate((values[breaks], [values[-1]]))
+    return np.stack((starts, ends), axis=1).tolist()
+
+
+def expand_ranges(runs):
+    return [value for first, last in runs for value in range(int(first), int(last) + 1)]
+
+
 def reference(vertices, triangles):
     digest = geometry_digest(vertices, triangles)
     if digest in _CACHE:

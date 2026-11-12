@@ -96,7 +96,7 @@ class InspectTests(unittest.TestCase):
         self.assertEqual(empty["status"],"partial");self.assertEqual(len(empty["payload"]["source_selection"]["triangle_ids"]),12)
         bounded=inspect(c,self.revision,{"kind":"select","scope":"all","limit":2})
         self.assertFalse(bounded["payload"]["completeness"]["complete"])
-        self.assertEqual(len(bounded["payload"]["completeness"]["unprocessed_triangle_ids"]),10)
+        self.assertEqual(bounded["payload"]["completeness"]["unprocessed_triangle_count"],10)
         record=inspect(c,self.revision,{"kind":"select","scope":"all"})["payload"]
         record["source_hash"]="changed"
         stale=inspect(c,self.revision,{"kind":"measure","selection":{"evidence_ref":"old"}},lambda _:record)

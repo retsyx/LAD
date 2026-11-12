@@ -13,7 +13,7 @@ import math
 from fractions import Fraction
 
 import numpy as np
-from mesh_reference import reference
+from mesh_reference import expand_ranges, reference, triangle_ranges
 
 VERSION = "iterative-inspect-1"
 _FULL = [[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]
@@ -510,7 +510,7 @@ def inspect(context,revision,query,resolve_evidence=None):
                     selection={tid:parts for tid,parts in selection.items() if tid in ids}
                     coverage=direction.get("coverage",{})
                     if not coverage.get("complete",False):
-                        unknown_scope.update(coverage.get("unprocessed_triangle_ids",[]))
+                        unknown_scope.update(expand_ranges(coverage.get("unprocessed_triangle_ranges",[])))
                         diagnostics.append(diagnostic("COMPARISON_PARTIAL","Discrepancy selection covers only processed source samples; other source triangles remain unknown"))
             elif kind=="measure" and query.get("source") in ("cad","both"):
                 cad_used=True;shape=revision.get("_shape")
@@ -549,7 +549,8 @@ def inspect(context,revision,query,resolve_evidence=None):
                                   "nonmanifold_edge_count":sum(len(uses)>2 and any(tid in selected_ids for tid,_ in uses) for uses in analysis["edges"].values()),
                                   "orientation_conflict_count":sum(len(uses)==2 and uses[0][1]==uses[1][1] and any(tid in selected_ids for tid,_ in uses) for uses in analysis["edges"].values())},
                  "completeness":{"complete":not omitted and not unknown_scope and not any(d["code"] in {"CAD_UNAVAILABLE","COMPARISON_UNAVAILABLE","COMPARISON_PARTIAL","BUDGET_EXHAUSTED"} for d in diagnostics),
-                                 "processed_triangle_count":len(selection),"unprocessed_triangle_ids":sorted(set(omitted)|unknown_scope),"CAD_available":revision.get("_shape") is not None if cad_used else None},
+                                 "processed_triangle_count":len(selection),"unprocessed_triangle_count":len(set(omitted)|unknown_scope),
+                                 "unprocessed_triangle_ranges":triangle_ranges(set(omitted)|unknown_scope),"CAD_available":revision.get("_shape") is not None if cad_used else None},
                  "dependencies":dependencies,"units":context.get("units","mm"),"provenance":provenance}
         if kind=="recognize":
             from mesh_recognition import recognize
@@ -557,7 +558,8 @@ def inspect(context,revision,query,resolve_evidence=None):
             diagnostics.extend(recognized.pop("recognition_diagnostics"))
             payload.update(recognized)
             payload["completeness"]["complete"] &= not payload["recognition_unknown_triangle_ids"]
-            payload["completeness"]["unprocessed_triangle_ids"]=sorted(set(payload["completeness"]["unprocessed_triangle_ids"])|set(payload["recognition_unknown_triangle_ids"]))
+            unprocessed=set(omitted)|unknown_scope|set(payload["recognition_unknown_triangle_ids"])
+            payload["completeness"].update(unprocessed_triangle_count=len(unprocessed),unprocessed_triangle_ranges=triangle_ranges(unprocessed))
         if isinstance(query.get("role"),str):payload["role"]=query["role"]
         payload["id"]="evidence-"+_hash(payload)[:24];payload["evidence_id"]=payload["id"]
         return {"status":"partial" if diagnostics or omitted else "ok","payload":payload,"diagnostics":diagnostics,"provenance":provenance}

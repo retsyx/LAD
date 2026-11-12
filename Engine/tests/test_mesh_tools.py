@@ -23,7 +23,9 @@ def box_mesh():
 
 
 class WorkerCalls:
-    def __init__(self,root):self.root=Path(root);self.index=0
+    """Stage each call like the app: a context travels with the binary
+    reference geometry its open_reference call published."""
+    def __init__(self,root):self.root=Path(root);self.index=0;self.references={}
     def call(self,operation,options=None,**assets):
         folder=self.root/str(self.index);self.index+=1;folder.mkdir()
         request={"operation":"mesh_"+operation,"options":options or {}}
@@ -32,9 +34,15 @@ class WorkerCalls:
             filename=key+suffix
             (folder/filename).write_bytes(value if isinstance(value,bytes) else json.dumps(value).encode())
             request[key]=filename
+        context=assets.get("contextAsset")
+        if isinstance(context,dict) and context.get("id") in self.references:
+            (folder/"reference.npz").write_bytes(self.references[context["id"]].read_bytes())
+            request["referenceAsset"]="reference.npz"
         path=folder/"request.json";path.write_text(json.dumps(request))
         metadata=run(path,folder,2,defer_step=True)
         record=json.loads((folder/"mesh-record.json").read_text())
+        if operation=="open_reference" and record.get("status")=="ok":
+            self.references[record["payload"]["context"]["id"]]=folder/"mesh-reference.npz"
         return metadata,record,folder
 
 
@@ -82,7 +90,7 @@ class IterativeMeshToolTests(unittest.TestCase):
             context,r0=open_reference(path,units="in",max_deviation=.01)
             self.assertEqual(context["units"],"mm")
             self.assertEqual(context["source_units"],"in")
-            self.assertEqual(context["original_vertices"],box_mesh()["vertices"])
+            self.assertEqual(context["original_vertices"].tolist(),box_mesh()["vertices"])
             for before,after in zip(box_mesh()["vertices"],context["vertices"]):
                 exact=[Fraction(v)*Fraction(127,5) for v in before]
                 error=sum(float(abs(Fraction.from_float(a)-b))**2 for a,b in zip(after,exact))**.5
@@ -110,6 +118,51 @@ class IterativeMeshToolTests(unittest.TestCase):
             self.assertEqual(preview["payload"]["quick_comparison"]["after"]["acceptance"],"not_evaluated")
             self.assertFalse((folder/"model.brep").exists())
             self.assertEqual(context,before)
+
+    def test_reference_geometry_travels_once_as_binary_arrays(self):
+        import struct
+        mesh=box_mesh()
+        stl=bytearray(80)+struct.pack("<I",len(mesh["triangles"]))
+        for triangle in mesh["triangles"]:
+            stl+=struct.pack("<12fH",0,0,0,*[value for index in triangle for value in mesh["vertices"][index]],0)
+        with tempfile.TemporaryDirectory() as directory:
+            calls=WorkerCalls(directory)
+            _,opened,folder=calls.call("open_reference",options={"units":"cm","max_deviation":.01},sourceAsset=bytes(stl))
+            self.assertEqual(opened["status"],"ok",opened)
+            context=opened["payload"]["context"]
+            for key in ("vertices","triangles","original_vertices"):self.assertNotIn(key,context)
+            self.assertEqual(context["geometry"]["triangle_count"],12)
+            self.assertEqual(context["geometry"]["vertex_count"],36,"Binary STL facets keep their own corners")
+            with np.load(folder/"mesh-reference.npz",allow_pickle=False) as arrays:
+                self.assertEqual(set(arrays.files),{"vertices","triangles","original_vertices"})
+                np.testing.assert_array_equal(arrays["original_vertices"][:3],[mesh["vertices"][i] for i in mesh["triangles"][0]])
+                np.testing.assert_allclose(arrays["vertices"],arrays["original_vertices"]*10)
+            # Later calls read the staged binary reference, never the JSON context.
+            _,inspected,_=calls.call("inspect",contextAsset=context,revisionAsset=opened["payload"]["revision"],
+                                     queryAsset={"kind":"select","source_triangles":[0,1]})
+            self.assertIn(inspected["status"],["ok","partial"],inspected)
+
+    def test_edits_from_one_revision_reuse_its_base_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls=WorkerCalls(directory)
+            _,opened,_=calls.call("open_reference",options={"units":"mm","max_deviation":.03},sourceAsset=box_mesh())
+            context=opened["payload"]["context"];revision=opened["payload"]["revision"]
+            edit={"kind":"construction","operation":"add","construction_id":"axis-main","tool":{"family":"axis","geometry":{"origin":[1,1.5,0],"direction":[0,0,1]}}}
+            _,first,_=calls.call("try_edit",contextAsset=context,revisionAsset=revision,editAsset=edit)
+            base=first["payload"]["base_comparison"]
+            self.assertEqual(first["payload"]["quick_comparison"]["before_comparison_id"],base["comparison_id"])
+            self.assertEqual(first["payload"]["quick_comparison"]["cache_reuse"],"base comparison computed")
+            _,second,_=calls.call("try_edit",contextAsset=context,revisionAsset=revision,editAsset=edit,baseComparisonAsset=base)
+            self.assertNotIn("base_comparison",second["payload"])
+            self.assertEqual(second["payload"]["quick_comparison"]["before_comparison_id"],base["comparison_id"])
+            self.assertEqual(second["payload"]["quick_comparison"]["cache_reuse"],"base comparison reused")
+            # A report that does not match the base revision is recomputed.
+            altered=dict(base,model_ref="another-revision")
+            _,third,_=calls.call("try_edit",contextAsset=context,revisionAsset=revision,editAsset=edit,baseComparisonAsset=altered)
+            self.assertEqual(third["payload"]["quick_comparison"]["cache_reuse"],"base comparison computed")
+            coverage=base["geometry"]["mesh_to_cad"]["coverage"]
+            self.assertNotIn("unprocessed_triangle_ids",coverage)
+            self.assertEqual(sum(last-first+1 for first,last in coverage["unprocessed_triangle_ranges"]),coverage["unprocessed_triangle_count"])
 
     def test_invalid_input_is_structured_without_delivered_geometry(self):
         with tempfile.TemporaryDirectory() as directory:

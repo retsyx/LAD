@@ -85,6 +85,10 @@ final class CADAgentMeshToolsTests: XCTestCase {
         let first = try object(try await tools.handle(name: "lad_mesh_try_edit", arguments: ["contextID": context, "revisionID": r0, "editPath": "edit.json"]))
         let firstPayload = try XCTUnwrap(first["payload"] as? [String: Any])
         XCTAssertEqual(firstPayload["commit_eligible"] as? Bool, true, String(describing: first))
+        XCTAssertEqual((firstPayload["quick_comparison"] as? [String: Any])?["cache_reuse"] as? String, "base comparison computed")
+        let repeated = try object(try await tools.handle(name: "lad_mesh_try_edit", arguments: ["contextID": context, "revisionID": r0, "editPath": "edit.json"]))
+        XCTAssertEqual(((repeated["payload"] as? [String: Any])?["quick_comparison"] as? [String: Any])?["cache_reuse"] as? String,
+                       "base comparison reused", "Another edit of the same revision reuses its stored base report")
         let p1 = try XCTUnwrap(first["previewID"] as? String)
         let firstArtifact = try XCTUnwrap(first["artifactID"] as? String)
         let firstModel = try model(first)

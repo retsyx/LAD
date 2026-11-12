@@ -140,18 +140,32 @@ final class EngineService {
         var preview: PreviewMesh?
         var native: Data?
         var step: Data?
+        /// Binary reference geometry published by open_reference. The file stays
+        /// valid while `artifacts` lives.
+        var reference: URL?
+        var artifacts: EngineBuildArtifacts
     }
 
     /// All reconstruction operations, including authored programs, use the
     /// existing CAD process sandbox and cancellation/deadline enforcement.
-    func meshOperation(request: Data, files: [String: Data], python: String, threads: Int) async throws -> MeshOutput {
+    /// `clones` stage large workspace files, such as the reference mesh, as APFS
+    /// clones instead of copying their bytes through memory.
+    func meshOperation(request: Data, files: [String: Data], clones: [String: URL] = [:],
+                       python: String, threads: Int) async throws -> MeshOutput {
         let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: true,
                                    action: "inspect or revise the mesh reconstruction") { folder in
-            for (name, data) in files {
+            for name in Array(files.keys) + Array(clones.keys) {
                 guard name == URL(fileURLWithPath: name).lastPathComponent, !name.isEmpty else {
                     throw LADError.message("A reconstruction asset has an invalid private name.")
                 }
+            }
+            for (name, data) in files {
                 try data.write(to: folder.appendingPathComponent(name), options: .atomic)
+            }
+            for (name, source) in clones {
+                guard copyfile(source.path, folder.appendingPathComponent(name).path, nil, copyfile_flags_t(COPYFILE_CLONE)) == 0 else {
+                    throw LADError.message("A reconstruction asset could not be staged.")
+                }
             }
             try request.write(to: folder.appendingPathComponent("request.json"), options: .atomic)
         }
@@ -164,11 +178,20 @@ final class EngineService {
                 ? try EngineArtifact.read(folder.appendingPathComponent("model.brep"), in: folder, maximumBytes: 256_000_000) : nil
             let step = object["step_available"] as? Bool == true
                 ? try EngineArtifact.read(folder.appendingPathComponent("export.step"), in: folder, maximumBytes: ProjectStore.maximumSTEPBytes) : nil
-            return (metadata, record, native, step, object["native_preview"] as? Bool == true)
+            let referenceURL = folder.appendingPathComponent("mesh-reference.npz")
+            var reference: URL?
+            if FileManager.default.fileExists(atPath: referenceURL.path) {
+                // Validates a regular, unlinked file within the geometry size limit.
+                let (file, _) = try EngineArtifact.openRegular(referenceURL, in: folder)
+                try? file.close()
+                reference = referenceURL
+            }
+            return (metadata, record, native, step, object["native_preview"] as? Bool == true, reference)
         }.value
         let preview = values.4 ? try await readPreview(output, deferSTEP: true) : nil
         try Task.checkCancellation()
-        return MeshOutput(metadata: values.0, record: values.1, preview: preview, native: values.2, step: values.3)
+        return MeshOutput(metadata: values.0, record: values.1, preview: preview, native: values.2, step: values.3,
+                          reference: values.5, artifacts: output.artifacts)
     }
 
     /// Export an already built native solid, with no program replay or meshing.

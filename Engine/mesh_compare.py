@@ -13,7 +13,7 @@ import json
 import math
 
 import numpy as np
-from mesh_reference import ReferenceMesh, reference
+from mesh_reference import ReferenceMesh, reference, triangle_ranges
 
 
 def _digest(value):
@@ -662,8 +662,9 @@ def compare(context,target,scope="all",quality="preview"):
     else:
         for row in source_rows:row.update(distance=None,unavailable_reason="The current CAD body is empty")
         cad_coverage={"complete":False,"reason":"No exposed CAD boundary"}
-    sampled=sorted({r["triangle_id"] for r in source_rows if r.get("distance") is not None});unprocessed=sorted(set(ids.tolist())-set(sampled))
-    source_coverage={"complete":False,"requested_triangle_count":len(ids),"processed_triangle_ids":sampled,"unprocessed_triangle_ids":unprocessed,"source_samples_reusable":True,"sampling_fingerprint":_digest([source.digest,ids.tolist(),budget]),"surface_interiors_sampled":True,"component_count":len(source.components),"component_guard_budget":max(1,budget//4),"guarantee":"sampled; no whole-cell acceptance claim"}
+    sampled=sorted({r["triangle_id"] for r in source_rows if r.get("distance") is not None});unprocessed=np.setdiff1d(ids,np.asarray(sampled,dtype=np.int64))
+    source_coverage={"complete":False,"requested_triangle_count":len(ids),"processed_triangle_count":len(sampled),"processed_triangle_ranges":triangle_ranges(sampled),
+                     "unprocessed_triangle_count":len(unprocessed),"unprocessed_triangle_ranges":triangle_ranges(unprocessed),"source_samples_reusable":True,"sampling_fingerprint":_digest([source.digest,ids.tolist(),budget]),"surface_interiors_sampled":True,"component_count":len(source.components),"component_guard_budget":max(1,budget//4),"guarantee":"sampled; no whole-cell acceptance claim"}
     m2c=_stats(source_rows,{"source_hash":context["source_hash"],**domains},{"geometry_hash":geometry_hash,"native_geometry_digest":native_digest,"boundary":"all exposed target faces"},units,source_coverage)
     c2m=_stats(cad_rows,{"model_ref":model_ref,"cad_face_refs":domains.get("cad_face_refs","all")},{"source_hash":context["source_hash"],"triangles":"all original triangles including interiors and lower-dimensional images"},units,cad_coverage)
     residuals=_residual_regions(source,source_rows,float(context["max_deviation"]),model_ref)
