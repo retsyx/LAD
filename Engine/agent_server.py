@@ -155,12 +155,18 @@ class NativeBridge:
             self.response_fd = os.open("responses", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.bridge_fd)
         finally:
             os.close(base)
-        # Wait for responses and the closed marker as directory changes rather
-        # than polling. A periodic timeout still notices a parent that exited.
+        # Wait for responses, the closed marker and the agent's exit as events
+        # rather than polling.
         self.events = select.kqueue()
         self.events.control([select.kevent(descriptor, filter=select.KQ_FILTER_VNODE,
                                            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR, fflags=select.KQ_NOTE_WRITE)
                              for descriptor in (self.response_fd, self.bridge_fd)], 0, 0)
+        self.parent_exited = False
+        try:
+            self.events.control([select.kevent(self.parent, filter=select.KQ_FILTER_PROC,
+                                               flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT)], 0, 0)
+        except ProcessLookupError:
+            self.parent_exited = True
 
     def call(self, name, arguments):
         if name not in TOOL_NAMES or not isinstance(arguments, dict):
@@ -178,7 +184,7 @@ class NativeBridge:
             stream.write(data)
         os.replace(temporary, final, src_dir_fd=self.request_fd, dst_dir_fd=self.request_fd)
         response = self.responses / (identity + ".json")
-        started = time.monotonic()
+        deadline = time.monotonic() + 3600
         while True:
             if response.exists():
                 try:
@@ -191,17 +197,14 @@ class NativeBridge:
                         pass
             if (self.bridge / "closed").exists():
                 raise ValueError("The LAD task has stopped; native tools are no longer available.")
-            try:
-                os.kill(self.parent, 0)
-            except ProcessLookupError as error:
-                raise ValueError("The agent task has stopped.") from error
-            except PermissionError:
-                # EPERM still means a process exists; an enclosing macOS
-                # sandbox may deny signaling the live parent even for signal 0.
-                pass
-            if time.monotonic() - started > 3600:
+            if self.parent_exited:
+                raise ValueError("The agent task has stopped.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise ValueError("The native LAD tool did not return a response within its one-hour tool timeout.")
-            self.events.control(None, 2, 1.0)
+            for event in self.events.control(None, 3, remaining):
+                if event.filter == select.KQ_FILTER_PROC:
+                    self.parent_exited = True
 
 
 def reply(identity, *, result=None, error=None):
