@@ -67,10 +67,12 @@ final class ProjectAssetCatalogTests: XCTestCase {
         let design = project(events: 17_000)
         let snapshot = try ProjectArchive.split(design)
         XCTAssertGreaterThan(snapshot.assets.count, 32_768)
-        XCTAssertEqual(try ProjectArchive.restore(metadata: snapshot.metadata, assets: snapshot.assets).taskAudits, design.taskAudits)
+        var document = try JSONDecoder().decode(ProjectArchive.Document.self, from: snapshot.metadata)
+        document.assets = snapshot.assets
+        XCTAssertEqual(try ProjectArchive.restore(document).taskAudits, design.taskAudits)
     }
 
-    func testVersionFivePackagesOpenWithTheirHistoryAndSaveAsVersionSix() throws {
+    func testVersionFivePackagesOpenWithTheirHistoryAndSaveAsTheCurrentVersion() throws {
         let url = folder.appendingPathComponent("Legacy.lad", isDirectory: true)
         var design = project(events: 40)
         _ = try save(design, to: url)

@@ -1,0 +1,9 @@
+import cadquery as cq
+
+base = cq.Workplane("XY").box(80, 50, 6, centered=(True, True, False)).val()
+wall = cq.Workplane("XY").box(80, 6, 40, centered=(True, True, False)).val().translate((0, 22, 0))
+body = base.fuse(wall).clean()
+hole = cq.Solid.makeCylinder(3, 10)
+holes = [hole.translate(position) for position in [(-28, -14, -2), (28, -14, -2), (-28, 8, -2), (28, 8, -2)]]
+opening = cq.Solid.makeCylinder(8, 12).rotate((0, 0, 0), (1, 0, 0), 90).translate((0, 28, 25))
+result = body.cut(*holes, opening).clean()

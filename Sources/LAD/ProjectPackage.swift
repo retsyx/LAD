@@ -9,10 +9,13 @@ import zlib
 /// Calls are coordinated by the document writer. In-process package locks also
 /// protect direct readers and multiple writers without blocking other designs.
 enum ProjectPackage {
-    /// Version 6 keeps the asset catalog in its own section. Version 5
-    /// packages, which inline it in project.json, still open with their full
-    /// history and are rewritten as version 6 by their next save.
-    static let formatVersion = 6
+    /// Version 7 encodes every section as typed records through one sorted-key
+    /// JSONEncoder. Versions 5 and 6 contain the same records written by
+    /// JSONSerialization; version 5 also inlines its asset catalog in
+    /// project.json. Both open with their full history, and their next save
+    /// rewrites every record and index in the current encoding.
+    static let formatVersion = 7
+    private static let readableFormatVersions = 5...formatVersion
     private static let inlineCatalogFormatVersion = 5
     static let maximumRootBytes = 32_000_000
     static let maximumChunkBytes = 512_000
@@ -94,44 +97,238 @@ enum ProjectPackage {
         var phaseSeconds: [String: TimeInterval] = [:]
     }
 
+    // MARK: - Section records
+
+    /// project.json: identity, per-design state, the draft and queue, and the
+    /// committed section references.
+    private struct Manifest: Codable, Equatable {
+        var formatVersion: Int
+        var commitID: UUID?
+        var parentCommitID: UUID?
+        var projectID: UUID?
+        var selectedRevisionID: UUID?
+        var codexSettings: CodexProjectSettings?
+        var projectName: String?
+        var showGrid: Bool?
+        var projectionMode: ViewportProjectionMode?
+        var displayMode: ViewportDisplayMode?
+        var partsPaneFraction: Double?
+        var recentPartColors: [PartColor]?
+        var queuedRequests: [ProjectArchive.ArchivedQueuedRequest]?
+        var draftPrompt: String?
+        var draftAttachments: [ProjectArchive.ArchivedAttachment]?
+        var queuePaused: Bool?
+        var revisions: Reference
+        var conversation: Reference
+        var activity: Reference
+        var catalog: Reference?
+        /// Version 5 lists its asset descriptors here instead of a catalog section.
+        var assets: [String: AssetDescriptor]?
+        var thumbnail: Thumbnail?
+        var thumbnailIdentity: String?
+
+        var uncommitted: Manifest {
+            var manifest = self
+            manifest.commitID = nil
+            manifest.parentCommitID = nil
+            return manifest
+        }
+    }
+
+    private struct Thumbnail: Codable, Equatable {
+        var path: String
+        var sha256: String
+        var byteCount: Int
+    }
+
+    private struct AssetDescriptor: Codable, Equatable {
+        var path: String
+        var sha256: String
+        var byteCount: Int
+        var storedByteCount: Int
+        var codec: String
+    }
+
+    private struct RevisionEntry: Codable {
+        var id: UUID
+        var name: String?
+        var recipe: Reference
+        var parts: Reference
+    }
+
+    private struct RevisionIndex: Codable { var entries: [RevisionEntry] }
+    private struct ConversationIndex: Codable { var chunks: [Reference] }
+    private struct ActivityIndex: Codable { var tasks: [Reference] }
+    private struct CatalogIndex: Codable { var buckets: [String: Reference] }
+
+    /// A task header and the chunks holding its events, coded as one object.
+    private struct TaskRecord: Codable {
+        var task: ProjectArchive.ArchivedTask
+        var eventChunks: [Reference]
+
+        init(task: ProjectArchive.ArchivedTask, eventChunks: [Reference]) {
+            self.task = task
+            self.eventChunks = eventChunks
+        }
+
+        private enum CodingKeys: String, CodingKey { case eventChunks }
+
+        init(from decoder: Decoder) throws {
+            task = try ProjectArchive.ArchivedTask(from: decoder)
+            eventChunks = try decoder.container(keyedBy: CodingKeys.self).decode([Reference].self, forKey: .eventChunks)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            try task.encode(to: encoder)
+            var values = encoder.container(keyedBy: CodingKeys.self)
+            try values.encode(eventChunks, forKey: .eventChunks)
+        }
+    }
+
+    /// A parts file contains only part organization.
+    private struct PartsRecord: Decodable {
+        var parts: ProjectArchive.ArchivedParts
+
+        private struct Field: CodingKey {
+            var stringValue: String
+            var intValue: Int? { nil }
+            init(stringValue: String) { self.stringValue = stringValue }
+            init?(intValue: Int) { nil }
+        }
+
+        init(from decoder: Decoder) throws {
+            let fields: Set = ["parts", "partLayout", "hiddenSolids", "partColors", "jointPositions"]
+            guard try decoder.container(keyedBy: Field.self).allKeys.allSatisfy({ fields.contains($0.stringValue) }) else {
+                throw invalid("A parts record contains unsupported fields.")
+            }
+            parts = try ProjectArchive.ArchivedParts(from: decoder)
+        }
+    }
+
+    /// The selected revision's replay inputs and presentation that a saved
+    /// thumbnail depicts.
+    private struct ThumbnailIdentity: Encodable {
+        var id: UUID?
+        var scriptAsset: String?
+        var sourceSTEPAsset: String?
+        var inputAssets: [ProjectArchive.ArchivedInputAsset]?
+        var hiddenSolids: [Int]?
+        var partColors: [String: PartColor]?
+        var jointPositions: [String: Double]?
+        var displayMode: ViewportDisplayMode?
+        var projectionMode: ViewportProjectionMode?
+
+        init(_ revision: RevisionRecords?, displayMode: ViewportDisplayMode?, projectionMode: ViewportProjectionMode?) {
+            id = revision?.recipe.id
+            scriptAsset = revision?.recipe.scriptAsset
+            sourceSTEPAsset = revision?.recipe.sourceSTEPAsset
+            inputAssets = revision?.recipe.inputAssets
+            hiddenSolids = revision?.parts.hiddenSolids
+            partColors = revision?.parts.partColors
+            jointPositions = revision?.parts.jointPositions
+            self.displayMode = displayMode
+            self.projectionMode = projectionMode
+        }
+
+        var digest: String {
+            get throws { ProjectPackage.digest(try ProjectPackage.encode(self)) }
+        }
+
+        /// Versions 5 and 6 hashed the same fields as JSONSerialization output.
+        var legacyDigest: String {
+            get throws {
+                var object = [String: Any]()
+                object["id"] = id?.uuidString
+                object["scriptAsset"] = scriptAsset
+                object["sourceSTEPAsset"] = sourceSTEPAsset
+                object["inputAssets"] = inputAssets?.map { ["id": $0.id, "name": $0.name, "format": $0.format, "dataAsset": $0.dataAsset] }
+                object["hiddenSolids"] = hiddenSolids
+                object["partColors"] = partColors?.mapValues { ["red": $0.red, "green": $0.green, "blue": $0.blue] }
+                object["jointPositions"] = jointPositions
+                object["displayMode"] = displayMode?.rawValue
+                object["projectionMode"] = projectionMode?.rawValue
+                return ProjectPackage.digest(try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+            }
+        }
+    }
+
+    // MARK: - Cached sections
+
     private struct Chunk {
-        var reference: [String: Any]
+        var reference: Reference
         var recordIDs: [String]
     }
 
-    /// Derived once when opening, then updated only for changed records. This
-    /// cache never becomes an additional on-disk dependency.
-    private struct Dependencies {
-        var revisions = [[String: Any]]()
-        var conversation = [Chunk]()
-        var tasks = [String: [String: Any]]()
-        var events = [String: [Chunk]]()
-        var recordData = [String: Data]()
-        var assetReferences = [String: Set<String>]()
-        /// Asset descriptors by hash, and the catalog file holding each
-        /// two-character hash prefix. A save rewrites only changed prefixes.
-        var catalog = [String: [String: Any]]()
-        var catalogBuckets = [String: [String: Any]]()
+    /// A history record with its canonical bytes, which rebuild changed chunks.
+    private struct Encoded<Record> {
+        var record: Record
+        var bytes: Data
     }
 
-    private struct MetadataSnapshot {
-        var metadata: [String: Any]
-        var assets: [String: Data]
-        var dependencies: Dependencies
-        var changedRecords: Set<String>
+    private struct RevisionRecords {
+        var recipe: ProjectArchive.ArchivedRecipe
+        var recipeFile: Reference?
+        var parts: ProjectArchive.ArchivedParts
+        var partsFile: Reference?
+    }
+
+    private struct TaskRecords {
+        var task: ProjectArchive.ArchivedTask
+        var file: Reference?
+        var events: [String: Encoded<ProjectArchive.ArchivedActivityEvent>]
+        var chunks: [Chunk]
+    }
+
+    /// Typed records of the committed sections and the files holding them.
+    /// Derived once when opening, then updated only for changed records; this
+    /// cache never becomes an additional on-disk dependency.
+    private struct Sections {
+        var revisions = [UUID: RevisionRecords]()
+        var messages = [UUID: Encoded<ProjectArchive.ArchivedMessage>]()
+        var conversation = [Chunk]()
+        var tasks = [UUID: TaskRecords]()
+        /// Asset descriptors by hash, and the catalog file holding each
+        /// two-character hash prefix. A save rewrites only changed prefixes.
+        var catalog = [String: AssetDescriptor]()
+        var catalogBuckets = [String: Reference]()
+
+        /// Keeps the records but none of their files, so a save rewrites them.
+        mutating func forgetFiles() {
+            for id in revisions.keys {
+                revisions[id]?.recipeFile = nil
+                revisions[id]?.partsFile = nil
+            }
+            conversation = []
+            for id in tasks.keys {
+                tasks[id]?.file = nil
+                tasks[id]?.chunks = []
+            }
+            catalogBuckets = [:]
+        }
+
+        /// Every payload the sections refer to.
+        var assetKeys: Set<String> {
+            var keys = Set<String>()
+            for revision in revisions.values { keys.formUnion(revision.recipe.assetKeys) }
+            for message in messages.values { keys.formUnion(message.record.assetKeys) }
+            for task in tasks.values {
+                keys.formUnion(task.task.assetKeys)
+                for event in task.events.values { keys.formUnion(event.record.assetKeys) }
+            }
+            return keys
+        }
     }
 
     private struct Session {
         var project: LADProject
-        var assets: [String: Data]
-        var metadata: [String: Any]
-        var root: [String: Any]
+        var manifest: Manifest
         var rootData: Data
-        var inlineData: Data
-        var sectionData: Data
+        var assets: [String: Data]
         var files: Set<String>
         var verifiedAttachments: [String: Data]
-        var dependencies: Dependencies
+        var sections: Sections
+        /// The current-encoding identity of the retained thumbnail.
+        var thumbnailIdentity: String?
     }
 
     static func rootData(from url: URL) throws -> Data {
@@ -150,11 +347,15 @@ enum ProjectPackage {
     /// The identity recorded in the authoritative manifest, without loading
     /// or caching the design's history.
     static func projectID(at url: URL) throws -> UUID? {
-        let root = try object(rootData(from: url))
-        guard let version = root["formatVersion"] as? Int, [inlineCatalogFormatVersion, formatVersion].contains(version) else {
+        struct Identity: Decodable {
+            var formatVersion: Int
+            var projectID: UUID?
+        }
+        let identity = try decode(Identity.self, from: rootData(from: url))
+        guard readableFormatVersions.contains(identity.formatVersion) else {
             throw invalid("Unsupported design package format.")
         }
-        return (root["projectID"] as? String).flatMap(UUID.init(uuidString:))
+        return identity.projectID
     }
 
     /// Renames a package without replacing an existing file, keeping its
@@ -188,6 +389,8 @@ enum ProjectPackage {
         withExtendedLifetime(discarded) {}
     }
 
+    // MARK: - Writing
+
     /// beforePublication is a fault-injection point: throwing must leave the
     /// previously committed root and all its dependencies readable.
     @discardableResult
@@ -195,20 +398,18 @@ enum ProjectPackage {
                       beforePublication: (() throws -> Void)? = nil,
                       didFinish: ((WriteMetrics) -> Void)? = nil) throws -> Data {
         let lease = acquirePackage(url); defer { releasePackage(lease) }
-        var metrics = WriteMetrics()
-        var phaseStart = ProcessInfo.processInfo.systemUptime
-        defer { didFinish?(metrics) }
+        let save = Save(url: url)
+        defer { didFinish?(save.metrics) }
         let key = sessionKey(url)
         let manager = FileManager.default
         let exists = manager.fileExists(atPath: url.path)
         if !exists { try manager.createDirectory(at: url, withIntermediateDirectories: false) }
         try requirePackage(url)
-        let rootURL = url.appendingPathComponent("project.json")
         var previous: Session?
-        if manager.fileExists(atPath: rootURL.path) {
+        if manager.fileExists(atPath: url.appendingPathComponent("project.json").path) {
             let data = try readFile("project.json", in: url, limit: maximumRootBytes)
             if let cached = cachedSession(key), cached.rootData == data { previous = cached }
-            else { previous = try load(url, caching: false); metrics.reloadedPrevious = true }
+            else { previous = try load(url, caching: false); save.metrics.reloadedPrevious = true }
             guard previous?.project.projectID == project.projectID else {
                 throw invalid("The destination belongs to a different design.")
             }
@@ -217,17 +418,11 @@ enum ProjectPackage {
                 throw invalid("The destination is not an empty design package.")
             }
         }
-        metrics.phaseSeconds["previous"] = ProcessInfo.processInfo.systemUptime - phaseStart
-        phaseStart = ProcessInfo.processInfo.systemUptime
+        save.endPhase("previous")
 
         let portable = try normalized(project)
         var verified = previous?.verifiedAttachments ?? [:]
         let historyChanged = previous.map { !sameHistory(portable, $0.project) } ?? true
-        let reuseDependencies = previous.map {
-            $0.root["catalog"] != nil &&
-            !historyChanged && sameQueuedAttachments(portable.queuedRequests, $0.project.queuedRequests) &&
-                portable.draftAttachments == $0.project.draftAttachments
-        } ?? false
         guard portable.selectedRevisionID.map({ id in portable.revisions.contains { $0.id == id } }) ?? true else {
             throw invalid("The selected revision does not exist.")
         }
@@ -236,311 +431,399 @@ enum ProjectPackage {
             try ProjectStore.validate(inlineProject(portable), verifiedAttachmentPayloads: &verified,
                                       validatedPrevious: previous.map { inlineProject($0.project) })
         }
-        metrics.phaseSeconds["validation"] = ProcessInfo.processInfo.systemUptime - phaseStart
-        phaseStart = ProcessInfo.processInfo.systemUptime
-        let metadata: [String: Any]
+        save.endPhase("validation")
+
+        save.prepare(previous: previous)
+        let queue = try save.queue(portable.queuedRequests)
+        let draftAttachments = try save.draftAttachments(portable.draftAttachments)
+        let revisions: Reference, conversation: Reference, activity: Reference, catalog: Reference
         let assets: [String: Data]
-        var dependencies: Dependencies
-        let changedRecords: Set<String>
-        if reuseDependencies, let previous {
-            metadata = try stateMetadata(portable, previous: previous)
+        if let previous, save.current, !historyChanged,
+           sameQueuedAttachments(portable.queuedRequests, previous.project.queuedRequests),
+           portable.draftAttachments == previous.project.draftAttachments, let previousCatalog = previous.manifest.catalog {
+            // Unchanged history and attachments keep every section and payload.
+            save.sections = previous.sections
+            save.files = previous.files
+            revisions = previous.manifest.revisions
+            conversation = previous.manifest.conversation
+            activity = previous.manifest.activity
+            catalog = previousCatalog
             assets = previous.assets
-            dependencies = previous.dependencies
-            changedRecords = []
         } else {
-            metrics.historySnapshots += 1
-            let snapshot = try makeSnapshot(portable, previous: previous)
-            metadata = snapshot.metadata
-            assets = snapshot.assets
-            dependencies = snapshot.dependencies
-            changedRecords = snapshot.changedRecords
-            metrics.encodedHistoryRecords = changedRecords.count
+            save.metrics.historySnapshots += 1
+            revisions = try save.revisions(portable.revisions)
+            conversation = try save.conversation(portable.messages)
+            activity = try save.activity(portable.taskAudits)
+            assets = try save.assets(queue: queue, draftAttachments: draftAttachments)
+            catalog = try save.catalog(assets)
         }
-        metrics.phaseSeconds["snapshot"] = ProcessInfo.processInfo.systemUptime - phaseStart
-        phaseStart = ProcessInfo.processInfo.systemUptime
-        var root = metadata
-        root.removeValue(forKey: "messages")
-        root.removeValue(forKey: "revisions")
-        root.removeValue(forKey: "taskAudits")
-        root.removeValue(forKey: "assets")
-        root["formatVersion"] = formatVersion
+        save.endPhase("sections")
+
+        let identity = try ThumbnailIdentity(portable.selectedRevisionID.flatMap { save.sections.revisions[$0] },
+                                             displayMode: portable.displayMode, projectionMode: portable.projectionMode).digest
+        let savedThumbnail = save.thumbnail(thumbnail, identity: identity)
+        save.endPhase("thumbnail")
+
+        var manifest = Manifest(formatVersion: formatVersion, projectID: portable.projectID,
+                                selectedRevisionID: portable.selectedRevisionID, codexSettings: portable.codexSettings,
+                                projectName: portable.projectName, showGrid: portable.showGrid,
+                                projectionMode: portable.projectionMode, displayMode: portable.displayMode,
+                                partsPaneFraction: portable.partsPaneFraction, recentPartColors: portable.recentPartColors,
+                                queuedRequests: queue, draftPrompt: portable.draftPrompt, draftAttachments: draftAttachments,
+                                queuePaused: portable.queuePaused, revisions: revisions, conversation: conversation,
+                                activity: activity, catalog: catalog, thumbnail: savedThumbnail?.reference,
+                                thumbnailIdentity: savedThumbnail == nil ? nil : identity)
+        // Do not create a new commit for an identical authoritative state.
+        // The catalog section's reference covers every asset descriptor.
+        if let previous, manifest == previous.manifest.uncommitted {
+            save.endPhase("manifest")
+            return previous.rootData
+        }
+        manifest.commitID = UUID()
+        manifest.parentCommitID = previous?.manifest.commitID
+        save.metrics.rootEncodings += 1
+        let data = try encode(manifest)
+        guard data.count <= maximumRootBytes else { throw invalid("The design manifest exceeds its size limit.") }
+        save.endPhase("manifest")
+        for directory in save.directories.sorted(by: { $0.count > $1.count }) {
+            try synchronizeDirectory(url.appendingPathComponent(directory))
+        }
+        try beforePublication?()
+        try writeAtomic(data, path: "project.json", in: url, directories: &save.directories)
+        try synchronizeDirectory(url)
+
+        var committed = portable
+        committed.fileOrigin = ProjectFileOrigin(url: url, data: data)
+        committed.thumbnailData = savedThumbnail?.bytes
+        remember(Session(project: committed, manifest: manifest, rootData: data, assets: assets, files: save.files,
+                         verifiedAttachments: verified, sections: save.sections,
+                         thumbnailIdentity: savedThumbnail == nil ? nil : identity), key: key)
+        // Cleanup follows publication and cannot invalidate an unsuccessful save.
+        // The inactive index slot is retained for the next alternating write.
+        if let previous {
+            for path in previous.files.subtracting(save.files) where !isIndexSlot(path) {
+                if let target = try? safeURL(path, in: url) { try? manager.removeItem(at: target) }
+            }
+        }
+        save.endPhase("publication")
+        return data
+    }
+
+    /// One save: the new sections, the payloads they store, and the files
+    /// written or kept for them.
+    private final class Save {
+        let url: URL
+        private(set) var previous: Session?
+        /// Whether the previous commit's files use the current encoding.
+        private(set) var current = false
+        /// The previous sections, whose unchanged records and files are reused.
+        private(set) var old = Sections()
+        var sections = Sections()
+        var writer = ProjectArchive.AssetWriter()
         var files = Set<String>()
         var directories = Set<String>()
+        var metrics = WriteMetrics()
+        private var phaseStart = ProcessInfo.processInfo.systemUptime
 
-        func storeData(_ data: Data, directory: String, prefix: String) throws -> [String: Any] {
-            let hash = digest(data)
-            let path = "\(directory)/\(prefix)-\(hash).json"
-            try writeImmutable(data, path: path, in: url, verified: previous?.files ?? [], directories: &directories)
-            files.insert(path)
-            return ["path": path, "sha256": hash]
+        init(url: URL) { self.url = url }
+
+        /// Records of an earlier format version are reused, but their files are
+        /// rewritten in the current encoding.
+        func prepare(previous: Session?) {
+            self.previous = previous
+            current = previous?.manifest.formatVersion == formatVersion
+            old = previous?.sections ?? Sections()
+            if !current { old.forgetFiles() }
         }
-        func store(_ value: Any, directory: String, prefix: String) throws -> [String: Any] {
-            try storeData(json(value), directory: directory, prefix: prefix)
+
+        func endPhase(_ name: String) {
+            let now = ProcessInfo.processInfo.systemUptime
+            metrics.phaseSeconds[name] = now - phaseStart
+            phaseStart = now
         }
-        func reuse(_ reference: [String: Any]) throws -> [String: Any] {
-            guard let path = reference["path"] as? String else { throw invalid("A cached design reference is invalid.") }
-            files.insert(path)
+
+        private var verified: Set<String> { previous?.files ?? [] }
+
+        func keep(_ reference: Reference) -> Reference {
+            files.insert(reference.path)
             return reference
         }
-        func index(_ value: Any, directory: String, old: Any?) throws -> [String: Any] {
+
+        private func keepFiles(prefix: String) {
+            files.formUnion((previous?.files ?? []).filter { $0.hasPrefix(prefix) })
+        }
+
+        func store(_ data: Data, directory: String, prefix: String) throws -> Reference {
+            let hash = digest(data)
+            let path = "\(directory)/\(prefix)-\(hash).json"
+            try writeImmutable(data, path: path, in: url, verified: verified, directories: &directories)
+            files.insert(path)
+            return Reference(path: path, sha256: hash)
+        }
+
+        /// Writes the inactive index slot unless the committed one holds these bytes.
+        func index<Value: Encodable>(_ value: Value, directory: String, old: Reference?) throws -> Reference {
             metrics.encodedSectionIndexes += 1
-            let data = try json(value), hash = digest(data)
-            let prior = old as? [String: Any]
-            if prior?["sha256"] as? String == hash, let path = prior?["path"] as? String {
-                try requireRegularFile(path, in: url)
-                files.insert(path)
-                return ["path": path, "sha256": hash]
+            let data = try encode(value), hash = digest(data)
+            if let old, old.sha256 == hash {
+                try requireRegularFile(old.path, in: url)
+                return keep(old)
             }
-            let oldPath = prior?["path"] as? String
-            let slot = oldPath == "\(directory)/index-1.json" ? 2 : 1
+            let slot = old?.path == "\(directory)/index-1.json" ? 2 : 1
             let path = "\(directory)/index-\(slot).json"
             try writeAtomic(data, path: path, in: url, directories: &directories)
             files.insert(path)
-            return ["path": path, "sha256": hash]
+            return Reference(path: path, sha256: hash)
         }
-        func chunks(_ values: [[String: Any]], directory: String, prefix: String, old: [Chunk]) throws -> [Chunk] {
-            let prior = Dictionary(uniqueKeysWithValues: old.compactMap { chunk in
-                chunk.recordIDs.first.map { ($0, chunk) }
-            })
-            var result = [Chunk](), pending = [String](), count = 2
+
+        /// Greedy chunks of encoded records. A chunk with the same records, none
+        /// of them changed, keeps its file.
+        func chunks(_ records: [(id: String, bytes: Data)], changed: Set<String>, directory: String, prefix: String,
+                    old: [Chunk]) throws -> [Chunk] {
+            let prior = Dictionary(old.compactMap { chunk in chunk.recordIDs.first.map { ($0, chunk) } },
+                                   uniquingKeysWith: { first, _ in first })
+            var result = [Chunk](), pending = [(id: String, bytes: Data)](), count = 2
             func flush() throws {
-                guard !pending.isEmpty else { return }
-                let reference: [String: Any]
-                if let cached = prior[pending[0]], cached.recordIDs == pending,
-                   !pending.contains(where: { changedRecords.contains("\(directory)/\($0)") }) {
-                    reference = try reuse(cached.reference)
+                guard let first = pending.first else { return }
+                let ids = pending.map(\.id)
+                let reference: Reference
+                if let cached = prior[first.id], cached.recordIDs == ids, !ids.contains(where: changed.contains) {
+                    reference = keep(cached.reference)
                 } else {
                     var data = Data([91])
-                    for (offset, id) in pending.enumerated() {
+                    for (offset, record) in pending.enumerated() {
                         if offset > 0 { data.append(44) }
-                        guard let bytes = dependencies.recordData["\(directory)/\(id)"] else {
-                            throw invalid("A cached history record is missing.")
-                        }
-                        data.append(bytes)
+                        data.append(record.bytes)
                     }
                     data.append(93)
                     metrics.encodedChunks += 1
-                    reference = try storeData(data, directory: directory, prefix: prefix)
+                    reference = try store(data, directory: directory, prefix: prefix)
                 }
-                result.append(Chunk(reference: reference, recordIDs: pending))
+                result.append(Chunk(reference: reference, recordIDs: ids))
                 pending = []; count = 2
             }
-            for value in values {
-                guard let id = value["id"] as? String, let data = dependencies.recordData["\(directory)/\(id)"] else {
-                    throw invalid("A cached history record is missing.")
-                }
-                let bytes = data.count + 1
+            for record in records {
+                let bytes = record.bytes.count + 1
                 if !pending.isEmpty && (pending.count >= maximumChunkRecords || count + bytes > maximumChunkBytes) {
                     try flush()
                 }
-                pending.append(id); count += bytes
+                pending.append(record); count += bytes
             }
             try flush()
             return result
         }
 
-        if reuseDependencies, let previous {
-            for field in ["revisions", "conversation", "activity", "catalog"] { root[field] = previous.root[field] }
-            files = previous.files
-        } else {
-        let oldRevisions = Dictionary(uniqueKeysWithValues: (previous?.project.revisions ?? []).map { ($0.id.uuidString, $0) })
-        let oldEntries = Dictionary(uniqueKeysWithValues: (previous?.dependencies.revisions ?? []).compactMap { entry in
-            (entry["id"] as? String).map { ($0, entry) }
-        })
-        if let previous, sameRevisions(portable.revisions, previous.project.revisions) {
-            root["revisions"] = previous.root["revisions"]
-            files.formUnion(previous.files.filter { $0.hasPrefix("revisions/") })
-        } else {
-            var revisionEntries = [[String: Any]]()
-            let current = Dictionary(uniqueKeysWithValues: portable.revisions.map { ($0.id.uuidString, $0) })
-            for archived in metadata["revisions"] as? [[String: Any]] ?? [] {
-                guard let id = archived["id"] as? String, let revision = current[id] else { throw invalid("A revision identity is invalid.") }
-                var recipe = archived, parts = [String: Any]()
-                for field in ["parts", "partLayout", "hiddenSolids", "partColors", "jointPositions"] {
-                    if let value = recipe.removeValue(forKey: field) { parts[field] = value }
-                }
-                let name = recipe.removeValue(forKey: "name")
-                let directory = "revisions/\(id)"
-                let oldRevision = oldRevisions[id], oldEntry = oldEntries[id]
-                let recipeReference: [String: Any]
-                if let oldRevision, sameRecipe(revision, oldRevision), let reference = oldEntry?["recipe"] as? [String: Any] {
-                    recipeReference = try reuse(reference)
-                } else {
-                    metrics.encodedRevisionRecipes += 1
-                    recipeReference = try store(recipe, directory: directory, prefix: "recipe")
-                }
-                let partsReference: [String: Any]
-                if let oldRevision, sameParts(revision, oldRevision), let reference = oldEntry?["parts"] as? [String: Any] {
-                    partsReference = try reuse(reference)
-                } else {
-                    metrics.encodedRevisionParts += 1
-                    partsReference = try store(parts, directory: directory, prefix: "parts")
-                }
-                var entry: [String: Any] = ["id": id, "recipe": recipeReference, "parts": partsReference]
-                entry["name"] = name
-                revisionEntries.append(entry)
+        func queue(_ requests: [ProjectQueuedRequest]?) throws -> [ProjectArchive.ArchivedQueuedRequest]? {
+            let oldRequests = Dictionary((previous?.project.queuedRequests ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let oldRecords = Dictionary((previous?.manifest.queuedRequests ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            return try requests?.map { request in
+                let old = oldRequests[request.id].flatMap { old in oldRecords[request.id].map { (old, $0) } }
+                return try ProjectArchive.ArchivedQueuedRequest(request, reusing: old, writer: &writer)
             }
-            dependencies.revisions = revisionEntries
-            root["revisions"] = try index(["entries": revisionEntries], directory: "revisions", old: previous?.root["revisions"])
-        }
-        if let previous, portable.messages == previous.project.messages {
-            root["conversation"] = previous.root["conversation"]
-            files.formUnion(previous.files.filter { $0.hasPrefix("conversation/") })
-        } else {
-            dependencies.conversation = try chunks(metadata["messages"] as? [[String: Any]] ?? [], directory: "conversation",
-                                                   prefix: "messages", old: previous?.dependencies.conversation ?? [])
-            root["conversation"] = try index(["chunks": dependencies.conversation.map(\.reference)], directory: "conversation", old: previous?.root["conversation"])
-        }
-        if let previous, portable.taskAudits == previous.project.taskAudits {
-            root["activity"] = previous.root["activity"]
-            files.formUnion(previous.files.filter { $0.hasPrefix("activity/") })
-        } else {
-            var taskEntries = [[String: Any]]()
-            var taskReferences = [String: [String: Any]](), eventChunks = [String: [Chunk]]()
-            let oldTasks = Dictionary(uniqueKeysWithValues: (previous?.project.taskAudits ?? []).map { ($0.id.uuidString, $0) })
-            let currentTasks = Dictionary(uniqueKeysWithValues: (portable.taskAudits ?? []).map { ($0.id.uuidString, $0) })
-            for archived in metadata["taskAudits"] as? [[String: Any]] ?? [] {
-                guard let id = archived["id"] as? String, let current = currentTasks[id] else { throw invalid("A task identity is invalid.") }
-                let reference: [String: Any]
-                let cachedChunks = previous?.dependencies.events[id] ?? []
-                if current == oldTasks[id], let oldReference = previous?.dependencies.tasks[id] {
-                    reference = try reuse(oldReference)
-                    eventChunks[id] = cachedChunks
-                    for chunk in cachedChunks { _ = try reuse(chunk.reference) }
-                } else {
-                    var task = archived
-                    let events = task.removeValue(forKey: "events") as? [[String: Any]] ?? []
-                    let directory = "activity/\(id)"
-                    let updatedChunks = try chunks(events, directory: directory, prefix: "events", old: cachedChunks)
-                    eventChunks[id] = updatedChunks
-                    task["eventChunks"] = updatedChunks.map(\.reference)
-                    metrics.encodedTaskRecords += 1
-                    reference = try store(task, directory: directory, prefix: "task")
-                }
-                taskReferences[id] = reference
-                taskEntries.append(reference)
-            }
-            dependencies.tasks = taskReferences
-            dependencies.events = eventChunks
-            root["activity"] = try index(["tasks": taskEntries], directory: "activity", old: previous?.root["activity"])
         }
 
-        var assetEntries = [String: [String: Any]]()
-        let previousAssets = previous?.dependencies.catalog ?? [:]
-        var changedBuckets = Set<String>()
-        for (hash, bytes) in assets {
-            let path = assetPath(hash)
-            if let old = previousAssets[hash],
-               old["byteCount"] as? Int == bytes.count, old["path"] as? String == path {
-                // These exact bytes already belong to the verified committed
-                // session. A transcript append need not stat every CAD input.
-                assetEntries[hash] = old
-            } else {
-                let stored = try compressedAsset(bytes)
-                metrics.compressedAssets += 1
-                try writeImmutable(stored.bytes, path: path, in: url, verified: previous?.files ?? [], directories: &directories)
-                assetEntries[hash] = ["path": path, "sha256": hash, "byteCount": bytes.count,
-                                      "storedByteCount": stored.bytes.count, "codec": stored.codec]
-                changedBuckets.insert(String(hash.prefix(2)))
+        func draftAttachments(_ attachments: [SourceAttachment]?) throws -> [ProjectArchive.ArchivedAttachment]? {
+            if let previous, attachments == previous.project.draftAttachments { return previous.manifest.draftAttachments }
+            return try attachments?.map { try ProjectArchive.ArchivedAttachment($0, writer: &writer) }
+        }
+
+        func revisions(_ revisions: [ProjectRevision]) throws -> Reference {
+            if let previous, current, sameRevisions(revisions, previous.project.revisions) {
+                sections.revisions = old.revisions
+                keepFiles(prefix: "revisions/")
+                return previous.manifest.revisions
             }
-            files.insert(path)
-        }
-        for hash in previousAssets.keys where assetEntries[hash] == nil { changedBuckets.insert(String(hash.prefix(2))) }
-        var bucketReferences = [String: [String: Any]]()
-        for (bucket, members) in Dictionary(grouping: assetEntries, by: { String($0.key.prefix(2)) }) {
-            if !changedBuckets.contains(bucket), let old = previous?.dependencies.catalogBuckets[bucket] {
-                bucketReferences[bucket] = try reuse(old)
-            } else {
-                metrics.encodedCatalogBuckets += 1
-                bucketReferences[bucket] = try store(Dictionary(uniqueKeysWithValues: members.map { ($0.key, $0.value) }),
-                                                     directory: "catalog", prefix: "assets-\(bucket)")
+            let oldRevisions = Dictionary((previous?.project.revisions ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            var entries = [RevisionEntry]()
+            for revision in revisions {
+                let oldRevision = oldRevisions[revision.id], cached = old.revisions[revision.id]
+                let directory = "revisions/\(revision.id.uuidString)"
+                let cachedRecipe = oldRevision.flatMap { sameRecipe(revision, $0) ? cached : nil }
+                let cachedParts = oldRevision.flatMap { sameParts(revision, $0) ? cached : nil }
+                let recipe = try cachedRecipe?.recipe ?? ProjectArchive.ArchivedRecipe(revision, writer: &writer)
+                let recipeFile: Reference
+                if let file = cachedRecipe?.recipeFile { recipeFile = keep(file) }
+                else {
+                    metrics.encodedRevisionRecipes += 1
+                    recipeFile = try store(encode(recipe), directory: directory, prefix: "recipe")
+                }
+                let parts = try cachedParts?.parts ?? ProjectArchive.ArchivedParts(revision)
+                let partsFile: Reference
+                if let file = cachedParts?.partsFile { partsFile = keep(file) }
+                else {
+                    metrics.encodedRevisionParts += 1
+                    partsFile = try store(encode(parts), directory: directory, prefix: "parts")
+                }
+                if !(oldRevision.map { sameRevision(revision, $0) } ?? false) { metrics.encodedHistoryRecords += 1 }
+                sections.revisions[revision.id] = RevisionRecords(recipe: recipe, recipeFile: recipeFile, parts: parts, partsFile: partsFile)
+                entries.append(RevisionEntry(id: revision.id, name: revision.name, recipe: recipeFile, parts: partsFile))
             }
+            return try index(RevisionIndex(entries: entries), directory: "revisions", old: previous?.manifest.revisions)
         }
-        dependencies.catalog = assetEntries
-        dependencies.catalogBuckets = bucketReferences
-        if changedBuckets.isEmpty, let prior = previous?.root["catalog"] as? [String: Any] {
-            root["catalog"] = try reuse(prior)
-        } else {
-            root["catalog"] = try index(["buckets": bucketReferences], directory: "catalog", old: previous?.root["catalog"])
-        }
-        }
-        metrics.phaseSeconds["dependencies"] = ProcessInfo.processInfo.systemUptime - phaseStart
-        phaseStart = ProcessInfo.processInfo.systemUptime
-        let thumbnailKey = try thumbnailIdentity(metadata)
-        if let old = previous?.root["thumbnail"] as? [String: Any], let path = old["path"] as? String,
-           let hash = old["sha256"] as? String, dependencies.catalog[hash] == nil {
-            files.remove(path)
-        }
-        var savedThumbnail: Data?
-        func keepThumbnail(_ bytes: Data, reference: [String: Any]) {
-            guard let path = reference["path"] as? String else { return }
-            if (try? requireRegularFile(path, in: url)) == nil {
-                // Presentation images are optional: unavailable thumbnail
-                // storage must not prevent saving the authoritative design.
-                guard (try? writeImmutable(bytes, path: path, in: url, verified: previous?.files ?? [], directories: &directories)) != nil else { return }
+
+        func conversation(_ messages: [ChatMessage]) throws -> Reference {
+            if let previous, current, messages == previous.project.messages {
+                sections.messages = old.messages
+                sections.conversation = old.conversation
+                keepFiles(prefix: "conversation/")
+                return previous.manifest.conversation
             }
-            files.insert(path)
-            root["thumbnail"] = reference; root["thumbnailIdentity"] = thumbnailKey
-            savedThumbnail = bytes
+            let oldMessages = Dictionary((previous?.project.messages ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            var records = [(id: String, bytes: Data)](), changed = Set<String>()
+            for message in messages {
+                let oldMessage = oldMessages[message.id], cached = old.messages[message.id]
+                let encoded: Encoded<ProjectArchive.ArchivedMessage>
+                if let cached, oldMessage == message { encoded = cached }
+                else {
+                    let reused = oldMessage.flatMap { old in cached.map { (old, $0.record) } }
+                    let record = try ProjectArchive.ArchivedMessage(message, reusing: reused, writer: &writer)
+                    encoded = Encoded(record: record, bytes: try encode(record))
+                    changed.insert(message.id.uuidString)
+                    metrics.encodedHistoryRecords += 1
+                }
+                sections.messages[message.id] = encoded
+                records.append((message.id.uuidString, encoded.bytes))
+            }
+            sections.conversation = try chunks(records, changed: changed, directory: "conversation", prefix: "messages",
+                                               old: old.conversation)
+            return try index(ConversationIndex(chunks: sections.conversation.map(\.reference)), directory: "conversation",
+                             old: previous?.manifest.conversation)
         }
-        if let thumbnail {
-            if thumbnail == previous?.project.thumbnailData,
-               let prior = previous?.root["thumbnail"] as? [String: Any] {
-                keepThumbnail(thumbnail, reference: prior)
-            } else {
-                metrics.thumbnailValidations += 1
-                if validThumbnail(thumbnail) {
-                    let hash = digest(thumbnail), path = assetPath(hash)
-                    if (try? writeImmutable(thumbnail, path: path, in: url, verified: previous?.files ?? [], directories: &directories)) != nil {
-                        keepThumbnail(thumbnail, reference: ["path": path, "sha256": hash, "byteCount": thumbnail.count])
+
+        func activity(_ tasks: [ProjectTaskAudit]?) throws -> Reference {
+            if let previous, current, tasks == previous.project.taskAudits {
+                sections.tasks = old.tasks
+                keepFiles(prefix: "activity/")
+                return previous.manifest.activity
+            }
+            let oldTasks = Dictionary((previous?.project.taskAudits ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            var references = [Reference]()
+            for task in tasks ?? [] {
+                let oldTask = oldTasks[task.id], cached = old.tasks[task.id]
+                if let cached, let file = cached.file, oldTask == task {
+                    sections.tasks[task.id] = cached
+                    references.append(keep(file))
+                    for chunk in cached.chunks { _ = keep(chunk.reference) }
+                    continue
+                }
+                let oldEvents = Dictionary((oldTask?.events ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                var events = [String: Encoded<ProjectArchive.ArchivedActivityEvent>]()
+                var records = [(id: String, bytes: Data)](), changed = Set<String>()
+                for event in task.events {
+                    let oldEvent = oldEvents[event.id], cachedEvent = cached?.events[event.id]
+                    let encoded: Encoded<ProjectArchive.ArchivedActivityEvent>
+                    if let cachedEvent, oldEvent == event { encoded = cachedEvent }
+                    else {
+                        let reused = oldEvent.flatMap { old in cachedEvent.map { (old, $0.record) } }
+                        let record = try ProjectArchive.ArchivedActivityEvent(event, reusing: reused, writer: &writer)
+                        encoded = Encoded(record: record, bytes: try encode(record))
+                        changed.insert(event.id)
+                        metrics.encodedHistoryRecords += 1
+                    }
+                    events[event.id] = encoded
+                    records.append((event.id, encoded.bytes))
+                }
+                let directory = "activity/\(task.id.uuidString)"
+                let eventChunks = try chunks(records, changed: changed, directory: directory, prefix: "events",
+                                             old: cached?.chunks ?? [])
+                let reused = oldTask.flatMap { old in cached.map { (old, $0.task) } }
+                let header = try ProjectArchive.ArchivedTask(task, reusing: reused, writer: &writer)
+                metrics.encodedTaskRecords += 1
+                let file = try store(encode(TaskRecord(task: header, eventChunks: eventChunks.map(\.reference))),
+                                     directory: directory, prefix: "task")
+                sections.tasks[task.id] = TaskRecords(task: header, file: file, events: events, chunks: eventChunks)
+                references.append(file)
+            }
+            return try index(ActivityIndex(tasks: references), directory: "activity", old: previous?.manifest.activity)
+        }
+
+        /// The exact payloads the new sections and inline state refer to, from
+        /// the previous commit or newly stored bytes.
+        func assets(queue: [ProjectArchive.ArchivedQueuedRequest]?,
+                    draftAttachments: [ProjectArchive.ArchivedAttachment]?) throws -> [String: Data] {
+            var required = sections.assetKeys
+            for request in queue ?? [] { required.formUnion(request.assetKeys) }
+            for attachment in draftAttachments ?? [] { required.insert(attachment.contentAsset) }
+            var assets = [String: Data](), total = 0
+            for key in required {
+                guard let bytes = writer.assets[key] ?? previous?.assets[key] else {
+                    throw invalid("A saved asset reference is missing.")
+                }
+                guard bytes.count <= ProjectStore.maximumFileBytes - total else {
+                    throw invalid("Saved assets exceed the design size limit.")
+                }
+                total += bytes.count
+                assets[key] = bytes
+            }
+            return assets
+        }
+
+        func catalog(_ assets: [String: Data]) throws -> Reference {
+            var descriptors = [String: AssetDescriptor](), changedBuckets = Set<String>()
+            for (hash, bytes) in assets {
+                let path = assetPath(hash)
+                if let descriptor = old.catalog[hash], descriptor.byteCount == bytes.count, descriptor.path == path {
+                    // These exact bytes already belong to the verified committed
+                    // session. A transcript append need not stat every CAD input.
+                    descriptors[hash] = descriptor
+                } else {
+                    let stored = try compressedAsset(bytes)
+                    metrics.compressedAssets += 1
+                    try writeImmutable(stored.bytes, path: path, in: url, verified: verified, directories: &directories)
+                    descriptors[hash] = AssetDescriptor(path: path, sha256: hash, byteCount: bytes.count,
+                                                        storedByteCount: stored.bytes.count, codec: stored.codec)
+                    changedBuckets.insert(String(hash.prefix(2)))
+                }
+                files.insert(path)
+            }
+            for hash in old.catalog.keys where descriptors[hash] == nil { changedBuckets.insert(String(hash.prefix(2))) }
+            var buckets = [String: Reference]()
+            for (bucket, members) in Dictionary(grouping: descriptors, by: { String($0.key.prefix(2)) }) {
+                if !changedBuckets.contains(bucket), let reference = old.catalogBuckets[bucket] {
+                    buckets[bucket] = keep(reference)
+                } else {
+                    metrics.encodedCatalogBuckets += 1
+                    let entries = Dictionary(uniqueKeysWithValues: members.map { ($0.key, $0.value) })
+                    buckets[bucket] = try store(encode(entries), directory: "catalog", prefix: "assets-\(bucket)")
+                }
+            }
+            sections.catalog = descriptors
+            sections.catalogBuckets = buckets
+            if buckets == old.catalogBuckets, let reference = previous?.manifest.catalog { return keep(reference) }
+            return try index(CatalogIndex(buckets: buckets), directory: "catalog", old: previous?.manifest.catalog)
+        }
+
+        /// Presentation images are optional: unavailable thumbnail storage must
+        /// not prevent saving the authoritative design.
+        func thumbnail(_ thumbnail: Data?, identity: String) -> (reference: Thumbnail, bytes: Data)? {
+            if let old = previous?.manifest.thumbnail, sections.catalog[old.sha256] == nil { files.remove(old.path) }
+            func retain(_ bytes: Data, _ reference: Thumbnail) -> (reference: Thumbnail, bytes: Data)? {
+                if (try? requireRegularFile(reference.path, in: url)) == nil {
+                    guard (try? writeImmutable(bytes, path: reference.path, in: url, verified: verified,
+                                               directories: &directories)) != nil else { return nil }
+                }
+                files.insert(reference.path)
+                return (reference, bytes)
+            }
+            if let thumbnail {
+                if thumbnail == previous?.project.thumbnailData, let reference = previous?.manifest.thumbnail {
+                    if let retained = retain(thumbnail, reference) { return retained }
+                } else {
+                    metrics.thumbnailValidations += 1
+                    if validThumbnail(thumbnail) {
+                        let hash = digest(thumbnail)
+                        if let retained = retain(thumbnail, Thumbnail(path: assetPath(hash), sha256: hash, byteCount: thumbnail.count)) {
+                            return retained
+                        }
                     }
                 }
             }
-        }
-        if savedThumbnail == nil, previous?.root["thumbnailIdentity"] as? String == thumbnailKey,
-           let prior = previous?.root["thumbnail"] as? [String: Any], let bytes = previous?.project.thumbnailData {
-            keepThumbnail(bytes, reference: prior)
-        }
-        metrics.phaseSeconds["thumbnail"] = ProcessInfo.processInfo.systemUptime - phaseStart
-        phaseStart = ProcessInfo.processInfo.systemUptime
-        // Do not create a new commit for a byte-identical authoritative state.
-        // The catalog section's reference covers every asset descriptor.
-        let inlineData = try json(inlineMetadata(root))
-        let sectionData: Data
-        if reuseDependencies, let previous { sectionData = previous.sectionData }
-        else { sectionData = try json(sectionReferences(root)) }
-        if let previous, inlineData == previous.inlineData, sectionData == previous.sectionData {
-            metrics.phaseSeconds["manifest"] = ProcessInfo.processInfo.systemUptime - phaseStart
-            return previous.rootData
-        }
-        root["commitID"] = UUID().uuidString
-        root["parentCommitID"] = previous?.root["commitID"]
-        metrics.rootEncodings += 1
-        let data = try json(root)
-        guard data.count <= maximumRootBytes else { throw invalid("The design manifest exceeds its size limit.") }
-        metrics.phaseSeconds["manifest"] = ProcessInfo.processInfo.systemUptime - phaseStart
-        phaseStart = ProcessInfo.processInfo.systemUptime
-        for directory in directories.sorted(by: { $0.count > $1.count }) { try synchronizeDirectory(url.appendingPathComponent(directory)) }
-        try beforePublication?()
-        try writeAtomic(data, path: "project.json", in: url, directories: &directories)
-        try synchronizeDirectory(url)
-
-        var committed = portable
-        committed.fileOrigin = ProjectFileOrigin(url: url, data: data)
-        committed.thumbnailData = savedThumbnail
-        let session = Session(project: committed, assets: assets, metadata: metadata, root: root,
-                              rootData: data, inlineData: inlineData, sectionData: sectionData,
-                              files: files, verifiedAttachments: verified, dependencies: dependencies)
-        remember(session, key: key)
-        // Cleanup follows publication and cannot invalidate an unsuccessful save.
-        // The inactive index slot is retained for the next alternating write.
-        if let previous {
-            for path in previous.files.subtracting(files) where !isIndexSlot(path) {
-                if let target = try? safeURL(path, in: url) { try? manager.removeItem(at: target) }
+            if previous?.thumbnailIdentity == identity, let reference = previous?.manifest.thumbnail,
+               let bytes = previous?.project.thumbnailData {
+                return retain(bytes, reference)
             }
+            return nil
         }
-        metrics.phaseSeconds["publication"] = ProcessInfo.processInfo.systemUptime - phaseStart
-        return data
     }
 
     /// Tests and one-time development conversion can discard process caches.
@@ -554,22 +837,18 @@ enum ProjectPackage {
         withExtendedLifetime(discarded) {}
     }
 
-    private static func load(_ url: URL, caching: Bool) throws -> Session {
-        try requirePackage(url)
-        let data = try readFile("project.json", in: url, limit: maximumRootBytes)
-        let root = try object(data)
-        guard let version = root["formatVersion"] as? Int, [inlineCatalogFormatVersion, formatVersion].contains(version),
-              let commitID = root["commitID"] as? String, UUID(uuidString: commitID) != nil else {
-            throw invalid("Unsupported design package format.")
-        }
+    // MARK: - Reading
+
+    /// Reads committed section files, checking their names, hashes and sizes
+    /// against the aggregate metadata limit.
+    private struct SectionReader {
+        let url: URL
+        var metadataBytes: Int
         var files = Set<String>()
-        var dependencies = Dependencies()
-        var metadataBytes = data.count
-        func readReference(_ value: Any?, prefix: String) throws -> Data {
-            guard let reference = value as? [String: Any], let path = reference["path"] as? String,
-                  path.hasPrefix(prefix), let hash = reference["sha256"] as? String, validHash(hash) else {
-                throw invalid("A design record reference is invalid.")
-            }
+
+        mutating func data(_ reference: Reference, prefix: String) throws -> Data {
+            let path = reference.path, hash = reference.sha256
+            guard path.hasPrefix(prefix), validHash(hash) else { throw invalid("A design record reference is invalid.") }
             if isIndexSlot(path) {
                 guard path == "\(prefix)1.json" || path == "\(prefix)2.json" else { throw invalid("An index slot is invalid.") }
             } else {
@@ -582,152 +861,147 @@ enum ProjectPackage {
             files.insert(path)
             return bytes
         }
-        func readChunks(_ value: Any?, prefix: String) throws -> (values: [[String: Any]], chunks: [Chunk]) {
-            guard let refs = value as? [[String: Any]], refs.count <= 100_000 else { throw invalid("A design chunk list is invalid.") }
-            var values = [[String: Any]]()
-            var chunks = [Chunk]()
-            for ref in refs {
-                let data = try readReference(ref, prefix: prefix)
-                guard let chunk = try jsonValue(data) as? [[String: Any]],
-                      chunk.count <= maximumChunkRecords else { throw invalid("A design chunk is invalid.") }
-                values.append(contentsOf: chunk)
-                let ids = chunk.compactMap { $0["id"] as? String }
-                guard ids.count == chunk.count else { throw invalid("A history record identity is invalid.") }
-                chunks.append(Chunk(reference: ref, recordIDs: ids))
-                guard values.count <= 100_000 else { throw invalid("A design chunk collection is too large.") }
+
+        mutating func record<Record: Decodable>(_ type: Record.Type, _ reference: Reference, prefix: String) throws -> Record {
+            try decode(type, from: data(reference, prefix: prefix))
+        }
+
+        mutating func chunks<Record: Decodable>(_ type: Record.Type, _ references: [Reference], prefix: String,
+                                                id: (Record) -> String) throws -> (records: [Record], chunks: [Chunk]) {
+            guard references.count <= 100_000 else { throw invalid("A design chunk list is invalid.") }
+            var records = [Record](), chunks = [Chunk]()
+            for reference in references {
+                let chunk = try record([Record].self, reference, prefix: prefix)
+                guard chunk.count <= maximumChunkRecords else { throw invalid("A design chunk is invalid.") }
+                records.append(contentsOf: chunk)
+                chunks.append(Chunk(reference: reference, recordIDs: chunk.map(id)))
+                guard records.count <= 100_000 else { throw invalid("A design chunk collection is too large.") }
             }
-            return (values, chunks)
+            return (records, chunks)
         }
-        var metadata = root
-        metadata["formatVersion"] = ProjectArchive.formatVersion
-        for field in ["commitID", "parentCommitID", "conversation", "activity", "thumbnail", "thumbnailIdentity"] { metadata.removeValue(forKey: field) }
-        let revisionIndex = try object(readReference(root["revisions"], prefix: "revisions/index-"))
-        guard let entries = revisionIndex["entries"] as? [[String: Any]], entries.count <= 1_000 else { throw invalid("The version index is invalid.") }
-        dependencies.revisions = entries
-        var revisions = [[String: Any]]()
-        for entry in entries {
-            guard let id = entry["id"] as? String, UUID(uuidString: id) != nil else { throw invalid("A version identity is invalid.") }
-            var revision = try object(readReference(entry["recipe"], prefix: "revisions/\(id)/recipe-"))
-            guard revision["id"] as? String == id else { throw invalid("A version record has a mismatched identity.") }
-            let parts = try object(readReference(entry["parts"], prefix: "revisions/\(id)/parts-"))
-            guard Set(parts.keys).isSubset(of: ["parts", "partLayout", "hiddenSolids", "partColors", "jointPositions"]) else { throw invalid("A parts record contains unsupported fields.") }
-            revision.merge(parts) { _, value in value }
-            revision["name"] = entry["name"]
-            revisions.append(revision)
+    }
+
+    private static func load(_ url: URL, caching: Bool) throws -> Session {
+        try requirePackage(url)
+        let data = try readFile("project.json", in: url, limit: maximumRootBytes)
+        let manifest = try decode(Manifest.self, from: data)
+        guard readableFormatVersions.contains(manifest.formatVersion), manifest.commitID != nil else {
+            throw invalid("Unsupported design package format.")
         }
-        metadata["revisions"] = revisions
-        let conversation = try object(readReference(root["conversation"], prefix: "conversation/index-"))
-        let messages = try readChunks(conversation["chunks"], prefix: "conversation/messages-")
-        metadata["messages"] = messages.values
-        dependencies.conversation = messages.chunks
-        let activity = try object(readReference(root["activity"], prefix: "activity/index-"))
-        guard let taskRefs = activity["tasks"] as? [[String: Any]], taskRefs.count <= 10_000 else { throw invalid("The activity index is invalid.") }
-        var tasks = [[String: Any]](), eventCount = 0
-        for reference in taskRefs {
-            var task = try object(readReference(reference, prefix: "activity/"))
-            guard let id = task["id"] as? String, UUID(uuidString: id) != nil,
-                  (reference["path"] as? String)?.hasPrefix("activity/\(id)/task-") == true else { throw invalid("A task identity is invalid.") }
-            let events = try readChunks(task.removeValue(forKey: "eventChunks"), prefix: "activity/\(id)/events-")
-            dependencies.tasks[id] = reference
-            dependencies.events[id] = events.chunks
-            eventCount += events.values.count
+        var reader = SectionReader(url: url, metadataBytes: data.count)
+        var sections = Sections()
+
+        let revisionIndex = try reader.record(RevisionIndex.self, manifest.revisions, prefix: "revisions/index-")
+        guard revisionIndex.entries.count <= 1_000 else { throw invalid("The version index is invalid.") }
+        var revisions = [ProjectArchive.ArchivedRevision]()
+        for entry in revisionIndex.entries {
+            let directory = "revisions/\(entry.id.uuidString)"
+            let recipe = try reader.record(ProjectArchive.ArchivedRecipe.self, entry.recipe, prefix: "\(directory)/recipe-")
+            guard recipe.id == entry.id else { throw invalid("A version record has a mismatched identity.") }
+            let parts = try reader.record(PartsRecord.self, entry.parts, prefix: "\(directory)/parts-").parts
+            revisions.append(ProjectArchive.ArchivedRevision(recipe: recipe, parts: parts, name: entry.name))
+            sections.revisions[entry.id] = RevisionRecords(recipe: recipe, recipeFile: entry.recipe, parts: parts, partsFile: entry.parts)
+        }
+
+        let conversation = try reader.record(ConversationIndex.self, manifest.conversation, prefix: "conversation/index-")
+        let messages = try reader.chunks(ProjectArchive.ArchivedMessage.self, conversation.chunks,
+                                         prefix: "conversation/messages-", id: \.id.uuidString)
+        sections.conversation = messages.chunks
+
+        let activity = try reader.record(ActivityIndex.self, manifest.activity, prefix: "activity/index-")
+        guard activity.tasks.count <= 10_000 else { throw invalid("The activity index is invalid.") }
+        var tasks = [ProjectArchive.ArchivedTaskAudit](), eventCount = 0
+        for reference in activity.tasks {
+            let task = try reader.record(TaskRecord.self, reference, prefix: "activity/")
+            let directory = "activity/\(task.task.id.uuidString)"
+            guard reference.path.hasPrefix("\(directory)/task-") else { throw invalid("A task identity is invalid.") }
+            let events = try reader.chunks(ProjectArchive.ArchivedActivityEvent.self, task.eventChunks,
+                                           prefix: "\(directory)/events-", id: \.id)
+            eventCount += events.records.count
             guard eventCount <= 100_000 else { throw invalid("The activity history is too large.") }
-            task["events"] = events.values
-            tasks.append(task)
+            tasks.append(ProjectArchive.ArchivedTaskAudit(task: task.task, events: events.records))
+            sections.tasks[task.task.id] = TaskRecords(task: task.task, file: reference, events: [:], chunks: events.chunks)
         }
-        if !tasks.isEmpty { metadata["taskAudits"] = tasks }
-        else { metadata.removeValue(forKey: "taskAudits") }
-        let descriptors: [String: Any]
-        if version == formatVersion {
-            guard root["assets"] == nil, let catalog = root["catalog"] else { throw invalid("The asset catalog is invalid.") }
-            let index = try object(readReference(catalog, prefix: "catalog/index-"))
-            guard let buckets = index["buckets"] as? [String: Any], buckets.count <= 256 else { throw invalid("The asset catalog is invalid.") }
-            var merged = [String: Any]()
-            for (bucket, value) in buckets {
-                guard bucket.utf8.count == 2, bucket.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
-                      let reference = value as? [String: Any] else { throw invalid("The asset catalog is invalid.") }
-                for (hash, descriptor) in try object(readReference(reference, prefix: "catalog/assets-\(bucket)-")) {
+
+        let descriptors: [String: AssetDescriptor]
+        if manifest.formatVersion == inlineCatalogFormatVersion {
+            guard manifest.catalog == nil, let inline = manifest.assets else { throw invalid("The asset catalog is invalid.") }
+            descriptors = inline
+        } else {
+            guard manifest.assets == nil, let catalog = manifest.catalog else { throw invalid("The asset catalog is invalid.") }
+            let index = try reader.record(CatalogIndex.self, catalog, prefix: "catalog/index-")
+            guard index.buckets.count <= 256 else { throw invalid("The asset catalog is invalid.") }
+            var merged = [String: AssetDescriptor]()
+            for (bucket, reference) in index.buckets {
+                guard bucket.utf8.count == 2, bucket.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                    throw invalid("The asset catalog is invalid.")
+                }
+                for (hash, descriptor) in try reader.record([String: AssetDescriptor].self, reference, prefix: "catalog/assets-\(bucket)-") {
                     guard hash.hasPrefix(bucket), merged[hash] == nil else { throw invalid("The asset catalog is invalid.") }
                     merged[hash] = descriptor
                 }
-                dependencies.catalogBuckets[bucket] = reference
+                sections.catalogBuckets[bucket] = reference
             }
             descriptors = merged
-        } else {
-            // A version 5 package inlines its catalog in project.json.
-            guard root["catalog"] == nil, let inline = root["assets"] as? [String: Any] else { throw invalid("The asset catalog is invalid.") }
-            descriptors = inline
         }
         var assets = [String: Data](), total = 0
-        for (hash, value) in descriptors {
-            guard validHash(hash), let descriptor = value as? [String: Any],
-                  descriptor["sha256"] as? String == hash,
-                  descriptor["path"] as? String == assetPath(hash),
-                  let count = descriptor["byteCount"] as? Int, (0...ProjectStore.maximumFileBytes).contains(count),
-                  let storedCount = descriptor["storedByteCount"] as? Int, (0...ProjectStore.maximumFileBytes).contains(storedCount),
-                  let codec = descriptor["codec"] as? String else { throw invalid("A saved asset descriptor is invalid.") }
-            guard count <= ProjectStore.maximumFileBytes - total else { throw invalid("Saved assets exceed the design size limit.") }
-            total += count
-            let path = assetPath(hash), stored = try readFile(path, in: url, limit: storedCount)
-            guard stored.count == storedCount else { throw invalid("A saved asset has an inconsistent size.") }
-            let bytes = try expandedAsset(stored, codec: codec, byteCount: count)
+        for (hash, descriptor) in descriptors {
+            guard validHash(hash), descriptor.sha256 == hash, descriptor.path == assetPath(hash),
+                  (0...ProjectStore.maximumFileBytes).contains(descriptor.byteCount),
+                  (0...ProjectStore.maximumFileBytes).contains(descriptor.storedByteCount) else {
+                throw invalid("A saved asset descriptor is invalid.")
+            }
+            guard descriptor.byteCount <= ProjectStore.maximumFileBytes - total else { throw invalid("Saved assets exceed the design size limit.") }
+            total += descriptor.byteCount
+            let stored = try readFile(descriptor.path, in: url, limit: descriptor.storedByteCount)
+            guard stored.count == descriptor.storedByteCount else { throw invalid("A saved asset has an inconsistent size.") }
+            let bytes = try expandedAsset(stored, codec: descriptor.codec, byteCount: descriptor.byteCount)
             guard digest(bytes) == hash else { throw invalid("A saved file asset failed its integrity check.") }
-            assets[hash] = bytes; files.insert(path)
-            dependencies.catalog[hash] = descriptor
+            assets[hash] = bytes
+            reader.files.insert(descriptor.path)
         }
-        metadata["assets"] = [String: Any]()
-        let snapshot = ProjectArchive.Snapshot(metadata: try json(metadata), assets: assets)
-        var project = try ProjectArchive.restore(metadata: snapshot.metadata, assets: assets)
+        sections.catalog = descriptors
+
+        let document = ProjectArchive.Document(
+            formatVersion: ProjectArchive.formatVersion, messages: messages.records, revisions: revisions,
+            selectedRevisionID: manifest.selectedRevisionID, projectID: manifest.projectID, codexSettings: manifest.codexSettings,
+            projectName: manifest.projectName, showGrid: manifest.showGrid, projectionMode: manifest.projectionMode,
+            displayMode: manifest.displayMode, partsPaneFraction: manifest.partsPaneFraction,
+            recentPartColors: manifest.recentPartColors, taskAudits: tasks.isEmpty ? nil : tasks,
+            queuedRequests: manifest.queuedRequests, draftPrompt: manifest.draftPrompt,
+            draftAttachments: manifest.draftAttachments, queuePaused: manifest.queuePaused, assets: assets)
+        var project = try ProjectArchive.restore(document, verifiedAssets: true)
         var verified = [String: Data]()
         try ProjectStore.validate(project, verifiedAttachmentPayloads: &verified)
         project.fileOrigin = ProjectFileOrigin(url: url, data: data)
-        _ = try cacheRecords(metadata, dependencies: &dependencies)
-        if let thumbnail = root["thumbnail"] as? [String: Any],
-           let identity = try? thumbnailIdentity(metadata), root["thumbnailIdentity"] as? String == identity,
-           let hash = thumbnail["sha256"] as? String, validHash(hash),
-           thumbnail["path"] as? String == assetPath(hash),
-           let bytes = try? readFile(assetPath(hash), in: url, limit: 8_000_000),
-           validThumbnail(bytes), digest(bytes) == hash {
-            project.thumbnailData = bytes
-            files.insert(assetPath(hash))
+        // Canonical record bytes rebuild a chunk once one of its records changes.
+        for message in messages.records { sections.messages[message.id] = Encoded(record: message, bytes: try encode(message)) }
+        for task in tasks {
+            for event in task.events {
+                sections.tasks[task.task.id]?.events[event.id] = Encoded(record: event, bytes: try encode(event))
+            }
         }
-        let session = Session(project: project, assets: assets, metadata: metadata, root: root,
-                              rootData: data, inlineData: try json(inlineMetadata(root)),
-                              sectionData: try json(sectionReferences(root)),
-                              files: files, verifiedAttachments: verified, dependencies: dependencies)
+
+        var thumbnailIdentity: String?
+        if let thumbnail = manifest.thumbnail, validHash(thumbnail.sha256), thumbnail.path == assetPath(thumbnail.sha256) {
+            let identity = ThumbnailIdentity(manifest.selectedRevisionID.flatMap { sections.revisions[$0] },
+                                             displayMode: manifest.displayMode, projectionMode: manifest.projectionMode)
+            let stored = try? (manifest.formatVersion == formatVersion ? identity.digest : identity.legacyDigest)
+            if stored != nil, manifest.thumbnailIdentity == stored,
+               let bytes = try? readFile(thumbnail.path, in: url, limit: 8_000_000),
+               validThumbnail(bytes), digest(bytes) == thumbnail.sha256 {
+                project.thumbnailData = bytes
+                reader.files.insert(thumbnail.path)
+                thumbnailIdentity = try identity.digest
+            }
+        }
+        let session = Session(project: project, manifest: manifest, rootData: data, assets: assets, files: reader.files,
+                              verifiedAttachments: verified, sections: sections, thumbnailIdentity: thumbnailIdentity)
         if caching { remember(session, key: sessionKey(url)) }
         return session
     }
 
-    /// Serialize only inline state. History and exact payload references are
-    /// already validated in the cached session and remain shared with it.
-    private static func stateMetadata(_ project: LADProject, previous: Session) throws -> [String: Any] {
-        var state = inlineProject(project)
-        state.draftAttachments = nil
-        for index in state.queuedRequests?.indices ?? 0..<0 where state.queuedRequests![index].attachments != nil {
-            state.queuedRequests![index].attachments = nil
-        }
-        var metadata = try object(ProjectArchive.split(state).metadata)
-        metadata["messages"] = previous.metadata["messages"]
-        metadata["revisions"] = previous.metadata["revisions"]
-        metadata["taskAudits"] = previous.metadata["taskAudits"]
-        metadata["draftAttachments"] = previous.metadata["draftAttachments"]
-        metadata["selectedRevisionID"] = project.selectedRevisionID?.uuidString
-        if var queue = metadata["queuedRequests"] as? [[String: Any]] {
-            let old = Dictionary((previous.metadata["queuedRequests"] as? [[String: Any]] ?? []).compactMap { row in
-                (row["id"] as? String).map { ($0, row) }
-            }, uniquingKeysWith: { _, new in new })
-            for index in queue.indices {
-                guard let attachments = project.queuedRequests?[index].attachments else { continue }
-                if attachments.isEmpty { queue[index]["attachments"] = [[String: Any]]() }
-                else if let id = queue[index]["id"] as? String, let archived = old[id]?["attachments"] {
-                    queue[index]["attachments"] = archived
-                } else { throw invalid("A queued request asset reference is missing.") }
-            }
-            metadata["queuedRequests"] = queue
-        }
-        return metadata
-    }
+    // MARK: - Comparison
 
     private static func inlineProject(_ project: LADProject) -> LADProject {
         var state = project
@@ -742,258 +1016,6 @@ enum ProjectPackage {
         })
         let current = (lhs ?? []).filter { $0.attachments?.isEmpty == false }
         return old.count == current.count && current.allSatisfy { old[$0.id] == $0.attachments }
-    }
-
-    private static func inlineMetadata(_ root: [String: Any]) -> [String: Any] {
-        var inline = root
-        for field in ["assets", "catalog", "revisions", "conversation", "activity", "commitID", "parentCommitID"] {
-            inline.removeValue(forKey: field)
-        }
-        return inline
-    }
-
-    private static func sectionReferences(_ root: [String: Any]) -> [String: Any] {
-        var references = [String: Any]()
-        for field in ["revisions", "conversation", "activity", "catalog"] { references[field] = root[field] }
-        return references
-    }
-
-    /// Cache canonical record bytes and exact asset-reference sets. Unchanged
-    /// rows retain both without encoding or recursively scanning old payloads.
-    @discardableResult
-    private static func cacheRecords(_ metadata: [String: Any], dependencies: inout Dependencies,
-                                     changed: Set<String>? = nil) throws -> Set<String> {
-        var live = Set<String>(), updated = Set<String>()
-        func record(_ row: [String: Any], key: String, needsBytes: Bool, countsAsHistoryRecord: Bool = true) throws {
-            live.insert(key)
-            if changed == nil || changed!.contains(key) || dependencies.assetReferences[key] == nil {
-                if needsBytes { dependencies.recordData[key] = try json(row) }
-                dependencies.assetReferences[key] = assetReferences(row)
-                if countsAsHistoryRecord { updated.insert(key) }
-            }
-        }
-        for row in metadata["revisions"] as? [[String: Any]] ?? [] {
-            guard let id = row["id"] as? String else { throw invalid("A revision identity is invalid.") }
-            try record(row, key: "revisions/\(id)", needsBytes: false)
-        }
-        for row in metadata["messages"] as? [[String: Any]] ?? [] {
-            guard let id = row["id"] as? String else { throw invalid("A message identity is invalid.") }
-            try record(row, key: "conversation/\(id)", needsBytes: true)
-        }
-        for task in metadata["taskAudits"] as? [[String: Any]] ?? [] {
-            guard let id = task["id"] as? String else { throw invalid("A task identity is invalid.") }
-            var taskMetadata = task
-            taskMetadata.removeValue(forKey: "events")
-            // Task headers have their own encodedTaskRecords metric. Their
-            // asset-reference cache must not count as another event row.
-            try record(taskMetadata, key: "activity/\(id)", needsBytes: false, countsAsHistoryRecord: false)
-            for row in task["events"] as? [[String: Any]] ?? [] {
-                guard let event = row["id"] as? String else { throw invalid("An activity identity is invalid.") }
-                try record(row, key: "activity/\(id)/\(event)", needsBytes: true)
-            }
-        }
-        // Only draft/queue attachments contribute inline payload references.
-        let inline: [String: Any] = ["draftAttachments": metadata["draftAttachments"] ?? [],
-                                      "queuedRequests": metadata["queuedRequests"] ?? []]
-        try record(inline, key: "inline", needsBytes: false)
-        updated.remove("inline")
-        dependencies.recordData = dependencies.recordData.filter { live.contains($0.key) }
-        dependencies.assetReferences = dependencies.assetReferences.filter { live.contains($0.key) }
-        return updated
-    }
-
-    private static func makeSnapshot(_ project: LADProject, previous: Session?) throws -> MetadataSnapshot {
-        guard let previous else {
-            let archive = try ProjectArchive.split(project)
-            let metadata = try object(archive.metadata)
-            var dependencies = Dependencies()
-            let changed = try cacheRecords(metadata, dependencies: &dependencies)
-            return MetadataSnapshot(metadata: metadata, assets: archive.assets, dependencies: dependencies, changedRecords: changed)
-        }
-        var changed = project
-        let sameMessages = project.messages == previous.project.messages
-        let sameVersions = sameRevisions(project.revisions, previous.project.revisions)
-        let sameTasks = project.taskAudits == previous.project.taskAudits
-        let oldMessages = Dictionary(uniqueKeysWithValues: previous.project.messages.map { ($0.id, $0) })
-        var reusedMessageAttachments = Set<String>()
-        changed.messages = sameMessages ? [] : project.messages.filter { oldMessages[$0.id] != $0 }.map { message in
-            var value = message
-            if let old = oldMessages[message.id], message.attachments == old.attachments {
-                value.attachments = nil
-                reusedMessageAttachments.insert(message.id.uuidString)
-            }
-            return value
-        }
-        let oldRevisions = Dictionary(uniqueKeysWithValues: previous.project.revisions.map { ($0.id, $0) })
-        var presentationRevisions = [String: ProjectRevision]()
-        changed.revisions = sameVersions ? [] : project.revisions.filter { revision in
-            guard let old = oldRevisions[revision.id] else { return true }
-            if sameRecipe(revision, old) {
-                if !sameRevision(revision, old) { presentationRevisions[revision.id.uuidString] = revision }
-                return false
-            }
-            return true
-        }
-        let oldTasks = Dictionary(uniqueKeysWithValues: (previous.project.taskAudits ?? []).map { ($0.id, $0) })
-        var reusedEventFields = [String: Set<String>]()
-        var reusedTaskRequests = Set<UUID>()
-        changed.taskAudits = sameTasks ? nil : project.taskAudits?.compactMap { task in
-            guard oldTasks[task.id] != task else { return nil }
-            var value = task
-            if let old = oldTasks[task.id], task.request == old.request {
-                value.request = nil
-                reusedTaskRequests.insert(task.id)
-            }
-            let oldEvents = Dictionary(uniqueKeysWithValues: (oldTasks[task.id]?.events ?? []).map { ($0.id, $0) })
-            value.events = task.events.filter { oldEvents[$0.id] != $0 }.map { event in
-                var value = event
-                if let old = oldEvents[event.id] {
-                    var fields = Set<String>()
-                    if event.input == old.input { value.input = nil; fields.insert("inputAsset") }
-                    if event.output == old.output { value.output = nil; fields.insert("outputAsset") }
-                    if event.imageData == old.imageData { value.imageData = nil; fields.insert("imageAsset") }
-                    if event.files == old.files { value.files = nil; fields.insert("files") }
-                    reusedEventFields["\(task.id.uuidString)/\(event.id)"] = fields
-                }
-                return value
-            }
-            return value
-        }
-        let sameQueue = project.queuedRequests == previous.project.queuedRequests
-        let sameDraftAttachments = project.draftAttachments == previous.project.draftAttachments
-        var reusedQueueAttachments = Set<String>()
-        if sameQueue { changed.queuedRequests = nil }
-        else {
-            let oldQueue = Dictionary(uniqueKeysWithValues: (previous.project.queuedRequests ?? []).map { ($0.id, $0) })
-            changed.queuedRequests = project.queuedRequests?.map { request in
-                var value = request
-                if let old = oldQueue[request.id], request.attachments == old.attachments {
-                    value.attachments = nil
-                    reusedQueueAttachments.insert(request.id.uuidString)
-                }
-                return value
-            }
-        }
-        if sameDraftAttachments { changed.draftAttachments = nil }
-        changed.selectedRevisionID = nil
-        let delta = try ProjectArchive.split(changed)
-        var metadata = try object(delta.metadata)
-        if !reusedQueueAttachments.isEmpty, var rows = metadata["queuedRequests"] as? [[String: Any]] {
-            let old = Dictionary((previous.metadata["queuedRequests"] as? [[String: Any]] ?? []).compactMap { row in
-                (row["id"] as? String).map { ($0, row) }
-            }, uniquingKeysWith: { _, new in new })
-            for index in rows.indices {
-                if let id = rows[index]["id"] as? String, reusedQueueAttachments.contains(id) {
-                    rows[index]["attachments"] = old[id]?["attachments"]
-                }
-            }
-            metadata["queuedRequests"] = rows
-        }
-        if !reusedEventFields.isEmpty, var tasks = metadata["taskAudits"] as? [[String: Any]] {
-            let oldTasks = Dictionary((previous.metadata["taskAudits"] as? [[String: Any]] ?? []).compactMap { row in
-                (row["id"] as? String).map { ($0, row) }
-            }, uniquingKeysWith: { _, new in new })
-            for taskIndex in tasks.indices {
-                guard let taskID = tasks[taskIndex]["id"] as? String,
-                      var events = tasks[taskIndex]["events"] as? [[String: Any]] else { continue }
-                let oldEvents = Dictionary((oldTasks[taskID]?["events"] as? [[String: Any]] ?? []).compactMap { row in
-                    (row["id"] as? String).map { ($0, row) }
-                }, uniquingKeysWith: { _, new in new })
-                for index in events.indices {
-                    guard let id = events[index]["id"] as? String,
-                          let fields = reusedEventFields["\(taskID)/\(id)"] else { continue }
-                    for field in fields { events[index][field] = oldEvents[id]?[field] }
-                }
-                tasks[taskIndex]["events"] = events
-            }
-            metadata["taskAudits"] = tasks
-        }
-        if !reusedMessageAttachments.isEmpty, var rows = metadata["messages"] as? [[String: Any]] {
-            let old = Dictionary((previous.metadata["messages"] as? [[String: Any]] ?? []).compactMap { row in
-                (row["id"] as? String).map { ($0, row) }
-            }, uniquingKeysWith: { _, new in new })
-            for index in rows.indices {
-                if let id = rows[index]["id"] as? String, reusedMessageAttachments.contains(id) {
-                    rows[index]["attachments"] = old[id]?["attachments"]
-                }
-            }
-            metadata["messages"] = rows
-        }
-        if !presentationRevisions.isEmpty {
-            let old = Dictionary((previous.metadata["revisions"] as? [[String: Any]] ?? []).compactMap { row in
-                (row["id"] as? String).map { ($0, row) }
-            }, uniquingKeysWith: { _, new in new })
-            var rows = metadata["revisions"] as? [[String: Any]] ?? []
-            for (id, revision) in presentationRevisions {
-                guard var row = old[id] else { throw invalid("A cached revision record is missing.") }
-                row["name"] = revision.name
-                if let oldRevision = oldRevisions[revision.id], !sameParts(revision, oldRevision) {
-                    func field<T: Encodable>(_ name: String, _ value: T?) throws {
-                        row[name] = try value.map { try jsonValue(JSONEncoder().encode($0)) }
-                    }
-                    try field("parts", revision.parts)
-                    try field("partLayout", revision.partLayout ?? revision.parts.map { PartLayout(nodes: $0) })
-                    try field("hiddenSolids", revision.hiddenSolids)
-                    try field("partColors", revision.partColors)
-                    try field("jointPositions", revision.jointPositions)
-                }
-                rows.append(row)
-            }
-            metadata["revisions"] = rows
-        }
-        var changedKeys = Set<String>()
-        for row in metadata["messages"] as? [[String: Any]] ?? [] {
-            if let id = row["id"] as? String { changedKeys.insert("conversation/\(id)") }
-        }
-        for row in metadata["revisions"] as? [[String: Any]] ?? [] {
-            if let id = row["id"] as? String { changedKeys.insert("revisions/\(id)") }
-        }
-        for task in metadata["taskAudits"] as? [[String: Any]] ?? [] {
-            guard let id = task["id"] as? String else { continue }
-            changedKeys.insert("activity/\(id)")
-            for row in task["events"] as? [[String: Any]] ?? [] {
-                if let event = row["id"] as? String { changedKeys.insert("activity/\(id)/\(event)") }
-            }
-        }
-        if !sameQueue || !sameDraftAttachments { changedKeys.insert("inline") }
-        func mergeRecords(_ field: String, ids: [String]) -> [[String: Any]] {
-            let old = previous.metadata[field] as? [[String: Any]] ?? []
-            let new = metadata[field] as? [[String: Any]] ?? []
-            let records = Dictionary((old + new).compactMap { row in (row["id"] as? String).map { ($0, row) } }, uniquingKeysWith: { _, new in new })
-            return ids.compactMap { records[$0] }
-        }
-        metadata["messages"] = sameMessages ? previous.metadata["messages"] : mergeRecords("messages", ids: project.messages.map { $0.id.uuidString })
-        metadata["revisions"] = sameVersions ? previous.metadata["revisions"] : mergeRecords("revisions", ids: project.revisions.map { $0.id.uuidString })
-        if sameTasks { metadata["taskAudits"] = previous.metadata["taskAudits"] }
-        else if project.taskAudits != nil {
-            var mergedTasks = mergeRecords("taskAudits", ids: (project.taskAudits ?? []).map { $0.id.uuidString })
-            let oldTaskRecords = Dictionary((previous.metadata["taskAudits"] as? [[String: Any]] ?? []).compactMap { row in (row["id"] as? String).map { ($0, row) } }, uniquingKeysWith: { _, new in new })
-            let currentTasks = Dictionary(uniqueKeysWithValues: (project.taskAudits ?? []).map { ($0.id.uuidString, $0) })
-            for index in mergedTasks.indices {
-                guard let id = mergedTasks[index]["id"] as? String, let task = currentTasks[id], oldTasks[task.id] != task else { continue }
-                if reusedTaskRequests.contains(task.id) { mergedTasks[index]["requestAsset"] = oldTaskRecords[id]?["requestAsset"] }
-                let old = oldTaskRecords[id]?["events"] as? [[String: Any]] ?? []
-                let new = mergedTasks[index]["events"] as? [[String: Any]] ?? []
-                let events = Dictionary((old + new).compactMap { row in (row["id"] as? String).map { ($0, row) } }, uniquingKeysWith: { _, new in new })
-                mergedTasks[index]["events"] = task.events.compactMap { events[$0.id] }
-            }
-            metadata["taskAudits"] = mergedTasks
-        }
-        if sameQueue { metadata["queuedRequests"] = previous.metadata["queuedRequests"] }
-        if sameDraftAttachments { metadata["draftAttachments"] = previous.metadata["draftAttachments"] }
-        metadata["selectedRevisionID"] = project.selectedRevisionID?.uuidString
-        var dependencies = previous.dependencies
-        let updated = try cacheRecords(metadata, dependencies: &dependencies, changed: changedKeys)
-        let candidates = previous.assets.merging(delta.assets) { _, new in new }
-        let required = dependencies.assetReferences.values.reduce(into: Set<String>()) { $0.formUnion($1) }
-        let assets = candidates.filter { required.contains($0.key) }
-        guard assets.count == required.count else { throw invalid("A saved asset reference is missing.") }
-        var assetBytes = 0
-        for bytes in assets.values {
-            guard bytes.count <= ProjectStore.maximumFileBytes - assetBytes else { throw invalid("Saved assets exceed the design size limit.") }
-            assetBytes += bytes.count
-        }
-        return MetadataSnapshot(metadata: metadata, assets: assets, dependencies: dependencies, changedRecords: updated)
     }
 
     private static func normalized(_ project: LADProject) throws -> LADProject {
@@ -1035,30 +1057,7 @@ enum ProjectPackage {
         lhs.partColors == rhs.partColors && lhs.jointPositions == rhs.jointPositions && lhs.name == rhs.name && lhs.validatedHash == rhs.validatedHash
     }
 
-    private static func assetReferences(_ value: Any) -> Set<String> {
-        let fields: Set<String> = ["scriptAsset", "sourceSTEPAsset", "dataAsset", "contentAsset", "inputAsset", "outputAsset",
-                                   "imageAsset", "requestAsset"]
-        var result = Set<String>()
-        func visit(_ value: Any) {
-            if let object = value as? [String: Any] {
-                for (key, value) in object {
-                    if fields.contains(key), let hash = value as? String { result.insert(hash) }
-                    else { visit(value) }
-                }
-            } else if let array = value as? [Any] { for value in array { visit(value) } }
-        }
-        visit(value)
-        return result
-    }
-
-    private static func thumbnailIdentity(_ metadata: [String: Any]) throws -> String {
-        let selected = metadata["selectedRevisionID"] as? String
-        let revision = (metadata["revisions"] as? [[String: Any]] ?? []).first { $0["id"] as? String == selected }
-        var identity = [String: Any]()
-        for field in ["id", "scriptAsset", "sourceSTEPAsset", "inputAssets", "hiddenSolids", "partColors", "jointPositions"] { identity[field] = revision?[field] }
-        for field in ["displayMode", "projectionMode"] { identity[field] = metadata[field] }
-        return digest(try json(identity))
-    }
+    // MARK: - Files
 
     private static func compressedAsset(_ data: Data) throws -> (bytes: Data, codec: String) {
         guard data.count >= 1_024,
@@ -1203,40 +1202,19 @@ enum ProjectPackage {
     private static func assetPath(_ hash: String) -> String { "assets/sha256/\(hash.prefix(2))/\(hash)" }
     private static func validHash(_ hash: String) -> Bool { hash.utf8.count == 64 && hash.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } }
     private static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
-    private static func json(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .fragmentsAllowed]) }
-    /// JSONSerialization parses the integer token -0 as positive Int zero.
-    /// Preserve Double's sign by giving that numeric token an explicit fraction;
-    /// quoted strings and exponents remain byte-for-byte untouched.
-    private static func jsonValue(_ data: Data) throws -> Any {
-        guard data.range(of: Data("-0".utf8)) != nil else { return try JSONSerialization.jsonObject(with: data) }
-        let bytes = [UInt8](data)
-        var output = Data(capacity: data.count), quoted = false, escaped = false, index = 0
-        let delimiters: Set<UInt8> = [9, 10, 13, 32, 44, 93, 125]
-        let starts: Set<UInt8> = [9, 10, 13, 32, 44, 58, 91, 123]
-        while index < bytes.count {
-            let byte = bytes[index]
-            if quoted {
-                output.append(byte)
-                if escaped { escaped = false }
-                else if byte == 92 { escaped = true }
-                else if byte == 34 { quoted = false }
-            } else if byte == 34 {
-                quoted = true; output.append(byte)
-            } else if byte == 45, index + 1 < bytes.count, bytes[index + 1] == 48,
-                      index == 0 || starts.contains(bytes[index - 1]),
-                      index + 2 == bytes.count || delimiters.contains(bytes[index + 2]) {
-                output.append(contentsOf: [45, 48, 46, 48])
-                index += 2
-                continue
-            } else { output.append(byte) }
-            index += 1
-        }
-        return try JSONSerialization.jsonObject(with: output)
+
+    /// The one encoder for every package file. Sorted keys make each record's
+    /// bytes, and therefore its content hash, a function of its value.
+    private static func encode<Value: Encodable>(_ value: Value) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(value)
     }
 
-    private static func object(_ data: Data) throws -> [String: Any] {
-        guard let value = try jsonValue(data) as? [String: Any] else { throw invalid("A design metadata record is invalid.") }
-        return value
+    private static func decode<Value: Decodable>(_ type: Value.Type, from data: Data) throws -> Value {
+        do { return try JSONDecoder().decode(type, from: data) }
+        catch is DecodingError { throw invalid("A design metadata record is invalid.") }
     }
+
     private static func invalid(_ reason: String) -> LADError { .message("Invalid LAD design. \(reason)") }
 }

@@ -22,6 +22,8 @@ final class ProjectAutosaveProfileTests: XCTestCase {
             let packageURL = temporary.appendingPathComponent(operation + ".lad", isDirectory: true)
             try FileManager.default.copyItem(at: sourceURL, to: packageURL)
             var project = try ProjectAutosaveStore.readProject(from: packageURL)
+            // The first save of an earlier format version rewrites every record.
+            try ProjectPackage.write(project, to: packageURL, thumbnail: project.thumbnailData)
             let initialRevisions = project.revisions.map(\.model)
             let projectID = try XCTUnwrap(project.projectID)
             guard !project.revisions.isEmpty, !project.messages.isEmpty, project.taskAudits?.isEmpty == false else {
@@ -47,9 +49,11 @@ final class ProjectAutosaveProfileTests: XCTestCase {
                 let after = try fingerprints(packageURL, includingRoot: true)
                 let changed = Set(before.keys).union(after.keys).filter { before[$0] != after[$0] }.sorted()
                 let prefix = operation == "transcript" ? "conversation/" : operation == "activity" ? "activity/" : "revisions/index-"
+                let payloadChanged = changed.contains { $0.hasPrefix("assets/") && (before[$0] == nil || after[$0] == nil) }
                 XCTAssertTrue(changed.allSatisfy { path in
                     path == "project.json" || path.hasPrefix(prefix) ||
-                        (path.hasPrefix("assets/") && (before[path] == nil || after[path] == nil))
+                        (path.hasPrefix("assets/") && (before[path] == nil || after[path] == nil)) ||
+                        (payloadChanged && path.hasPrefix("catalog/"))
                 },
                     "\(operation) changed unrelated dependency content, inode, size or modification time: \(changed)")
                 changedPerSave.append(changed)
@@ -119,6 +123,8 @@ final class ProjectAutosaveProfileTests: XCTestCase {
         let packageURL = temporary.appendingPathComponent(sourceURL.lastPathComponent, isDirectory: true)
         try FileManager.default.copyItem(at: sourceURL, to: packageURL)
         var project = try ProjectAutosaveStore.readProject(from: packageURL)
+        // The first save of an earlier format version rewrites every record.
+        try ProjectPackage.write(project, to: packageURL, thumbnail: project.thumbnailData)
         XCTAssertFalse(project.revisions.isEmpty, "Profile a saved design with real revision history")
         let projectID = try XCTUnwrap(project.projectID)
         let samples = min(9, max(3, Int(environment["LAD_AUTOSAVE_PROFILE_SAMPLES"] ?? "5") ?? 5))

@@ -3,7 +3,8 @@ import Foundation
 
 /// The on-disk representation stores each exact file payload once, regardless
 /// of how many messages or revisions refer to it. Generated geometry is rebuilt
-/// from the saved CAD program and never belongs to the archive.
+/// from the saved CAD program and never belongs to the archive. Design packages
+/// store these same typed records in their sections.
 enum ProjectArchive {
     static let formatVersion = 4
     private static let maximumAssetBytes = ProjectStore.maximumFileBytes
@@ -19,12 +20,6 @@ enum ProjectArchive {
         let assets = archive.assets
         archive.assets = [:]
         return Snapshot(metadata: try encoder().encode(archive), assets: assets)
-    }
-
-    static func restore(metadata: Data, assets: [String: Data]) throws -> LADProject {
-        var archive = try JSONDecoder().decode(Document.self, from: metadata)
-        archive.assets = assets
-        return try restored(archive)
     }
 
     static func encode(_ project: LADProject) throws -> Data {
@@ -64,18 +59,20 @@ enum ProjectArchive {
         guard data.count <= ProjectStore.maximumFileBytes else {
             throw invalid("File exceeds the 1,024 MB design limit.")
         }
-        let archive = try JSONDecoder().decode(Document.self, from: data)
-        return try restored(archive)
+        return try restore(JSONDecoder().decode(Document.self, from: data))
     }
 
-    private static func restored(_ archive: Document) throws -> LADProject {
+    /// Restores the application model with the archive's history limits, asset
+    /// roles and reference checks. Package readers have already verified each
+    /// asset's bytes against its hash.
+    static func restore(_ archive: Document, verifiedAssets: Bool = false) throws -> LADProject {
         guard archive.formatVersion == formatVersion else {
             throw invalid("Unsupported format version \(archive.formatVersion).")
         }
         guard archive.messages.count <= 10_000, archive.revisions.count <= 1_000,
               (archive.queuedRequests?.count ?? 0) <= 10_000,
               (archive.draftAttachments?.count ?? 0) <= SourceImport.maximumAttachmentCount,
-              archive.revisions.allSatisfy({ ($0.inputAssets?.count ?? 0) <= 256 }) else {
+              archive.revisions.allSatisfy({ ($0.recipe.inputAssets?.count ?? 0) <= 256 }) else {
             throw invalid("Design contains too many revisions or messages.")
         }
         if let tasks = archive.taskAudits {
@@ -87,7 +84,7 @@ enum ProjectArchive {
                 events += task.events.count
             }
         }
-        var reader = try AssetReader(assets: archive.assets)
+        var reader = try AssetReader(assets: archive.assets, verified: verifiedAssets)
         let messages = try archive.messages.map { try $0.restored(reader: &reader) }
         let revisions = try archive.revisions.map { try $0.restored(reader: &reader) }
         let taskAudits = try archive.taskAudits?.map { try $0.restored(reader: &reader) }
@@ -108,7 +105,7 @@ enum ProjectArchive {
                           queuePaused: archive.queuePaused, partsPaneFraction: archive.partsPaneFraction ?? 0.75)
     }
 
-    private struct Document: Codable {
+    struct Document: Codable {
         var formatVersion: Int
         var messages: [ArchivedMessage]
         var revisions: [ArchivedRevision]
@@ -129,7 +126,8 @@ enum ProjectArchive {
         var assets: [String: Data]
     }
 
-    private struct ArchivedTaskAudit: Codable {
+    /// A task's provenance and outcome, without its events.
+    struct ArchivedTask: Codable, Equatable {
         var id: UUID
         var userMessageID: UUID?
         var startedAt: Date
@@ -138,7 +136,6 @@ enum ProjectArchive {
         var model: String?
         var reasoningEffort: String?
         var status: String
-        var events: [ArchivedActivityEvent]
         var additionalUserMessageIDs: [UUID]?
         var externalClient: ProjectExternalAgentIdentity?
         var requestAsset: String?
@@ -146,29 +143,63 @@ enum ProjectArchive {
         var commitKey: String?
         var commitArtifactID: String?
 
-        init(_ task: ProjectTaskAudit, writer: inout AssetWriter) throws {
+        /// An unchanged request keeps its stored asset without hashing it again.
+        init(_ task: ProjectTaskAudit, reusing old: (task: ProjectTaskAudit, record: ArchivedTask)? = nil,
+             writer: inout AssetWriter) throws {
             id = task.id; userMessageID = task.userMessageID
             startedAt = task.startedAt; finishedAt = task.finishedAt
             agent = task.agent; model = task.model; reasoningEffort = task.reasoningEffort; status = task.status
-            events = try task.events.map { try ArchivedActivityEvent($0, writer: &writer) }
             additionalUserMessageIDs = task.additionalUserMessageIDs
             externalClient = task.externalClient
-            requestAsset = try task.request.map { try writer.store(Data($0.utf8), role: .activity) }
+            if let old, old.task.request == task.request { requestAsset = old.record.requestAsset }
+            else { requestAsset = try task.request.map { try writer.store(Data($0.utf8), role: .activity) } }
             committedRevisionID = task.committedRevisionID; commitKey = task.commitKey; commitArtifactID = task.commitArtifactID
         }
 
+        var assetKeys: [String] { requestAsset.map { [$0] } ?? [] }
+    }
+
+    /// A task and its events, coded as one object.
+    struct ArchivedTaskAudit: Codable {
+        var task: ArchivedTask
+        var events: [ArchivedActivityEvent]
+
+        init(task: ArchivedTask, events: [ArchivedActivityEvent]) {
+            self.task = task
+            self.events = events
+        }
+
+        init(_ task: ProjectTaskAudit, writer: inout AssetWriter) throws {
+            self.task = try ArchivedTask(task, writer: &writer)
+            events = try task.events.map { try ArchivedActivityEvent($0, writer: &writer) }
+        }
+
+        private enum CodingKeys: String, CodingKey { case events }
+
+        init(from decoder: Decoder) throws {
+            task = try ArchivedTask(from: decoder)
+            events = try decoder.container(keyedBy: CodingKeys.self).decode([ArchivedActivityEvent].self, forKey: .events)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            try task.encode(to: encoder)
+            var values = encoder.container(keyedBy: CodingKeys.self)
+            try values.encode(events, forKey: .events)
+        }
+
         func restored(reader: inout AssetReader) throws -> ProjectTaskAudit {
-            ProjectTaskAudit(id: id, userMessageID: userMessageID, startedAt: startedAt, finishedAt: finishedAt,
-                             agent: agent, model: model, reasoningEffort: reasoningEffort, status: status,
+            ProjectTaskAudit(id: task.id, userMessageID: task.userMessageID, startedAt: task.startedAt, finishedAt: task.finishedAt,
+                             agent: task.agent, model: task.model, reasoningEffort: task.reasoningEffort, status: task.status,
                              events: try events.map { try $0.restored(reader: &reader) },
-                             additionalUserMessageIDs: additionalUserMessageIDs,
-                             externalClient: externalClient,
-                             request: try requestAsset.map { try reader.text($0, role: .activity) },
-                             committedRevisionID: committedRevisionID, commitKey: commitKey, commitArtifactID: commitArtifactID)
+                             additionalUserMessageIDs: task.additionalUserMessageIDs,
+                             externalClient: task.externalClient,
+                             request: try task.requestAsset.map { try reader.text($0, role: .activity) },
+                             committedRevisionID: task.committedRevisionID, commitKey: task.commitKey,
+                             commitArtifactID: task.commitArtifactID)
         }
     }
 
-    private struct ArchivedQueuedRequest: Codable {
+    struct ArchivedQueuedRequest: Codable, Equatable {
         var id: UUID
         var content: String
         var date: Date
@@ -177,13 +208,18 @@ enum ProjectArchive {
         var capturedSourcePaths: [String]?
         var selection: ProjectSelectionContext?
 
-        init(_ request: ProjectQueuedRequest, writer: inout AssetWriter) throws {
+        /// Unchanged attachments keep their stored assets without hashing them again.
+        init(_ request: ProjectQueuedRequest, reusing old: (request: ProjectQueuedRequest, record: ArchivedQueuedRequest)? = nil,
+             writer: inout AssetWriter) throws {
             id = request.id; content = request.content; date = request.date
-            attachments = try request.attachments?.map { try ArchivedAttachment($0, writer: &writer) }
+            if let old, old.request.attachments == request.attachments { attachments = old.record.attachments }
+            else { attachments = try request.attachments?.map { try ArchivedAttachment($0, writer: &writer) } }
             codexSettings = request.codexSettings
             capturedSourcePaths = request.capturedSourcePaths
             selection = request.selection
         }
+
+        var assetKeys: [String] { attachments?.map(\.contentAsset) ?? [] }
 
         func restored(reader: inout AssetReader) throws -> ProjectQueuedRequest {
             ProjectQueuedRequest(id: id, content: content, date: date,
@@ -192,7 +228,7 @@ enum ProjectArchive {
         }
     }
 
-    private struct ArchivedActivityEvent: Codable {
+    struct ArchivedActivityEvent: Codable, Equatable {
         var id: String
         var date: Date
         var category: String
@@ -204,13 +240,23 @@ enum ProjectArchive {
         var durationSeconds: Double?
         var files: [ArchivedActivityFile]?
 
-        init(_ event: ProjectActivityEvent, writer: inout AssetWriter) throws {
+        /// Unchanged payloads keep their stored assets without hashing them again.
+        init(_ event: ProjectActivityEvent, reusing old: (event: ProjectActivityEvent, record: ArchivedActivityEvent)? = nil,
+             writer: inout AssetWriter) throws {
             id = event.id; date = event.date; category = event.category
             title = event.title; status = event.status; durationSeconds = event.durationSeconds
-            inputAsset = try event.input.map { try writer.store(Data($0.utf8), role: .activity) }
-            outputAsset = try event.output.map { try writer.store(Data($0.utf8), role: .activity) }
-            imageAsset = try event.imageData.map { try writer.store($0, role: .activityImage) }
-            files = try event.files?.map { try ArchivedActivityFile($0, writer: &writer) }
+            if let old, old.event.input == event.input { inputAsset = old.record.inputAsset }
+            else { inputAsset = try event.input.map { try writer.store(Data($0.utf8), role: .activity) } }
+            if let old, old.event.output == event.output { outputAsset = old.record.outputAsset }
+            else { outputAsset = try event.output.map { try writer.store(Data($0.utf8), role: .activity) } }
+            if let old, old.event.imageData == event.imageData { imageAsset = old.record.imageAsset }
+            else { imageAsset = try event.imageData.map { try writer.store($0, role: .activityImage) } }
+            if let old, old.event.files == event.files { files = old.record.files }
+            else { files = try event.files?.map { try ArchivedActivityFile($0, writer: &writer) } }
+        }
+
+        var assetKeys: [String] {
+            [inputAsset, outputAsset, imageAsset].compactMap { $0 } + (files?.map(\.dataAsset) ?? [])
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -242,7 +288,7 @@ enum ProjectArchive {
         }
     }
 
-    private struct ArchivedActivityFile: Codable {
+    struct ArchivedActivityFile: Codable, Equatable {
         var name: String
         var path: String
         var dataAsset: String
@@ -267,7 +313,7 @@ enum ProjectArchive {
         }
     }
 
-    private struct ArchivedInputAsset: Codable {
+    struct ArchivedInputAsset: Codable, Equatable {
         var id: String
         var name: String
         var format: String
@@ -294,7 +340,7 @@ enum ProjectArchive {
         }
     }
 
-    private struct ArchivedMessage: Codable {
+    struct ArchivedMessage: Codable, Equatable {
         var id: UUID
         var role: String
         var content: String
@@ -303,15 +349,20 @@ enum ProjectArchive {
         var phase: String?
         var selection: ProjectSelectionContext?
 
-        init(_ message: ChatMessage, writer: inout AssetWriter) throws {
+        /// Unchanged attachments keep their stored assets without hashing them again.
+        init(_ message: ChatMessage, reusing old: (message: ChatMessage, record: ArchivedMessage)? = nil,
+             writer: inout AssetWriter) throws {
             id = message.id
             role = message.role
             content = message.content
             date = message.date
-            attachments = try message.attachments?.map { try ArchivedAttachment($0, writer: &writer) }
+            if let old, old.message.attachments == message.attachments { attachments = old.record.attachments }
+            else { attachments = try message.attachments?.map { try ArchivedAttachment($0, writer: &writer) } }
             phase = message.phase
             selection = message.selection
         }
+
+        var assetKeys: [String] { attachments?.map(\.contentAsset) ?? [] }
 
         func restored(reader: inout AssetReader) throws -> ChatMessage {
             let sources = try attachments?.map { try $0.restored(reader: &reader) }
@@ -319,7 +370,7 @@ enum ProjectArchive {
         }
     }
 
-    private struct ArchivedAttachment: Codable {
+    struct ArchivedAttachment: Codable, Equatable {
         var id: UUID
         var name: String
         var path: String
@@ -366,7 +417,7 @@ enum ProjectArchive {
         }
     }
 
-    private struct ArchivedModel: Codable {
+    struct ArchivedModel: Codable, Equatable {
         var title: String
         var summary: String
         var units: String
@@ -396,23 +447,18 @@ enum ProjectArchive {
         }
     }
 
-    private struct ArchivedRevision: Codable {
+    /// A revision's modeling instructions and provenance.
+    struct ArchivedRecipe: Codable, Equatable {
         var id: UUID
         var model: ArchivedModel
         var date: Date
         var sourceSTEPAsset: String?
         var scriptAsset: String
         var inputAssets: [ArchivedInputAsset]?
-        var parts: [PartNode]?
-        var partLayout: PartLayout?
-        var hiddenSolids: [Int]?
         var runtime: CADRuntime?
         var userMessageID: UUID?
         var responseMessageID: UUID?
-        var partColors: [String: PartColor]?
-        var name: String?
         var validatedHash: String?
-        var jointPositions: [String: Double]?
 
         init(_ revision: ProjectRevision, writer: inout AssetWriter) throws {
             id = revision.id
@@ -421,31 +467,18 @@ enum ProjectArchive {
             sourceSTEPAsset = try revision.model.sourceSTEP.map { try writer.store($0, role: .step) }
             scriptAsset = try writer.store(Data(revision.model.script.utf8), role: .script)
             inputAssets = try revision.model.inputAssets?.map { try ArchivedInputAsset($0, writer: &writer) }
-            if let semanticParts = revision.parts ?? revision.preview?.parts {
-                parts = semanticParts
-            } else if let preview = revision.preview {
-                guard (0...4_096).contains(preview.solids) else {
-                    throw invalid("The saved design contains too many solids.")
-                }
-                parts = (0..<preview.solids).map {
-                    PartNode(id: "solid/\($0)", name: "Part \($0 + 1)", solidIndices: [$0])
-                }
-            }
-            partLayout = revision.partLayout ?? parts.map { PartLayout(nodes: $0) }
-            hiddenSolids = revision.hiddenSolids
             runtime = revision.runtime
             userMessageID = revision.userMessageID
             responseMessageID = revision.responseMessageID
-            partColors = revision.partColors
-            name = revision.name
             validatedHash = revision.validatedHash
-            jointPositions = revision.jointPositions
+        }
+
+        var assetKeys: [String] {
+            [scriptAsset] + (sourceSTEPAsset.map { [$0] } ?? []) + (inputAssets?.map(\.dataAsset) ?? [])
         }
 
         private enum CodingKeys: String, CodingKey {
-            case id, model, date, sourceSTEPAsset, scriptAsset, parts, partLayout, hiddenSolids, runtime
-            case userMessageID, responseMessageID, partColors, name, jointPositions
-            case inputAssets
+            case id, model, date, sourceSTEPAsset, scriptAsset, inputAssets, runtime, userMessageID, responseMessageID
             case validatedHash = "validated_hash"
         }
 
@@ -458,40 +491,95 @@ enum ProjectArchive {
             sourceSTEPAsset = try values.decodeIfPresent(String.self, forKey: .sourceSTEPAsset)
             scriptAsset = try values.decode(String.self, forKey: .scriptAsset)
             inputAssets = try values.decodeIfPresent([ArchivedInputAsset].self, forKey: .inputAssets)
-            parts = try values.decodeIfPresent([PartNode].self, forKey: .parts)
-            partLayout = try values.decodeIfPresent(PartLayout.self, forKey: .partLayout)
-            hiddenSolids = try values.decodeIfPresent([Int].self, forKey: .hiddenSolids)
             runtime = try values.decodeIfPresent(CADRuntime.self, forKey: .runtime)
             userMessageID = try values.decodeIfPresent(UUID.self, forKey: .userMessageID)
             responseMessageID = try values.decodeIfPresent(UUID.self, forKey: .responseMessageID)
-            partColors = try values.decodeIfPresent([String: PartColor].self, forKey: .partColors)
-            name = try values.decodeIfPresent(String.self, forKey: .name)
             validatedHash = try values.decodeIfPresent(String.self, forKey: .validatedHash)
-            jointPositions = try values.decodeIfPresent([String: Double].self, forKey: .jointPositions)
+        }
+    }
+
+    /// A revision's part organization, visibility, colors and assembly pose.
+    struct ArchivedParts: Codable, Equatable {
+        var parts: [PartNode]?
+        var partLayout: PartLayout?
+        var hiddenSolids: [Int]?
+        var partColors: [String: PartColor]?
+        var jointPositions: [String: Double]?
+
+        init(_ revision: ProjectRevision) throws {
+            if let semanticParts = revision.parts ?? revision.preview?.parts {
+                parts = semanticParts
+            } else if let preview = revision.preview {
+                guard (0...4_096).contains(preview.solids) else {
+                    throw invalid("The saved design contains too many solids.")
+                }
+                parts = (0..<preview.solids).map {
+                    PartNode(id: "solid/\($0)", name: "Part \($0 + 1)", solidIndices: [$0])
+                }
+            }
+            partLayout = revision.partLayout ?? parts.map { PartLayout(nodes: $0) }
+            hiddenSolids = revision.hiddenSolids
+            partColors = revision.partColors
+            jointPositions = revision.jointPositions
+        }
+    }
+
+    /// A revision's recipe, parts and optional name, coded as one object.
+    struct ArchivedRevision: Codable {
+        var recipe: ArchivedRecipe
+        var parts: ArchivedParts
+        var name: String?
+
+        init(recipe: ArchivedRecipe, parts: ArchivedParts, name: String?) {
+            self.recipe = recipe
+            self.parts = parts
+            self.name = name
+        }
+
+        init(_ revision: ProjectRevision, writer: inout AssetWriter) throws {
+            recipe = try ArchivedRecipe(revision, writer: &writer)
+            parts = try ArchivedParts(revision)
+            name = revision.name
+        }
+
+        private enum CodingKeys: String, CodingKey { case name }
+
+        init(from decoder: Decoder) throws {
+            recipe = try ArchivedRecipe(from: decoder)
+            parts = try ArchivedParts(from: decoder)
+            name = try decoder.container(keyedBy: CodingKeys.self).decodeIfPresent(String.self, forKey: .name)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            try recipe.encode(to: encoder)
+            try parts.encode(to: encoder)
+            var values = encoder.container(keyedBy: CodingKeys.self)
+            try values.encodeIfPresent(name, forKey: .name)
         }
 
         func restored(reader: inout AssetReader) throws -> ProjectRevision {
+            let model = recipe.model
             let restoredModel = ModelSpec(title: model.title, summary: model.summary, units: model.units,
-                                          script: try reader.text(scriptAsset, role: .script),
-                                          sourceSTEP: try sourceSTEPAsset.map { try reader.data($0, role: .step) },
+                                          script: try reader.text(recipe.scriptAsset, role: .script),
+                                          sourceSTEP: try recipe.sourceSTEPAsset.map { try reader.data($0, role: .step) },
                                           sourceName: model.sourceName, reorganizePartIDs: model.reorganizePartIDs,
-                                          inputAssets: try inputAssets?.map { try $0.restored(reader: &reader) })
-            var revision = ProjectRevision(id: id, model: restoredModel, date: date,
-                                          preview: nil, partLayout: partLayout,
-                                          hiddenSolids: hiddenSolids)
-            revision.parts = parts
-            revision.runtime = runtime
-            revision.userMessageID = userMessageID
-            revision.responseMessageID = responseMessageID
-            revision.partColors = partColors
+                                          inputAssets: try recipe.inputAssets?.map { try $0.restored(reader: &reader) })
+            var revision = ProjectRevision(id: recipe.id, model: restoredModel, date: recipe.date,
+                                          preview: nil, partLayout: parts.partLayout,
+                                          hiddenSolids: parts.hiddenSolids)
+            revision.parts = parts.parts
+            revision.runtime = recipe.runtime
+            revision.userMessageID = recipe.userMessageID
+            revision.responseMessageID = recipe.responseMessageID
+            revision.partColors = parts.partColors
             revision.name = name
-            revision.validatedHash = validatedHash
-            revision.jointPositions = jointPositions
+            revision.validatedHash = recipe.validatedHash
+            revision.jointPositions = parts.jointPositions
             return revision
         }
     }
 
-    private enum AssetRole: Equatable {
+    enum AssetRole: Equatable {
         case attachment, image, script, step, input, activity, activityFile, activityImage
 
         var maximumBytes: Int {
@@ -508,7 +596,7 @@ enum ProjectArchive {
         }
     }
 
-    private struct AssetWriter {
+    struct AssetWriter {
         var assets: [String: Data] = [:]
         private var totalAssetBytes = 0
 
@@ -525,16 +613,16 @@ enum ProjectArchive {
         }
     }
 
-    private struct AssetReader {
+    struct AssetReader {
         var assets: [String: Data]
         var usedAssets: Set<String> = []
         private var decodedText: [String: String] = [:]
 
-        init(assets: [String: Data]) throws {
+        init(assets: [String: Data], verified: Bool = false) throws {
             var total = 0
             for (key, bytes) in assets {
                 try addBytes(bytes.count, to: &total, limit: maximumAssetBytes)
-                guard validKey(key), digest(bytes) == key else {
+                guard validKey(key), verified || digest(bytes) == key else {
                     throw invalid("A saved file asset failed its integrity check.")
                 }
             }

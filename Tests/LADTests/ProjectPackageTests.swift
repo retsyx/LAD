@@ -181,7 +181,7 @@ final class ProjectPackageTests: XCTestCase {
         value.messages[0].attachments = [SourceAttachment(name: "board.step", path: "/missing/board.step", content: text, sha256: hash)]
         try ProjectStore.write(value, to: url)
         let json = try root(url)
-        XCTAssertEqual(json["formatVersion"] as? Int, 6)
+        XCTAssertEqual(json["formatVersion"] as? Int, ProjectPackage.formatVersion)
         XCTAssertNil(json["assets"], "The asset catalog is its own section")
         XCTAssertNil(json["messages"])
         XCTAssertNil(json["taskAudits"])
