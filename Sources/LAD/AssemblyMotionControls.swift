@@ -3,6 +3,8 @@ import SwiftUI
 struct AssemblyMotionControls: View {
     @ObservedObject var state: AppState
     let motion: AssemblyMotion
+    /// The turn a continuous revolute slider is centered on while it is dragged.
+    @State private var heldTurns: [String: Double] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -53,8 +55,11 @@ struct AssemblyMotionControls: View {
                     .accessibilityLabel("\(joint.name) position")
                 Text(joint.unit).foregroundStyle(Palette.muted)
             }.font(.system(size: 10))
-            if range(joint).lowerBound < range(joint).upperBound {
-                Slider(value: position(joint), in: range(joint))
+            let bounds = Self.sliderRange(joint, current: state.jointPosition(joint), heldTurn: heldTurns[joint.id])
+            if bounds.lowerBound < bounds.upperBound {
+                Slider(value: position(joint), in: bounds, onEditingChanged: { editing in
+                    heldTurns[joint.id] = editing ? Self.turn(state.jointPosition(joint)) : nil
+                })
                     .controlSize(.mini).tint(Palette.accent)
                     .accessibilityLabel("\(joint.name) motion")
                     .accessibilityValue("\(state.jointPosition(joint).formatted()) \(joint.unit)")
@@ -66,12 +71,22 @@ struct AssemblyMotionControls: View {
         Binding(get: { state.jointPosition(joint) }, set: { state.setJointPosition(joint.id, to: $0) })
     }
 
-    private func range(_ joint: AssemblyJoint) -> ClosedRange<Double> {
+    /// The nearest whole-turn angle to a revolute coordinate.
+    static func turn(_ degrees: Double) -> Double { (degrees / 360).rounded() * 360 }
+
+    /// Text entry remains unbounded when the joint has no travel limits. A
+    /// continuous revolute slider spans one revolution around the current turn,
+    /// while the coordinate itself keeps counting turns for couplings. The
+    /// window holds during a drag so the thumb does not jump, unless the
+    /// position has moved outside it by other means.
+    static func sliderRange(_ joint: AssemblyJoint, current: Double, heldTurn: Double?) -> ClosedRange<Double> {
         if let limits = joint.limits, limits.count == 2 { return limits[0]...limits[1] }
-        let extent = joint.type == .revolute ? 180.0 : 100.0
-        // Text entry remains unbounded when the joint has no travel limits.
+        if joint.type == .revolute {
+            let center = heldTurn.flatMap { abs(current - $0) <= 180 ? $0 : nil } ?? turn(current)
+            return center - 180...center + 180
+        }
+        let extent = 100.0
         let center = (joint.position / extent).rounded(.towardZero) * extent
-        let current = state.jointPosition(joint)
         return min(center - extent, current)...max(center + extent, current)
     }
 }
