@@ -59,9 +59,6 @@ final class EngineService {
         var parts: [[Int]]? = nil
         var transforms: [AssemblySolidTransform] = []
     }
-    private var exportedSTEP: [STEPExportKey: [Data]] = [:]
-    private var exportedSTEPOrder: [STEPExportKey] = []
-    private var exportedSTEPBytes = 0
 
     /// Measurements, clearance checks, exports and runtime inspection share
     /// one long-lived worker; builds keep their own sandboxed process.
@@ -246,7 +243,7 @@ final class EngineService {
                 return data
             }.value
             try Task.checkCancellation()
-            cacheSTEP([data], for: cacheKey)
+            cacheSTEP([data], for: cacheKey, owner: artifacts)
             return data
         }
         throw EngineExportError.nativeArtifactUnavailable
@@ -314,29 +311,18 @@ final class EngineService {
             return result
         }.value
         try Task.checkCancellation()
-        cacheSTEP(data, for: cacheKey)
+        cacheSTEP(data, for: cacheKey, owner: artifacts)
         return data
     }
 
+    /// Every engine shares one byte-bounded cache, so several windows and
+    /// agent sessions cannot each retain their own 512 MB of exports.
     private func cachedSTEP(for key: STEPExportKey) -> [Data]? {
-        guard let data = exportedSTEP[key] else { return nil }
-        exportedSTEPOrder.removeAll { $0 == key }
-        exportedSTEPOrder.append(key)
-        return data
+        STEPExportCache.shared.data(for: key)
     }
 
-    private func cacheSTEP(_ data: [Data], for key: STEPExportKey) {
-        // Recoloring can produce many large STEP variants of one assembly.
-        // Keep a small, byte-bounded LRU rather than retaining every finish.
-        let bytes = data.reduce(0) { $0 + $1.count }
-        while !exportedSTEPOrder.isEmpty &&
-                (exportedSTEP.count >= 8 || exportedSTEPBytes + bytes > ProjectStore.maximumSTEPBytes) {
-            let oldest = exportedSTEPOrder.removeFirst()
-            if let removed = exportedSTEP.removeValue(forKey: oldest) { exportedSTEPBytes -= removed.reduce(0) { $0 + $1.count } }
-        }
-        exportedSTEP[key] = data
-        exportedSTEPBytes += bytes
-        exportedSTEPOrder.append(key)
+    private func cacheSTEP(_ data: [Data], for key: STEPExportKey, owner artifacts: EngineBuildArtifacts) {
+        STEPExportCache.shared.store(data, for: key, owner: artifacts.folder)
     }
 
     /// Unmoved single-item properties reuse session metadata. Posed properties

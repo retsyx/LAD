@@ -18,6 +18,30 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertEqual(parser.request?.body, body)
     }
 
+    func testCompletedRequestSharesTheReceivedBodyInsteadOfCopyingIt() throws {
+        let body = Data((0..<(256 * 1024 + 7)).map { UInt8(truncatingIfNeeded: $0 &* 31) })
+        var parser = LoopbackHTTPParser(maximumBodyBytes: 1 << 20)
+        // The first packet carries the head and the start of the upload.
+        var first = Data("POST /tasks/a/files?name=part.step HTTP/1.1\r\nHost: localhost\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
+        first.append(body.prefix(100))
+        try parser.append(first)
+        var offset = 100
+        while offset < body.count {
+            let end = min(offset + 65_536, body.count)
+            try parser.append(body[offset..<end])
+            offset = end
+        }
+        let request = try XCTUnwrap(parser.request)
+        let again = try XCTUnwrap(parser.request)
+        XCTAssertEqual(request.body, body)
+        let address = request.body.withUnsafeBytes { UInt(bitPattern: $0.baseAddress) }
+        XCTAssertEqual(address, again.body.withUnsafeBytes { UInt(bitPattern: $0.baseAddress) },
+                       "Requests must share the parser's body buffer rather than holding another copy.")
+        XCTAssertThrowsError(try parser.append(Data([0]))) {
+            XCTAssertEqual(($0 as? LoopbackHTTPParser.Failure)?.status, 400)
+        }
+    }
+
     func testParserRejectsAmbiguousFramingAndHeaderInjection() {
         let invalid = [
             "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\nx",

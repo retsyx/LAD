@@ -55,6 +55,7 @@ final class CodexFinalMetadataTests: XCTestCase {
         let reused = try XCTUnwrap(service.validatedPreview(for: accepted), "Metadata edits must retain validated geometry reuse.")
         XCTAssertEqual(reused.brepPath, fixture.preview.brepPath)
         XCTAssertEqual(reused.stepPath, fixture.preview.stepPath)
+        XCTAssertNil(service.validatedPreview(for: accepted), "The validated geometry handoff is single use.")
         let revision = ProjectRevision(model: accepted)
         let project = LADProject(messages: [], revisions: [revision], selectedRevisionID: revision.id)
         let restored = try ProjectStore.decode(ProjectStore.encode(project))

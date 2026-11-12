@@ -1,6 +1,8 @@
 import AppKit
+import ImageIO
 import Metal
 import SceneKit
+import UniformTypeIdentifiers
 
 /// Agent images use the same prepared geometry, camera convention, materials
 /// and lights as LAD's viewer, without capturing the desktop or moving its view.
@@ -93,6 +95,21 @@ enum CADAgentRenderer {
         let width = max(1, Int((requestedWidth * factor).rounded()))
         let height = max(1, Int((requestedHeight * factor).rounded()))
         return try await snapshotWithMetadata(of: view, width: width, height: height)
+    }
+
+    /// Encode the snapshot's own CGImage. A TIFF round trip through
+    /// NSBitmapImageRep produces the same pixels with two more full copies.
+    nonisolated static func encodePNG(_ image: NSImage) throws -> Data {
+        let encoded = NSMutableData()
+        guard let pixels = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let destination = CGImageDestinationCreateWithData(encoded, UTType.png.identifier as CFString, 1, nil) else {
+            throw LADError.message("LAD could not encode the design image.")
+        }
+        CGImageDestinationAddImage(destination, pixels, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw LADError.message("LAD could not encode the design image.")
+        }
+        return encoded as Data
     }
 
     static func validateDimensions(width: Int, height: Int) throws {
@@ -240,10 +257,7 @@ private final class CADAgentSceneSnapshot: @unchecked Sendable {
         }
         try Task.checkCancellation()
         let image = renderer.snapshot(atTime: 0, with: CGSize(width: width, height: height), antialiasingMode: .multisampling4X)
-        guard let tiff = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff),
-              let png = bitmap.representation(using: .png, properties: [:]) else {
-            throw LADError.message("LAD could not encode the design image.")
-        }
+        let png = try CADAgentRenderer.encodePNG(image)
         try Task.checkCancellation()
         return png
     }

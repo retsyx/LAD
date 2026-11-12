@@ -63,6 +63,8 @@ final class EngineServiceTests: XCTestCase {
         try FileManager.default.removeItem(at: brep)
         let cached = try await service.exportSTEP(preview, python: "/nonexistent/python", threads: 1)
         XCTAssertEqual(cached, data)
+        let shared = try await EngineService().exportSTEP(preview, python: "/nonexistent/python", threads: 1)
+        XCTAssertEqual(shared, data, "Every engine shares one bounded export cache.")
         let imported = try await EngineService().previewSTEP(data, parts: preview.parts,
                                                             python: EngineService.defaultPython, threads: 2)
         defer { try? FileManager.default.removeItem(at: URL(fileURLWithPath: imported.stepPath).deletingLastPathComponent()) }

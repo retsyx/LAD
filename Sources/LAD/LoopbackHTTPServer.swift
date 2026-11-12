@@ -79,8 +79,13 @@ struct LoopbackHTTPParser {
 
     static let maximumHeaderBytes = 16 * 1024
     private let maximumBodyBytes: Int
-    private var bytes = Data()
-    private var bodyOffset: Int?
+    private var receivedBytes = 0
+    /// Bytes up to the end of the header block; released once it is parsed.
+    private var headBytes = Data()
+    /// The body has its own buffer, which the completed request shares rather
+    /// than copying, so an upload is held in memory once.
+    private var body = Data()
+    private var reservedBody = false
     private var contentLength = 0
     private(set) var head: LoopbackHTTPRequest?
 
@@ -90,31 +95,39 @@ struct LoopbackHTTPParser {
 
     mutating func append(_ data: Data) throws {
         let maximumBytes = maximumBodyBytes.addingReportingOverflow(Self.maximumHeaderBytes)
-        guard !maximumBytes.overflow, bytes.count <= maximumBytes.partialValue,
-              data.count <= maximumBytes.partialValue - bytes.count else { throw Failure(status: 413) }
-        bytes.append(data)
-        if bodyOffset == nil {
-            guard let separator = bytes.range(of: Data([13, 10, 13, 10])) else {
-                if bytes.count > Self.maximumHeaderBytes { throw Failure(status: 431) }
-                return
-            }
-            let offset = separator.upperBound
-            guard offset <= Self.maximumHeaderBytes else { throw Failure(status: 431) }
-            head = try Self.parseHead(bytes[..<separator.lowerBound])
-            if let length = head?.headers["content-length"] {
-                guard !length.isEmpty, length.utf8.allSatisfy({ (48...57).contains($0) }) else { throw Failure(status: 400) }
-                guard let value = Int(length), value <= maximumBodyBytes else { throw Failure(status: 413) }
-                contentLength = value
-            }
-            bodyOffset = offset
+        guard !maximumBytes.overflow, receivedBytes <= maximumBytes.partialValue,
+              data.count <= maximumBytes.partialValue - receivedBytes else { throw Failure(status: 413) }
+        receivedBytes += data.count
+        guard head == nil else {
+            guard data.count <= contentLength - body.count else { throw Failure(status: 400) }
+            // Later reads follow admission. Size the buffer once from the
+            // declared length instead of regrowing it while it fills.
+            if !reservedBody { body.reserveCapacity(contentLength); reservedBody = true }
+            body.append(data)
+            return
         }
-        if let offset = bodyOffset, bytes.count - offset > contentLength { throw Failure(status: 400) }
+        headBytes.append(data)
+        guard let separator = headBytes.range(of: Data([13, 10, 13, 10])) else {
+            if headBytes.count > Self.maximumHeaderBytes { throw Failure(status: 431) }
+            return
+        }
+        guard separator.upperBound <= Self.maximumHeaderBytes else { throw Failure(status: 431) }
+        let parsed = try Self.parseHead(headBytes[..<separator.lowerBound])
+        if let length = parsed.headers["content-length"] {
+            guard !length.isEmpty, length.utf8.allSatisfy({ (48...57).contains($0) }) else { throw Failure(status: 400) }
+            guard let value = Int(length), value <= maximumBodyBytes else { throw Failure(status: 413) }
+            contentLength = value
+        }
+        let remainder = headBytes[separator.upperBound...]
+        guard remainder.count <= contentLength else { throw Failure(status: 400) }
+        body = Data(remainder)
+        headBytes = Data()
+        head = parsed
     }
 
     var request: LoopbackHTTPRequest? {
-        guard let head, let offset = bodyOffset, bytes.count - offset == contentLength else { return nil }
-        return LoopbackHTTPRequest(method: head.method, target: head.target, headers: head.headers,
-                                   body: Data(bytes[offset...]))
+        guard let head, body.count == contentLength else { return nil }
+        return LoopbackHTTPRequest(method: head.method, target: head.target, headers: head.headers, body: body)
     }
 
     private static func parseHead(_ bytes: Data.SubSequence) throws -> LoopbackHTTPRequest {

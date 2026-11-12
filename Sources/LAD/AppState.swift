@@ -1107,6 +1107,10 @@ final class AppState {
                         self.setSteeringAvailable(available)
                     }
                 }, selection: request.selection, selectionModel: selectionModel, selectionModelsByRevision: selectionModels, versions: versions)
+                // Take the single-use validated geometry before any early exit,
+                // so the service never retains it past this request.
+                var validatedPreview: PreviewMesh?
+                if case .ready(let candidate) = result { validatedPreview = codex.validatedPreview(for: candidate) }
                 guard operationID == token else { return }
                 drainGenerationFeedback(feedback, token: token)
                 try Task.checkCancellation()
@@ -1122,7 +1126,7 @@ final class AppState {
                 activity = "Building solid geometry…"
                 var preview: PreviewMesh
                 do {
-                    if let validated = codex.validatedPreview(for: spec) {
+                    if let validated = validatedPreview {
                         preview = validated
                         recordTaskEvent(ProjectActivityEvent(id: "final:validation", category: "validation",
                             title: "Final design matches validated CAD geometry", status: "completed",
@@ -1173,6 +1177,7 @@ final class AppState {
                             self.setSteeringAvailable(available)
                         }
                     }, selection: request.selection, selectionModel: selectionModel, selectionModelsByRevision: selectionModels, versions: versions)
+                    if case .ready(let candidate) = repairResult { validatedPreview = codex.validatedPreview(for: candidate) }
                     guard operationID == token else { return }
                     drainGenerationFeedback(feedback, token: token)
                     try Task.checkCancellation()
@@ -1185,7 +1190,7 @@ final class AppState {
                         return
                     }
                     activity = "Validating the repaired geometry…"
-                    if let validated = codex.validatedPreview(for: spec) { preview = validated }
+                    if let validated = validatedPreview { preview = validated }
                     else { preview = try await engine.buildPreview(spec, python: runtime, threads: cores) }
                     guard operationID == token else { return }
                     try Task.checkCancellation()

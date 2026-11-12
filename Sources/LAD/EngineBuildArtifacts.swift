@@ -72,6 +72,7 @@ final class EngineBuildArtifacts: @unchecked Sendable {
 
     deinit {
         let folder = folder
+        STEPExportCache.shared.removeAll(ownedBy: folder)
         try? lease.close()
         Self.cleanupQueue.async { _ = Self.removeIfAbandoned(folder) }
     }
