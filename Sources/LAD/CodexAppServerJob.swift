@@ -158,6 +158,7 @@ final class CodexAppServerJob: @unchecked Sendable {
                                           expectedTurnID: turnID, continuation: continuation)
                 outbound.append(data)
                 lock.unlock()
+                pipes.wake()
             } catch {
                 lock.unlock()
                 continuation.resume(throwing: error)
@@ -172,6 +173,7 @@ final class CodexAppServerJob: @unchecked Sendable {
         cancellationDate = Date()
         let currentThread = threadID, currentTurn = turnID
         lock.unlock()
+        pipes.wake()
         publishAvailability(false)
         if let currentThread, let currentTurn {
             try? enqueue("turn/interrupt", purpose: .interrupt,
@@ -230,6 +232,7 @@ final class CodexAppServerJob: @unchecked Sendable {
             let ending = terminal
             let endingDate = completedAt
             let awaitingSteer = pending.values.contains { $0.purpose == .steer }
+            let requestDeadline = pending.values.compactMap(\.deadline).min()
             lock.unlock()
             if isCancelled, Date().timeIntervalSince(cancelDate ?? Date()) >= 0.35 { throw CancellationError() }
             if let ending, !awaitingSteer { return try terminalData(ending) }
@@ -237,7 +240,7 @@ final class CodexAppServerJob: @unchecked Sendable {
                 rejectPendingSteers("The task finished before acknowledging this information.")
                 continue
             }
-            if !process.isRunning, exitedAt == nil { exitedAt = Date() }
+            if pipes.hasExited, exitedAt == nil { exitedAt = Date() }
             if pipes.outputClosed || exitedAt.map({ Date().timeIntervalSince($0) > 0.15 }) == true {
                 if isCancelled { throw CancellationError() }
                 if let ending { return try terminalData(ending) }
@@ -245,7 +248,13 @@ final class CodexAppServerJob: @unchecked Sendable {
                 let detail = String(decoding: pipes.stderrTail, as: UTF8.self)
                 throw CodexError.failed("The design task exited\(status).\n\n\(detail.isEmpty ? "The app-server connection closed before the design was complete." : String(detail.suffix(2_400)))")
             }
-            let inputOpen = try pipes.step(timeout: 40, next: {
+            // Wait for output, queued input, cancellation or exit; otherwise
+            // wake only for the earliest timeout that the checks above apply.
+            let deadline = [requestDeadline,
+                            isCancelled ? cancelDate.map { $0.addingTimeInterval(0.35) } : nil,
+                            ending != nil && awaitingSteer ? endingDate.map { $0.addingTimeInterval(5) } : nil,
+                            exitedAt.map { $0.addingTimeInterval(0.15) }].compactMap { $0 }.min()
+            let inputOpen = try pipes.step(until: deadline, next: {
                 lock.lock(); defer { lock.unlock() }
                 return outbound.isEmpty ? nil : outbound.removeFirst()
             }, onOutput: { try consume($0, prompt: prompt, imagePaths: imagePaths) })
@@ -292,6 +301,7 @@ final class CodexAppServerJob: @unchecked Sendable {
         let id = nextRequestID; nextRequestID += 1
         outbound.append(try Self.frame(["id": id, "method": method, "params": params]))
         pending[id] = PendingRPC(purpose: purpose, deadline: purpose == .interrupt ? nil : Date().addingTimeInterval(60))
+        pipes.wake()
     }
     private func notification(_ method: String) throws {
         let data = try Self.frame(["method": method])

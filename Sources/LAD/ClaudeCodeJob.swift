@@ -156,6 +156,7 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
                 pendingSteers[id] = PendingSteer(deadline: Date().addingTimeInterval(30), continuation: continuation)
                 outbound.append(data)
                 lock.unlock()
+                pipes.wake()
             } catch {
                 lock.unlock()
                 continuation.resume(throwing: error)
@@ -173,6 +174,7 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
             outbound.append(data)
         }
         lock.unlock()
+        pipes.wake()
         publishAvailability(false)
         // First allow the protocol interrupt to stop tools and subagents.
         // Always terminate a CLI that does not promptly honor it.
@@ -212,6 +214,7 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
             let endingDate = resultDate
             let unfinished = !unfinishedSteers.isEmpty
             let awaitingAcknowledgement = !pendingSteers.isEmpty
+            let steerDeadline = pendingSteers.values.map(\.deadline).min()
             let lifecycle = lifecycleSupported
             lock.unlock()
             if isCancelled, Date().timeIntervalSince(cancelDate ?? Date()) >= 0.35 { throw CancellationError() }
@@ -225,7 +228,7 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
                     return try terminalData(ending)
                 }
             }
-            if !process.isRunning, exitedAt == nil { exitedAt = Date() }
+            if pipes.hasExited, exitedAt == nil { exitedAt = Date() }
             if pipes.outputClosed || exitedAt.map({ Date().timeIntervalSince($0) > 0.15 }) == true {
                 if isCancelled { throw CancellationError() }
                 if let ending { return try terminalData(ending) }
@@ -233,7 +236,15 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
                 let detail = String(decoding: pipes.stderrTail, as: UTF8.self)
                 throw CodexError.failed("The design task exited\(status).\n\n\(detail.isEmpty ? "The Claude Code connection closed before the design was complete." : String(detail.suffix(2_400)))")
             }
-            let inputOpen = try pipes.step(timeout: 40, next: {
+            // Wait for output, queued input, cancellation or exit; otherwise
+            // wake only for the earliest timeout that the checks above apply.
+            let settling = ending != nil && !unfinished
+            let deadline = [steerDeadline,
+                            isCancelled ? cancelDate.map { $0.addingTimeInterval(0.35) } : nil,
+                            settling && awaitingAcknowledgement ? endingDate.map { $0.addingTimeInterval(5) } : nil,
+                            settling && !awaitingAcknowledgement && !lifecycle ? endingDate.map { $0.addingTimeInterval(0.5) } : nil,
+                            exitedAt.map { $0.addingTimeInterval(0.15) }].compactMap { $0 }.min()
+            let inputOpen = try pipes.step(until: deadline, next: {
                 lock.lock(); defer { lock.unlock() }
                 return outbound.isEmpty ? nil : outbound.removeFirst()
             }, onOutput: { try consume($0) })

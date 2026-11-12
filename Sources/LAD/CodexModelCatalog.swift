@@ -278,7 +278,7 @@ private final class CodexCatalogJob: AgentCatalogLookup, @unchecked Sendable {
             if let params { object["params"] = params }
             var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
             data.append(10)
-            guard try pipes.writeAll(data, check: check) else {
+            guard try pipes.writeAll(data, until: deadline, check: check) else {
                 throw AgentCatalogError.failed("The model catalog connection closed unexpectedly.")
             }
         }
@@ -300,7 +300,7 @@ private final class CodexCatalogJob: AgentCatalogLookup, @unchecked Sendable {
                     guard let result = object["result"] else { throw AgentCatalogError.invalidResponse }
                     return try JSONSerialization.data(withJSONObject: result)
                 }
-                _ = try pipes.step(timeout: 50) { data in
+                _ = try pipes.step(until: deadline) { data in
                     receivedBytes += data.count
                     guard receivedBytes <= 4_194_304 else { throw AgentCatalogError.invalidResponse }
                     pending.append(data)

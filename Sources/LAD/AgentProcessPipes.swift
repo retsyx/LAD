@@ -2,8 +2,11 @@ import Darwin
 import Foundation
 
 /// Non-blocking pipe plumbing shared by the agent task and model catalog
-/// processes: polled reads and writes, a bounded stderr tail and escalating
-/// shutdown. Each job keeps its own protocol handling.
+/// processes: event-driven reads and writes, a bounded stderr tail and
+/// escalating shutdown. Each job keeps its own protocol handling.
+///
+/// Waits end on stream activity, process exit or `wake()`, and otherwise only
+/// at the caller's next deadline, so idle jobs do not poll.
 final class AgentProcessPipes {
     let process: Process
     private let input = Pipe(), output = Pipe(), errors = Pipe()
@@ -13,13 +16,63 @@ final class AgentProcessPipes {
     /// The last 16 KB of stderr, for failure messages.
     private(set) var stderrTail = Data()
     private(set) var outputClosed = false
+    private var errorsClosed = false
+    /// Read and write ends of a self-pipe that interrupts a wait.
+    private let wakeFDs: (read: Int32, write: Int32)
+    private let exitLock = NSLock()
+    private var exitedValue = false
+    private let exitSignal = DispatchSemaphore(value: 0)
 
     init(_ process: Process, readBufferSize: Int = 16_384) {
         self.process = process
         buffer = [UInt8](repeating: 0, count: readBufferSize)
+        var descriptors: [Int32] = [-1, -1]
+        if Darwin.pipe(&descriptors) == 0 {
+            for descriptor in descriptors {
+                _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK)
+                _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC)
+            }
+        }
+        wakeFDs = (descriptors[0], descriptors[1])
         process.standardInput = input
         process.standardOutput = output
         process.standardError = errors
+        process.terminationHandler = { [weak self] _ in
+            guard let self else { return }
+            exitLock.lock(); exitedValue = true; exitLock.unlock()
+            exitSignal.signal()
+            wake()
+        }
+    }
+
+    deinit {
+        if wakeFDs.read >= 0 { Darwin.close(wakeFDs.read) }
+        if wakeFDs.write >= 0 { Darwin.close(wakeFDs.write) }
+    }
+
+    /// True once the process has exited, whether or not its streams closed.
+    var hasExited: Bool {
+        exitLock.lock(); defer { exitLock.unlock() }
+        return exitedValue
+    }
+
+    /// Ends the current or next wait, for example after queuing input or
+    /// cancelling. Safe from any thread.
+    func wake() {
+        var byte: UInt8 = 1
+        _ = Darwin.write(wakeFDs.write, &byte, 1)
+    }
+
+    /// Milliseconds until `deadline` for poll(2): -1 waits indefinitely.
+    private static func pollTimeout(until deadline: Date?) -> Int32 {
+        guard let deadline else { return -1 }
+        let milliseconds = (deadline.timeIntervalSinceNow * 1_000).rounded(.up)
+        return Int32(clamping: Int(max(0, min(milliseconds, Double(Int32.max)))))
+    }
+
+    private func drainWake() {
+        var bytes = [UInt8](repeating: 0, count: 64)
+        while Darwin.read(wakeFDs.read, &bytes, bytes.count) > 0 {}
     }
 
     private var inputFD: Int32 { input.fileHandleForWriting.fileDescriptor }
@@ -34,18 +87,23 @@ final class AgentProcessPipes {
         _ = fcntl(inputFD, F_SETNOSIGPIPE, 1)
     }
 
-    /// Wait up to `timeout` milliseconds, write queued input taken from `next`,
-    /// and deliver stdout to `onOutput`. Each stream yields after about 1 MB so
-    /// the caller's loop stays responsive to cancellation. Returns false if the
+    /// Wait until stream activity, process exit, `wake()` or `deadline` (nil
+    /// waits indefinitely), write queued input taken from `next`, and deliver
+    /// stdout to `onOutput`. Each stream yields after about 1 MB so the
+    /// caller's loop stays responsive to cancellation. Returns false if the
     /// process closed its input.
-    func step(timeout: Int32, next: () -> Data? = { nil }, onOutput: (Data) throws -> Void) rethrows -> Bool {
+    func step(until deadline: Date?, next: () -> Data? = { nil }, onOutput: (Data) throws -> Void) rethrows -> Bool {
         if writing == nil, let data = next() { writing = data; writeOffset = 0 }
         var descriptors = [
-            pollfd(fd: outputFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
-            pollfd(fd: errorFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
-            pollfd(fd: writing == nil ? -1 : inputFD, events: Int16(POLLOUT | POLLHUP | POLLERR), revents: 0)
+            pollfd(fd: outputClosed ? -1 : outputFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
+            pollfd(fd: errorsClosed ? -1 : errorFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
+            pollfd(fd: writing == nil ? -1 : inputFD, events: Int16(POLLOUT | POLLHUP | POLLERR), revents: 0),
+            pollfd(fd: wakeFDs.read, events: Int16(POLLIN), revents: 0)
         ]
-        _ = Darwin.poll(&descriptors, nfds_t(descriptors.count), timeout)
+        // Exit is a wake source, but the exit grace period still needs a
+        // deadline when the streams stay open.
+        _ = Darwin.poll(&descriptors, nfds_t(descriptors.count), Self.pollTimeout(until: deadline))
+        if descriptors[3].revents != 0 { drainWake() }
         if descriptors[2].revents != 0, let data = writing {
             let written = data.withUnsafeBytes { bytes in
                 Darwin.write(inputFD, bytes.baseAddress!.advanced(by: writeOffset), bytes.count - writeOffset)
@@ -61,7 +119,7 @@ final class AgentProcessPipes {
             var received = 0
             while received < 1_048_576 {
                 let count = Darwin.read(descriptors[index].fd, &buffer, buffer.count)
-                if count == 0 { if index == 0 { outputClosed = true }; break }
+                if count == 0 { if index == 0 { outputClosed = true } else { errorsClosed = true }; break }
                 if count < 0 { break }
                 let data = Data(buffer.prefix(count))
                 if index == 0 { try onOutput(data) }
@@ -75,9 +133,10 @@ final class AgentProcessPipes {
         return true
     }
 
-    /// Write all of `data`, waiting for the pipe as needed. `check` runs before
-    /// each attempt and throws to stop. Returns false if the input closed.
-    func writeAll(_ data: Data, check: () throws -> Void) rethrows -> Bool {
+    /// Write all of `data`, waiting for the pipe, process exit, `wake()` or
+    /// `deadline` as needed. `check` runs before each attempt and throws to
+    /// stop. Returns false if the input closed.
+    func writeAll(_ data: Data, until deadline: Date?, check: () throws -> Void) rethrows -> Bool {
         var offset = 0
         while offset < data.count {
             try check()
@@ -87,8 +146,10 @@ final class AgentProcessPipes {
             if written > 0 { offset += written }
             else if written < 0 && errno != EAGAIN && errno != EINTR { return false }
             else {
-                var writable = pollfd(fd: inputFD, events: Int16(POLLOUT | POLLHUP | POLLERR), revents: 0)
-                _ = Darwin.poll(&writable, 1, 50)
+                var descriptors = [pollfd(fd: inputFD, events: Int16(POLLOUT | POLLHUP | POLLERR), revents: 0),
+                                   pollfd(fd: wakeFDs.read, events: Int16(POLLIN), revents: 0)]
+                _ = Darwin.poll(&descriptors, 2, Self.pollTimeout(until: deadline))
+                if descriptors[1].revents != 0 { drainWake() }
             }
         }
         return true
@@ -100,9 +161,9 @@ final class AgentProcessPipes {
     func shutdown(terminate: () -> Void) {
         try? input.fileHandleForWriting.close()
         terminate()
-        let deadline = Date().addingTimeInterval(0.5)
-        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
-        if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+        if !hasExited, exitSignal.wait(timeout: .now() + 0.5) == .timedOut, process.isRunning {
+            Darwin.kill(process.processIdentifier, SIGKILL)
+        }
         process.waitUntilExit()
         try? output.fileHandleForReading.close()
         try? errors.fileHandleForReading.close()

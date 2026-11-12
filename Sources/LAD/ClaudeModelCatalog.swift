@@ -138,7 +138,7 @@ final class ClaudeCatalogJob: AgentCatalogLookup, @unchecked Sendable {
                                                                       "request": ["subtype": subtype]], options: [.sortedKeys]))
             request.append(10)
         }
-        guard try pipes.writeAll(request, check: check) else {
+        guard try pipes.writeAll(request, until: deadline, check: check) else {
             throw AgentCatalogError.failed("The model catalog connection closed unexpectedly.")
         }
         var pending = Data(), receivedBytes = 0
@@ -168,7 +168,7 @@ final class ClaudeCatalogJob: AgentCatalogLookup, @unchecked Sendable {
                 }
             }
             if initialize != nil && settingsAnswered { break }
-            _ = try pipes.step(timeout: 50) { data in
+            _ = try pipes.step(until: deadline) { data in
                 receivedBytes += data.count
                 guard receivedBytes <= 8_388_608 else { throw AgentCatalogError.invalidResponse }
                 pending.append(data)
