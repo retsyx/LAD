@@ -40,9 +40,7 @@ final class CodexAppServerJob: @unchecked Sendable {
     }
 
     private let process = Process()
-    private let inputPipe = Pipe()
-    private let outputPipe = Pipe()
-    private let errorPipe = Pipe()
+    private lazy var pipes = AgentProcessPipes(process)
     private let lock = NSLock()
     private var cancelled = false
     private var cancellationDate: Date?
@@ -70,9 +68,7 @@ final class CodexAppServerJob: @unchecked Sendable {
     private let onActivity: @Sendable (ProjectActivityEvent) -> Void
     private let onSteeringAvailability: @Sendable (Bool) -> Void
     // Stream state below is touched only by the utility I/O thread.
-    private var stdoutLine = Data()
-    private var discardingOversizedLine = false
-    private var stderrTail = Data()
+    private var lines = AgentLineBuffer(maximumBytes: CodexAppServerJob.maximumEventBytes)
     private var messages: [String: Message] = [:]
     private var emittedCommentary: [String: String] = [:]
     private var activityStarts: [String: Date] = [:]
@@ -110,9 +106,7 @@ final class CodexAppServerJob: @unchecked Sendable {
         environment["NO_COLOR"] = "1"
         environment.merge(overrides) { _, new in new }
         process.environment = environment
-        process.standardInput = inputPipe
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
+        _ = pipes
     }
 
     var canSteer: Bool {
@@ -221,21 +215,12 @@ final class CodexAppServerJob: @unchecked Sendable {
         do { try process.run(); running = true; lock.unlock() }
         catch { lock.unlock(); throw CodexError.failed("Could not start the design task: \(error.localizedDescription)") }
         defer { shutdown() }
-        let outputFD = outputPipe.fileHandleForReading.fileDescriptor
-        let errorFD = errorPipe.fileHandleForReading.fileDescriptor
-        let inputFD = inputPipe.fileHandleForWriting.fileDescriptor
-        for descriptor in [outputFD, errorFD, inputFD] {
-            _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK)
-        }
-        _ = fcntl(inputFD, F_SETNOSIGPIPE, 1)
+        pipes.configure()
         try enqueue("initialize", purpose: .initialize, params: [
             "clientInfo": CodexAppServerClient.info(),
             "capabilities": ["experimentalApi": false]
         ])
-        var buffer = [UInt8](repeating: 0, count: 16_384)
-        var writeBuffer: Data?, writeOffset = 0
         let prompt = String(decoding: input, as: UTF8.self)
-        var outputClosed = false
         var exitedAt: Date?
         while true {
             try expireRequests()
@@ -245,7 +230,6 @@ final class CodexAppServerJob: @unchecked Sendable {
             let ending = terminal
             let endingDate = completedAt
             let awaitingSteer = pending.values.contains { $0.purpose == .steer }
-            if writeBuffer == nil, !outbound.isEmpty { writeBuffer = outbound.removeFirst(); writeOffset = 0 }
             lock.unlock()
             if isCancelled, Date().timeIntervalSince(cancelDate ?? Date()) >= 0.35 { throw CancellationError() }
             if let ending, !awaitingSteer { return try terminalData(ending) }
@@ -254,46 +238,20 @@ final class CodexAppServerJob: @unchecked Sendable {
                 continue
             }
             if !process.isRunning, exitedAt == nil { exitedAt = Date() }
-            if outputClosed || exitedAt.map({ Date().timeIntervalSince($0) > 0.15 }) == true {
+            if pipes.outputClosed || exitedAt.map({ Date().timeIntervalSince($0) > 0.15 }) == true {
                 if isCancelled { throw CancellationError() }
                 if let ending { return try terminalData(ending) }
                 let status = process.isRunning ? "" : " with status \(process.terminationStatus)"
-                let detail = String(decoding: stderrTail, as: UTF8.self)
+                let detail = String(decoding: pipes.stderrTail, as: UTF8.self)
                 throw CodexError.failed("The design task exited\(status).\n\n\(detail.isEmpty ? "The app-server connection closed before the design was complete." : String(detail.suffix(2_400)))")
             }
-            var descriptors = [
-                pollfd(fd: outputFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
-                pollfd(fd: errorFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
-                pollfd(fd: writeBuffer == nil ? -1 : inputFD, events: Int16(POLLOUT | POLLHUP | POLLERR), revents: 0)
-            ]
-            _ = Darwin.poll(&descriptors, nfds_t(descriptors.count), 40)
-            if descriptors[2].revents != 0, let writing = writeBuffer {
-                let written = writing.withUnsafeBytes { bytes in
-                    Darwin.write(inputFD, bytes.baseAddress!.advanced(by: writeOffset), bytes.count - writeOffset)
-                }
-                if written > 0 {
-                    writeOffset += written
-                    if writeOffset == writing.count { writeBuffer = nil }
-                } else if written < 0, errno != EAGAIN, errno != EINTR {
-                    if isCancelled { throw CancellationError() }
-                    throw CodexError.failed("The task’s input connection closed unexpectedly.")
-                }
-            }
-            for index in 0..<2 where descriptors[index].revents != 0 {
-                var received = 0
-                while true {
-                    let count = Darwin.read(descriptors[index].fd, &buffer, buffer.count)
-                    if count == 0 { if index == 0 { outputClosed = true }; break }
-                    if count < 0 { break }
-                    let data = Data(buffer.prefix(count))
-                    if index == 0 { try consume(data, prompt: prompt, imagePaths: imagePaths) }
-                    else {
-                        stderrTail.append(data)
-                        if stderrTail.count > 16_384 { stderrTail.removeFirst(stderrTail.count - 16_384) }
-                    }
-                    received += count
-                    if received >= 1_048_576 { break }
-                }
+            let inputOpen = try pipes.step(timeout: 40, next: {
+                lock.lock(); defer { lock.unlock() }
+                return outbound.isEmpty ? nil : outbound.removeFirst()
+            }, onOutput: { try consume($0, prompt: prompt, imagePaths: imagePaths) })
+            if !inputOpen {
+                if isCancelled { throw CancellationError() }
+                throw CodexError.failed("The task’s input connection closed unexpectedly.")
             }
         }
     }
@@ -319,15 +277,8 @@ final class CodexAppServerJob: @unchecked Sendable {
         for continuation in remaining {
             continuation.resume(throwing: CodexSteeringError.uncertain(wasCancelled ? "The task stopped before acknowledging the additional information." : "The task’s connection closed before acknowledging the additional information."))
         }
-        try? inputPipe.fileHandleForWriting.close()
-        if process.isRunning { process.terminate() }
-        let deadline = Date().addingTimeInterval(0.5)
-        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
-        if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
-        process.waitUntilExit()
+        pipes.shutdown { if process.isRunning { process.terminate() } }
         lock.lock(); running = false; lock.unlock()
-        try? outputPipe.fileHandleForReading.close()
-        try? errorPipe.fileHandleForReading.close()
     }
 
     private static func frame(_ object: [String: Any]) throws -> Data {
@@ -375,35 +326,7 @@ final class CodexAppServerJob: @unchecked Sendable {
     }
 
     private func consume(_ chunk: Data, prompt: String, imagePaths: [String]) throws {
-        // Search only new bytes. Rescanning an accumulated unterminated frame
-        // for every pipe read makes a large malformed line quadratic and can
-        // prevent cancellation from reaching the I/O loop promptly.
-        try chunk.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
-            guard let base = bytes.baseAddress else { return }
-            var offset = 0
-            while offset < bytes.count {
-                let newline = memchr(base.advanced(by: offset), 10, bytes.count - offset)
-                let end = newline.map { base.distance(to: UnsafeRawPointer($0)) } ?? bytes.count
-                let count = end - offset
-                if !discardingOversizedLine {
-                    if count > Self.maximumEventBytes - stdoutLine.count {
-                        oversizedEvent()
-                        stdoutLine.removeAll(keepingCapacity: false)
-                        discardingOversizedLine = true
-                    } else if count > 0 {
-                        stdoutLine.append(base.assumingMemoryBound(to: UInt8.self).advanced(by: offset), count: count)
-                    }
-                }
-                guard newline != nil else { break }
-                if !discardingOversizedLine {
-                    let line = stdoutLine
-                    stdoutLine = Data()
-                    try receive(line, prompt: prompt, imagePaths: imagePaths)
-                }
-                discardingOversizedLine = false
-                offset = end + 1
-            }
-        }
+        try lines.append(chunk, oversized: oversizedEvent) { try receive($0, prompt: prompt, imagePaths: imagePaths) }
     }
     private func oversizedEvent() {
         onActivity(ProjectActivityEvent(id: "server:oversized:\(UUID().uuidString)", category: "diagnostic",
@@ -552,19 +475,8 @@ final class CodexAppServerJob: @unchecked Sendable {
         emitActivity(item, completed: completed, thread: thread)
     }
     private func emitActivity(_ source: [String: Any], completed: Bool, thread: String) {
-        var item = source
         guard let originalKind = source["type"] as? String, let id = source["id"] as? String else { return }
-        item["id"] = thread + ":" + id
         switch originalKind {
-        case "commandExecution":
-            item["type"] = "command_execution"
-            item["aggregated_output"] = source["aggregatedOutput"]
-            item["exit_code"] = source["exitCode"]
-            item["duration_ms"] = source["durationMs"]
-        case "fileChange": item["type"] = "file_change"
-        case "mcpToolCall": item["type"] = "mcp_tool_call"; item["duration_ms"] = source["durationMs"]
-        case "webSearch": item["type"] = "web_search"
-        case "plan": item["type"] = "plan"
         case "imageView":
             onActivity(ProjectActivityEvent(id: "server:\(thread):\(id)", category: "tool", title: originalKind,
                 status: completed ? "completed" : "running", output: CodexActivity.json(CodexActivity.sanitize(source)),
@@ -574,9 +486,10 @@ final class CodexAppServerJob: @unchecked Sendable {
             onActivity(ProjectActivityEvent(id: "server:\(thread):\(id)", category: "tool", title: source["tool"] as? String ?? originalKind,
                 status: completed ? "completed" : "running", output: CodexActivity.json(CodexActivity.sanitize(source))))
             return
-        default: return
+        default:
+            if let event = CodexActivity.event(item: source, id: thread + ":" + id, completed: completed,
+                                               starts: &activityStarts) { onActivity(event) }
         }
-        if let event = CodexActivity.event(["type": completed ? "item.completed" : "item.started", "item": item], starts: &activityStarts) { onActivity(event) }
     }
     private func activityImageData(_ path: String?) -> Data? {
         lock.lock(); let isCancelled = cancelled; lock.unlock()

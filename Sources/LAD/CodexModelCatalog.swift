@@ -243,12 +243,9 @@ private final class CodexCatalogJob: AgentCatalogLookup, @unchecked Sendable {
     private func lookup() throws -> AgentCatalogSnapshot {
         guard let binary = CodexService.resolveExecutable(executable) else { throw AgentCatalogError.executableMissing(.codex) }
         let path = binary.path
-        let input = Pipe(), output = Pipe(), errors = Pipe()
+        let pipes = AgentProcessPipes(process)
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = ["app-server", "--listen", "stdio://"]
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = errors
         process.currentDirectoryURL = FileManager.default.temporaryDirectory
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = URL(fileURLWithPath: path).deletingLastPathComponent().path + ":" + (environment["PATH"] ?? "/usr/bin:/bin")
@@ -259,27 +256,21 @@ private final class CodexCatalogJob: AgentCatalogLookup, @unchecked Sendable {
         do { try process.run(); running = true; lock.unlock() }
         catch { lock.unlock(); throw AgentCatalogError.failed("Check your installed app or CLI and its sign-in.") }
         defer {
-            try? input.fileHandleForWriting.close()
-            lock.lock()
-            if process.isRunning { process.terminate() }
-            lock.unlock()
-            let deadline = Date().addingTimeInterval(0.5)
-            while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
-            if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
-            process.waitUntilExit()
+            pipes.shutdown {
+                lock.lock()
+                if process.isRunning { process.terminate() }
+                lock.unlock()
+            }
             lock.lock(); running = false; lock.unlock()
-            try? output.fileHandleForReading.close()
-            try? errors.fileHandleForReading.close()
         }
-
-        let outFD = output.fileHandleForReading.fileDescriptor, errorFD = errors.fileHandleForReading.fileDescriptor
-        let inputFD = input.fileHandleForWriting.fileDescriptor
-        _ = fcntl(outFD, F_SETFL, fcntl(outFD, F_GETFL) | O_NONBLOCK)
-        _ = fcntl(errorFD, F_SETFL, fcntl(errorFD, F_GETFL) | O_NONBLOCK)
-        _ = fcntl(inputFD, F_SETFL, fcntl(inputFD, F_GETFL) | O_NONBLOCK)
-        _ = fcntl(inputFD, F_SETNOSIGPIPE, 1)
-        var pending = Data(), stderrTail = Data(), receivedBytes = 0, outputClosed = false
+        pipes.configure()
+        var pending = Data(), receivedBytes = 0
         let deadline = Date().addingTimeInterval(10)
+        func check() throws {
+            lock.lock(); let isCancelled = cancelled; lock.unlock()
+            if isCancelled { throw CancellationError() }
+            guard Date() < deadline else { throw AgentCatalogError.timedOut }
+        }
 
         func send(_ method: String, id: Int? = nil, params: [String: Any]? = nil) throws {
             var object: [String: Any] = ["method": method]
@@ -287,21 +278,8 @@ private final class CodexCatalogJob: AgentCatalogLookup, @unchecked Sendable {
             if let params { object["params"] = params }
             var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
             data.append(10)
-            var offset = 0
-            while offset < data.count {
-                lock.lock(); let isCancelled = cancelled; lock.unlock()
-                if isCancelled { throw CancellationError() }
-                guard Date() < deadline else { throw AgentCatalogError.timedOut }
-                let written = data.withUnsafeBytes { bytes in
-                    Darwin.write(inputFD, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
-                }
-                if written > 0 { offset += written }
-                else if written < 0 && errno != EAGAIN && errno != EINTR {
-                    throw AgentCatalogError.failed("The model catalog connection closed unexpectedly.")
-                } else {
-                    var writable = pollfd(fd: inputFD, events: Int16(POLLOUT | POLLHUP | POLLERR), revents: 0)
-                    _ = Darwin.poll(&writable, 1, 50)
-                }
+            guard try pipes.writeAll(data, check: check) else {
+                throw AgentCatalogError.failed("The model catalog connection closed unexpectedly.")
             }
         }
 
@@ -322,25 +300,14 @@ private final class CodexCatalogJob: AgentCatalogLookup, @unchecked Sendable {
                     guard let result = object["result"] else { throw AgentCatalogError.invalidResponse }
                     return try JSONSerialization.data(withJSONObject: result)
                 }
-                var descriptors = [pollfd(fd: outFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
-                                   pollfd(fd: errorFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)]
-                _ = Darwin.poll(&descriptors, nfds_t(descriptors.count), 50)
-                for index in descriptors.indices where descriptors[index].revents != 0 {
-                    var bytes = [UInt8](repeating: 0, count: 16_384)
-                    let count = Darwin.read(descriptors[index].fd, &bytes, bytes.count)
-                    if count > 0 {
-                        if index == 0 {
-                            receivedBytes += count
-                            guard receivedBytes <= 4_194_304 else { throw AgentCatalogError.invalidResponse }
-                            pending.append(contentsOf: bytes.prefix(count))
-                            guard pending.count <= 1_048_576 else { throw AgentCatalogError.invalidResponse }
-                        } else {
-                            stderrTail.append(contentsOf: bytes.prefix(count))
-                            if stderrTail.count > 65_536 { stderrTail.removeFirst(stderrTail.count - 65_536) }
-                        }
-                    } else if count == 0, index == 0 { outputClosed = true }
+                _ = try pipes.step(timeout: 50) { data in
+                    receivedBytes += data.count
+                    guard receivedBytes <= 4_194_304 else { throw AgentCatalogError.invalidResponse }
+                    pending.append(data)
+                    guard pending.count <= 1_048_576 else { throw AgentCatalogError.invalidResponse }
                 }
-                if outputClosed {
+                // Lines read together with the end of the stream are parsed first.
+                if pipes.outputClosed, pending.firstIndex(of: 10) == nil {
                     if !pending.isEmpty {
                         // The protocol requires JSONL; do not spin on a
                         // truncated response after the stream has closed.

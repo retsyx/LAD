@@ -108,12 +108,9 @@ final class ClaudeCatalogJob: AgentCatalogLookup, @unchecked Sendable {
 
     private func lookup() throws -> AgentCatalogSnapshot {
         guard let binary = ClaudeExecutable.resolve(executable) else { throw AgentCatalogError.executableMissing(.claude) }
-        let input = Pipe(), output = Pipe(), errors = Pipe()
+        let pipes = AgentProcessPipes(process, readBufferSize: 65_536)
         process.executableURL = binary
         process.arguments = ClaudeCodeJob.controlArguments
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = errors
         process.currentDirectoryURL = FileManager.default.temporaryDirectory
         process.environment = ClaudeCodeJob.environment(executable: binary, overrides: [:])
         lock.lock()
@@ -121,42 +118,28 @@ final class ClaudeCatalogJob: AgentCatalogLookup, @unchecked Sendable {
         do { try process.run(); running = true; lock.unlock() }
         catch { lock.unlock(); throw AgentCatalogError.failed("Check your installed Claude Code and its sign-in.") }
         defer {
-            try? input.fileHandleForWriting.close()
-            lock.lock()
-            if process.isRunning { process.terminate() }
-            lock.unlock()
-            let deadline = Date().addingTimeInterval(0.5)
-            while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
-            if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
-            process.waitUntilExit()
+            pipes.shutdown {
+                lock.lock()
+                if process.isRunning { process.terminate() }
+                lock.unlock()
+            }
             lock.lock(); running = false; lock.unlock()
-            try? output.fileHandleForReading.close()
-            try? errors.fileHandleForReading.close()
         }
-        let outFD = output.fileHandleForReading.fileDescriptor, errorFD = errors.fileHandleForReading.fileDescriptor
-        let inputFD = input.fileHandleForWriting.fileDescriptor
-        for descriptor in [outFD, errorFD, inputFD] { _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK) }
-        _ = fcntl(inputFD, F_SETNOSIGPIPE, 1)
+        pipes.configure()
         let deadline = Date().addingTimeInterval(15)
+        func check() throws {
+            lock.lock(); let isCancelled = cancelled; lock.unlock()
+            if isCancelled { throw CancellationError() }
+            guard Date() < deadline else { throw AgentCatalogError.timedOut }
+        }
         var request = Data()
         for (id, subtype) in [("lad-initialize", "initialize"), ("lad-settings", "get_settings")] {
             request.append(try JSONSerialization.data(withJSONObject: ["type": "control_request", "request_id": id,
                                                                       "request": ["subtype": subtype]], options: [.sortedKeys]))
             request.append(10)
         }
-        var offset = 0
-        while offset < request.count {
-            lock.lock(); let isCancelled = cancelled; lock.unlock()
-            if isCancelled { throw CancellationError() }
-            guard Date() < deadline else { throw AgentCatalogError.timedOut }
-            let written = request.withUnsafeBytes { Darwin.write(inputFD, $0.baseAddress!.advanced(by: offset), $0.count - offset) }
-            if written > 0 { offset += written }
-            else if written < 0 && errno != EAGAIN && errno != EINTR {
-                throw AgentCatalogError.failed("The model catalog connection closed unexpectedly.")
-            } else {
-                var writable = pollfd(fd: inputFD, events: Int16(POLLOUT | POLLHUP | POLLERR), revents: 0)
-                _ = Darwin.poll(&writable, 1, 50)
-            }
+        guard try pipes.writeAll(request, check: check) else {
+            throw AgentCatalogError.failed("The model catalog connection closed unexpectedly.")
         }
         var pending = Data(), receivedBytes = 0
         var initialize: Data?, settings: Data?, settingsAnswered = false
@@ -185,20 +168,12 @@ final class ClaudeCatalogJob: AgentCatalogLookup, @unchecked Sendable {
                 }
             }
             if initialize != nil && settingsAnswered { break }
-            var descriptors = [pollfd(fd: outFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
-                               pollfd(fd: errorFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)]
-            _ = Darwin.poll(&descriptors, nfds_t(descriptors.count), 50)
-            var outputClosed = false
-            for index in descriptors.indices where descriptors[index].revents != 0 {
-                var bytes = [UInt8](repeating: 0, count: 65_536)
-                let count = Darwin.read(descriptors[index].fd, &bytes, bytes.count)
-                if count > 0, index == 0 {
-                    receivedBytes += count
-                    guard receivedBytes <= 8_388_608 else { throw AgentCatalogError.invalidResponse }
-                    pending.append(contentsOf: bytes.prefix(count))
-                } else if count == 0, index == 0 { outputClosed = true }
+            _ = try pipes.step(timeout: 50) { data in
+                receivedBytes += data.count
+                guard receivedBytes <= 8_388_608 else { throw AgentCatalogError.invalidResponse }
+                pending.append(data)
             }
-            if outputClosed, pending.firstIndex(of: 10) == nil {
+            if pipes.outputClosed, pending.firstIndex(of: 10) == nil {
                 if let initialize { return try CodexModelCatalog.decodeClaudeCatalog(initialize: initialize, settings: settings) }
                 throw AgentCatalogError.failed("Check your installed Claude Code and its sign-in.")
             }

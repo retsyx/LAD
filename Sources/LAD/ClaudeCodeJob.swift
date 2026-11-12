@@ -68,9 +68,7 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
     }
 
     private let process = Process()
-    private let inputPipe = Pipe()
-    private let outputPipe = Pipe()
-    private let errorPipe = Pipe()
+    private lazy var pipes = AgentProcessPipes(process, readBufferSize: 65_536)
     private let lock = NSLock()
     private var cancelled = false
     private var cancellationDate: Date?
@@ -95,9 +93,7 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
     private let onActivity: @Sendable (ProjectActivityEvent) -> Void
     private let onSteeringAvailability: @Sendable (Bool) -> Void
     // Stream state below is touched only by the utility I/O thread.
-    private var stdoutLine = Data()
-    private var discardingOversizedLine = false
-    private var stderrTail = Data()
+    private var lines = AgentLineBuffer(maximumBytes: ClaudeCodeJob.maximumEventBytes)
     private var heldCommentary: CodexProgressMessage?
     private var emittedCommentary = 0
     private var toolUses: [String: ToolUse] = [:]
@@ -120,9 +116,7 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
         process.arguments = arguments
         process.currentDirectoryURL = directory
         process.environment = Self.environment(executable: executable, overrides: overrides)
-        process.standardInput = inputPipe
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
+        _ = pipes
     }
 
     var canSteer: Bool {
@@ -205,18 +199,9 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
         do { try process.run(); running = true; lock.unlock() }
         catch { lock.unlock(); throw CodexError.failed("Could not start the design task: \(error.localizedDescription)") }
         defer { shutdown() }
-        let outputFD = outputPipe.fileHandleForReading.fileDescriptor
-        let errorFD = errorPipe.fileHandleForReading.fileDescriptor
-        let inputFD = inputPipe.fileHandleForWriting.fileDescriptor
-        for descriptor in [outputFD, errorFD, inputFD] {
-            _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK)
-        }
-        _ = fcntl(inputFD, F_SETNOSIGPIPE, 1)
+        pipes.configure()
         let initial = try Self.frame(Self.userMessage(text: String(decoding: input, as: UTF8.self), id: UUID().uuidString.lowercased()))
         lock.lock(); outbound.insert(initial, at: 0); lock.unlock()
-        var buffer = [UInt8](repeating: 0, count: 65_536)
-        var writeBuffer: Data?, writeOffset = 0
-        var outputClosed = false
         var exitedAt: Date?
         while true {
             expireSteers()
@@ -228,7 +213,6 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
             let unfinished = !unfinishedSteers.isEmpty
             let awaitingAcknowledgement = !pendingSteers.isEmpty
             let lifecycle = lifecycleSupported
-            if writeBuffer == nil, !outbound.isEmpty { writeBuffer = outbound.removeFirst(); writeOffset = 0 }
             lock.unlock()
             if isCancelled, Date().timeIntervalSince(cancelDate ?? Date()) >= 0.35 { throw CancellationError() }
             if let ending, !unfinished {
@@ -242,47 +226,21 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
                 }
             }
             if !process.isRunning, exitedAt == nil { exitedAt = Date() }
-            if outputClosed || exitedAt.map({ Date().timeIntervalSince($0) > 0.15 }) == true {
+            if pipes.outputClosed || exitedAt.map({ Date().timeIntervalSince($0) > 0.15 }) == true {
                 if isCancelled { throw CancellationError() }
                 if let ending { return try terminalData(ending) }
                 let status = process.isRunning ? "" : " with status \(process.terminationStatus)"
-                let detail = String(decoding: stderrTail, as: UTF8.self)
+                let detail = String(decoding: pipes.stderrTail, as: UTF8.self)
                 throw CodexError.failed("The design task exited\(status).\n\n\(detail.isEmpty ? "The Claude Code connection closed before the design was complete." : String(detail.suffix(2_400)))")
             }
-            var descriptors = [
-                pollfd(fd: outputFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
-                pollfd(fd: errorFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0),
-                pollfd(fd: writeBuffer == nil ? -1 : inputFD, events: Int16(POLLOUT | POLLHUP | POLLERR), revents: 0)
-            ]
-            _ = Darwin.poll(&descriptors, nfds_t(descriptors.count), 40)
-            if descriptors[2].revents != 0, let writing = writeBuffer {
-                let written = writing.withUnsafeBytes { bytes in
-                    Darwin.write(inputFD, bytes.baseAddress!.advanced(by: writeOffset), bytes.count - writeOffset)
-                }
-                if written > 0 {
-                    writeOffset += written
-                    if writeOffset == writing.count { writeBuffer = nil }
-                } else if written < 0, errno != EAGAIN, errno != EINTR {
-                    if isCancelled { throw CancellationError() }
-                    if let ending { return try terminalData(ending) }
-                    throw CodexError.failed("The task’s input connection closed unexpectedly.")
-                }
-            }
-            for index in 0..<2 where descriptors[index].revents != 0 {
-                var received = 0
-                while true {
-                    let count = Darwin.read(descriptors[index].fd, &buffer, buffer.count)
-                    if count == 0 { if index == 0 { outputClosed = true }; break }
-                    if count < 0 { break }
-                    let data = Data(buffer.prefix(count))
-                    if index == 0 { try consume(data) }
-                    else {
-                        stderrTail.append(data)
-                        if stderrTail.count > 16_384 { stderrTail.removeFirst(stderrTail.count - 16_384) }
-                    }
-                    received += count
-                    if received >= 1_048_576 { break }
-                }
+            let inputOpen = try pipes.step(timeout: 40, next: {
+                lock.lock(); defer { lock.unlock() }
+                return outbound.isEmpty ? nil : outbound.removeFirst()
+            }, onOutput: { try consume($0) })
+            if !inputOpen {
+                if isCancelled { throw CancellationError() }
+                if let ending { return try terminalData(ending) }
+                throw CodexError.failed("The task’s input connection closed unexpectedly.")
             }
         }
     }
@@ -309,15 +267,8 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
                 ? "The task stopped before acknowledging the additional information."
                 : "The task’s connection closed before acknowledging the additional information."))
         }
-        try? inputPipe.fileHandleForWriting.close()
-        if process.isRunning { process.terminate() }
-        let deadline = Date().addingTimeInterval(0.5)
-        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
-        if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
-        process.waitUntilExit()
+        pipes.shutdown { if process.isRunning { process.terminate() } }
         lock.lock(); running = false; lock.unlock()
-        try? outputPipe.fileHandleForReading.close()
-        try? errorPipe.fileHandleForReading.close()
     }
 
     private static func frame(_ object: [String: Any]) throws -> Data {
@@ -363,35 +314,11 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
     }
 
     private func consume(_ chunk: Data) throws {
-        // Search only new bytes so a large malformed line stays linear.
-        try chunk.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
-            guard let base = bytes.baseAddress else { return }
-            var offset = 0
-            while offset < bytes.count {
-                let newline = memchr(base.advanced(by: offset), 10, bytes.count - offset)
-                let end = newline.map { base.distance(to: UnsafeRawPointer($0)) } ?? bytes.count
-                let count = end - offset
-                if !discardingOversizedLine {
-                    if count > Self.maximumEventBytes - stdoutLine.count {
-                        onActivity(ProjectActivityEvent(id: "server:oversized:\(UUID().uuidString)", category: "diagnostic",
-                            title: "Oversized task event", status: "failed",
-                            output: "A Claude Code event exceeded 32 MB and could not be retained. This execution record is incomplete."))
-                        stdoutLine.removeAll(keepingCapacity: false)
-                        discardingOversizedLine = true
-                    } else if count > 0 {
-                        stdoutLine.append(base.assumingMemoryBound(to: UInt8.self).advanced(by: offset), count: count)
-                    }
-                }
-                guard newline != nil else { break }
-                if !discardingOversizedLine {
-                    let line = stdoutLine
-                    stdoutLine = Data()
-                    try receive(line)
-                }
-                discardingOversizedLine = false
-                offset = end + 1
-            }
-        }
+        try lines.append(chunk, oversized: {
+            onActivity(ProjectActivityEvent(id: "server:oversized:\(UUID().uuidString)", category: "diagnostic",
+                title: "Oversized task event", status: "failed",
+                output: "A Claude Code event exceeded 32 MB and could not be retained. This execution record is incomplete."))
+        }, receive: receive)
     }
 
     private func receive(_ line: Data) throws {

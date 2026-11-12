@@ -1,48 +1,41 @@
 import Foundation
 
-/// Convert public CLI execution events into audit facts. Agent messages and
+/// Convert public app-server items into audit facts. Agent messages and
 /// reasoning are deliberately handled elsewhere, never copied into this log.
 enum CodexActivity {
-    static func event(_ object: [String: Any], starts: inout [String: Date]) -> ProjectActivityEvent? {
-        guard let eventType = object["type"] as? String else { return nil }
-        if eventType == "thread.started" || eventType == "turn.completed" || eventType == "turn.failed" || eventType == "error" {
-            let failed = eventType == "turn.failed" || eventType == "error"
-            let title = eventType == "thread.started" ? "Session started" : eventType == "turn.completed" ? "Task finished" : "Task error"
-            return ProjectActivityEvent(id: "cli:\(eventType):\(object["thread_id"] as? String ?? UUID().uuidString)",
-                category: failed ? "diagnostic" : "lifecycle", title: title,
-                status: failed ? "failed" : "completed", output: json(sanitize(object)))
-        }
-        guard ["item.started", "item.updated", "item.completed"].contains(eventType),
-              let item = object["item"] as? [String: Any], let kind = item["type"] as? String,
-              let rawID = item["id"] as? String, !rawID.isEmpty, rawID.utf8.count <= 900,
+    /// `id` is unique within the task; `completed` marks the item's final
+    /// update. Updates keep the item's original start time.
+    static func event(item: [String: Any], id rawID: String, completed: Bool,
+                      starts: inout [String: Date]) -> ProjectActivityEvent? {
+        guard let kind = item["type"] as? String, !rawID.isEmpty, rawID.utf8.count <= 900,
               rawID.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else { return nil }
         let category: String
         let title: String
         let input: String?
         let output: String?
         switch kind {
-        case "command_execution":
+        case "commandExecution":
             category = "command"
             title = String((item["command"] as? String ?? "Command").prefix(180))
             input = item["command"] as? String
-            output = item["aggregated_output"] as? String ?? item["output"] as? String
-        case "mcp_tool_call":
-            let server = item["server"] as? String ?? item["server_name"] as? String ?? "MCP"
+            output = item["aggregatedOutput"] as? String
+        case "mcpToolCall":
+            let server = item["server"] as? String ?? "MCP"
             // Native LAD calls are logged by the trusted host with exact
-            // results and timing; the CLI copy can contain PNG base64.
+            // results and timing; the agent's copy can contain PNG base64.
             guard server != "lad" else { return nil }
             category = "tool"
-            title = "\(server) · \(item["tool"] as? String ?? item["tool_name"] as? String ?? "Tool")"
+            title = "\(server) · \(item["tool"] as? String ?? "Tool")"
             input = item["arguments"].map { json(sanitize($0)) }
             output = (item["result"] ?? item["error"]).map { json(sanitize($0)) }
-        case "file_change":
+        case "fileChange":
             category = "file_change"; title = "Workspace file changes"
             input = item["changes"].map { json(sanitize($0)) }; output = nil
-        case "web_search":
+        case "webSearch":
             category = "web_search"; title = "Web search"
             input = item["query"] as? String
             output = json(sanitize(item))
-        case "plan", "plan_update", "todo_list":
+        case "plan":
             category = "plan"; title = "Task plan"
             input = nil; output = json(sanitize(item))
         default: return nil
@@ -56,11 +49,11 @@ enum CodexActivity {
         let hasError = item["error"].map { !($0 is NSNull) } ?? false
         if rawStatus == "canceled" || rawStatus == "cancelled" { status = "canceled" }
         else if rawStatus == "interrupted" { status = "interrupted" }
-        else if rawStatus == "failed" || hasError || (item["exit_code"] as? Int).map({ $0 != 0 }) == true { status = "failed" }
-        else if eventType == "item.completed" { status = "completed" }
+        else if rawStatus == "failed" || hasError || (item["exitCode"] as? Int).map({ $0 != 0 }) == true { status = "failed" }
+        else if completed { status = "completed" }
         else { status = "running" }
-        let duration = (item["duration_ms"] as? Double).map { $0 / 1_000 }
-            ?? (eventType == "item.completed" ? now.timeIntervalSince(started) : nil)
+        let duration = (item["durationMs"] as? Double).map { $0 / 1_000 }
+            ?? (completed ? now.timeIntervalSince(started) : nil)
         return ProjectActivityEvent(id: id, date: started, category: category, title: title, status: status,
                                     input: input, output: output, durationSeconds: duration)
     }
