@@ -13,7 +13,8 @@ import math
 import numpy as np
 from scipy.optimize import least_squares
 
-from mesh_inspect import EvidenceError,_analysis,_selection,_hash,_frame,diagnostic
+from mesh_inspect import EvidenceError,_analysis,_selection,_frame,diagnostic
+from mesh_reference import canonical_digest
 
 VERSION="iterative-fit-1"
 SUPPORTED={"plane","line","circle","cylinder","cone","sphere","profile","extrusion","revolution"}
@@ -508,7 +509,7 @@ def _recognized_candidates(context,records,requested,constraints,limit,tolerance
             error=report["source_vertex_maximum"]
             if error>tolerance and not context.get("fit_policy",{}).get("allow_partial",False):continue
             report.update(source_vertex_or_fit_sample_maximum=error,recognized_region_ref=entry["id"])
-            supported.append({"id":"member-"+_hash([evidence["id"],entry["id"]])[:20],"evidence_id":evidence["id"],"role":evidence.get("role",entry["id"]),
+            supported.append({"id":"member-"+canonical_digest([evidence["id"],entry["id"]])[:20],"evidence_id":evidence["id"],"role":evidence.get("role",entry["id"]),
                               "family":family,"geometry":copy.deepcopy(entry["geometry"]),"observed_extent":copy.deepcopy(entry["observed_extent"]),
                               "inferred_extent":{"material_role":"unknown","terminal_faces":"unresolved","unobserved_trims":"unresolved"},
                               "fit_report":report,"conditioning_report":{"method":"bounded_regional_recognition","unique_original_design":False},
@@ -544,8 +545,8 @@ def _recognized_candidates(context,records,requested,constraints,limit,tolerance
                    "observed_extent":{m["id"]:m["observed_extent"] for m in members},"inferred_extensions":{m["id"]:m["inferred_extent"] for m in members},
                    "fit_report":{"guarantee":"sampled_local_fit_only","distance_tolerance":tolerance,"public_max_deviation":context.get("max_deviation"),"recognition_does_not_decide_material":True},
                    "conditioning_report":{m["id"]:m["conditioning_report"] for m in members},"complexity":{"members":len(members),"representation":"analytic_or_compact_line_arc_profile"},
-                   "dependencies":dependencies,"dependency_fingerprint":_hash(dependencies),"units":"mm","provenance":provenance}
-        candidate["id"]="fit-"+_hash(candidate)[:24];candidates.append(candidate)
+                   "dependencies":dependencies,"dependency_fingerprint":canonical_digest(dependencies),"units":"mm","provenance":provenance}
+        candidate["id"]="fit-"+canonical_digest(candidate)[:24];candidates.append(candidate)
     candidates.sort(key=lambda c:(-sum(m["recognition_area"] for m in c["members"]),len(c["unresolved_evidence"]),c["id"]))
     if not candidates:return {"status":"no_result","payload":[],"diagnostics":diagnostics or [diagnostic("CONSTRAINT_CONFLICT","No recognized alternative satisfies the requested checked constraints")],"provenance":provenance}
     return {"status":"partial" if diagnostics or any(c["unresolved_evidence"] for c in candidates) else "ok","payload":candidates[:limit],"diagnostics":diagnostics,"provenance":provenance}
@@ -592,7 +593,7 @@ def fit(context,evidence_records,families="auto",constraints=(),resolve_referenc
                     generated=_generated_candidate(family,record,tolerance,context,data)
                     if generated:
                         geometry,error=generated
-                        fits.append({"id":"member-"+_hash([identity,family])[:20],"evidence_id":identity,"role":record.get("role",identity),"family":family,"geometry":geometry,
+                        fits.append({"id":"member-"+canonical_digest([identity,family])[:20],"evidence_id":identity,"role":record.get("role",identity),"family":family,"geometry":geometry,
                                      "observed_extent":{"classification":"observed_sections","terminal_faces_observed":False},"inferred_extent":{"closure":"none_inferred","end_caps":"unresolved"},
                                      "fit_report":{"sampled_maximum":error,"guarantee":"sampled_section_fit"},"conditioning_report":{"ambiguous_parameters":["unobserved_extents"]}})
                     elif family=="revolution":diagnostics.append(diagnostic("INSUFFICIENT_EVIDENCE","Revolution fitting requires several meridian observations and a resolved axis; arbitrary revolution inference is unavailable",evidence_refs=[identity]))
@@ -611,7 +612,7 @@ def fit(context,evidence_records,families="auto",constraints=(),resolve_referenc
                 if family=="sphere":
                     span=extent.get("direction_span_singular_values",[0,0,0])
                     if len(span)<3 or span[-1]<max(span[0],1e-30)*.05:ambiguity.append("small_cap_or_ring_does_not_identify_sphere_uniquely")
-                fits.append({"id":"member-"+_hash([identity,family])[:20],"evidence_id":identity,"role":record.get("role",identity),"family":family,"geometry":geometry,
+                fits.append({"id":"member-"+canonical_digest([identity,family])[:20],"evidence_id":identity,"role":record.get("role",identity),"family":family,"geometry":geometry,
                              "observed_extent":extent,"inferred_extent":{"support_surface":"unbounded_continuation","terminal_faces":"unresolved","material_role":"unknown"},
                              "fit_report":report,"conditioning_report":{"solver":solver,"ambiguous_parameters":ambiguity}})
             if not fits:
@@ -651,7 +652,7 @@ def fit(context,evidence_records,families="auto",constraints=(),resolve_referenc
                        "fit_report":{"guarantee":"sampled_local_fit_only","distance_tolerance":tolerance,"public_max_deviation":context.get("max_deviation"),"robustly_excluded_source_remains_in_reference":True},
                        "conditioning_report":{m["id"]:m.get("conditioning_report",{}) for m in members},"complexity":{"members":len(members),"representation":"analytic_or_compact_line_arc_profile"},
                        "dependencies":{"source_hash":context["source_hash"],"evidence_dependencies":dependencies},"units":context.get("units","mm"),"provenance":provenance}
-            candidate["dependency_fingerprint"]=_hash(candidate["dependencies"]);candidate["id"]="fit-"+_hash(candidate)[:24];candidates.append(candidate)
+            candidate["dependency_fingerprint"]=canonical_digest(candidate["dependencies"]);candidate["id"]="fit-"+canonical_digest(candidate)[:24];candidates.append(candidate)
         if not candidates:return {"status":"no_result","payload":[],"diagnostics":diagnostics+[diagnostic("CONSTRAINT_CONFLICT" if constraints else "NO_ACCEPTABLE_FIT","No joint alternative satisfies hard constraints and local evidence obligations")],"provenance":provenance}
         candidates.sort(key=lambda candidate:(len(candidate["unresolved_evidence"]),sum(m["fit_report"].get("area_weighted_rms",m["fit_report"].get("sampled_maximum",0)) for m in candidate["members"]),candidate["id"]))
         return {"status":"partial" if diagnostics or any(c["unresolved_evidence"] for c in candidates) else "ok","payload":candidates[:limit],"diagnostics":diagnostics,"provenance":provenance}

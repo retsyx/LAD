@@ -7,19 +7,15 @@ No construction schema or execution pipeline is retained here.
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import math
 import numpy as np
 from scipy.optimize import least_squares
 
+from mesh_reference import canonical_digest, connected_components
+
 VERSION = "regional-recognition-1"
 FAMILIES = {"plane", "sphere", "cylinder", "torus", "helical_sweep",
             "rounded_rectangle_extrusion", "concentric_spherical_shell"}
-
-
-def _hash(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
 def _rounded(value):
@@ -96,24 +92,6 @@ def _axes(points, normals, areas, edges=None):
         if not any(abs(float(np.dot(axis, old))) > 1 - 1e-8 for old in result):
             result.append(axis)
     return result[:15]
-
-
-def _connected_subset(indices, adjacency):
-    remaining = set(int(i) for i in indices)
-    result = []
-    while remaining:
-        seed = min(remaining)
-        remaining.remove(seed)
-        stack, group = [seed], []
-        while stack:
-            current = stack.pop()
-            group.append(current)
-            for neighbor in adjacency[current]:
-                if neighbor in remaining:
-                    remaining.remove(neighbor)
-                    stack.append(neighbor)
-        result.append(sorted(group))
-    return result
 
 
 def _sphere_evidence(points, triangles, normals, scale):
@@ -230,7 +208,7 @@ def _cylinder_evidence(points, triangles, normals, areas, axes, scale, excluded,
             for second in neighbors:
                 if not excluded[second] and float(normals[first]@normals[second]) > math.cos(math.radians(25)):
                     smooth[first].add(second)
-        patches = _connected_subset(np.flatnonzero(~excluded),smooth)
+        patches = connected_components(np.flatnonzero(~excluded),smooth)
         patches.sort(key=lambda tids:-float(areas[tids].sum()))
         for tids in patches[:24]:
             if len(tids) < 12:
@@ -276,7 +254,7 @@ def _cylinder_evidence(points, triangles, normals, areas, axes, scale, excluded,
                 continue
             model = {"kind":"cylinder","origin":(centerline+axis*low).tolist(),
                      "axis":axis.tolist(),"radius":float(radius*scale),"height":high-low}
-            signature = _hash(_rounded(model))
+            signature = canonical_digest(_rounded(model))
             if signature in seen:
                 continue
             seen.add(signature)
@@ -330,7 +308,7 @@ def _coherent_regions(points, triangles, normals, areas, adjacency, axes, scale)
         tids = tids[~assigned[tids]]
         if len(tids) < 12:
             continue
-        for connected in _connected_subset(tids,adjacency):
+        for connected in connected_components(tids,adjacency):
             if len(connected) < 8:
                 continue
             assigned[connected] = True
@@ -342,7 +320,7 @@ def _coherent_regions(points, triangles, normals, areas, adjacency, axes, scale)
         area = float(areas[tids].sum())
         if len(tids) < 2 or area < scale*scale*1e-5 or len(tids) == 2 and area < scale*scale*.001:
             continue
-        for connected in _connected_subset([t for t in tids if not assigned[t]],adjacency):
+        for connected in connected_components([t for t in tids if not assigned[t]],adjacency):
             if not connected:
                 continue
             assigned[connected] = True
@@ -358,12 +336,12 @@ def _coherent_regions(points, triangles, normals, areas, adjacency, axes, scale)
         for neighbor in neighbors:
             if not assigned[neighbor] and abs(float(normals[current]@normals[neighbor])) > math.cos(math.radians(25)):
                 residual_adjacency[current].add(neighbor)
-    for tids in _connected_subset(np.flatnonzero(~assigned),residual_adjacency):
+    for tids in connected_components(np.flatnonzero(~assigned),residual_adjacency):
         groups.append((tids,{}))
     regions,lookup = [],{}
     for tids,item in groups:
         tids = sorted(tids)
-        identity = "region-"+_hash(tids)[:20]
+        identity = "region-"+canonical_digest(tids)[:20]
         for tid in tids:
             lookup[tid] = identity
         values = tri[tids].reshape(-1,3)
@@ -465,7 +443,7 @@ def refine_torus_regions(points,triangles,normals,areas,adjacency,regions,scale,
                 proposals.append((float(areas[ids].sum()),ids,model))
         for _,ids,model in sorted(proposals,key=lambda item:-item[0]):
             available = sorted(set(ids.tolist())&remaining)
-            for connected in _connected_subset(available,adjacency):
+            for connected in connected_components(available,adjacency):
                 if len(connected)<12:
                     continue
                 remaining.difference_update(connected)
@@ -478,14 +456,14 @@ def refine_torus_regions(points,triangles,normals,areas,adjacency,regions,scale,
                 direction=vector if model["kind"]=="cylinder" else middle-model["major_radius"]*vector/np.maximum(length[:,None],1e-30)
                 deviation=np.abs(length-model["radius"]) if model["kind"]=="cylinder" else np.abs(np.linalg.norm(direction,axis=1)-model["minor_radius"])
                 direction/=np.maximum(np.linalg.norm(direction,axis=1)[:,None],1e-30)
-                output.append({"id":"region-"+_hash(connected)[:20],"triangle_ids":connected,"area":float(areas[connected].sum()),
+                output.append({"id":"region-"+canonical_digest(connected)[:20],"triangle_ids":connected,"area":float(areas[connected].sum()),
                                "surface_kind":model["kind"],"analytic_model":model,"normal":None,"plane":None,"provisional":True,
                                "orientation_agreement":int(np.sign(np.median(np.sum(direction*normals[connected],axis=1)))),
                                "fit_error":{"source_vertex_maximum":float(vertex_error.max()),"triangle_centroid_maximum":float(deviation.max()),"estimated":True},
                                "bounds":{"min":values.min(axis=0).tolist(),"max":values.max(axis=0).tolist()}})
-        for connected in _connected_subset(remaining,adjacency):
+        for connected in connected_components(remaining,adjacency):
             item = copy.deepcopy(region)
-            item.update(id="region-"+_hash(connected)[:20],triangle_ids=connected,area=float(areas[connected].sum()))
+            item.update(id="region-"+canonical_digest(connected)[:20],triangle_ids=connected,area=float(areas[connected].sum()))
             values=tri[connected].reshape(-1,3)
             item["bounds"]={"min":values.min(axis=0).tolist(),"max":values.max(axis=0).tolist()}
             output.append(item)
@@ -552,7 +530,7 @@ def helical_profile_evidence(points,triangles,normals,regions,scale):
             if a["phase_interval"][1]>=b["phase_interval"][0] or b["phase_interval"][1]>a["phase_interval"][0]+pitch:
                 continue
             identities=sorted(a["region_ids"]+b["region_ids"])
-            identity="helical-profile-"+_hash(identities)[:20]
+            identity="helical-profile-"+canonical_digest(identities)[:20]
             if identity in used:continue
             used.add(identity)
             r0=(a["radial_interval"][0]+b["radial_interval"][0])/2;r1=(a["radial_interval"][1]+b["radial_interval"][1])/2
@@ -703,7 +681,7 @@ def rounded_extrusion_evidence(points,triangles,regions,scale):
                     if len(signs)==4 and corner.sum()>=12:
                         key=tuple(np.round(np.r_[axis,fit["center"],fit["width"],fit["height"],fit["corner_radius"]],4))
                         if key not in seen:
-                            seen.add(key);identity="rounded-extrusion-"+_hash(list(key))[:20]
+                            seen.add(key);identity="rounded-extrusion-"+canonical_digest(list(key))[:20]
                             source_regions=[entry["id"] for entry in regions if set(entry["triangle_ids"])&set(owned.tolist())]
                             features.append({"id":identity,"kind":"rounded_rectangle_extrusion","region_ids":source_regions,"axis":axis.tolist(),"x_direction":x.tolist(),
                                              "profile":_rounded_profile(fit),"dimensions":{k:fit[k] for k in ("center","width","height","corner_radius","angle_radians")},
@@ -727,7 +705,7 @@ def rounded_extrusion_evidence(points,triangles,regions,scale):
                 key=tuple(np.round(np.r_[axis,fit["center"],fit["width"],fit["height"],fit["corner_radius"]],4))
                 if key in seen:continue
                 seen.add(key)
-                identity="rounded-extrusion-"+_hash(list(key))[:20]
+                identity="rounded-extrusion-"+canonical_digest(list(key))[:20]
                 measured=[(level,fit)]+matches
                 profile=_rounded_profile(fit)
                 features.append({"id":identity,"kind":"rounded_rectangle_extrusion","region_ids":[region["id"]],"axis":axis.tolist(),"x_direction":x.tolist(),
@@ -796,9 +774,9 @@ def recognize(context, analysis, selection, families="auto", *, triangle_budget=
             if covered:
                 remaining=[]
                 for region in regions:
-                    for group in _connected_subset(set(region["triangle_ids"])-covered,adjacency):
+                    for group in connected_components(set(region["triangle_ids"])-covered,adjacency):
                         item=copy.deepcopy(region);values=points[triangles[group]].reshape(-1,3)
-                        item.update(id="region-"+_hash(group)[:20],triangle_ids=group,area=float(areas[group].sum()),bounds={"min":values.min(axis=0).tolist(),"max":values.max(axis=0).tolist()})
+                        item.update(id="region-"+canonical_digest(group)[:20],triangle_ids=group,area=float(areas[group].sum()),bounds={"min":values.min(axis=0).tolist(),"max":values.max(axis=0).tolist()})
                         remaining.append(item)
                 regions=remaining+tori
     helices=helical_profile_evidence(points,triangles,normals,regions+hints,scale) if "helical_sweep" in requested else []
@@ -813,7 +791,7 @@ def recognize(context, analysis, selection, families="auto", *, triangle_budget=
                 "area":float(areas[local_ids].sum()),"fit_report":{"source_vertex_maximum":float(error),"guarantee":"sampled_local_fit_only","final_acceptance":"not_evaluated"},
                 "observed_extent":{"bounds":bounds,"triangle_ids":original,"classification":"observed_surface_support_only","terminal_faces_observed":False},
                 "material_role":"unknown","unresolved_decisions":["material_side","finite_construction_extent","unobserved_trims_and_neighboring_features"],**details}
-        record["id"]="recognition-"+_hash([context["source_hash"],record])[:24]
+        record["id"]="recognition-"+canonical_digest([context["source_hash"],record])[:24]
         records.append(record)
         return record
     for region in regions:
@@ -871,14 +849,14 @@ def recognize(context, analysis, selection, families="auto", *, triangle_budget=
                     surface_members=[{"role":"outer","triangle_ids":[selected[i] for i in outer["triangle_ids"]]},{"role":"inner","triangle_ids":[selected[i] for i in inner["triangle_ids"]]}])
     # Recompute IDs after support extents were added; record files and handles
     # remain content addressed and independent of the current CAD revision.
-    for record in records:record["id"]="recognition-"+_hash([context["source_hash"],{k:v for k,v in record.items() if k!="id"}])[:24]
+    for record in records:record["id"]="recognition-"+canonical_digest([context["source_hash"],{k:v for k,v in record.items() if k!="id"}])[:24]
     records.sort(key=lambda record:(-record["area"],record["family"],record["id"]))
     covered={tid for record in records for tid in record["triangle_ids"]}
     unknown.update(set(selected)-covered)
     summaries=[]
     for region in regions:
         original=[selected[i] for i in region["triangle_ids"]]
-        summaries.append({"id":"recognized-region-"+_hash([context["source_hash"],original])[:24],"triangle_ids":original,"surface_kind":region["surface_kind"],"area":region["area"],"bounds":region["bounds"],"provisional":True})
+        summaries.append({"id":"recognized-region-"+canonical_digest([context["source_hash"],original])[:24],"triangle_ids":original,"surface_kind":region["surface_kind"],"area":region["area"],"bounds":region["bounds"],"provisional":True})
     if unknown:diagnostics.append(diagnostic("UNRESOLVED_RECOGNITION_SCOPE","Requested recognizers leave source triangles without a geometric explanation",triangle_count=len(unknown)))
     return {"recognition_records":records,"recognized_regions":summaries,"recognition_unknown_triangle_ids":sorted(unknown),"recognition_diagnostics":diagnostics,
             "recognition_work":{"processed_triangle_count":len(selected),"triangle_budget":triangle_budget,"algorithm_version":VERSION,"bounded_sphere_passes":4,"sphere_trials_per_pass":320}}

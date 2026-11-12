@@ -114,6 +114,23 @@ class SharedReferenceTests(unittest.TestCase):
         self.assertNotEqual(source.digest, changed_source.digest)
         self.assertEqual(source.vertices[0, 0], 0)
 
+    def test_shared_identity_component_and_distance_helpers(self):
+        expected = hashlib.sha256(b'{"a":[1.5,"\\u00e9"],"b":1}').hexdigest()
+        self.assertEqual(mesh_reference.canonical_digest({"b": 1, "a": [1.5, "é"]}), expected)
+        with self.assertRaises(ValueError):
+            mesh_reference.canonical_digest(float("nan"))
+        adjacency = {1: {4}, 2: set(), 4: {1, 7}, 7: {4, 9}, 9: {7}}
+        self.assertEqual(mesh_reference.connected_components([9, 7, 4, 2, 1], adjacency), [[1, 4, 7, 9], [2]])
+        faces = np.asarray([[[0., 0, 0], [2, 0, 0], [0, 2, 0]],
+                            [[5., 0, 0], [5, 0, 0], [5, 0, 0]],
+                            [[0., 0, 3], [2, 0, 3], [4, 0, 3]]])
+        point = np.asarray([0.5, 0.5, 1.0])
+        distances, points, bary = mesh_reference.triangle_distances(point, faces)
+        np.testing.assert_array_equal(distances, [1.0, 21.5, 4.25])
+        np.testing.assert_array_equal(points, [[0.5, 0.5, 0], [5, 0, 0], [0.5, 0, 3]])
+        np.testing.assert_array_equal(bary, [[0.5, 0.25, 0.25], [1, 0, 0], [0.75, 0.25, 0]])
+        np.testing.assert_array_equal(mesh_reference.triangle_distances(point, faces, witnesses=False), distances)
+
 
 if __name__ == "__main__":
     unittest.main()

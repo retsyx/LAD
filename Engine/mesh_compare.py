@@ -9,15 +9,11 @@ import hashlib
 import copy
 import heapq
 import io
-import json
 import math
 
 import numpy as np
-from mesh_reference import ReferenceMesh, reference, triangle_ranges
-
-
-def _digest(value):
-    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
+from mesh_reference import (ReferenceMesh, canonical_digest, connected_components, reference,
+                            triangle_distances, triangle_ranges)
 
 
 def _shape(value):
@@ -65,7 +61,7 @@ class _Source:
         self.unique,_,self.welded=shared.welding;self.indexed=shared.indexed
         incidence=shared.incidence(self.areas)
         self.edges,self.adjacency=incidence.edges,incidence.connected
-        self.components=_groups(set(np.flatnonzero(self.areas>0)),self.adjacency)
+        self.components=connected_components(set(np.flatnonzero(self.areas>0)),self.adjacency)
         self._tree=[];self.root=self._build(np.arange(len(triangles))) if build_index else None
         self._audit=None
 
@@ -85,7 +81,7 @@ class _Source:
             if lower>best:continue
             low,high,left,right,indices=self._tree[index]
             if indices is not None:
-                distances,points,weights=_triangle_distances(point,self.faces[indices])
+                distances,points,weights=triangle_distances(point,self.faces[indices])
                 local=int(np.argmin(distances))
                 if distances[local]<best:best=float(distances[local]);witness=points[local];triangle=int(indices[local]);bary=weights[local]
             else:
@@ -93,32 +89,6 @@ class _Source:
                     a,b,*_=self._tree[child];delta=np.maximum(np.maximum(a-point,point-b),0);bound=float(delta@delta)
                     if bound<=best:heapq.heappush(queue,(bound,child))
         return math.sqrt(max(0,best)),witness,triangle,bary
-
-
-def _triangle_distances(point,faces):
-    a,b,c=faces[:,0],faces[:,1],faces[:,2];ab=b-a;ac=c-a;ap=point-a
-    d00=np.einsum('ij,ij->i',ab,ab);d01=np.einsum('ij,ij->i',ab,ac);d11=np.einsum('ij,ij->i',ac,ac)
-    d20=np.einsum('ij,ij->i',ap,ab);d21=np.einsum('ij,ij->i',ap,ac);den=d00*d11-d01*d01
-    v=np.divide(d11*d20-d01*d21,den,out=np.zeros_like(den),where=den>0);w=np.divide(d00*d21-d01*d20,den,out=np.zeros_like(den),where=den>0)
-    bary=np.column_stack((1-v-w,v,w));points=a+v[:,None]*ab+w[:,None]*ac
-    distances=np.einsum('ij,ij->i',points-point,points-point);distances[(den<=0)|(v<0)|(w<0)|(v+w>1)]=np.inf
-    for i,j in ((0,1),(1,2),(2,0)):
-        edge=faces[:,j]-faces[:,i];length=np.einsum('ij,ij->i',edge,edge)
-        t=np.divide(np.einsum('ij,ij->i',point-faces[:,i],edge),length,out=np.zeros_like(length),where=length>0);t=np.clip(t,0,1)
-        q=faces[:,i]+t[:,None]*edge;d=np.einsum('ij,ij->i',q-point,q-point);mask=d<distances
-        points[mask]=q[mask];distances[mask]=d[mask];bary[mask]=0;bary[mask,i]=1-t[mask];bary[mask,j]=t[mask]
-    return distances,points,bary
-
-
-def _groups(indices,adjacency):
-    remaining=set(int(i) for i in indices);result=[]
-    while remaining:
-        seed=min(remaining);remaining.remove(seed);stack=[seed];group=[]
-        while stack:
-            current=stack.pop();group.append(current)
-            for neighbor in adjacency[current]&remaining:remaining.remove(neighbor);stack.append(neighbor)
-        result.append(sorted(group))
-    return result
 
 
 def _scope(context,source,scope):
@@ -156,7 +126,7 @@ def _source_samples(source,ids,budget):
             tid=max(candidates,key=lambda t:source.areas[t]);rows.append({"triangle_id":tid,"barycentric":[1/3]*3,"position":source.centroids[tid].tolist(),"stratum":"component_guard","area_weight":0.})
     for tid in ids[source.areas[ids]==0][:budget//8]:
         for bary in ([1,0,0],[0,1,0],[0,0,1]):rows.append({"triangle_id":int(tid),"barycentric":bary,"position":(np.asarray(bary)@source.faces[tid]).tolist(),"stratum":"lower_dimensional","area_weight":0.})
-    for index,row in enumerate(rows):row["id"]="mesh-sample-"+_digest([source.digest,row["triangle_id"],row["barycentric"],row["stratum"]])[:20]
+    for index,row in enumerate(rows):row["id"]="mesh-sample-"+canonical_digest([source.digest,row["triangle_id"],row["barycentric"],row["stratum"]])[:20]
     return rows
 
 
@@ -210,7 +180,7 @@ def _cad_samples(shape,refs,budget,span):
             else:uv=None
         if uv is None:
             distance,witness,_=_nearest_cad(point,face,[face],[refs[fi]]);point=np.asarray(witness)
-        rows.append({"id":"cad-sample-"+_digest([refs[fi],triangle,stratum])[:20],"cad_entity_ref":refs[fi],"position":point.tolist(),"uv":uv.tolist() if uv is not None else None,"stratum":stratum,"area_weight":weight})
+        rows.append({"id":"cad-sample-"+canonical_digest([refs[fi],triangle,stratum])[:20],"cad_entity_ref":refs[fi],"position":point.tolist(),"uv":uv.tolist() if uv is not None else None,"stratum":stratum,"area_weight":weight})
     return rows,{"complete":False,"method":"isolated acceleration triangulation chooses UV/trim-valid native surface samples; no meshing-error certificate","sampling_deflection":max(span/180,.002),"sampled_face_refs":sorted({r["cad_entity_ref"] for r in rows}),"face_count":len(faces)}
 
 
@@ -220,7 +190,16 @@ def _stats(samples,domain,target,units,coverage):
     if weighted:
         values=np.asarray([s["distance"] for s in weighted]);weights=np.asarray([s["area_weight"] for s in weighted]);order=np.argsort(values);cdf=np.cumsum(weights[order])/sum(weights)
         rms=float(np.sqrt(np.average(values**2,weights=weights)));quantiles={str(q):float(values[order[min(np.searchsorted(cdf,q),len(order)-1)]]) for q in [.5,.9,.95,.99]}
-    return {"domain_ref":domain,"target_ref":target,"sampled_max":max((s["distance"] for s in finite),default=None),"area_weighted_rms":rms,"area_weighted_quantiles":quantiles,"lower_bound":None,"upper_bound":None,"guarantee":"sampled" if finite else "unavailable","units":units,"samples":samples,"witness_refs":[s["id"] for s in sorted(finite,key=lambda r:-r["distance"])[:16]],"coverage":coverage,"numeric_policy":"ordinary floating/native closest distances are estimates, not rigorous lower witnesses","unavailable_reason":None if finite else "No nonempty opposite boundary or no completed samples"}
+    return {
+        "domain_ref":domain,"target_ref":target,
+        "sampled_max":max((s["distance"] for s in finite),default=None),
+        "area_weighted_rms":rms,"area_weighted_quantiles":quantiles,
+        "lower_bound":None,"upper_bound":None,"guarantee":"sampled" if finite else "unavailable",
+        "units":units,"samples":samples,
+        "witness_refs":[s["id"] for s in sorted(finite,key=lambda r:-r["distance"])[:16]],
+        "coverage":coverage,
+        "numeric_policy":"ordinary floating/native closest distances are estimates, not rigorous lower witnesses",
+        "unavailable_reason":None if finite else "No nonempty opposite boundary or no completed samples"}
 
 
 def _residual_regions(source,samples,threshold,model_ref):
@@ -228,9 +207,17 @@ def _residual_regions(source,samples,threshold,model_ref):
     for sample in samples:
         if sample.get("distance") is not None and sample["distance"]>threshold:by_triangle.setdefault(sample["triangle_id"],[]).append(sample)
     rows=[]
-    for group in _groups(set(by_triangle),source.adjacency):
+    for group in connected_components(set(by_triangle),source.adjacency):
         evidence=[s for t in group for s in by_triangle[t]]
-        rows.append({"id":"residual-"+_digest([source.digest,model_ref,group])[:20],"direction":"mesh_to_cad","triangle_ids":group,"sample_ids":[s["id"] for s in evidence],"minimum_distance":min(s["distance"] for s in evidence),"maximum_distance":max(s["distance"] for s in evidence),"area_estimate":sum(s["area_weight"] for s in evidence),"location":max(evidence,key=lambda s:s["distance"])["position"],"connectivity":"original exact-incidence adjacency among sampled failing triangles","complete":False,"unprocessed_complement":True,"guarantee":"sampled"})
+        rows.append({
+            "id":"residual-"+canonical_digest([source.digest,model_ref,group])[:20],"direction":"mesh_to_cad",
+            "triangle_ids":group,"sample_ids":[s["id"] for s in evidence],
+            "minimum_distance":min(s["distance"] for s in evidence),
+            "maximum_distance":max(s["distance"] for s in evidence),
+            "area_estimate":sum(s["area_weight"] for s in evidence),
+            "location":max(evidence,key=lambda s:s["distance"])["position"],
+            "connectivity":"original exact-incidence adjacency among sampled failing triangles",
+            "complete":False,"unprocessed_complement":True,"guarantee":"sampled"})
     return sorted(rows,key=lambda r:-r["maximum_distance"])
 
 
@@ -256,7 +243,7 @@ def _native_checks(shape,final=False,face_budget=2048):
 def _result_requirement(requirement,status,reason=None,**values):
     identity=requirement.get("id")
     if not identity:
-        try:identity="requirement-"+_digest(requirement)[:16]
+        try:identity="requirement-"+canonical_digest(requirement)[:16]
         except (ValueError,TypeError):identity="invalid-requirement-"+hashlib.sha256(repr(requirement).encode()).hexdigest()[:16]
     return {"id":identity,"kind":requirement.get("kind"),"mandatory":requirement.get("mandatory",True),"status":status,"reason":reason,**values}
 
@@ -395,7 +382,7 @@ def _source_audit(source,policy):
     budgets=policy.get("source_audit",{})
     allowed={"max_node_pairs","max_candidate_pairs","max_exact_pairs","max_issues"}
     options={k:v for k,v in budgets.items() if k in allowed}
-    key=_digest(options)
+    key=canonical_digest(options)
     if source._audit is not None and source._audit[0]==key:return source._audit[1]
     audit=audit_self_intersections(source.unique,source.indexed,**options)
     closed=bool(source.components) and all(len(uses)==2 for uses in source.edges.values())
@@ -408,7 +395,7 @@ def _source_audit(source,policy):
             for tid,_ in uses:local.setdefault(tid,set()).update(other for other,_ in uses if other!=tid)
     nonmanifold_vertices=[]
     for vertex,local in links.items():
-        if any(len(neighbors)!=2 for neighbors in local.values()) or len(_groups(set(local),local))!=1:nonmanifold_vertices.append(vertex)
+        if any(len(neighbors)!=2 for neighbors in local.values()) or len(connected_components(set(local),local))!=1:nonmanifold_vertices.append(vertex)
     euler=[];component_bounds=[]
     for group in source.components:
         faces=source.indexed[group];edges={tuple(sorted((int(a),int(b)))) for tri in faces for a,b in zip(tri,np.roll(tri,-1))}
@@ -499,7 +486,7 @@ def _protected_checks(source,shape,context):
             for point in points:locations.setdefault(point,[]).append(index)
         for uses in locations.values():
             for index in uses:adjacency[index].update(uses)
-        return _groups(set(range(len(segments))),adjacency)
+        return connected_components(set(range(len(segments))),adjacency)
     source_groups=components(source_segments);native_groups=components(native_segments)
     choices=[{i for i,g in enumerate(native_groups) if all(matches[e].intersection(g) for e in group)} for group in source_groups]
     owners={};matched=True
@@ -519,7 +506,13 @@ def _protected_checks(source,shape,context):
             if parents[node] is None:break
             node,target=parents[node]
     passed=not failed and matched and len(source_groups)==len(native_groups)
-    return {"kind":"observed_sharp_features","status":"pass" if passed else "fail","source_edge_count":len(protected),"native_edge_count":len(native),"source_chain_components":len(source_groups),"native_chain_components":len(native_groups),"unmatched_features":failed,"threshold_degrees":math.degrees(angle),"scope":"observed high-dihedral source features; source tessellation intent is not inferred","method":"source endpoints, oriented incident normals and one-to-one sharp-chain correspondence"}
+    return {
+        "kind":"observed_sharp_features","status":"pass" if passed else "fail",
+        "source_edge_count":len(protected),"native_edge_count":len(native),
+        "source_chain_components":len(source_groups),"native_chain_components":len(native_groups),
+        "unmatched_features":failed,"threshold_degrees":math.degrees(angle),
+        "scope":"observed high-dihedral source features; source tessellation intent is not inferred",
+        "method":"source endpoints, oriented incident normals and one-to-one sharp-chain correspondence"}
 
 
 def _representation(context,target,shape):
@@ -554,7 +547,7 @@ def _requirements(context,target,key):
     for values in (context.get("policy",{}).get(key,[]),target.get("state",{}).get(key,[]),target.get(key,[])):
         if not isinstance(values,list):raise ValueError(key+" must be a list")
         for value in values:
-            identity=value if isinstance(value,str) else value.get("id") or _digest(value)
+            identity=value if isinstance(value,str) else value.get("id") or canonical_digest(value)
             if identity not in seen:result.append(value);seen.add(identity)
     return result
 
@@ -663,26 +656,64 @@ def compare(context,target,scope="all",quality="preview"):
         for row in source_rows:row.update(distance=None,unavailable_reason="The current CAD body is empty")
         cad_coverage={"complete":False,"reason":"No exposed CAD boundary"}
     sampled=sorted({r["triangle_id"] for r in source_rows if r.get("distance") is not None});unprocessed=np.setdiff1d(ids,np.asarray(sampled,dtype=np.int64))
-    source_coverage={"complete":False,"requested_triangle_count":len(ids),"processed_triangle_count":len(sampled),"processed_triangle_ranges":triangle_ranges(sampled),
-                     "unprocessed_triangle_count":len(unprocessed),"unprocessed_triangle_ranges":triangle_ranges(unprocessed),"source_samples_reusable":True,"sampling_fingerprint":_digest([source.digest,ids.tolist(),budget]),"surface_interiors_sampled":True,"component_count":len(source.components),"component_guard_budget":max(1,budget//4),"guarantee":"sampled; no whole-cell acceptance claim"}
+    source_coverage={
+        "complete":False,"requested_triangle_count":len(ids),
+        "processed_triangle_count":len(sampled),"processed_triangle_ranges":triangle_ranges(sampled),
+        "unprocessed_triangle_count":len(unprocessed),"unprocessed_triangle_ranges":triangle_ranges(unprocessed),
+        "source_samples_reusable":True,
+        "sampling_fingerprint":canonical_digest([source.digest,ids.tolist(),budget]),
+        "surface_interiors_sampled":True,"component_count":len(source.components),
+        "component_guard_budget":max(1,budget//4),"guarantee":"sampled; no whole-cell acceptance claim"}
     m2c=_stats(source_rows,{"source_hash":context["source_hash"],**domains},{"geometry_hash":geometry_hash,"native_geometry_digest":native_digest,"boundary":"all exposed target faces"},units,source_coverage)
     c2m=_stats(cad_rows,{"model_ref":model_ref,"cad_face_refs":domains.get("cad_face_refs","all")},{"source_hash":context["source_hash"],"triangles":"all original triangles including interiors and lower-dimensional images"},units,cad_coverage)
     residuals=_residual_regions(source,source_rows,float(context["max_deviation"]),model_ref)
     if not faces and len(ids):
-        residuals=[{"id":"unexplained-empty-"+_digest([source.digest,group])[:20],"direction":"mesh_to_cad","category":"unexplained","triangle_ids":group,"sample_ids":[],"minimum_distance":None,"maximum_distance":None,"reason":"The current CAD boundary is empty","complete":True,"guarantee":"unavailable"} for group in _groups(set(ids.tolist()),source.adjacency)]
+        residuals=[{"id":"unexplained-empty-"+canonical_digest([source.digest,group])[:20],"direction":"mesh_to_cad","category":"unexplained","triangle_ids":group,"sample_ids":[],"minimum_distance":None,"maximum_distance":None,"reason":"The current CAD boundary is empty","complete":True,"guarantee":"unavailable"} for group in connected_components(set(ids.tolist()),source.adjacency)]
     m2c["residual_regions"]=residuals;c2m["residual_regions"]=[]
     for face_ref in sorted({r["cad_entity_ref"] for r in cad_rows}):
         rows=[r for r in cad_rows if r["cad_entity_ref"]==face_ref and r["distance"]>context["max_deviation"]]
-        if rows:c2m["residual_regions"].append({"id":"cad-residual-"+_digest([geometry_hash,face_ref])[:20],"direction":"cad_to_mesh","cad_entity_refs":[face_ref],"sample_ids":[r["id"] for r in rows],"triangle_ids":sorted({r["triangle_id"] for r in rows}),"minimum_distance":min(r["distance"] for r in rows),"maximum_distance":max(r["distance"] for r in rows),"complete":False,"guarantee":"sampled"})
+        if rows:
+            c2m["residual_regions"].append({
+                "id":"cad-residual-"+canonical_digest([geometry_hash,face_ref])[:20],"direction":"cad_to_mesh",
+                "cad_entity_refs":[face_ref],"sample_ids":[r["id"] for r in rows],
+                "triangle_ids":sorted({r["triangle_id"] for r in rows}),
+                "minimum_distance":min(r["distance"] for r in rows),
+                "maximum_distance":max(r["distance"] for r in rows),"complete":False,"guarantee":"sampled"})
     validity=_native_checks(shape,False);representation=_representation_strict(context,target,shape) if faces else {"kind":"reconstructed_representation","status":"not_evaluated","reason":"No current CAD boundary"}
     completion=check_requirements(context,target,_requirements(context,target,"completion_obligations"));invariants=check_requirements(context,target,_requirements(context,target,"active_invariants"));constraints=check_requirements(context,target,_requirements(context,target,"constraints"))
     feature_checks={"completion_obligations":completion,"active_invariants":invariants,"constraints":constraints,"observed_features":{"status":"not_evaluated","reason":"Protected source topology is a final-only computation"}}
     material={"available":False,"assumptions":policy.get("reference_interpretation",{"material":"unknown"}),"estimates_or_bounds":None,"ambiguous_regions":[],"reason":"Unsigned surface distances are supplied; signed material differences are not computed"}
-    report={"comparison_id":None,"context_revision":context_revision,"source_hash":context["source_hash"],"model_ref":model_ref,"geometry_hash":geometry_hash,"native_geometry_digest":native_digest,"scope_requested":scope,"scope_completed":{"source_sample_count":len(sampled),"cad_sample_count":len(cad_rows),"whole_continuous_cover":False},"scope_unknown":{"source_triangle_count":len(unprocessed),"reverse_domain_unspecified":not whole and domains.get("cad_face_refs") is None},"quality_requested":quality,"units":units,"methods_used":methods,"geometry":{"mesh_to_cad":m2c,"cad_to_mesh":c2m,"symmetric":{"lower_bound":None,"upper_bound":None,"decision":"not_evaluated","guarantee":"sampled"},"discrepancies":residuals+c2m["residual_regions"]},"source_samples":source_rows,"validity_checks":validity,"representation_checks":[representation],"feature_checks":feature_checks,"material":material,"reference_assumptions":{"source":"immutable original triangle surface set","comparison_arithmetic_margin":context.get("conversion_arithmetic_margin",0),"material_interpretation":policy.get("reference_interpretation",{"material":"unknown"})},"acceptance":"not_evaluated","limitations":limitations,"dependencies":{"context_revision":context_revision,"source_hash":context["source_hash"],"geometry_hash":geometry_hash,"native_geometry_digest":native_digest,"policy_fingerprint":_digest(policy)},"provenance":{"parameters":{"scope":scope,"quality":quality},"algorithm_versions":{"compare":"iterative-compare-1","bounds":"adaptive-outward-native-surfaces-1"},"reference_samples":source_coverage["sampling_fingerprint"]}}
+    report={
+        "comparison_id":None,"context_revision":context_revision,"source_hash":context["source_hash"],
+        "model_ref":model_ref,"geometry_hash":geometry_hash,"native_geometry_digest":native_digest,
+        "scope_requested":scope,
+        "scope_completed":{"source_sample_count":len(sampled),"cad_sample_count":len(cad_rows),
+                           "whole_continuous_cover":False},
+        "scope_unknown":{"source_triangle_count":len(unprocessed),
+                         "reverse_domain_unspecified":not whole and domains.get("cad_face_refs") is None},
+        "quality_requested":quality,"units":units,"methods_used":methods,
+        "geometry":{
+            "mesh_to_cad":m2c,"cad_to_mesh":c2m,
+            "symmetric":{"lower_bound":None,"upper_bound":None,"decision":"not_evaluated","guarantee":"sampled"},
+            "discrepancies":residuals+c2m["residual_regions"]},
+        "source_samples":source_rows,"validity_checks":validity,"representation_checks":[representation],
+        "feature_checks":feature_checks,"material":material,
+        "reference_assumptions":{
+            "source":"immutable original triangle surface set",
+            "comparison_arithmetic_margin":context.get("conversion_arithmetic_margin",0),
+            "material_interpretation":policy.get("reference_interpretation",{"material":"unknown"})},
+        "acceptance":"not_evaluated","limitations":limitations,
+        "dependencies":{"context_revision":context_revision,"source_hash":context["source_hash"],
+                        "geometry_hash":geometry_hash,"native_geometry_digest":native_digest,
+                        "policy_fingerprint":canonical_digest(policy)},
+        "provenance":{
+            "parameters":{"scope":scope,"quality":quality},
+            "algorithm_versions":{"compare":"iterative-compare-1","bounds":"adaptive-outward-native-surfaces-1"},
+            "reference_samples":source_coverage["sampling_fingerprint"]}}
     if quality=="final" and whole:
         _final(context,target,shape,source,report)
     elif quality=="final":report["limitations"].append("A local comparison cannot approve whole-reconstruction acceptance")
-    report["comparison_id"]="comparison-"+_digest({k:v for k,v in report.items() if k!="comparison_id"})[:24]
+    report["comparison_id"]="comparison-"+canonical_digest({k:v for k,v in report.items() if k!="comparison_id"})[:24]
     return report
 
 

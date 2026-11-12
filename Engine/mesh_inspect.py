@@ -6,14 +6,12 @@ distances are observations, not a reconstruction acceptance certificate.
 from __future__ import annotations
 
 import copy
-import hashlib
 import heapq
-import json
 import math
 from fractions import Fraction
 
 import numpy as np
-from mesh_reference import expand_ranges, reference, triangle_ranges
+from mesh_reference import canonical_digest, connected_components, expand_ranges, reference, triangle_ranges
 
 VERSION = "iterative-inspect-1"
 _FULL = [[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]
@@ -22,10 +20,6 @@ _FULL = [[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]
 class EvidenceError(ValueError):
     def __init__(self,code,message):
         super().__init__(message); self.code=code
-
-
-def _hash(value):
-    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
 
 
 def diagnostic(code,message,*,severity="warning",recoverable=True,**extra):
@@ -94,7 +88,7 @@ def _analysis(context):
     unique,representative,_=shared.welding
     incidence=shared.incidence(areas)
     edges,adjacency=incidence.edges,incidence.manifold
-    components=_components(range(len(triangles)),adjacency)
+    components=connected_components(range(len(triangles)),adjacency)
     result={"vertices":vertices,"triangles":triangles,"faces":faces,"normals":normals,"areas":areas,"centroids":shared.centroids,
             "adjacency":adjacency,"components":components,"edges":edges,"triangle_edges":incidence.triangle_edges,"welded_vertices":unique,
             "welded_triangles":shared.indexed,"representative_vertices":representative,"geometry_hash":shared.digest,"scale":scale,
@@ -103,18 +97,6 @@ def _analysis(context):
         if isinstance(value,np.ndarray):value.setflags(write=False)
     shared.inspection=result
     return result
-
-
-def _components(ids,adjacency):
-    remaining=set(int(x) for x in ids);groups=[]
-    while remaining:
-        seed=min(remaining);remaining.remove(seed);stack=[seed];group=[]
-        while stack:
-            current=stack.pop();group.append(current)
-            for neighbor in adjacency[current]:
-                if neighbor in remaining:remaining.remove(neighbor);stack.append(neighbor)
-        groups.append(sorted(group))
-    return groups
 
 
 def _indices(values,count):
@@ -484,7 +466,7 @@ def inspect(context,revision,query,resolve_evidence=None):
                                 polygon=_clip(part,lambda bary:sign*distance(bary))
                                 if polygon:sides[i].setdefault(tid,[]).append(polygon)
                     partition_groups=[part for part in sides if part]
-                else:partition_groups=[{i:selection[i] for i in group} for group in _components(selection,analysis["adjacency"])]
+                else:partition_groups=[{i:selection[i] for i in group} for group in connected_components(selection,analysis["adjacency"])]
             elif kind=="section":
                 planes=query.get("planes",[query.get("plane")]);source=query.get("source","reference")
                 if not isinstance(planes,list) or not 1<=len(planes)<=policy["max_planes"] or not all(isinstance(p,dict) for p in planes):raise EvidenceError("INVALID_QUERY","Section planes exceed the declared query policy or are invalid")
@@ -531,12 +513,12 @@ def inspect(context,revision,query,resolve_evidence=None):
             if record["reason"]=="work_budget":
                 unknown_scope.update(record["frontier_triangle_ids"]);diagnostics.append(diagnostic("BUDGET_EXHAUSTED","Growth frontier budget exhausted; reachable unprocessed geometry remains unknown"))
         members=[_member(tid,parts) for tid,parts in sorted(selection.items())]
-        if partition_groups is None:partition_groups=[{i:selection[i] for i in group} for group in _components(selection,analysis["adjacency"])]
+        if partition_groups is None:partition_groups=[{i:selection[i] for i in group} for group in connected_components(selection,analysis["adjacency"])]
         regions=[]
         for group in partition_groups:
             entries=[_member(i,parts) for i,parts in sorted(group.items()) if i in selection]
             if not entries:continue
-            regions.append({"region_id":"region-"+_hash([context["source_hash"],entries])[:24],"triangle_ids":[m["triangle_id"] for m in entries],"source_members":entries,
+            regions.append({"region_id":"region-"+canonical_digest([context["source_hash"],entries])[:24],"triangle_ids":[m["triangle_id"] for m in entries],"source_members":entries,
                             "measurements":_measure(analysis,{i:parts for i,parts in group.items() if i in selection}),"boundary":_boundary(analysis,group)})
         dependencies={"context_ref":context["id"],"source_hash":context["source_hash"],"source_geometry_hash":analysis["geometry_hash"]}
         if cad_used:dependencies["cad_revision"]=revision["id"];provenance["dependency_revisions"]=[revision["id"]]
@@ -561,7 +543,7 @@ def inspect(context,revision,query,resolve_evidence=None):
             unprocessed=set(omitted)|unknown_scope|set(payload["recognition_unknown_triangle_ids"])
             payload["completeness"].update(unprocessed_triangle_count=len(unprocessed),unprocessed_triangle_ranges=triangle_ranges(unprocessed))
         if isinstance(query.get("role"),str):payload["role"]=query["role"]
-        payload["id"]="evidence-"+_hash(payload)[:24];payload["evidence_id"]=payload["id"]
+        payload["id"]="evidence-"+canonical_digest(payload)[:24];payload["evidence_id"]=payload["id"]
         return {"status":"partial" if diagnostics or omitted else "ok","payload":payload,"diagnostics":diagnostics,"provenance":provenance}
     except (EvidenceError,ValueError,TypeError,KeyError,IndexError,RuntimeError) as error:
         return {"status":"error","payload":None,"diagnostics":[diagnostic(getattr(error,"code","INVALID_QUERY"),str(error),severity="error")],"provenance":provenance}

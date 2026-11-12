@@ -3,18 +3,93 @@
 The two consumers keep their established numerical formulas and connectivity
 rules. Coordinates, expanded facets and welded edge incidence have one owner;
 consumer-specific measurements and adjacency are prepared only when requested.
+Record identities, connected components and point-to-triangle distances used
+by several mesh modules are also defined once here.
 """
 from __future__ import annotations
 
 from collections import OrderedDict
 from functools import cached_property
 import hashlib
+import json
 from types import MappingProxyType
 
 import numpy as np
 
 
 _CACHE = OrderedDict()
+
+
+def canonical(value):
+    """Deterministic compact JSON bytes for records and their identities."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def canonical_digest(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def connected_components(indices, adjacency):
+    """Sorted connected groups of indices, ordered by their smallest member."""
+    remaining = set(int(index) for index in indices)
+    groups = []
+    while remaining:
+        seed = min(remaining)
+        remaining.remove(seed)
+        stack, group = [seed], []
+        while stack:
+            current = stack.pop()
+            group.append(current)
+            for neighbor in adjacency[current]:
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    stack.append(neighbor)
+        groups.append(sorted(group))
+    return groups
+
+
+def triangle_distances(point, faces, witnesses=True):
+    """Squared distances from a point to each triangle of an (n, 3, 3) array.
+
+    An interior plane projection competes with the closest point of every
+    edge, which also covers degenerate triangles. With witnesses, also return
+    each triangle's closest point and its barycentric weights.
+    """
+    a, b, c = faces[:, 0], faces[:, 1], faces[:, 2]
+    ab, ac, ap = b - a, c - a, point - a
+    d00 = np.einsum("ij,ij->i", ab, ab)
+    d01 = np.einsum("ij,ij->i", ab, ac)
+    d11 = np.einsum("ij,ij->i", ac, ac)
+    d20 = np.einsum("ij,ij->i", ap, ab)
+    d21 = np.einsum("ij,ij->i", ap, ac)
+    denominator = d00 * d11 - d01 * d01
+    v = np.divide(d11 * d20 - d01 * d21, denominator,
+                  out=np.zeros_like(denominator), where=denominator > 0)
+    w = np.divide(d00 * d21 - d01 * d20, denominator,
+                  out=np.zeros_like(denominator), where=denominator > 0)
+    points = a + v[:, None] * ab + w[:, None] * ac
+    distances = np.einsum("ij,ij->i", points - point, points - point)
+    outside = (denominator <= 0) | (v < 0) | (w < 0) | (v + w > 1)
+    distances[outside | ~np.isfinite(v) | ~np.isfinite(w)] = np.inf
+    bary = np.column_stack((1 - v - w, v, w)) if witnesses else None
+    for i, j in ((0, 1), (1, 2), (2, 0)):
+        edge = faces[:, j] - faces[:, i]
+        length = np.einsum("ij,ij->i", edge, edge)
+        t = np.divide(np.einsum("ij,ij->i", point - faces[:, i], edge), length,
+                      out=np.zeros_like(length), where=length > 0)
+        t = np.clip(t, 0, 1)
+        q = faces[:, i] + t[:, None] * edge
+        d = np.einsum("ij,ij->i", q - point, q - point)
+        if not witnesses:
+            distances = np.minimum(distances, d)
+            continue
+        mask = d < distances
+        points[mask] = q[mask]
+        distances[mask] = d[mask]
+        bary[mask] = 0
+        bary[mask, i] = 1 - t[mask]
+        bary[mask, j] = t[mask]
+    return (distances, points, bary) if witnesses else distances
 
 
 def _readonly(values):

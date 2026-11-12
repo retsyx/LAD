@@ -32,6 +32,8 @@ from typing import Any
 import numpy as np
 from scipy.spatial import cKDTree
 
+from mesh_reference import triangle_distances
+
 
 _EPS = sys.float_info.epsilon
 _INF = float("inf")
@@ -636,29 +638,7 @@ class _Mesh:
         # whose interior contains the query.  Compute approximate triangle
         # distances to choose witnesses; no accuracy claim relies on this
         # floating point ranking (point_bound verifies feasibility).
-        a, b, c = self.triangles[:, 0], self.triangles[:, 1], self.triangles[:, 2]
-        ab, ac, ap = b - a, c - a, point - a
-        d00 = np.einsum('ij,ij->i', ab, ab)
-        d01 = np.einsum('ij,ij->i', ab, ac)
-        d11 = np.einsum('ij,ij->i', ac, ac)
-        d20 = np.einsum('ij,ij->i', ap, ab)
-        d21 = np.einsum('ij,ij->i', ap, ac)
-        denominator = d00 * d11 - d01 * d01
-        with np.errstate(divide='ignore', invalid='ignore'):
-            v = (d11 * d20 - d01 * d21) / denominator
-            w = (d00 * d21 - d01 * d20) / denominator
-        projected = a + np.nan_to_num(v)[:, None] * ab + np.nan_to_num(w)[:, None] * ac
-        distance2 = np.einsum('ij,ij->i', projected - point, projected - point)
-        distance2[(denominator <= 0) | (v < 0) | (w < 0) | (v + w > 1) |
-                  ~np.isfinite(v) | ~np.isfinite(w)] = np.inf
-        for i, j in ((0, 1), (1, 2), (2, 0)):
-            edges = self.triangles[:, j] - self.triangles[:, i]
-            lengths = np.einsum('ij,ij->i', edges, edges)
-            numerators = np.einsum('ij,ij->i', point - self.triangles[:, i], edges)
-            t = np.divide(numerators, lengths, out=np.zeros_like(lengths), where=lengths > 0)
-            t = np.clip(t, 0, 1)
-            residual = self.triangles[:, i] + t[:, None] * edges - point
-            distance2 = np.minimum(distance2, np.einsum('ij,ij->i', residual, residual))
+        distance2 = triangle_distances(point, self.triangles, witnesses=False)
         count = min(4, len(distance2))
         return np.argpartition(distance2, count - 1)[:count]
 

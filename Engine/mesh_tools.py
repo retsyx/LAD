@@ -18,6 +18,8 @@ import stat
 import struct
 import uuid
 
+from mesh_reference import canonical, canonical_digest, geometry_digest
+
 VERSION = "iterative-mesh-1"
 MAX_FILE = 512_000_000  # Match the app's geometry-file admission limit.
 MAX_SOURCE_TRIANGLES = 1_000_000
@@ -29,12 +31,8 @@ UNIT_RATIOS = {"mm":(1,1), "cm":(10,1), "m":(1000,1), "um":(1,1000),
                "µm":(1,1000), "in":(127,5), "inch":(127,5), "ft":(1524,5)}
 
 
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-
-
 def identity(prefix, value):
-    return prefix + "-" + hashlib.sha256(canonical(value)).hexdigest()
+    return prefix + "-" + canonical_digest(value)
 
 
 def read_asset(directory, name, maximum=MAX_FILE):
@@ -138,7 +136,6 @@ def open_reference(path,*,units,max_deviation,source_kind="unknown",policy=None)
     allowance=float(exact_allowance)
     if not math.isfinite(allowance):raise ValueError("Deviation exceeds the working range")
     if Fraction.from_float(allowance)>exact_allowance:allowance=math.nextafter(allowance,-math.inf)
-    from mesh_reference import geometry_digest
     source_hash=hashlib.sha256(data).hexdigest()
     context={"source_hash":source_hash,"units":"mm","source_units":units,
              "max_deviation":allowance,"source_max_deviation":float(max_deviation),
@@ -178,7 +175,6 @@ def write_reference(context,output):
 def attach_reference(context,directory,name):
     """Load the staged binary reference into an in-memory context."""
     import numpy as np
-    from mesh_reference import geometry_digest
     geometry=context.get("geometry")
     if not isinstance(geometry,dict):raise ValueError("The reference context has no geometry record")
     with np.load(read_asset(directory,name),allow_pickle=False) as arrays:
