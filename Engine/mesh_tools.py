@@ -274,13 +274,17 @@ def _compact(value,depth=0):
     return value
 
 
-def execute(spec,directory,output,threads=1):
-    """Create immutable worker records; never advance the native branch tip."""
+def execute(spec,directory,output,threads=1,*,worker):
+    """Create immutable worker records; never advance the native branch tip.
+
+    `worker` is the running worker module, which supplies the CAD build,
+    validation and preview pipeline. Never import it here: run as a script it
+    is __main__, and importing worker would load a second copy of its state.
+    """
     from mesh_inspect import inspect
     from mesh_fit import fit
     from mesh_compare import compare,check_requirements,audit_body
     from mesh_edits import compile_edit
-    import worker
     operation=spec.get("operation")
     options=spec.get("options",{})
     if not isinstance(options,dict):raise ValueError("Tool options must be an object")

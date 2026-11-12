@@ -3032,7 +3032,8 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
     if isinstance(spec, dict) and str(spec.get("operation", "")).startswith("mesh_"):
         from mesh_tools import execute, envelope, diagnostic, canonical
         try:
-            return execute(spec, request.parent.resolve(), output, threads)
+            # Lend mesh tools this loaded module (__main__ when run as a script).
+            return execute(spec, request.parent.resolve(), output, threads, worker=sys.modules[__name__])
         except Exception as error:
             # Domain failures remain inspectable tool results. The native host
             # never receives a candidate artifact from an unsuccessful call.

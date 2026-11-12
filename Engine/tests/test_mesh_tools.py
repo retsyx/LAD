@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -163,6 +164,34 @@ class IterativeMeshToolTests(unittest.TestCase):
             coverage=base["geometry"]["mesh_to_cad"]["coverage"]
             self.assertNotIn("unprocessed_triangle_ids",coverage)
             self.assertEqual(sum(last-first+1 for first,last in coverage["unprocessed_triangle_ranges"]),coverage["unprocessed_triangle_count"])
+
+    def test_script_worker_runs_mesh_tools_without_loading_itself_again(self):
+        # Run as a script, the worker module is __main__. A mesh edit must use
+        # that module's CAD pipeline rather than import worker.py again as a
+        # second copy with its own module-level state.
+        with tempfile.TemporaryDirectory() as directory:
+            calls=WorkerCalls(directory)
+            _,opened,_=calls.call("open_reference",options={"units":"mm","max_deviation":.03},sourceAsset=box_mesh())
+            self.assertEqual(opened["status"],"ok",opened)
+            context=opened["payload"]["context"]
+            folder=Path(directory)/"script";folder.mkdir()
+            request={"operation":"mesh_try_edit","options":{},"referenceAsset":"reference.npz"}
+            for key,value in {"contextAsset":context,"revisionAsset":opened["payload"]["revision"],
+                              "editAsset":{"kind":"body","operation":"create","body_id":"body-main",
+                                           "tool":{"family":"box","geometry":{"origin":[0,0,0],"size":[2,3,4]}}}}.items():
+                (folder/(key+".json")).write_text(json.dumps(value));request[key]=key+".json"
+            (folder/"reference.npz").write_bytes(calls.references[context["id"]].read_bytes())
+            (folder/"request.json").write_text(json.dumps(request))
+            # -X importtime reports every module the process imports by name.
+            process=subprocess.run([sys.executable,"-X","importtime",str(Path(__file__).resolve().parents[1]/"worker.py"),
+                                    "--request",str(folder/"request.json"),"--output",str(folder),"--threads","1","--defer-step"],
+                                   capture_output=True,text=True,timeout=300)
+            self.assertEqual(process.returncode,0,process.stderr[-4000:])
+            imported={line.rsplit("|",1)[1].strip() for line in process.stderr.splitlines() if line.startswith("import time:")}
+            self.assertTrue("mesh_tools" in imported,"The request did not reach the mesh tools")
+            self.assertFalse("worker" in imported,"Mesh tools imported a second copy of worker.py")
+            result=json.loads((folder/"mesh-result.json").read_text())
+            self.assertTrue(result["native_preview"],result)
 
     def test_invalid_input_is_structured_without_delivered_geometry(self):
         with tempfile.TemporaryDirectory() as directory:
