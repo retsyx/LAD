@@ -17,6 +17,8 @@ enum CADHighlightTechnique {
     private static let heightKey = "cadReferenceHeight"
     private static let verticesKey = "cadVertexHighlightsEnabled"
     private static let translucentKey = "cadTranslucentFaces"
+    /// The scene's constant background, composited under translucent faces.
+    private static let backgroundKey = "cadBackgroundColor"
     private static let colorKeys = ["cadSelectedColor", "cadHoverColor", "cadHoverHaloColor", "cadInkColor"]
     private static func silhouetteBoundsKey(_ index: Int) -> String { "cadSilhouetteBounds\(index)" }
     private static var cachedLibrary: (device: UInt64, library: any MTLLibrary)?
@@ -36,6 +38,7 @@ enum CADHighlightTechnique {
         for (key, color) in zip(colorKeys, [selected, hover, hoverHalo, ink]) {
             technique.setValue(linearColor(color), forKey: key)
         }
+        setBackground(CADSceneView.sceneBackgroundColor, on: technique)
         setSilhouetteBounds(Array(repeating: SIMD4(-1, -1, 1, 1), count: max(0, silhouetteCount)), on: technique)
         return technique
     }
@@ -46,6 +49,13 @@ enum CADHighlightTechnique {
             let key = silhouetteBoundsKey(index)
             if (technique.value(forKey: key) as? NSValue) != value { technique.setValue(value, forKey: key) }
         }
+    }
+
+    /// Translucent faces composite over this constant color instead of a
+    /// rendered background pass. Installers pass their scene's background.
+    static func setBackground(_ color: NSColor, on technique: SCNTechnique) {
+        let value = linearColor(color)
+        if (technique.value(forKey: backgroundKey) as? NSValue) != value { technique.setValue(value, forKey: backgroundKey) }
     }
 
     static func setViewportHeight(_ height: CGFloat, on technique: SCNTechnique) {
@@ -76,7 +86,7 @@ enum CADHighlightTechnique {
         technique.library = source.library
         let symbols = source.dictionaryRepresentation["symbols"] as? [String: Any] ?? [:]
         let boundsKeys = silhouetteCount == nil ? symbols.keys.filter { $0.hasPrefix("cadSilhouetteBounds") } : []
-        for key in [heightKey, verticesKey, translucentKey] + colorKeys + boundsKeys {
+        for key in [heightKey, verticesKey, translucentKey, backgroundKey] + colorKeys + boundsKeys {
             if let value = source.value(forKey: key) { technique.setValue(value, forKey: key) }
         }
         return technique
@@ -100,7 +110,8 @@ enum CADHighlightTechnique {
     }
 
     private static func definition(frameCompletion: Bool, translucentFaces: Bool, silhouetteCount: Int) -> [String: Any] {
-        var symbols: [String: Any] = [heightKey: ["type": "float"], verticesKey: ["type": "float"], translucentKey: ["type": "float"]]
+        var symbols: [String: Any] = [heightKey: ["type": "float"], verticesKey: ["type": "float"], translucentKey: ["type": "float"],
+                                      backgroundKey: ["type": "vec4"]]
         for key in colorKeys { symbols[key] = ["type": "vec4"] }
         let nearest: (String) -> [String: Any] = { ["target": $0, "minificationFilter": "nearest", "magnificationFilter": "nearest"] }
         var compositeInputs: [String: Any] = ["cadDistances": nearest(translucentFaces ? "cadRevealage" : "cadHorizontalDistances"),
@@ -108,7 +119,7 @@ enum CADHighlightTechnique {
                                               verticesKey: verticesKey, translucentKey: translucentKey]
         compositeInputs["cadHighlightDistances"] = nearest("cadHorizontalDistances")
         compositeInputs["cadDecorationsColor"] = nearest("cadSceneColor")
-        compositeInputs["cadBackgroundColor"] = nearest(translucentFaces ? "cadBackgroundColor" : "cadSceneColor")
+        compositeInputs[backgroundKey] = backgroundKey
         for key in colorKeys { compositeInputs[key] = key }
         var passes: [String: Any] = [
                 // Only solid faces write scene depth. Ordinary edges and grid
@@ -118,12 +129,9 @@ enum CADHighlightTechnique {
                     "outputs": ["color": "cadSceneColor", "depth": "cadSceneDepth"], "samples": 4,
                     "colorStates": ["clear": true, "clearColor": "sceneBackground"],
                     "depthStates": ["clear": true, "enableRead": true, "enableWrite": true]],
-                "cadBackground": ["draw": "DRAW_SCENE", "includeCategoryMask": 0, "samples": 4,
-                    "outputs": ["color": "cadBackgroundColor"],
-                    "colorStates": ["clear": true, "clearColor": "sceneBackground"],
-                    "depthStates": ["clear": false, "enableRead": false, "enableWrite": false]],
                 // Nearest solid depth belongs only to ordinary decorations;
-                // it must never reject a transparent color contribution.
+                // it must never reject a transparent color contribution. Only
+                // depth is used; its required color output is a minimal target.
                 "cadVisibility": ["draw": "DRAW_SCENE", "includeCategoryMask": 1, "cullMode": "none",
                     "outputs": ["color": "cadVisibilityColor", "depth": "cadSceneDepth"], "samples": 4,
                     "colorStates": ["clear": true, "clearColor": "0 0 0 0"],
@@ -201,16 +209,15 @@ enum CADHighlightTechnique {
             silhouettePasses += [clear, projection, contour]
         }
         return [
-            "sequence": (translucentFaces ? ["cadBackground", "cadVisibility", "cadAccumulate", "cadReveal"] : ["cadBase"])
+            "sequence": (translucentFaces ? ["cadVisibility", "cadAccumulate", "cadReveal"] : ["cadBase"])
                 + ["cadDecorations", "cadSeeds"] + silhouettePasses + ["cadHorizontal", "cadComposite"]
                 + (frameCompletion ? ["cadCompleted"] : []),
             "symbols": symbols,
             "targets": [
                 "cadSceneColor": ["type": "color"],
-                "cadVisibilityColor": ["type": "color"],
+                "cadVisibilityColor": ["type": "color", "format": "r8"],
                 "cadAccumulatedColor": ["type": "color", "format": "rgba16f"],
                 "cadRevealage": ["type": "color", "format": "rgba16f"],
-                "cadBackgroundColor": ["type": "color"],
                 "cadSceneDepth": ["type": "depth", "format": "depth32f"],
                 "cadSilhouetteMask": ["type": "color", "format": "rgba8"],
                 "cadSeedMask": ["type": "color", "format": "rgba8"],
@@ -236,6 +243,7 @@ enum CADHighlightTechnique {
         float4 cadHoverColor;
         float4 cadHoverHaloColor;
         float4 cadInkColor;
+        float4 cadBackgroundColor;
     };
     constant float cadEdgeHoverRadius = \(Float(CADHighlightStyle.hoverEdgeWidth / 2))f;
     constant float cadEdgeSelectedRadius = \(Float(CADHighlightStyle.selectedEdgeWidth / 2))f;
@@ -310,7 +318,6 @@ enum CADHighlightTechnique {
         texture2d<float, access::read> cadSceneColor [[texture(1)]],
         texture2d<float, access::read> cadHighlightDistances [[texture(2)]],
         texture2d<float, access::read> cadDecorationsColor [[texture(3)]],
-        texture2d<float, access::read> cadBackgroundColor [[texture(4)]],
         constant CADHighlightParameters &params [[buffer(0)]]) {
         bool translucent = params.cadTranslucentFaces > 0.5f;
         int2 size = int2(cadDistances.get_width(), cadDistances.get_height());
@@ -331,7 +338,7 @@ enum CADHighlightTechnique {
         float4 result = cadSceneColor.read(uint2(center));
         if (translucent) {
             float revealage = saturate(cadDistances.read(uint2(center)).a);
-            float4 background = cadBackgroundColor.read(uint2(center));
+            float4 background = params.cadBackgroundColor;
             float coverage = 1.0f - revealage;
             float3 averageColor = result.rgb / max(result.a, 1.0e-5f);
             result = float4(averageColor * coverage + background.rgb * revealage,

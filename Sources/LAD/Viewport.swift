@@ -339,9 +339,12 @@ final class CADSceneView: SCNView {
 
     required init?(coder: NSCoder) { super.init(coder: coder); setup() }
 
+    /// The viewport's constant background, also composited under translucent faces.
+    static let sceneBackgroundColor = NSColor(srgbRed: 0.071, green: 0.086, blue: 0.106, alpha: 1)
+
     private func setup() {
         let scene = SCNScene()
-        scene.background.contents = NSColor(srgbRed: 0.071, green: 0.086, blue: 0.106, alpha: 1)
+        scene.background.contents = Self.sceneBackgroundColor
         self.scene = scene
         redrawDriver.setFrameHandler { [weak self] in
             Task { @MainActor [weak self] in self?.schedulePauseAfterRenderedFrame() }
@@ -1021,6 +1024,7 @@ final class CADSceneView: SCNView {
         }
         guard let installed = technique else { return }
         CADHighlightTechnique.setViewportHeight(bounds.height, on: installed)
+        CADHighlightTechnique.setBackground(scene?.background.contents as? NSColor ?? Self.sceneBackgroundColor, on: installed)
         CADHighlightTechnique.setSilhouetteBounds(silhouetteBatchBounds, on: installed)
         CADHighlightTechnique.setVertexHighlightsEnabled(highlightedFeatures.contains {
             $0.kind == .vertex && !hiddenSolids.contains($0.solidIndex)

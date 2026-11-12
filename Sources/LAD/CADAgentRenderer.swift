@@ -217,6 +217,7 @@ private final class CADAgentSceneSnapshot: @unchecked Sendable {
         self.technique = technique.flatMap { CADHighlightTechnique.copy($0, silhouetteCount: silhouetteBatches.count) }
         if let technique = self.technique {
             CADHighlightTechnique.setSilhouetteBounds(silhouetteBatches.map { $0.rect.vector }, on: technique)
+            if let background = scene.background.contents as? NSColor { CADHighlightTechnique.setBackground(background, on: technique) }
         }
         self.width = width
         self.height = height
