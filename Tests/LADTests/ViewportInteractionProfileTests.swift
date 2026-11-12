@@ -24,17 +24,15 @@ final class ViewportInteractionProfileTests: XCTestCase {
         let preview = try PreviewMesh.loadResult(at: URL(fileURLWithPath: path))
         let display = ProcessInfo.processInfo.environment["LAD_VIEWPORT_PROFILE_DISPLAY"]
             .flatMap(ViewportDisplayMode.init(rawValue:)) ?? .edges
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 618, height: 770), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 618, height: 770))
         let frames = ViewportProfileFrameCounter()
-        view.delegate = frames
+        view.onFrameRendered = { [weak view] in frames.frameRendered(pose: view?.renderedCameraTransform) }
         let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "LAD viewport interaction profile"
         window.isReleasedWhenClosed = false
         window.contentView = view
         defer {
-            view.delegate = nil
+            view.onFrameRendered = nil
             window.orderOut(nil)
             window.contentView = nil
             window.close()
@@ -61,7 +59,7 @@ final class ViewportInteractionProfileTests: XCTestCase {
         let preparationMS = (ProcessInfo.processInfo.systemUptime - preparationStarted) * 1_000
         let beforeFirst = frames.count
         while frames.count <= beforeFirst, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
-        XCTAssertGreaterThan(frames.count, beforeFirst, "The real hosted SCNView must render before profiling input.")
+        XCTAssertGreaterThan(frames.count, beforeFirst, "The real hosted viewport must render before profiling input.")
         try await Task.sleep(for: .milliseconds(300))
 
         let initialCamera = view.agentCaptureMetadata["cameraTransform"] as? [Double]
@@ -180,7 +178,8 @@ final class ViewportInteractionProfileTests: XCTestCase {
     }
 }
 
-private final class ViewportProfileFrameCounter: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
+/// Receives each completed live frame and its camera pose on the main actor.
+private final class ViewportProfileFrameCounter: @unchecked Sendable {
     private struct Input {
         let pose: [Float]
         let time: TimeInterval
@@ -224,9 +223,9 @@ private final class ViewportProfileFrameCounter: NSObject, SCNSceneRendererDeleg
         return (latencies, gaps, inputCount, latencies.count, coalesced, inputs.count)
     }
 
-    func renderer(_ renderer: any SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
+    func frameRendered(pose transform: simd_float4x4?) {
         let renderedAt = ProcessInfo.processInfo.systemUptime
-        let pose = renderer.pointOfView.map { viewportProfilePose($0.presentation.simdWorldTransform) }
+        let pose = transform.map(viewportProfilePose)
         lock.lock(); defer { lock.unlock() }
         value += 1
         guard recording else { return }

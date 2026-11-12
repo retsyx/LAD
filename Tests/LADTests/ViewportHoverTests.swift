@@ -28,20 +28,17 @@ final class ViewportHoverTests: XCTestCase {
         view.onDeselectAll = { clears += 1 }
 
         view.mouseEntered(with: try event(.mouseEntered, at: point([-10, -10, 0], in: view)))
-        let vertexNode = try node(vertex, in: view)
-        try await waitForHighlight(vertexNode)
+        XCTAssertEqual(channels(in: view), [.hoveredVertex])
         XCTAssertEqual(view.feature(at: point([-10, -10, 0], in: view)), vertex)
 
         view.mouseMoved(with: try event(.mouseMoved, at: point([0, -10, 0], in: view)))
-        let edgeNode = try node(edge, in: view)
-        try await waitForHighlight(edgeNode)
-        XCTAssertTrue(vertexNode.isHidden)
+        XCTAssertEqual(channels(in: view), [.hoveredEdge])
         XCTAssertEqual(view.feature(at: point([0, -10, 0], in: view)), edge)
 
         view.mouseMoved(with: try event(.mouseMoved, at: point([0, 0, 0], in: view)))
         let faceNode = try node(face, in: view)
         try await waitForHighlight(faceNode)
-        XCTAssertTrue(edgeNode.isHidden)
+        XCTAssertEqual(channels(in: view), [])
         XCTAssertEqual(view.feature(at: point([0, 0, 0], in: view)), face)
         XCTAssertEqual(partChanges, 0)
         XCTAssertEqual(featureChanges, 0, "Preselection must not become a measurement selection.")
@@ -67,21 +64,18 @@ final class ViewportHoverTests: XCTestCase {
         view.update(mesh: mesh(), mode: .edges, grid: false, command: ViewportCommand(.top),
                     selectedSolids: [0], hiddenSolids: [], selectedFeatures: [vertex, edge, face])
         try await waitForPreparation(view)
-        let part = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry?.firstMaterial)
+        let part = try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry?.firstMaterial)
         let partColor = try color(part.diffuse.contents)
-        for feature in [vertex, edge, face] {
-            let highlight = try node(feature, in: view)
-            try await waitForHighlight(highlight)
-            let material = try XCTUnwrap(highlight.geometry?.firstMaterial)
-            if feature.kind == .face {
-                assertEqualColor(try color(material.diffuse.contents), partColor)
-            } else {
-                XCTAssertEqual(material.diffuse.contents as? NSColor, feature.kind == .vertex ? .blue : .red)
-                XCTAssertFalse(material.readsFromDepthBuffer)
-                XCTAssertFalse(material.writesToDepthBuffer)
-            }
-            XCTAssertEqual(material.transparency, 1, accuracy: 1e-6)
-        }
+        let highlight = try node(face, in: view)
+        try await waitForHighlight(highlight)
+        let material = try XCTUnwrap(highlight.geometry?.firstMaterial)
+        assertEqualColor(try color(material.diffuse.contents), partColor)
+        XCTAssertEqual(material.transparency, 1, accuracy: 1e-6)
+        XCTAssertEqual(Set(channels(in: view)), [.selectedVertex, .selectedEdge],
+                       "Selected vertex and edge seeds keep their selection channels in the unoccluded overlay.")
+        let frame = view.makeFrame(width: 640, height: 480)
+        XCTAssertEqual(frame.batches.flatMap(\.masks).filter(\.selected).count, 2,
+                       "The selected part and face each project an outline mask.")
         let faceMaterial = try XCTUnwrap(node(face, in: view).geometry?.firstMaterial)
         XCTAssertEqual(faceMaterial.lightingModel, part.lightingModel)
         XCTAssertEqual(try number(faceMaterial.metalness.contents), try number(part.metalness.contents), accuracy: 1e-6)
@@ -138,7 +132,7 @@ final class ViewportHoverTests: XCTestCase {
                     selectedSolids: [], hiddenSolids: [])
         try await Task.sleep(for: .milliseconds(80))
         XCTAssertNil(oldHighlight.parent)
-        XCTAssertNil(view.scene?.rootNode.childNode(withName: name(face), recursively: true))
+        XCTAssertNil(view.scene.rootNode.childNode(withName: name(face), recursively: true))
         XCTAssertNil(view.feature(at: NSPoint(x: 320, y: 240)))
     }
 
@@ -162,7 +156,7 @@ final class ViewportHoverTests: XCTestCase {
         let corner = point([-10, -10, 0], in: view)
         XCTAssertEqual(view.feature(at: corner), vertex, "A resized viewport must not use the old projected-feature cache.")
         view.mouseMoved(with: try event(.mouseMoved, at: corner))
-        try await waitForHighlight(node(vertex, in: view))
+        XCTAssertEqual(channels(in: view), [.hoveredVertex])
     }
 
     @MainActor
@@ -176,20 +170,19 @@ final class ViewportHoverTests: XCTestCase {
         let selected = try node(face, in: view)
         try await waitForHighlight(selected)
         view.mouseMoved(with: try event(.mouseMoved, at: point([-10, -10, 0], in: view)))
-        let hovered = try node(vertex, in: view)
-        try await waitForHighlight(hovered)
+        XCTAssertEqual(channels(in: view), [.hoveredVertex])
         NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
-        XCTAssertTrue(hovered.isHidden)
+        XCTAssertEqual(channels(in: view), [])
         XCTAssertFalse(selected.isHidden)
         view.mouseMoved(with: try event(.mouseMoved, at: point([-10, -10, 0], in: view)))
-        try await waitForHighlight(hovered)
+        XCTAssertEqual(channels(in: view), [.hoveredVertex])
         XCTAssertTrue(view.resignFirstResponder())
-        XCTAssertTrue(hovered.isHidden, "Moving keyboard focus to the composer must clear preselection too.")
+        XCTAssertEqual(channels(in: view), [], "Moving keyboard focus to the composer must clear preselection too.")
         XCTAssertFalse(selected.isHidden)
         view.mouseMoved(with: try event(.mouseMoved, at: point([-10, -10, 0], in: view)))
-        try await waitForHighlight(hovered)
+        XCTAssertEqual(channels(in: view), [.hoveredVertex])
         view.removeFromSuperview()
-        XCTAssertTrue(hovered.isHidden)
+        XCTAssertEqual(channels(in: view), [])
         XCTAssertFalse(selected.isHidden)
     }
 
@@ -211,10 +204,9 @@ final class ViewportHoverTests: XCTestCase {
         for vertex in try XCTUnwrap(preview.topology).vertices {
             view.mouseMoved(with: try event(.mouseMoved, at: point(vertex.position, in: view)))
         }
-        let last = CADFeatureID(kind: .vertex, solidIndex: 0, localIndex: 80)
-        try await waitForHighlight(node(last, in: view))
-        let overlays = try XCTUnwrap(selected.parent).childNodes
-        XCTAssertLessThanOrEqual(overlays.count, 66, "Exploring topology must not retain an overlay for every feature ever hovered.")
+        XCTAssertEqual(channels(in: view), [.hoveredVertex])
+        XCTAssertLessThanOrEqual(view.cachedFeatureHighlightCount, 66,
+                                 "Exploring topology must not retain an overlay for every feature ever hovered.")
         XCTAssertTrue(try node(face, in: view) === selected)
         XCTAssertFalse(selected.isHidden, "Cache eviction must preserve selected geometry.")
     }
@@ -231,9 +223,7 @@ final class ViewportHoverTests: XCTestCase {
     @MainActor
     private func makeView() throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
         view.layout()
         return view
     }
@@ -268,11 +258,17 @@ final class ViewportHoverTests: XCTestCase {
         XCTAssertFalse(node.isHidden)
     }
 
+    /// Seed channels the next frame draws for vertex and edge highlights.
+    @MainActor
+    private func channels(in view: CADSceneView) -> [CADViewportFrame.SeedChannel] {
+        view.makeFrame(width: 640, height: 480).seeds.map(\.channel)
+    }
+
     private func name(_ id: CADFeatureID) -> String { "feature:\(id.kind.rawValue):\(id.solidIndex):\(id.localIndex)" }
 
     @MainActor
     private func node(_ id: CADFeatureID, in view: CADSceneView) throws -> SCNNode {
-        try XCTUnwrap(view.scene?.rootNode.childNode(withName: name(id), recursively: true))
+        try XCTUnwrap(view.scene.rootNode.childNode(withName: name(id), recursively: true))
     }
 
     private func color(_ contents: Any?) throws -> NSColor {

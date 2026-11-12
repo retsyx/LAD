@@ -21,17 +21,13 @@ final class ViewportVertexTests: XCTestCase {
         XCTAssertEqual(view.feature(at: NSPoint(x: point.x - 11, y: point.y)), vertex,
                        "A small native vertex needs the same usable screen-point acquisition radius as its visible target.")
         view.mouseMoved(with: try mouse(.mouseMoved, at: point))
-        let overlay = try featureNode(vertex, in: view)
-        try await visible(overlay)
-        let center = try XCTUnwrap(overlay.geometry)
-        XCTAssertEqual(center.elements.first?.primitiveType, .point)
-        XCTAssertEqual(overlay.categoryBitMask, CADHighlightTechnique.seedCategory)
-        XCTAssertTrue(overlay.childNodes.isEmpty, "Screen-space circles need only the native vertex center.")
-        let material = try XCTUnwrap(center.firstMaterial)
-        XCTAssertEqual(material.diffuse.contents as? NSColor, .red)
-        XCTAssertFalse(material.readsFromDepthBuffer,
-                       "Highlight overlays remain visible through other geometry.")
-        XCTAssertFalse(material.writesToDepthBuffer)
+        // Screen-space circles need only the native vertex center.
+        let hovered = try XCTUnwrap(seeds(in: view).first)
+        XCTAssertEqual(seeds(in: view).count, 1)
+        XCTAssertEqual(hovered.channel, .hoveredVertex)
+        XCTAssertEqual(hovered.buffer.primitive, .point)
+        XCTAssertEqual(hovered.buffer.vertexCount, 1)
+        let center = hovered.buffer
         let hover = try await CADAgentRenderer.capturePNG(view: view)
         try hover.write(to: URL(fileURLWithPath: "/tmp/lad-vertex-hover.png"))
         XCTAssertGreaterThan(try markerPixels(hover, around: point, in: view), 35,
@@ -40,8 +36,8 @@ final class ViewportVertexTests: XCTestCase {
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [], projection: .isometric, solidColors: colors, selectedFeatures: [vertex])
         try await ready(view)
-        XCTAssertTrue(overlay.geometry === center)
-        XCTAssertEqual(material.diffuse.contents as? NSColor, .blue)
+        XCTAssertTrue(seeds(in: view).first?.buffer === center)
+        XCTAssertEqual(seeds(in: view).map(\.channel), [.selectedVertex])
         let selected = try await CADAgentRenderer.capturePNG(view: view)
         try selected.write(to: URL(fileURLWithPath: "/tmp/lad-vertex-selected.png"))
         XCTAssertGreaterThan(try markerPixels(selected, around: point, in: view), 45)
@@ -51,22 +47,26 @@ final class ViewportVertexTests: XCTestCase {
                     selectedSolids: [0], hiddenSolids: [], projection: .isometric, solidColors: colors,
                     selectedFeatures: [vertex, edge])
         try await ready(view)
-        let selectedEdge = try featureNode(edge, in: view)
-        try await visible(selectedEdge)
-        XCTAssertEqual(selectedEdge.geometry?.firstMaterial?.diffuse.contents as? NSColor, .red)
-        XCTAssertEqual(material.diffuse.contents as? NSColor, .blue)
+        XCTAssertEqual(Set(seeds(in: view).map(\.channel)), [.selectedVertex, .selectedEdge])
         view.mouseMoved(with: try mouse(.mouseMoved, at: point))
-        XCTAssertEqual(material.diffuse.contents as? NSColor, .blue, "Hover cannot downgrade a selected dot.")
+        XCTAssertEqual(Set(seeds(in: view).map(\.channel)), [.selectedVertex, .selectedEdge],
+                       "Hover cannot downgrade a selected dot.")
         view.mouseExited(with: try mouse(.mouseExited, at: NSPoint(x: -1, y: -1)))
-        XCTAssertFalse(overlay.isHidden)
+        XCTAssertTrue(seeds(in: view).contains { $0.channel == .selectedVertex })
         view.setFrameSize(NSSize(width: 800, height: 600))
         view.layout()
-        XCTAssertEqual((view.technique?.value(forKey: "cadReferenceHeight") as? NSNumber)?.doubleValue, 600)
+        XCTAssertEqual(view.makeFrame(width: 1_600, height: 1_200).referenceHeight, 600,
+                       "Screen-point widths scale from the view's logical height to output pixels.")
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [0], hiddenSolids: [0], projection: .isometric, solidColors: colors,
                     selectedFeatures: [vertex, edge])
-        XCTAssertTrue(overlay.isHidden)
+        XCTAssertTrue(seeds(in: view).isEmpty)
         XCTAssertNil(view.feature(at: projectedCorner(in: view)), "Hidden owners must exclude their vertices from picking as well as rendering.")
+    }
+
+    @MainActor
+    private func seeds(in view: CADSceneView) -> [CADViewportFrame.Seeds] {
+        view.makeFrame(width: Int(view.bounds.width), height: Int(view.bounds.height)).seeds
     }
 
     @MainActor
@@ -90,9 +90,7 @@ final class ViewportVertexTests: XCTestCase {
     @MainActor
     private func makeView() throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 512, height: 512), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 512, height: 512))
     }
 
     @MainActor
@@ -103,21 +101,9 @@ final class ViewportVertexTests: XCTestCase {
     }
 
     @MainActor
-    private func visible(_ node: SCNNode) async throws {
-        let deadline = ContinuousClock.now + .seconds(10)
-        while node.isHidden, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-        XCTAssertFalse(node.isHidden)
-    }
-
-    @MainActor
     private func projectedCorner(in view: CADSceneView) -> NSPoint {
         let point = view.projectPoint(SCNVector3(-10, -10, 0))
         return NSPoint(x: CGFloat(point.x), y: CGFloat(point.y))
-    }
-
-    @MainActor
-    private func featureNode(_ id: CADFeatureID, in view: CADSceneView) throws -> SCNNode {
-        try XCTUnwrap(view.scene?.rootNode.childNode(withName: "feature:\(id.kind.rawValue):\(id.solidIndex):\(id.localIndex)", recursively: true))
     }
 
     @MainActor

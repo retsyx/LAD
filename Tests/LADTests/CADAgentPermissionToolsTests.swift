@@ -66,9 +66,7 @@ final class CADAgentPermissionToolsTests: XCTestCase {
         let owner = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 100), styleMask: [.titled], backing: .buffered, defer: false)
         owner.isReleasedWhenClosed = false
         defer { owner.close() }
-        let viewport = CADSceneView(frame: owner.contentView!.bounds, options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let viewport = CADSceneView(frame: owner.contentView!.bounds)
         owner.contentView = viewport
         let tools = try fixture.tools(viewport: viewport)
         let pending = Task { try await tools.handle(name: "lad_request_permission", arguments: [

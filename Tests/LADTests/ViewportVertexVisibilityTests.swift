@@ -61,7 +61,6 @@ final class ViewportVertexVisibilityTests: XCTestCase {
     @MainActor
     private func render(orthographic: Bool, zoomedOut: Bool = false, scale: Int,
                         hover: Bool, independentOccluderDistance: Double? = nil) throws -> Shot {
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let scene = SCNScene()
         scene.background.contents = NSColor.black
         let camera = SCNNode()
@@ -86,11 +85,6 @@ final class ViewportVertexVisibilityTests: XCTestCase {
         surface.categoryBitMask = 1
         scene.rootNode.addChildNode(surface)
 
-        let geometry = CADVertexSeedGeometry.make([0, 0, 0])
-        geometry.firstMaterial?.diffuse.contents = hover ? NSColor.red : NSColor.blue
-        let seed = SCNNode(geometry: geometry)
-        seed.categoryBitMask = CADHighlightTechnique.seedCategory
-        scene.rootNode.addChildNode(seed)
         if let distance = independentOccluderDistance {
             let occluder = SCNNode(geometry: SCNPlane(width: 8, height: 8))
             occluder.geometry?.materials = [surfaceMaterial]
@@ -99,19 +93,13 @@ final class ViewportVertexVisibilityTests: XCTestCase {
             scene.rootNode.addChildNode(occluder)
         }
 
-        let renderer = SCNRenderer(device: device, options: nil)
-        renderer.scene = scene
-        renderer.pointOfView = camera
-        renderer.autoenablesDefaultLighting = false
-        renderer.technique = try XCTUnwrap(CADHighlightTechnique.make(viewportHeight: 192,
-            selected: NSColor(srgbRed: 0.96, green: 0.63, blue: 0.23, alpha: 1),
+        let palette = CADHighlightPalette(selected: NSColor(srgbRed: 0.96, green: 0.63, blue: 0.23, alpha: 1),
             hover: NSColor(srgbRed: 0.35, green: 0.83, blue: 0.72, alpha: 1),
             hoverHalo: NSColor(srgbRed: 0.14, green: 0.22, blue: 0.28, alpha: 1),
-            ink: NSColor(srgbRed: 0.025, green: 0.035, blue: 0.045, alpha: 1)))
-        XCTAssertTrue(renderer.prepare(scene, shouldAbortBlock: nil))
-        let image = renderer.snapshot(atTime: 0, with: CGSize(width: 256 * scale, height: 192 * scale),
-                                      antialiasingMode: .multisampling4X)
-        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+            ink: NSColor(srgbRed: 0.025, green: 0.035, blue: 0.045, alpha: 1), background: .black)
+        let seed = try ViewportPassTestRenderer.point(SIMD3(0, 0, 0), channel: hover ? .hoveredVertex : .selectedVertex)
+        let bitmap = try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: 256 * scale,
+            height: 192 * scale, referenceHeight: 192, palette: palette, seeds: [seed]).image
         return Shot(image: bitmap, png: try XCTUnwrap(bitmap.representation(using: .png, properties: [:])))
     }
 

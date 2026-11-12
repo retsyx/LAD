@@ -131,9 +131,7 @@ final class ViewportNavigationTests: XCTestCase {
     @MainActor
     private func readyView() async throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
         let preview = PreviewMesh(vertices: [[-10, -10, 0], [10, -10, 0], [10, 10, 0], [-10, 10, 0]],
             triangles: [[0, 1, 2], [0, 2, 3]], edges: [[-10, -10, 0, 10, -10, 0]],
             bounds: [-10, -10, 0, 10, 10, 0], volume: 1, area: 400, solids: 1, faces: 1,
@@ -149,16 +147,15 @@ final class ViewportNavigationTests: XCTestCase {
 
     @MainActor
     private func geometry(_ name: String, in view: CADSceneView) throws -> SCNGeometry {
-        try XCTUnwrap(view.scene?.rootNode.childNode(withName: name, recursively: true)?.geometry)
+        try XCTUnwrap(view.scene.rootNode.childNode(withName: name, recursively: true)?.geometry)
     }
 
     @MainActor
     private func projectedOrigin(in view: CADSceneView) throws -> SIMD2<Double> {
         let node = try XCTUnwrap(view.pointOfView)
         let camera = try XCTUnwrap(node.camera)
-        // SCNView.projectPoint can retain the previous renderer camera until
-        // its next draw. Project from the actual SceneKit camera state and
-        // its viewport-specific projection to verify input synchronously.
+        // Project from the actual SceneKit camera state and its
+        // viewport-specific projection to verify input synchronously.
         let projection = simd_float4x4(camera.projectionTransform(withViewportSize: view.bounds.size))
         let clip = projection * simd_inverse(node.simdWorldTransform) * SIMD4<Float>(0, 0, 0, 1)
         XCTAssertGreaterThan(abs(clip.w), 1e-6)

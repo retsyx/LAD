@@ -105,7 +105,7 @@ struct CADViewport: NSViewRepresentable {
     var onAssemblyGrabCancelled: (() -> Void)? = nil
 
     func makeNSView(context: Context) -> CADSceneView {
-        CADSceneView(frame: .zero, options: [SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue])
+        CADSceneView(frame: .zero)
     }
 
     func updateNSView(_ view: CADSceneView, context: Context) {
@@ -127,35 +127,57 @@ struct CADViewport: NSViewRepresentable {
     }
 }
 
-final class CADSceneView: SCNView {
+final class CADSceneView: NSView {
     // CAD translucency fades the whole lit face, including PBR specular
-    // reflections. Native PBR material transparency instead retains glasslike
-    // reflections that can leave bright surfaces apparently opaque.
+    // reflections, as premultiplied color accumulated without depth testing.
     private static let translucentFragment = """
     #pragma opaque
     #pragma body
-    _output.color *= 0.28;
+    _output.color *= \(CADTranslucency.alpha);
     """
     private static let opaqueFragment = """
     #pragma opaque
     #pragma body
     _output.color.a = 1.0;
     """
+    /// Each translucent face layer multiplies the remaining transmittance.
+    private static let revealageFragment = """
+    #pragma body
+    _output.color = float4(\(1 - CADTranslucency.alpha));
+    """
     private static let selectionColor = NSColor(srgbRed: 0.92, green: 0.61, blue: 0.24, alpha: 1)
     private static let edgeInk = NSColor(srgbRed: 0.025, green: 0.035, blue: 0.05, alpha: 1)
     private static let hoveredFeatureColor = selectionColor.blended(withFraction: 0.25, of: .white) ?? selectionColor
     private static let hoveredFeatureHalo = selectionColor.blended(withFraction: 0.70, of: .white) ?? selectionColor
+    /// The viewport's constant background, also composited under translucent faces.
+    static let sceneBackgroundColor = NSColor(srgbRed: 0.071, green: 0.086, blue: 0.106, alpha: 1)
+    static let highlightPalette = CADHighlightPalette(selected: selectionColor, hover: hoveredFeatureColor,
+        hoverHalo: hoveredFeatureHalo, ink: edgeInk, background: sceneBackgroundColor)
+
+    let scene = SCNScene()
     private let cameraNode = SCNNode()
     private let modelNode = SCNNode()
     private let edgeNode = SCNNode()
     private let gridNode = SCNNode()
     private let featureNode = SCNNode()
-    private let silhouetteNode = SCNNode()
-    private var partSilhouettes = [Int: SCNNode]()
-    private var silhouetteSlots = [SCNNode]()
-    private var silhouetteBatches = [SCNNode]()
-    private var silhouetteInputBounds = [[Double]]()
-    private var silhouetteBatchBounds = [SIMD4<Float>]()
+    private var sceneSource: CADViewportSceneSource!
+    /// The design camera. Rendering never changes it.
+    var pointOfView: SCNNode? { cameraNode }
+    private let device = MTLCreateSystemDefaultDevice()
+    /// Shared with the render thread, which is its only renderer. Main-thread
+    /// use is limited to asynchronous resource preparation.
+    private lazy var renderer: SCNRenderer = {
+        let renderer = SCNRenderer(device: device, options: nil)
+        renderer.scene = scene
+        renderer.pointOfView = cameraNode
+        renderer.usesReverseZ = true
+        renderer.autoenablesDefaultLighting = false
+        return renderer
+    }()
+    private var renderLoop: ViewportRenderLoop?
+    private var windowVisibilityObservation: NSKeyValueObservation?
+    /// The studio lights are the scene's only illumination.
+    var autoenablesDefaultLighting: Bool { renderer.autoenablesDefaultLighting }
     private var rig = CameraRig()
     private var cameraTransitionTask: Task<Void, Never>?
     private var cameraTransitionID: UUID?
@@ -202,8 +224,17 @@ final class CADSceneView: SCNView {
     private var faceIndices = [CADFeatureID: [Int32]]()
     private var faceBounds = [CADFeatureID: CADSilhouetteBatching.Bounds]()
     private var meshSources = [SCNGeometrySource]()
+    private var solidNodes = [Int: SCNNode]()
+    /// Highlight geometry for the unoccluded overlay, created on first use.
+    private var meshPositions: (any MTLBuffer)?
+    private var partMasks = [Int: CADHighlightBuffers.Mask]()
+    private var featureSeeds = [CADFeatureID: CADHighlightBuffers.Seeds]()
+    private var featureMasks = [CADFeatureID: CADHighlightBuffers.Mask]()
+    /// Lit face overlays drawn by the scene pass.
     private var featureNodes = [CADFeatureID: SCNNode]() { didSet { resumeCaptureWaitersIfReady() } }
     private var featureCreationOrder = [CADFeatureID]()
+    /// Retained highlight resources, active or cached. Regression tests compare it.
+    var cachedFeatureHighlightCount: Int { featureCreationOrder.count }
     private var featureSelectionStyles = [CADFeatureID: Bool]()
     private var preparedFeatures = Set<CADFeatureID>() { didSet { resumeCaptureWaitersIfReady() } }
     private var featurePreparationID = UUID()
@@ -232,16 +263,18 @@ final class CADSceneView: SCNView {
         case agent(name: String, camera: CADAgentCamera)
     }
     private var pendingCamera: PendingCamera?
-    private let redrawDriver = ViewportRedrawDriver()
-    private var opaqueHighlightTechnique: SCNTechnique?
-    private var translucentHighlightTechnique: SCNTechnique?
-    private var installedHighlightTemplate: SCNTechnique?
-    private var highlightSilhouetteCount = 0
-    private var techniqueFrameObserver: ViewportTechniqueFrameObserver?
-    private var redrawDelegateInstalled = false
-    private var redrawPauseTask: Task<Void, Never>?
-    private var redrawRecoveryTask: Task<Void, Never>?
-    private var redrawRecoveryState = ViewportRedrawRecoveryState()
+    private var framePublicationScheduled = false
+    private var publishedGeneration: UInt64 = 0
+    /// The newest frame generation the GPU has completed in this view.
+    private(set) var renderedGeneration: UInt64 = 0
+    /// Frames this view has completed. Diagnostics and tests compare it.
+    private(set) var renderedFrameCount = 0
+    /// The design camera's world transform in the newest completed frame.
+    private(set) var renderedCameraTransform: simd_float4x4?
+    private var publishedCameraTransforms: [(generation: UInt64, transform: simd_float4x4)] = []
+    /// True until the GPU has completed a frame showing the latest change.
+    var hasPendingFrames: Bool { framePublicationScheduled || renderedGeneration < publishedGeneration }
+    var onFrameRendered: (() -> Void)?
     private(set) var isPreparingResources = false {
         didSet { resumeCaptureWaitersIfReady() }
     }
@@ -293,10 +326,11 @@ final class CADSceneView: SCNView {
         captureWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
     }
+
     /// Public capture facts, read directly from the camera node that will be
     /// cloned by the renderer. Reading them never changes the user's view.
     var agentCaptureMetadata: [String: Any] {
-        let pointOfView = self.pointOfView ?? cameraNode
+        let pointOfView = cameraNode
         let transform = pointOfView.simdWorldTransform
         let values = (0..<4).flatMap { column in (0..<4).map { row in Double(transform[column][row]) } }
         let camera = pointOfView.camera
@@ -362,64 +396,39 @@ final class CADSceneView: SCNView {
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { false }
+    override var isOpaque: Bool { true }
     deinit {
         meshPreparationTask?.cancel()
+        renderLoop?.stop()
         if let modifierMonitor { NSEvent.removeMonitor(modifierMonitor) }
     }
-    override var delegate: (any SCNSceneRendererDelegate)? {
-        get { super.delegate }
-        set {
-            guard redrawDelegateInstalled else { super.delegate = newValue; return }
-            if newValue === redrawDriver { super.delegate = newValue; return }
-            redrawDriver.forwardedDelegate = newValue
-            refreshRedrawDelegate()
-        }
-    }
 
-    override init(frame frameRect: NSRect, options: [String: Any]? = nil) {
-        super.init(frame: frameRect, options: options)
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
         setup()
     }
 
     required init?(coder: NSCoder) { super.init(coder: coder); setup() }
 
-    /// The viewport's constant background, also composited under translucent faces.
-    static let sceneBackgroundColor = NSColor(srgbRed: 0.071, green: 0.086, blue: 0.106, alpha: 1)
+    override func makeBackingLayer() -> CALayer {
+        let layer = CAMetalLayer()
+        layer.device = device
+        layer.pixelFormat = CADViewportPasses.colorFormat
+        layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+        layer.framebufferOnly = true
+        layer.isOpaque = true
+        layer.maximumDrawableCount = 3
+        layer.displaySyncEnabled = true
+        layer.backgroundColor = Self.sceneBackgroundColor.cgColor
+        layer.needsDisplayOnBoundsChange = false
+        return layer
+    }
 
     private func setup() {
-        let scene = SCNScene()
+        wantsLayer = true
+        // The render thread owns the layer's contents.
+        layerContentsRedrawPolicy = .never
         scene.background.contents = Self.sceneBackgroundColor
-        self.scene = scene
-        redrawDriver.setFrameHandler { [weak self] in
-            Task { @MainActor [weak self] in self?.schedulePauseAfterRenderedFrame() }
-        }
-        redrawDelegateInstalled = true
-        refreshRedrawDelegate()
-        backgroundColor = .clear
-        allowsCameraControl = false
-        autoenablesDefaultLighting = false
-        rendersContinuously = false
-        isPlaying = false
-        antialiasingMode = .multisampling4X
-        usesReverseZ = true
-        let highlightTechnique = CADHighlightTechnique.make(viewportHeight: bounds.height, selected: Self.selectionColor,
-            hover: Self.hoveredFeatureColor, hoverHalo: Self.hoveredFeatureHalo, ink: Self.edgeInk,
-            frameCompletion: true, vertexHighlights: false, silhouetteCount: 0)
-        if let highlightTechnique {
-            opaqueHighlightTechnique = highlightTechnique
-            redrawDriver.setTechniqueCompletionEnabled(true)
-            let observer = ViewportTechniqueFrameObserver(driver: redrawDriver, renderer: self)
-            techniqueFrameObserver = observer
-            let completion = SCNNode()
-            completion.name = CADHighlightTechnique.completionNodeName
-            completion.categoryBitMask = CADHighlightTechnique.completionCategory
-            completion.rendererDelegate = observer
-            scene.rootNode.addChildNode(completion)
-            // DRAW_NODE resolves its named node when the technique is set.
-            technique = highlightTechnique
-            installedHighlightTemplate = highlightTechnique
-        }
-        preferredFramesPerSecond = 60
         cameraNode.camera = SCNCamera()
         cameraNode.camera?.fieldOfView = rig.fieldOfView
         cameraNode.camera?.projectionDirection = .vertical
@@ -429,18 +438,15 @@ final class CADSceneView: SCNView {
         cameraNode.camera?.wantsHDR = false
         cameraNode.camera?.exposureOffset = 0
         scene.rootNode.addChildNode(cameraNode)
-        pointOfView = cameraNode
+        sceneSource = CADViewportSceneSource.install(in: scene, camera: cameraNode)
         scene.rootNode.addChildNode(modelNode)
         scene.rootNode.addChildNode(edgeNode)
         scene.rootNode.addChildNode(gridNode)
         scene.rootNode.addChildNode(featureNode)
-        silhouetteNode.name = CADHighlightTechnique.silhouetteContainerName
-        scene.rootNode.addChildNode(silhouetteNode)
-        modelNode.categoryBitMask = 1
-        edgeNode.categoryBitMask = 2
-        gridNode.categoryBitMask = 2
-        featureNode.categoryBitMask = 4
-        silhouetteNode.categoryBitMask = CADHighlightTechnique.silhouetteCategory
+        modelNode.categoryBitMask = CADViewportCategory.faces
+        edgeNode.categoryBitMask = CADViewportCategory.decorations
+        gridNode.categoryBitMask = CADViewportCategory.decorations
+        featureNode.categoryBitMask = CADViewportCategory.featureFaces
         addLight(type: .ambient, intensity: 480, color: NSColor(srgbRed: 0.63, green: 0.70, blue: 0.82, alpha: 1), parent: scene.rootNode)
         // Camera-local studio lights keep the main illumination above-right
         // and the softer fill above-left throughout orbit, pan, and zoom.
@@ -579,7 +585,6 @@ final class CADSceneView: SCNView {
         for node in edgeNode.childNodes {
             if let solid = solidIndex(of: node, prefix: "edges:") { apply(node, solid: solid) }
         }
-        for (solid, node) in partSilhouettes { apply(node, solid: solid) }
         for (feature, node) in featureNodes { apply(node, solid: feature.solidIndex) }
         SCNTransaction.commit()
         if next.isEmpty {
@@ -619,13 +624,7 @@ final class CADSceneView: SCNView {
         faceBounds = prepared.faceBounds
         modelNode.childNodes.forEach { $0.removeFromParentNode() }
         modelNode.geometry = nil
-        silhouetteNode.childNodes.forEach { $0.removeFromParentNode() }
-        partSilhouettes.removeAll()
-        silhouetteSlots.removeAll()
-        silhouetteBatches.removeAll()
-        silhouetteInputBounds.removeAll()
-        silhouetteBatchBounds.removeAll()
-        highlightSilhouetteCount = -1
+        solidNodes.removeAll()
         for solid in groups.keys.sorted() {
             let geometry = SCNGeometry(sources: [source, normalSource],
                                        elements: [SCNGeometryElement(indices: groups[solid]!, primitiveType: .triangles)])
@@ -638,14 +637,14 @@ final class CADSceneView: SCNView {
             geometry.materials = [material]
             let node = SCNNode(geometry: geometry)
             node.name = "solid:\(solid)"
-            node.categoryBitMask = 1
+            node.categoryBitMask = CADViewportCategory.faces
             modelNode.addChildNode(node)
-            // Share the prepared mesh buffers, but keep projection masks
-            // independent of wireframe visibility and surface materials.
-            let silhouette = makeSilhouette(geometry)
-            silhouette.isHidden = true
-            silhouetteNode.addChildNode(silhouette)
-            partSilhouettes[solid] = silhouette
+            solidNodes[solid] = node
+            // Translucent passes draw the same shared buffers with their own
+            // fixed materials. Children follow the solid's pose and hiding.
+            for category in [CADViewportCategory.visibility, CADViewportCategory.revealage] {
+                node.addChildNode(Self.translucentCopy(of: geometry, category: category, visible: mode == .translucent))
+            }
         }
         solidBounds = prepared.solidBounds
         originalMeshBounds = mesh.bounds
@@ -666,15 +665,9 @@ final class CADSceneView: SCNView {
         resetFeatureResources()
         modelNode.geometry = nil
         modelNode.childNodes.forEach { $0.removeFromParentNode() }
+        solidNodes.removeAll()
         edgeNode.geometry = nil
         edgeNode.childNodes.forEach { $0.removeFromParentNode() }
-        silhouetteNode.childNodes.forEach { $0.removeFromParentNode() }
-        partSilhouettes.removeAll()
-        silhouetteSlots.removeAll()
-        silhouetteBatches.removeAll()
-        silhouetteInputBounds.removeAll()
-        silhouetteBatchBounds.removeAll()
-        highlightSilhouetteCount = -1
         ownedEdgeSolids.removeAll()
         hasOwnedEdges = false
         hasModel = false
@@ -683,8 +676,50 @@ final class CADSceneView: SCNView {
         solidTransforms.removeAll()
         solidMatrices.removeAll()
         appliedStyle = nil
-        updateHighlightTechnique(silhouetteCount: 0)
         updateModelVisibility()
+    }
+
+    /// A depth-only or transmittance copy of a solid's faces, sharing its
+    /// geometry buffers. Shown only in translucent mode.
+    static func translucentCopy(of geometry: SCNGeometry, category: Int, visible: Bool) -> SCNNode {
+        let copy = SCNGeometry(sources: geometry.sources, elements: geometry.elements)
+        let material = SCNMaterial()
+        material.lightingModel = .constant
+        material.isDoubleSided = true
+        if category == CADViewportCategory.visibility {
+            // Nearest solid depth belongs only to ordinary decorations.
+            material.colorBufferWriteMask = []
+            material.writesToDepthBuffer = true
+            material.readsFromDepthBuffer = true
+        } else {
+            // Multiplicative transmittance is independent of draw order and
+            // never rejected by depth.
+            material.shaderModifiers = [.fragment: Self.revealageFragment]
+            material.blendMode = .multiply
+            material.writesToDepthBuffer = false
+            material.readsFromDepthBuffer = false
+        }
+        copy.materials = [material]
+        let node = SCNNode(geometry: copy)
+        node.categoryBitMask = category
+        node.isHidden = !visible
+        return node
+    }
+
+    /// Switches a solid's face material between opaque shading and additive
+    /// translucent accumulation. Convex-only dual-layer sorting changes with
+    /// the view on CAD shells. Translucent faces instead add premultiplied
+    /// color without depth testing, so every contribution is independent of
+    /// object and triangle submission order; depth-only and transmittance
+    /// copies supply decoration occlusion and coverage.
+    static func configureFaceMaterial(_ material: SCNMaterial, translucent: Bool) {
+        material.transparency = 1
+        material.shaderModifiers = [.fragment: translucent ? translucentFragment : opaqueFragment]
+        material.transparencyMode = .aOne
+        material.blendMode = translucent ? .add : .alpha
+        material.writesToDepthBuffer = !translucent
+        material.readsFromDepthBuffer = !translucent
+        material.isDoubleSided = translucent
     }
 
     private func invalidateResourcePreparation() {
@@ -735,7 +770,7 @@ final class CADSceneView: SCNView {
     }
 
     private func prepareModelResources() {
-        guard pendingMesh == nil, hasModel, let scene else { return }
+        guard pendingMesh == nil, hasModel else { return }
         let token = UUID()
         resourcePreparationID = token
         guard preparesRendererResources else {
@@ -748,11 +783,11 @@ final class CADSceneView: SCNView {
         // Upload geometry and prepare the material/light pipelines before the
         // model is revealed, rather than compiling on the first orbit frame.
         // The renderer's asynchronous overload performs this work off the UI
-        // thread. Including the scene root gives it the complete light setup.
-        // SceneKit's preparation queue also uses the renderer itself. Keep the
-        // view alive through completion, then release its final capture on the
-        // main queue even if the containing SwiftUI view has been removed.
-        prepare([scene.rootNode], completionHandler: { [self] _ in
+        // thread, on the renderer the render thread draws with. Including the
+        // scene root gives it the complete light setup. Keep the view alive
+        // through completion, then release its final capture on the main
+        // queue even if the containing SwiftUI view has been removed.
+        renderer.prepare([scene.rootNode], completionHandler: { [self] _ in
             DispatchQueue.main.async {
                 guard self.resourcePreparationID == token else { return }
                 self.isPreparingResources = false
@@ -770,10 +805,6 @@ final class CADSceneView: SCNView {
         let edgesHidden = hidden || mode == .shaded
         if edgeNode.isHidden != edgesHidden { edgeNode.isHidden = edgesHidden }
         if featureNode.isHidden != hidden { featureNode.isHidden = hidden }
-        if silhouetteNode.isHidden != hidden {
-            silhouetteNode.isHidden = hidden
-            updateSilhouettes(active: highlightedFeatures)
-        }
     }
 
     private func resetFeatureResources() {
@@ -782,6 +813,10 @@ final class CADSceneView: SCNView {
         projectedFeatures = nil
         featureNode.childNodes.forEach { $0.removeFromParentNode() }
         featureNodes.removeAll()
+        featureSeeds.removeAll()
+        featureMasks.removeAll()
+        partMasks.removeAll()
+        meshPositions = nil
         featureCreationOrder.removeAll()
         featureSelectionStyles.removeAll()
         preparedFeatures.removeAll()
@@ -805,61 +840,61 @@ final class CADSceneView: SCNView {
         highlightedFeatures = active
         highlightedSelection = selected
         var newNodes = [(CADFeatureID, SCNNode)]()
-        for feature in active where featureNodes[feature] == nil {
-            guard let geometry = featureGeometry(for: feature) else { continue }
-            let node = SCNNode(geometry: geometry)
-            node.name = "feature:\(feature.kind.rawValue):\(feature.solidIndex):\(feature.localIndex)"
-            node.categoryBitMask = feature.kind == .face ? 4 : CADHighlightTechnique.seedCategory
-            if feature.kind == .face {
+        for feature in active where featureNodes[feature] == nil && featureSeeds[feature] == nil {
+            switch feature.kind {
+            case .face:
+                guard let geometry = featureGeometry(for: feature), let mask = faceMask(feature) else { continue }
+                let node = SCNNode(geometry: geometry)
+                node.name = "feature:\(feature.kind.rawValue):\(feature.solidIndex):\(feature.localIndex)"
+                node.categoryBitMask = CADViewportCategory.featureFaces
                 node.renderingOrder = 3
-                let silhouette = makeSilhouette(geometry, triangleIndices: faceIndices[feature])
-                node.addChildNode(silhouette)
+                node.isHidden = true
+                node.simdTransform = ViewportRigidTransform.sceneMatrix(solidMatrices[feature.solidIndex] ?? matrix_identity_double4x4)
+                featureNode.addChildNode(node)
+                featureNodes[feature] = node
+                featureMasks[feature] = mask
+                newNodes.append((feature, node))
+            case .edge, .vertex:
+                // Overlay buffers need no renderer preparation.
+                guard let seeds = seedBuffer(for: feature) else { continue }
+                featureSeeds[feature] = seeds
+                preparedFeatures.insert(feature)
             }
-            node.isHidden = true
-            node.simdTransform = ViewportRigidTransform.sceneMatrix(solidMatrices[feature.solidIndex] ?? matrix_identity_double4x4)
-            featureNode.addChildNode(node)
-            featureNodes[feature] = node
             featureCreationOrder.append(feature)
-            newNodes.append((feature, node))
             changed = true
         }
         let activeSet = Set(active)
         // Hover can visit every face in a large assembly. Retain selected and
         // active overlays, with only a small cache of inactive drawing resources.
-        if featureNodes.count > activeSet.count + 64 {
-            for feature in featureCreationOrder where !activeSet.contains(feature) {
-                guard featureNodes.count > activeSet.count + 64 else { break }
+        var excess = featureCreationOrder.count - (activeSet.count + 64)
+        if excess > 0 {
+            var evicted = Set<CADFeatureID>()
+            for feature in featureCreationOrder where excess > 0 && !activeSet.contains(feature) {
                 featureNodes.removeValue(forKey: feature)?.removeFromParentNode()
+                featureSeeds.removeValue(forKey: feature)
+                featureMasks.removeValue(forKey: feature)
                 featureSelectionStyles.removeValue(forKey: feature)
                 preparedFeatures.remove(feature)
+                evicted.insert(feature)
+                excess -= 1
             }
-            featureCreationOrder.removeAll { featureNodes[$0] == nil }
+            featureCreationOrder.removeAll { evicted.contains($0) }
         }
         for (feature, node) in featureNodes {
             let isSelected = selected.contains(feature)
             if featureSelectionStyles[feature] != isSelected {
-                switch feature.kind {
-                case .edge:
-                    node.geometry?.firstMaterial?.diffuse.contents = isSelected ? NSColor.red : NSColor.green
-                case .vertex:
-                    node.geometry?.firstMaterial?.diffuse.contents = isSelected ? NSColor.blue : NSColor.red
-                case .face:
-                    node.geometry?.firstMaterial?.diffuse.contents = isSelected ? Self.selectionColor : Self.hoveredFeatureColor
-                    node.childNodes.first { $0.categoryBitMask == CADHighlightTechnique.silhouetteCategory }?
-                        .geometry?.firstMaterial?.diffuse.contents = isSelected ? NSColor.red : NSColor.green
-                }
+                node.geometry?.firstMaterial?.diffuse.contents = isSelected ? Self.selectionColor : Self.hoveredFeatureColor
                 featureSelectionStyles[feature] = isSelected
                 changed = true
             }
             let hidden = !activeSet.contains(feature) || hiddenSolids.contains(feature.solidIndex) || !preparedFeatures.contains(feature)
             if node.isHidden != hidden { node.isHidden = hidden; changed = true }
         }
-        updateSilhouettes(active: active)
         if !newNodes.isEmpty {
             let token = featurePreparationID
             // Hover and selection reuse preview geometry. Upload an overlay once,
             // without delaying the scene or rebuilding CAD geometry.
-            prepare(newNodes.map(\.1), completionHandler: { [self] _ in
+            renderer.prepare(newNodes.map(\.1), completionHandler: { [self] _ in
                 DispatchQueue.main.async {
                     guard self.featurePreparationID == token else { return }
                     // A quickly visited hover overlay may have been evicted
@@ -875,24 +910,11 @@ final class CADSceneView: SCNView {
         return changed
     }
 
+    /// The lit overlay a highlighted face adds to the scene pass.
     private func featureGeometry(for feature: CADFeatureID) -> SCNGeometry? {
-        guard let topology else { return nil }
-        let geometry: SCNGeometry
-        switch feature.kind {
-        case .face:
-            guard let indices = faceIndices[feature], !indices.isEmpty else { return nil }
-            geometry = SCNGeometry(sources: meshSources,
+        guard feature.kind == .face, let indices = faceIndices[feature], !indices.isEmpty else { return nil }
+        let geometry = SCNGeometry(sources: meshSources,
                                    elements: [SCNGeometryElement(indices: indices, primitiveType: .triangles)])
-        case .edge:
-            guard let edge = topology.edges.first(where: { $0.id == feature }) else { return nil }
-            let points = edge.polyline.filter { validFeaturePoint($0) }
-            guard points.count > 1 else { return nil }
-            let segments = zip(points, points.dropFirst()).map { pair in pair.0 + pair.1 }
-            return CADStrokeSeedGeometry.make(segments)
-        case .vertex:
-            guard let vertex = topology.vertices.first(where: { $0.id == feature }), validFeaturePoint(vertex.position) else { return nil }
-            return CADVertexSeedGeometry.make(vertex.position)
-        }
         let material = SCNMaterial()
         material.lightingModel = .physicallyBased
         material.diffuse.contents = Self.selectionColor
@@ -907,176 +929,109 @@ final class CADSceneView: SCNView {
         return geometry
     }
 
-    private func makeSilhouette(_ source: SCNGeometry, triangleIndices: [Int32]? = nil) -> SCNNode {
-        var elements = source.elements
-        if let indices = triangleIndices {
-            // A face viewed edge-on has no filled pixels. Explicit lines keep
-            // its degenerate projection; filled coverage swallows these mesh
-            // seams at ordinary view angles. Polygon line mode still drops
-            // zero-area triangles, so use native line primitives here.
-            var lines = [Int32]()
-            lines.reserveCapacity(indices.count * 2)
-            for index in stride(from: 0, to: indices.count - 2, by: 3) {
-                let a = indices[index], b = indices[index + 1], c = indices[index + 2]
-                lines.append(contentsOf: [a, b, b, c, c, a])
-            }
-            elements.append(SCNGeometryElement(indices: lines, primitiveType: .line))
+    /// Native edge centerlines or a vertex center for the unoccluded overlay.
+    private func seedBuffer(for feature: CADFeatureID) -> CADHighlightBuffers.Seeds? {
+        guard let topology, let device else { return nil }
+        func point(_ value: [Double]) -> SIMD3<Float> { SIMD3(Float(value[0]), Float(value[1]), Float(value[2])) }
+        switch feature.kind {
+        case .edge:
+            guard let edge = topology.edges.first(where: { $0.id == feature }) else { return nil }
+            let points = edge.polyline.filter { validFeaturePoint($0) }.map(point)
+            guard points.count > 1 else { return nil }
+            var segments = [SIMD3<Float>]()
+            segments.reserveCapacity((points.count - 1) * 2)
+            for (start, end) in zip(points, points.dropFirst()) { segments += [start, end] }
+            return CADHighlightBuffers.Seeds(device: device, points: segments, primitive: .line)
+        case .vertex:
+            guard let vertex = topology.vertices.first(where: { $0.id == feature }), validFeaturePoint(vertex.position) else { return nil }
+            return CADHighlightBuffers.Seeds(device: device, points: [point(vertex.position)], primitive: .point)
+        case .face:
+            return nil
         }
-        let geometry = SCNGeometry(sources: source.sources, elements: elements)
-        let material = SCNMaterial()
-        material.lightingModel = .constant
-        // Mask channels carry selected/hovered coverage, never lit face color.
-        material.diffuse.contents = NSColor.red
-        material.isDoubleSided = true
-        material.readsFromDepthBuffer = false
-        material.writesToDepthBuffer = false
-        geometry.materials = [material]
-        let node = SCNNode(geometry: geometry)
-        node.categoryBitMask = CADHighlightTechnique.silhouetteCategory
-        return node
     }
 
-    private func updateSilhouettes(active: [CADFeatureID]) {
-        var masks = [SCNNode]()
-        var bounds = [[Double]]()
-        for (solid, node) in partSilhouettes {
-            let hidden = !selectedSolids.contains(solid) || hiddenSolids.contains(solid)
-            if node.isHidden != hidden { node.isHidden = hidden }
+    /// The preview's positions, uploaded once for projected outline masks.
+    private func highlightPositions() -> (any MTLBuffer)? {
+        if let meshPositions { return meshPositions }
+        guard let device, let data = meshSources.first?.data, !data.isEmpty else { return nil }
+        meshPositions = data.withUnsafeBytes { raw in
+            raw.baseAddress.flatMap { device.makeBuffer(bytes: $0, length: data.count, options: .storageModeShared) }
         }
-        for solid in selectedSolids.sorted() where !hiddenSolids.contains(solid) {
-            if let mask = partSilhouettes[solid] {
-                masks.append(mask); bounds.append(solidBounds[solid] ?? originalMeshBounds)
-            }
-        }
-        for feature in active where feature.kind == .face && !hiddenSolids.contains(feature.solidIndex) {
-            if let node = featureNodes[feature]?.childNodes.first(where: {
-                $0.categoryBitMask == CADHighlightTechnique.silhouetteCategory
-            }) {
-                masks.append(node)
-                bounds.append(faceBounds[feature]?.values ?? solidBounds[feature.solidIndex] ?? originalMeshBounds)
-            }
-        }
-        // Slots share immutable geometry and mutable style with their source.
-        // Permanent batch roots, rather than individual items, own DRAW_NODE.
-        while silhouetteSlots.count < masks.count {
-            let slot = SCNNode()
-            slot.categoryBitMask = CADHighlightTechnique.silhouetteCategory
-            slot.name = CADHighlightTechnique.silhouetteMaskNodeName(silhouetteSlots.count)
-            silhouetteNode.addChildNode(slot)
-            silhouetteSlots.append(slot)
-        }
-        for (index, slot) in silhouetteSlots.enumerated() {
-            let mask = masks.indices.contains(index) ? masks[index] : nil
-            if slot.geometry !== mask?.geometry { slot.geometry = mask?.geometry }
-            // Mask slots live beside the parts, while a face mask lives under
-            // its feature overlay. Carry the complete rigid pose into DRAW_NODE.
-            let transform = mask.map { simd_inverse(silhouetteNode.simdWorldTransform) * $0.simdWorldTransform }
-                ?? matrix_identity_float4x4
-            if slot.simdTransform != transform { slot.simdTransform = transform }
-            let hidden = !hasModel || isPreparingResources || mask == nil || mask?.isHidden == true ||
-                (mask?.parent !== silhouetteNode && mask?.parent?.isHidden == true)
-            if slot.isHidden != hidden { slot.isHidden = hidden }
-        }
-        silhouetteInputBounds = bounds
-        refreshSilhouetteBatches()
+        return meshPositions
     }
 
-    /// Capture layout is computed without changing live nodes or attachments.
-    func captureSilhouetteBatches(outputSize: CGSize) -> [CADSilhouetteBatching.Batch] {
-        projectedSilhouetteBatches(outputSize: outputSize)
+    /// A face's filled projection plus its triangle edges, so a face viewed
+    /// edge-on keeps a line projection that filled coverage would drop.
+    private func faceMask(_ feature: CADFeatureID) -> CADHighlightBuffers.Mask? {
+        guard let device, let positions = highlightPositions(), let indices = faceIndices[feature], !indices.isEmpty else { return nil }
+        return CADHighlightBuffers.Mask(device: device, positions: positions,
+                                        triangleIndices: indices.withUnsafeBufferPointer { Data(buffer: $0) }, includeLines: true)
     }
 
-    private func projectedSilhouetteBatches(outputSize: CGSize?) -> [CADSilhouetteBatching.Batch] {
-        let size = outputSize ?? convertToBacking(bounds).size
-        let pixels = SIMD2(Double(size.width), Double(size.height))
-        let projection = assemblyGrabProjection(viewportSize: outputSize)
-        let rectangles: [CADSilhouetteBatching.Rect?] = silhouetteInputBounds.enumerated().map { index, bounds in
-            let slot = silhouetteSlots[index]
-            guard !slot.isHidden else { return nil }
+    /// A selected part's filled projection, sharing its scene geometry indices.
+    private func partMask(_ solid: Int) -> CADHighlightBuffers.Mask? {
+        if let mask = partMasks[solid] { return mask }
+        guard let device, let positions = highlightPositions(),
+              let element = solidNodes[solid]?.geometry?.elements.first, element.bytesPerIndex == MemoryLayout<Int32>.size,
+              let mask = CADHighlightBuffers.Mask(device: device, positions: positions, triangleIndices: element.data,
+                                                  includeLines: false) else { return nil }
+        partMasks[solid] = mask
+        return mask
+    }
+
+    /// Highlight geometry and parameters for one frame of `width`×`height`
+    /// pixels. Captures call this with their own output size.
+    func makeFrame(width: Int, height: Int) -> CADViewportFrame {
+        var frame = CADViewportFrame(width: width, height: height, referenceHeight: Double(bounds.height),
+                                     translucent: mode == .translucent, palette: Self.highlightPalette)
+        guard hasModel, !isPreparingResources, width > 0, height > 0 else { return frame }
+        let projection = assemblyGrabProjection(viewportSize: CGSize(width: width, height: height))
+        let pixels = SIMD2(Double(width), Double(height))
+        var area: CADSilhouetteBatching.Rect?
+        func include(_ rect: CADSilhouetteBatching.Rect) { area = area.map { $0.union(rect) } ?? rect }
+        func model(_ solid: Int) -> simd_float4x4 {
+            ViewportRigidTransform.sceneMatrix(solidMatrices[solid] ?? matrix_identity_double4x4)
+        }
+        // A missing projection conservatively covers the whole frame; a box
+        // entirely behind the eye or outside the frame contributes nothing.
+        func project(_ bounds: [Double], _ transform: simd_float4x4) -> CADSilhouetteBatching.Rect? {
             guard let projection else { return .full }
-            return CADSilhouetteBatching.project(bounds: bounds, transform: slot.simdWorldTransform,
-                                                 projection: projection, pixels: pixels)
+            return CADSilhouetteBatching.project(bounds: bounds, transform: transform, projection: projection, pixels: pixels)
         }
-        return CADSilhouetteBatching.make(rectangles)
-    }
-
-    func refreshSilhouetteBatches() {
-        let batches = projectedSilhouetteBatches(outputSize: nil)
-        // Keep a small reusable capacity instead of reconstructing techniques
-        // whenever selection or camera movement changes the overlap count.
-        var capacity = max(1, silhouetteBatches.count)
-        while capacity < batches.count { capacity *= 2 }
-        if batches.isEmpty && silhouetteBatches.isEmpty { capacity = 0 }
-        // Keep hover-sized allocations warm, but do not retain thousands of
-        // dormant passes after an overlapping assembly selection is cleared.
-        if capacity > max(8, batches.count * 4) {
-            capacity = batches.isEmpty ? 0 : 1
-            while capacity < batches.count { capacity *= 2 }
+        let selected = highlightedSelection
+        for feature in highlightedFeatures where feature.kind != .face && !hiddenSolids.contains(feature.solidIndex) {
+            guard preparedFeatures.contains(feature), let seeds = featureSeeds[feature] else { continue }
+            let transform = model(feature.solidIndex)
+            guard let rect = project(seeds.bounds, transform) else { continue }
+            include(rect)
+            let isSelected = selected.contains(feature)
+            let channel: CADViewportFrame.SeedChannel = feature.kind == .edge
+                ? (isSelected ? .selectedEdge : .hoveredEdge)
+                : (isSelected ? .selectedVertex : .hoveredVertex)
+            frame.seeds.append(.init(buffer: seeds, channel: channel, model: transform))
         }
-        if capacity < silhouetteBatches.count {
-            for batch in silhouetteBatches[capacity...] {
-                for slot in batch.childNodes { silhouetteNode.addChildNode(slot) }
-                batch.removeFromParentNode()
-            }
-            silhouetteBatches.removeSubrange(capacity...)
+        var masks = [CADViewportFrame.Mask](), rectangles = [CADSilhouetteBatching.Rect?]()
+        for solid in selectedSolids.sorted() where !hiddenSolids.contains(solid) {
+            guard let mask = partMask(solid) else { continue }
+            let transform = model(solid)
+            masks.append(.init(buffer: mask, selected: true, model: transform))
+            rectangles.append(project(solidBounds[solid] ?? originalMeshBounds, transform))
         }
-        while silhouetteBatches.count < capacity {
-            let batch = SCNNode()
-            batch.categoryBitMask = CADHighlightTechnique.silhouetteCategory
-            batch.name = CADHighlightTechnique.silhouetteNodeName(silhouetteBatches.count)
-            silhouetteNode.addChildNode(batch)
-            silhouetteBatches.append(batch)
+        for feature in highlightedFeatures where feature.kind == .face && !hiddenSolids.contains(feature.solidIndex) {
+            guard preparedFeatures.contains(feature), let mask = featureMasks[feature] else { continue }
+            let transform = model(feature.solidIndex)
+            masks.append(.init(buffer: mask, selected: selected.contains(feature), model: transform))
+            rectangles.append(project(faceBounds[feature]?.values ?? solidBounds[feature.solidIndex] ?? originalMeshBounds, transform))
         }
-        var activeSlots = Set<Int>()
-        silhouetteBatchBounds = Array(repeating: .zero, count: capacity)
-        for (index, batch) in batches.enumerated() {
-            silhouetteBatchBounds[index] = batch.rect.vector
-            let parent = silhouetteBatches[index]
-            for item in batch.items {
-                let slot = silhouetteSlots[item]
-                if slot.parent !== parent { parent.addChildNode(slot) }
-                activeSlots.insert(item)
-            }
+        // Disjoint masks share one projection and contour pass; overlapping
+        // masks keep separate passes so nested parts keep their own outline.
+        for batch in CADSilhouetteBatching.make(rectangles) {
+            include(batch.rect)
+            frame.batches.append(.init(rect: batch.rect, masks: batch.items.map { masks[$0] }))
         }
-        for (index, slot) in silhouetteSlots.enumerated() where !activeSlots.contains(index) {
-            // Offscreen and removed slots must not remain in a batch's draw.
-            if slot.parent !== silhouetteNode { silhouetteNode.addChildNode(slot) }
-        }
-        for (index, batch) in silhouetteBatches.enumerated() { batch.isHidden = index >= batches.count }
-        updateHighlightTechnique(silhouetteCount: capacity)
-    }
-
-    private func updateHighlightTechnique(silhouetteCount: Int) {
-        if silhouetteCount != highlightSilhouetteCount {
-            highlightSilhouetteCount = silhouetteCount
-            opaqueHighlightTechnique = nil
-            translucentHighlightTechnique = nil
-        }
-        func make(translucent: Bool) -> SCNTechnique? {
-            CADHighlightTechnique.make(viewportHeight: bounds.height, selected: Self.selectionColor,
-                hover: Self.hoveredFeatureColor, hoverHalo: Self.hoveredFeatureHalo, ink: Self.edgeInk,
-                frameCompletion: true, vertexHighlights: false, translucentFaces: translucent,
-                silhouetteCount: silhouetteCount)
-        }
-        if opaqueHighlightTechnique == nil { opaqueHighlightTechnique = make(translucent: false) }
-        if mode == .translucent, translucentHighlightTechnique == nil {
-            translucentHighlightTechnique = make(translucent: true)
-        }
-        guard let next = mode == .translucent ? translucentHighlightTechnique ?? opaqueHighlightTechnique : opaqueHighlightTechnique else { return }
-        // SCNView copies its technique on assignment. Track the template we
-        // installed, then update the live copy instead of repeatedly replacing
-        // its attachments or changing uniforms on an unrendered template.
-        if installedHighlightTemplate !== next {
-            technique = next
-            installedHighlightTemplate = next
-        }
-        guard let installed = technique else { return }
-        CADHighlightTechnique.setViewportHeight(bounds.height, on: installed)
-        CADHighlightTechnique.setBackground(scene?.background.contents as? NSColor ?? Self.sceneBackgroundColor, on: installed)
-        CADHighlightTechnique.setSilhouetteBounds(silhouetteBatchBounds, on: installed)
-        CADHighlightTechnique.setVertexHighlightsEnabled(highlightedFeatures.contains {
-            $0.kind == .vertex && !hiddenSolids.contains($0.solidIndex)
-        }, on: installed)
+        frame.highlightBounds = area
+        frame.verticesEnabled = highlightedFeatures.contains { $0.kind == .vertex && !hiddenSolids.contains($0.solidIndex) }
+        return frame
     }
 
     private func validFeaturePoint(_ point: [Double]) -> Bool {
@@ -1092,7 +1047,7 @@ final class CADSceneView: SCNView {
             let node = SCNNode(geometry: CADStrokeGeometry.make(prepared.edges[solid]!, color: Self.edgeInk,
                 viewportHeight: bounds.height))
             node.name = solid < 0 ? "legacy-edges" : "edges:\(solid)"
-            node.categoryBitMask = 2
+            node.categoryBitMask = CADViewportCategory.decorations
             node.renderingOrder = 1
             node.geometry?.firstMaterial?.writesToDepthBuffer = false
             node.geometry?.firstMaterial?.isDoubleSided = true
@@ -1108,7 +1063,6 @@ final class CADSceneView: SCNView {
         let previous = appliedStyle
         appliedStyle = style
         let translucent = mode == .translucent
-        if previous?.mode != mode { updateHighlightTechnique(silhouetteCount: max(0, highlightSilhouetteCount)) }
         let coloredLegacyWire = !hasOwnedEdges && mode == .wireframe && !solidColors.isEmpty
         let selectionColor = Self.selectionColor
         for node in edgeNode.childNodes {
@@ -1147,14 +1101,8 @@ final class CADSceneView: SCNView {
             node.geometry?.firstMaterial?.fillMode = mode == .wireframe ? .lines : .fill
             // Let interior parts show through the filled surfaces. Restore
             // depth writing and opaque materials when leaving this mode.
-            node.geometry?.firstMaterial?.transparency = 1
-            node.geometry?.firstMaterial?.shaderModifiers = [.fragment: translucent ? Self.translucentFragment : Self.opaqueFragment]
-            // Convex-only dual-layer sorting changes with the view on CAD
-            // shells. The technique resolves all single-pass contributions
-            // independently of object and triangle submission order.
-            node.geometry?.firstMaterial?.transparencyMode = .aOne
-            node.geometry?.firstMaterial?.writesToDepthBuffer = !translucent
-            node.geometry?.firstMaterial?.isDoubleSided = translucent
+            if let material = node.geometry?.firstMaterial { Self.configureFaceMaterial(material, translucent: translucent) }
+            for copy in node.childNodes where copy.isHidden == translucent { copy.isHidden = !translucent }
             node.geometry?.firstMaterial?.diffuse.contents = selected && mode != .wireframe
                 ? selectionColor
                 : assignedColor(for: solid) ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
@@ -1186,6 +1134,8 @@ final class CADSceneView: SCNView {
         let material = SCNMaterial()
         material.lightingModel = .constant
         material.diffuse.contents = color
+        // Only solid faces write visibility depth; guides read it.
+        material.writesToDepthBuffer = false
         geometry.materials = [material]
         return geometry
     }
@@ -1215,7 +1165,11 @@ final class CADSceneView: SCNView {
         gridNode.addChildNode(SCNNode(geometry: lineGeometry(minor, color: NSColor(srgbRed: 0.13, green: 0.16, blue: 0.19, alpha: 1))))
         gridNode.addChildNode(SCNNode(geometry: lineGeometry(major, color: NSColor(srgbRed: 0.18, green: 0.21, blue: 0.25, alpha: 1))))
         // Guides must not intercept solid selection or cursor zoom hit tests.
-        for node in gridNode.childNodes { node.categoryBitMask = 2 }
+        // They draw after the faces whose depth they read.
+        for node in gridNode.childNodes {
+            node.categoryBitMask = CADViewportCategory.decorations
+            node.renderingOrder = 1
+        }
         gridNode.isHidden = !gridVisible
         if gridSpacing != step {
             gridSpacing = step
@@ -1359,8 +1313,8 @@ final class CADSceneView: SCNView {
             SIMD4(SIMD3<Float>(pose.backward), 0), SIMD4(SIMD3<Float>(pose.position), 1)))
         cameraNode.camera?.usesOrthographicProjection = rig.usesOrthographicProjection
         cameraNode.camera?.orthographicScale = pose.orthographicScale
+        sceneSource.synchronizeCameras()
         SCNTransaction.commit()
-        refreshSilhouetteBatches()
         notifyCameraOrientation()
         requestRedraw()
     }
@@ -1386,8 +1340,8 @@ final class CADSceneView: SCNView {
         if cameraNode.camera?.orthographicScale != rig.orthographicScale {
             cameraNode.camera?.orthographicScale = rig.orthographicScale
         }
+        sceneSource?.synchronizeCameras()
         SCNTransaction.commit()
-        refreshSilhouetteBatches()
         notifyCameraOrientation()
         requestRedraw()
     }
@@ -1402,7 +1356,6 @@ final class CADSceneView: SCNView {
             projectedFeatures = nil
             setHoveredFeature(nil)
             updateStrokeViewportHeight()
-            refreshSilhouetteBatches()
         }
         if needsInitialFit, bounds.width >= 10, bounds.height >= 10 {
             cancelCameraTransition()
@@ -1415,110 +1368,63 @@ final class CADSceneView: SCNView {
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
-        refreshSilhouetteBatches()
+        layer?.contentsScale = window?.backingScaleFactor ?? 1
         requestRedraw()
     }
 
-    /// A paused Metal drawable may take longer than a timer to wake. Keep the
-    /// requested burst alive until a frame that started after these changes
-    /// actually rendered, then stop once input has also become quiet.
+    /// Publishes the view's state to the render thread once per main-queue
+    /// turn, however many changes that turn made. The render thread draws
+    /// exactly the frames published; nothing renders while nothing changes.
     private func requestRedraw() {
-        needsDisplay = true
-        redrawPauseTask?.cancel()
-        redrawPauseTask = nil
-        guard canDrawViewport else { stopRedraw(); return }
-        let wasActive = redrawDriver.isActive
-        // A cold display link needs the initial pending scene committed.
-        // Active navigation uses SceneKit's normal per-frame commits, rather
-        // than synchronously flushing its transaction for every mouse event.
-        if !wasActive { SCNTransaction.flush() }
-        let now = ProcessInfo.processInfo.systemUptime
-        redrawDriver.request(at: now)
-        if !wasActive {
-            redrawRecoveryState.stop()
-            _ = redrawRecoveryState.shouldRestart(at: now, finalFrameCount: redrawDriver.finalFrameCount)
-            refreshRedrawDelegate()
-        } else if redrawRecoveryState.shouldRestartForNewRequest(at: now, finalFrameCount: redrawDriver.finalFrameCount) {
-            restartRedrawPlayback()
-        }
-        if !rendersContinuously { rendersContinuously = true }
-        if !isPlaying { isPlaying = true }
-        scheduleRedrawRecovery()
+        guard !framePublicationScheduled else { return }
+        framePublicationScheduled = true
+        DispatchQueue.main.async { [weak self] in self?.publishFrame() }
     }
 
-    private func scheduleRedrawRecovery() {
-        guard redrawRecoveryTask == nil else { return }
-        redrawRecoveryTask = Task { @MainActor [weak self] in
-            do { try await Task.sleep(for: .milliseconds(350)) }
-            catch { return }
-            guard let self, !Task.isCancelled else { return }
-            self.redrawRecoveryTask = nil
-            guard self.canDrawViewport, self.redrawDriver.isActive else { self.stopRedraw(); return }
-            if self.redrawRecoveryState.shouldRestart(at: ProcessInfo.processInfo.systemUptime,
-                                                     finalFrameCount: self.redrawDriver.finalFrameCount) {
-                self.restartRedrawPlayback()
-            }
-            if self.redrawRecoveryState.canRestart { self.scheduleRedrawRecovery() }
-        }
-    }
-
-    /// SceneKit can retain true playback flags after its display link stops.
-    /// Rearm only a stalled burst, preserving its generation and external
-    /// delegate; ordinary navigation does no extra work.
-    private func restartRedrawPlayback() {
-        isPlaying = false
-        rendersContinuously = false
-        refreshRedrawDelegate()
+    private func publishFrame() {
+        framePublicationScheduled = false
+        // Changes made while the window cannot draw are published when it is
+        // revealed or deminiaturized.
+        guard canDrawViewport, let loop = renderLoop ?? startRenderLoop() else { return }
+        let size = convertToBacking(bounds).size
+        let width = Int(size.width.rounded()), height = Int(size.height.rounded())
+        guard width > 0, height > 0 else { return }
+        // Commit this turn's implicit scene changes before the render thread
+        // reads the scene, so the frame shows all of them together.
         SCNTransaction.flush()
-        rendersContinuously = true
-        isPlaying = true
-        needsDisplay = true
+        publishedGeneration &+= 1
+        publishedCameraTransforms.append((publishedGeneration, cameraNode.simdWorldTransform))
+        if publishedCameraTransforms.count > 16 { publishedCameraTransforms.removeFirst() }
+        loop.submit(.init(frame: makeFrame(width: width, height: height), source: sceneSource,
+                          generation: publishedGeneration))
+    }
+
+    private func startRenderLoop() -> ViewportRenderLoop? {
+        guard renderLoop == nil, let layer = layer as? CAMetalLayer else { return renderLoop }
+        renderLoop = ViewportRenderLoop(layer: layer, renderer: renderer) { [weak self] generation in
+            MainActor.assumeIsolated { self?.frameCompleted(generation) }
+        }
+        return renderLoop
+    }
+
+    private func frameCompleted(_ generation: UInt64) {
+        renderedFrameCount += 1
+        renderedGeneration = max(renderedGeneration, generation)
+        if let published = publishedCameraTransforms.last(where: { $0.generation == generation }) {
+            renderedCameraTransform = published.transform
+        }
+        publishedCameraTransforms.removeAll { $0.generation <= generation }
+        onFrameRendered?()
     }
 
     private var canDrawViewport: Bool {
         guard let window, window.isVisible, !window.isMiniaturized, !isHiddenOrHasHiddenAncestor else { return false }
         // Direct input and window captures can arrive while AppKit's occlusion
-        // state is stale. Allow their bounded bursts on an attached visible view.
+        // state is stale, so occlusion alone never suppresses a frame.
         return true
     }
 
-    private func refreshRedrawDelegate() {
-        // SceneKit caches optional delegate capabilities. Reinstall the proxy
-        // when its early-frame hook or the external delegate changes.
-        super.delegate = nil
-        super.delegate = redrawDriver
-    }
-
-    private func schedulePauseAfterRenderedFrame() {
-        guard canDrawViewport else { stopRedraw(); return }
-        guard let delay = redrawDriver.pauseDelay(at: ProcessInfo.processInfo.systemUptime, quietPeriod: 0.12) else { return }
-        redrawPauseTask?.cancel()
-        redrawPauseTask = Task { @MainActor [weak self] in
-            do { try await Task.sleep(for: .seconds(delay)) }
-            catch { return }
-            guard !Task.isCancelled, let self else { return }
-            // A newer request may have arrived while this task was queued.
-            guard let remaining = self.redrawDriver.pauseDelay(at: ProcessInfo.processInfo.systemUptime, quietPeriod: 0.12) else { return }
-            if remaining > 0 { self.schedulePauseAfterRenderedFrame() }
-            else { self.stopRedraw() }
-        }
-    }
-
-    private func stopRedraw() {
-        redrawRecoveryTask?.cancel()
-        redrawRecoveryTask = nil
-        redrawRecoveryState.stop()
-        redrawPauseTask?.cancel()
-        redrawPauseTask = nil
-        isPlaying = false
-        rendersContinuously = false
-        let wasActive = redrawDriver.isActive
-        redrawDriver.stop()
-        if wasActive { refreshRedrawDelegate() }
-    }
-
     private func updateStrokeViewportHeight() {
-        if let technique { CADHighlightTechnique.setViewportHeight(bounds.height, on: technique) }
         for node in edgeNode.childNodes {
             if let geometry = node.geometry { CADStrokeGeometry.setViewportHeight(bounds.height, on: geometry) }
         }
@@ -1553,15 +1459,17 @@ final class CADSceneView: SCNView {
         NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: window)
         NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: window)
         NotificationCenter.default.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didDeminiaturizeNotification, object: window)
         NotificationCenter.default.removeObserver(self, name: NSApplication.didBecomeActiveNotification, object: NSApp)
         NotificationCenter.default.removeObserver(self, name: NSApplication.didChangeScreenParametersNotification, object: NSApp)
         NSWorkspace.shared.notificationCenter.removeObserver(self, name: NSWorkspace.didWakeNotification, object: nil)
         NSWorkspace.shared.notificationCenter.removeObserver(self, name: NSWorkspace.screensDidWakeNotification, object: nil)
+        windowVisibilityObservation = nil
         setHoveredFeature(nil)
         resetNavigationGesture()
         cancelCameraTransition()
         if newWindow == nil {
-            stopRedraw()
+            renderLoop?.cancelPending()
             if pendingMesh != nil {
                 // Retain the requested input for reattachment, but discard work
                 // and completions owned by the detached rendering surface.
@@ -1576,6 +1484,7 @@ final class CADSceneView: SCNView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if let window {
+            layer?.contentsScale = window.backingScaleFactor
             if let pendingMesh, meshPreparationTask == nil { prepareMesh(pendingMesh) }
             window.acceptsMouseMovedEvents = true
             // Modifier events go to the first responder, which may be the
@@ -1590,6 +1499,15 @@ final class CADSceneView: SCNView {
                                                    name: NSWindow.didBecomeKeyNotification, object: window)
             NotificationCenter.default.addObserver(self, selector: #selector(windowVisibilityChanged),
                                                    name: NSWindow.didChangeOcclusionStateNotification, object: window)
+            // Ordering a window in or out changes this synchronously, while
+            // occlusion notifications arrive later through the event loop.
+            windowVisibilityObservation = window.observe(\.isVisible) { [weak self] window, _ in
+                MainActor.assumeIsolated {
+                    if window.isVisible { self?.requestRedraw() }
+                }
+            }
+            NotificationCenter.default.addObserver(self, selector: #selector(windowDeminiaturized),
+                                                   name: NSWindow.didDeminiaturizeNotification, object: window)
             NotificationCenter.default.addObserver(self, selector: #selector(viewportEnvironmentWoke),
                                                    name: NSApplication.didBecomeActiveNotification, object: NSApp)
             NotificationCenter.default.addObserver(self, selector: #selector(viewportEnvironmentWoke),
@@ -1601,7 +1519,7 @@ final class CADSceneView: SCNView {
             if window.isKeyWindow { onActivated?(self) }
             requestRedraw()
         } else {
-            stopRedraw()
+            renderLoop?.cancelPending()
         }
     }
 
@@ -1616,26 +1534,22 @@ final class CADSceneView: SCNView {
         onActivated?(self)
         requestRedraw()
     }
+    @objc private func windowDeminiaturized() { requestRedraw() }
+
     @objc private func windowVisibilityChanged() {
-        // An explicit hidden/covered notification stops the burst even if
-        // AppKit temporarily retains the key-window flag. Input and wake
-        // requests can still recover from a stale occlusion bit afterward.
         if window?.occlusionState.contains(.visible) == true {
-            stopRedraw()
             requestRedraw()
         } else {
             cancelAssemblyGrab()
             cancelCameraTransition()
-            stopRedraw()
         }
     }
 
+    /// Display and color changes, activation and wake redraw the current
+    /// state once; idle views otherwise draw nothing.
     @objc private func viewportEnvironmentWoke() {
         cancelAssemblyGrab()
         guard window != nil else { return }
-        // A display link can be suspended across sleep or activation while
-        // its public playback flags still read true. Re-arm both edges.
-        stopRedraw()
         requestRedraw()
     }
 
@@ -2036,12 +1950,76 @@ final class CADSceneView: SCNView {
         let search = hiddenSolids.isEmpty ? SCNHitTestSearchMode.closest : .all
         // The deprecated sortResults option overrides nearest-hit ordering,
         // even with searchMode.closest, and can return a farther solid first.
-        return hitTest(point, options: [.categoryBitMask: 1, .ignoreHiddenNodes: false,
+        return hitTest(point, options: [.categoryBitMask: CADViewportCategory.faces, .ignoreHiddenNodes: false,
                                  .searchMode: search.rawValue])
             .first { hit in
                 guard let solid = solidIndex(of: hit.node) else { return false }
                 return !hiddenSolids.contains(solid)
             }
+    }
+
+    /// Scene hits along the design camera's ray through a point in view
+    /// coordinates, ordered from the eye like the rendered frame's depth.
+    func hitTest(_ point: NSPoint, options: [SCNHitTestOption: Any] = [:]) -> [SCNHitTestResult] {
+        guard let ray = cameraRay(at: point) else { return [] }
+        var native = [String: Any]()
+        for (key, value) in options { native[key.rawValue] = value }
+        return scene.rootNode.hitTestWithSegment(from: SCNVector3(ray.from), to: SCNVector3(ray.to), options: native)
+    }
+
+    /// Projects a world point to view coordinates with a bottom-left origin,
+    /// using the design camera. Z is the point's distance in front of the eye.
+    func projectPoint(_ point: SCNVector3) -> SCNVector3 {
+        guard let basis = cameraBasis() else { return SCNVector3Zero }
+        let delta = SIMD3<Double>(Double(point.x), Double(point.y), Double(point.z)) - basis.position
+        let depth = -simd_dot(delta, basis.backward)
+        let height = basis.orthographic ? basis.halfHeight : depth * basis.halfHeight
+        let width = height * Double(bounds.width / max(bounds.height, 1))
+        let x = (simd_dot(delta, basis.right) / width + 1) / 2 * Double(bounds.width)
+        let y = (simd_dot(delta, basis.up) / height + 1) / 2 * Double(bounds.height)
+        return SCNVector3(x, y, depth)
+    }
+
+    /// The camera's world axes and vertical half-extent: the orthographic
+    /// scale, or the tangent of half the vertical field of view.
+    private func cameraBasis() -> (position: SIMD3<Double>, right: SIMD3<Double>, up: SIMD3<Double>,
+                                    backward: SIMD3<Double>, orthographic: Bool, halfHeight: Double)? {
+        guard let camera = cameraNode.camera, bounds.width > 0, bounds.height > 0 else { return nil }
+        let t = cameraNode.simdWorldTransform
+        func axis(_ column: SIMD4<Float>) -> SIMD3<Double> { SIMD3<Double>(Double(column.x), Double(column.y), Double(column.z)) }
+        let orthographic = camera.usesOrthographicProjection
+        let halfHeight = orthographic ? camera.orthographicScale : tan(Double(camera.fieldOfView) * .pi / 360)
+        guard halfHeight.isFinite, halfHeight > 0 else { return nil }
+        return (axis(t.columns.3), simd_normalize(axis(t.columns.0)), simd_normalize(axis(t.columns.1)),
+                simd_normalize(axis(t.columns.2)), orthographic, halfHeight)
+    }
+
+    /// A segment from the eye through a view point to beyond the design.
+    private func cameraRay(at point: NSPoint) -> (from: SIMD3<Double>, to: SIMD3<Double>)? {
+        guard let basis = cameraBasis(), point.x.isFinite, point.y.isFinite else { return nil }
+        let x = Double(point.x / bounds.width) * 2 - 1, y = Double(point.y / bounds.height) * 2 - 1
+        let aspect = Double(bounds.width / bounds.height)
+        var reach = 1.0
+        if meshBounds.count == 6 {
+            for corner in 0..<8 {
+                let p = SIMD3(meshBounds[corner & 1 == 0 ? 0 : 3], meshBounds[corner & 2 == 0 ? 1 : 4],
+                              meshBounds[corner & 4 == 0 ? 2 : 5])
+                reach = max(reach, simd_length(p - basis.position))
+            }
+        }
+        reach *= 2
+        let from: SIMD3<Double>, direction: SIMD3<Double>
+        if basis.orthographic {
+            from = basis.position + basis.right * (x * basis.halfHeight * aspect) + basis.up * (y * basis.halfHeight)
+            direction = -basis.backward
+        } else {
+            from = basis.position
+            direction = simd_normalize(basis.right * (x * basis.halfHeight * aspect) + basis.up * (y * basis.halfHeight)
+                                       - basis.backward)
+        }
+        let to = from + direction * reach
+        guard from.x.isFinite, from.y.isFinite, from.z.isFinite, to.x.isFinite, to.y.isFinite, to.z.isFinite else { return nil }
+        return (from, to)
     }
 
     override func scrollWheel(with event: NSEvent) {

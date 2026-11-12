@@ -43,47 +43,35 @@ final class CADSilhouetteBatchingTests: XCTestCase {
     }
 
     @MainActor
-    func testThousandSelectedPartsUseOneBatchAndKeepTechniqueWhenSelectionShrinks() async throws {
+    func testThousandSelectedPartsShareOneBatchAndDeselectionDropsHighlightPasses() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 625), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 625))
         let preview = tiledParts(count: 1_000)
         view.update(mesh: preview, mode: .wireframe, grid: false, command: ViewportCommand(.top),
                     selectedSolids: Set(0..<1_000), hiddenSolids: [], projection: .isometric)
         let deadline = ContinuousClock.now + .seconds(30)
         while view.isPreparingCaptureResources, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertFalse(view.isPreparingCaptureResources)
-        let technique = try XCTUnwrap(view.technique)
-        let sequence = try XCTUnwrap(technique.dictionaryRepresentation["sequence"] as? [String])
-        let capacity = sequence.filter { $0.hasPrefix("cadContour") }.count
-        let activeBatches = (0..<capacity).filter { index in
-            let rect = (technique.value(forKey: "cadSilhouetteBounds\(index)") as? NSValue)?.scnVector4Value
-            return rect.map { $0.z > $0.x && $0.w > $0.y } ?? false
-        }.count
-        XCTAssertEqual(activeBatches, 1,
-            "Selecting a disjoint thousand-part assembly must not add a thousand full-screen passes.")
-        XCTAssertLessThanOrEqual(capacity, 2, "The initial isometric pose may leave one reusable empty bucket after the top-view command.")
-        for _ in 0..<4 {
-            view.refreshSilhouetteBatches()
-            XCTAssertTrue(view.technique === technique,
-                "SceneKit copies assigned techniques; bounds updates must reuse and mutate the installed copy.")
-        }
+        // At Retina output the tiles' padded projections are disjoint. At 1×,
+        // padding makes neighbors touch, which only alternates batches.
+        let frame = view.makeFrame(width: 2_000, height: 1_250)
+        XCTAssertEqual(frame.batches.count, 1,
+            "Selecting a disjoint thousand-part assembly must not add a thousand mask passes.")
+        XCTAssertEqual(frame.batches.first?.masks.count, 1_000)
+        XCTAssertLessThanOrEqual(view.makeFrame(width: 1_000, height: 625).batches.count, 4)
         let start = ContinuousClock.now
         let png = try await CADAgentRenderer.capturePNG(view: view)
-        XCTAssertTrue(view.technique === technique, "Independent output dimensions must not replace live attachments.")
         let image = try XCTUnwrap(NSBitmapImageRep(data: png))
         for solid in [0, 19, 39, 480, 999] {
             let x = Double(solid % 40), y = Double(solid / 40)
             XCTAssertTrue(pixels(image, at: SCNVector3(x + 0.3, y, 0), in: view, radius: 2).contains(where: isGold),
-                "The grouped mask must draw the complete outline of part \(solid), including batch children.")
+                "The grouped mask must draw the complete outline of part \(solid).")
             XCTAssertFalse(pixels(image, at: SCNVector3(x + 0.3, y + 0.3, 0), in: view, radius: 0).contains(where: isGold),
                 "A silhouette must not fill the part's projected interior.")
         }
-        print("LAD selected-part profile: 1000 parts, \(activeBatches) active contour batches / \(capacity) retained, capture \(ContinuousClock.now - start)")
+        print("LAD selected-part profile: 1000 parts, \(frame.batches.count) contour batch, capture \(ContinuousClock.now - start)")
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: Set(0..<100), hiddenSolids: [], projection: .isometric)
-        XCTAssertTrue(view.technique === technique, "Selection count changes inside retained batch capacity must reuse the technique.")
         let ordinaryPNG = try await CADAgentRenderer.capturePNG(view: view)
         let ordinary = try XCTUnwrap(NSBitmapImageRep(data: ordinaryPNG))
         XCTAssertTrue(pixels(ordinary, at: SCNVector3(39.3, 24, 0), in: view, radius: 2).contains {
@@ -91,16 +79,14 @@ final class CADSilhouetteBatchingTests: XCTestCase {
         }, "An unselected part's ordinary edge ink must survive the shared mask and compositor.")
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [], projection: .isometric)
-        XCTAssertTrue(view.technique === technique)
-        let bounds = try XCTUnwrap(technique.value(forKey: "cadSilhouetteBounds0") as? NSValue).scnVector4Value
-        XCTAssertEqual(bounds.x, 0); XCTAssertEqual(bounds.y, 0); XCTAssertEqual(bounds.z, 0); XCTAssertEqual(bounds.w, 0)
+        let cleared = view.makeFrame(width: 1_000, height: 625)
+        XCTAssertFalse(cleared.hasHighlights, "Without highlights a frame is only its scene pass.")
+        XCTAssertNil(cleared.highlightBounds)
     }
 
     @MainActor
-    func testLargeOverlappingSelectionReleasesDormantPasses() async throws {
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+    func testOverlappingSelectionUsesOnePassPerOverlapOnlyWhileSelected() async throws {
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         var preview = tiledParts(count: 32)
         for index in preview.vertices.indices { preview.vertices[index][0] -= Double(index / 4) }
         for index in preview.edges.indices {
@@ -111,13 +97,11 @@ final class CADSilhouetteBatchingTests: XCTestCase {
                     selectedSolids: Set(0..<32), hiddenSolids: [], projection: .isometric)
         let deadline = ContinuousClock.now + .seconds(10)
         while view.isPreparingCaptureResources, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
-        func passCount() -> Int {
-            (view.technique?.dictionaryRepresentation["sequence"] as? [String] ?? []).filter { $0.hasPrefix("cadContour") }.count
-        }
-        XCTAssertEqual(passCount(), 32)
+        XCTAssertEqual(view.makeFrame(width: 320, height: 240).batches.count, 32)
         view.update(mesh: preview, mode: .wireframe, grid: false, command: nil,
                     selectedSolids: [0], hiddenSolids: [], projection: .isometric)
-        XCTAssertEqual(passCount(), 1, "A previous large overlap must not leave its pass count attached to ordinary navigation.")
+        XCTAssertEqual(view.makeFrame(width: 320, height: 240).batches.count, 1,
+                       "A previous large overlap must not leave its passes attached to ordinary navigation.")
     }
 
     @MainActor
@@ -137,7 +121,7 @@ final class CADSilhouetteBatchingTests: XCTestCase {
                 }
                 XCTAssertGreaterThan(gold, 200)
                 XCTAssertLessThan(different, 8,
-                    "Batching and bounded clears must retain every independent outline without stale rectangular ink. scale=\(scale), orthographic=\(orthographic)")
+                    "Batching and bounded mask regions must retain every independent outline without stale rectangular ink. scale=\(scale), orthographic=\(orthographic)")
             }
         }
     }
@@ -167,55 +151,41 @@ final class CADSilhouetteBatchingTests: XCTestCase {
             (-0.9, 0.1, 2.0, 1.7), (-0.73, 0.19, 0.47, 0.66),
             (1.5, 1.2, 0.67, 0.45), (1.2, -1.1, 0.8, 0.63), (-2.4, -1.3, 0.4, 0.5)
         ]
-        var nodes: [SCNNode] = [], rectangles: [CADSilhouetteBatching.Rect?] = []
-        for (index, definition) in definitions.enumerated() {
-            let (x, y, width, height) = definition
-            let node = SCNNode(geometry: SCNPlane(width: width, height: height))
-            let material = SCNMaterial()
-            material.lightingModel = .constant; material.diffuse.contents = index == 1 ? NSColor.green : NSColor.red
-            material.isDoubleSided = true
-            node.geometry?.materials = [material]
-            node.position = SCNVector3(x, y, 0)
-            node.categoryBitMask = CADHighlightTechnique.silhouetteCategory
-            rectangles.append(CADSilhouetteBatching.project(bounds: [-width / 2, -height / 2, 0, width / 2, height / 2, 0],
-                transform: node.simdTransform, projection: projection, pixels: size))
-            nodes.append(node)
+        func rectangle(_ width: Double, _ height: Double) -> [[SIMD3<Float>]] {
+            let w = Float(width / 2), h = Float(height / 2)
+            return [[SIMD3(-w, -h, 0), SIMD3(w, -h, 0), SIMD3(w, h, 0)], [SIMD3(-w, -h, 0), SIMD3(w, h, 0), SIMD3(-w, h, 0)]]
         }
-        let batches = batched ? CADSilhouetteBatching.make(rectangles) : nodes.indices.map {
-            CADSilhouetteBatching.Batch(items: [$0], rect: .full)
-        }
-        for (index, batch) in batches.enumerated() {
-            let root = SCNNode()
-            root.name = CADHighlightTechnique.silhouetteNodeName(index)
-            root.categoryBitMask = CADHighlightTechnique.silhouetteCategory
-            for item in batch.items { root.addChildNode(nodes[item]) }
-            scene.rootNode.addChildNode(root)
-        }
-        let technique = try XCTUnwrap(CADHighlightTechnique.make(viewportHeight: 240,
-            selected: NSColor(srgbRed: 0.96, green: 0.63, blue: 0.23, alpha: 1),
-            hover: NSColor(srgbRed: 1, green: 0.9, blue: 0.5, alpha: 1), hoverHalo: .gray, ink: .black,
-            silhouetteCount: batches.count))
-        CADHighlightTechnique.setSilhouetteBounds(batches.map { $0.rect.vector }, on: technique)
-        let renderer = SCNRenderer(device: device, options: nil)
-        renderer.scene = scene; renderer.pointOfView = camera; renderer.technique = technique
-        XCTAssertTrue(renderer.prepare(scene, shouldAbortBlock: nil))
-        // Render twice through the same attachments. Fractional, moving bounds
-        // must not reuse stale MSAA samples from the preceding larger masks.
-        _ = renderer.snapshot(atTime: 0, with: CGSize(width: size.x, height: size.y), antialiasingMode: .multisampling4X)
-        nodes[1].position.x += 0.137; nodes[1].position.y -= 0.073
-        nodes[1].scale = SCNVector3(0.65, 0.65, 1)
-        if batched {
-            let moved = definitions.enumerated().map { index, definition -> CADSilhouetteBatching.Rect in
-                let (_, _, width, height) = definition
-                return CADSilhouetteBatching.project(bounds: [-width / 2, -height / 2, 0, width / 2, height / 2, 0],
-                    transform: nodes[index].simdWorldTransform, projection: projection, pixels: size) ?? .full
+        func layout(moved: Bool) throws -> [CADViewportFrame.Batch] {
+            var masks: [CADViewportFrame.Mask] = [], rectangles: [CADSilhouetteBatching.Rect?] = []
+            for (index, definition) in definitions.enumerated() {
+                let (x, y, width, height) = definition
+                var transform = matrix_identity_float4x4
+                transform.columns.3 = SIMD4(Float(x), Float(y), 0, 1)
+                if moved && index == 1 {
+                    transform.columns.3.x += 0.137; transform.columns.3.y -= 0.073
+                    transform.columns.0.x = 0.65; transform.columns.1.y = 0.65
+                }
+                masks.append(try ViewportPassTestRenderer.mask(triangles: rectangle(width, height), selected: index != 1,
+                                                               model: transform))
+                rectangles.append(CADSilhouetteBatching.project(bounds: [-width / 2, -height / 2, 0, width / 2, height / 2, 0],
+                    transform: transform, projection: projection, pixels: size))
             }
-            CADHighlightTechnique.setSilhouetteBounds(batches.map { batch in
-                batch.items.dropFirst().reduce(moved[batch.items[0]]) { $0.union(moved[$1]) }.vector
-            }, on: try XCTUnwrap(renderer.technique))
+            let batches = batched ? CADSilhouetteBatching.make(rectangles) : masks.indices.map {
+                CADSilhouetteBatching.Batch(items: [$0], rect: .full)
+            }
+            return batches.map { CADViewportFrame.Batch(rect: $0.rect, masks: $0.items.map { masks[$0] }) }
         }
-        let image = renderer.snapshot(atTime: 0, with: CGSize(width: size.x, height: size.y), antialiasingMode: .multisampling4X)
-        return try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+        let palette = CADHighlightPalette(selected: NSColor(srgbRed: 0.96, green: 0.63, blue: 0.23, alpha: 1),
+            hover: NSColor(srgbRed: 1, green: 0.9, blue: 0.5, alpha: 1), hoverHalo: .gray, ink: .black,
+            background: try XCTUnwrap(scene.background.contents as? NSColor))
+        // Render twice through the same targets. Moving, scaled bounds must not
+        // reuse stale samples from the preceding larger masks.
+        let passes = try CADViewportPasses(device: device)
+        _ = try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: Int(size.x), height: Int(size.y),
+            referenceHeight: 240, palette: palette, batches: try layout(moved: false), passes: passes)
+        let shot = try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: Int(size.x), height: Int(size.y),
+            referenceHeight: 240, palette: palette, batches: try layout(moved: true), passes: passes)
+        return shot.image
     }
 
     @MainActor

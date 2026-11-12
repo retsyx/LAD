@@ -61,9 +61,7 @@ final class ViewportSurfaceShadingTests: XCTestCase {
     @MainActor
     private func cylinderShot(exactNormals: Bool) async throws -> Shot {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         view.update(mesh: cylinder(exactNormals: exactNormals), mode: .shaded, grid: false, command: nil,
             selectedSolids: [], hiddenSolids: [], solidColors: [0: PartColor(red: 0.32, green: 0.67, blue: 0.80)])
         let deadline = ContinuousClock.now + .seconds(5)

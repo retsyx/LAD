@@ -17,18 +17,14 @@ final class ViewportLiveRedrawTests: XCTestCase {
         application.finishLaunching()
 
         for projection in ViewportProjectionMode.allCases {
-            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360), options: [
-                SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-            ])
-            let frames = ViewportRenderCounter()
-            view.delegate = frames
+            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+            let frames = ViewportRenderCounter(view)
             let window = NSWindow(contentRect: NSRect(x: 50, y: 50, width: 480, height: 360),
                                   styleMask: [.titled], backing: .buffered, defer: false)
             window.title = "LAD viewport wheel zoom test"
             window.isReleasedWhenClosed = false
             window.contentView = view
             defer {
-                view.delegate = nil
                 window.orderOut(nil)
                 window.contentView = nil
                 window.close()
@@ -83,7 +79,7 @@ final class ViewportLiveRedrawTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(projectedWidth(), fittedWidth * 0.6, "Wheel zoom must recover visible design scale without Fit.")
             let recovered = view.projectPoint(SCNVector3Zero)
             XCTAssertTrue(view.bounds.insetBy(dx: 10, dy: 10).contains(NSPoint(x: CGFloat(recovered.x), y: CGFloat(recovered.y))))
-            XCTAssertFalse(view.rendersContinuously, "Recovered wheel navigation must return to idle.")
+            XCTAssertFalse(view.hasPendingFrames, "Recovered wheel navigation must return to idle.")
         }
     }
 
@@ -98,18 +94,14 @@ final class ViewportLiveRedrawTests: XCTestCase {
         XCTAssertTrue(application.setActivationPolicy(.regular))
         defer { _ = application.setActivationPolicy(previousPolicy) }
         application.finishLaunching()
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
-        let frames = ViewportRenderCounter()
-        view.delegate = frames
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        let frames = ViewportRenderCounter(view)
         let window = NSWindow(contentRect: NSRect(x: 50, y: 50, width: 480, height: 360),
                               styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "LAD viewport redraw test"
         window.isReleasedWhenClosed = false
         window.contentView = view
         defer {
-            view.delegate = nil
             window.orderOut(nil)
             window.contentView = nil
             window.close()
@@ -128,16 +120,15 @@ final class ViewportLiveRedrawTests: XCTestCase {
         guard try await waitForFrame(frames, after: 0, reason: "A hosted viewport must draw its initial scene.") else { return }
         guard try await waitForIdle(frames) else { return }
 
-        // Adding and removing a projected part outline changes the multipass
-        // technique. Each new pipeline must finish its live frame and release
-        // the redraw burst through the final completion marker.
+        // Adding and removing a projected part outline adds and removes the
+        // highlight passes. Each change must draw one live frame, then idle.
         let beforeSelection = frames.count
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [0], hiddenSolids: [])
         guard try await waitForFrame(frames, after: beforeSelection,
                                     reason: "Selecting a part after idle must draw its silhouette in a fresh live frame.") else { return }
         guard try await waitForIdle(frames) else { return }
-        XCTAssertFalse(view.rendersContinuously, "A completed silhouette frame must let the viewport pause.")
+        XCTAssertFalse(view.hasPendingFrames, "A completed silhouette frame must leave nothing pending.")
 
         let beforeDeselection = frames.count
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
@@ -145,12 +136,10 @@ final class ViewportLiveRedrawTests: XCTestCase {
         guard try await waitForFrame(frames, after: beforeDeselection,
                                     reason: "Deselecting a part after idle must remove its silhouette in a fresh live frame.") else { return }
         guard try await waitForIdle(frames) else { return }
-        XCTAssertFalse(view.rendersContinuously, "Removing the silhouette must retain normal viewport pausing.")
+        XCTAssertFalse(view.hasPendingFrames, "Removing the silhouette must leave nothing pending.")
 
-        // Cold display links must restart after app/display lifecycle events,
+        // App and display lifecycle events redraw the current state once,
         // even when no CAD geometry or camera property changes at that instant.
-        // A timer-only burst can otherwise leave a stale drawable until the
-        // user raises the window, while input changes accumulate underneath.
         try await Task.sleep(for: .seconds(1))
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
             let beforeWake = frames.count
@@ -167,8 +156,8 @@ final class ViewportLiveRedrawTests: XCTestCase {
             guard try await waitForIdle(frames) else { return }
         }
 
-        // Observe the original SCNView's delegate. Independent SCNRenderer
-        // snapshots would hide a broken live display link or paused renderer.
+        // Count frames the live render thread completes for this view.
+        // Independent snapshots would hide a broken live presentation path.
         let beforeWire = frames.count
         view.update(mesh: preview, mode: .wireframe, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
         guard try await waitForFrame(frames, after: beforeWire,
@@ -212,8 +201,8 @@ final class ViewportLiveRedrawTests: XCTestCase {
         guard try await waitForIdle(frames) else { return }
         view.update(mesh: preview, mode: .wireframe, grid: false, command: ViewportCommand(.top),
                     selectedSolids: [], hiddenSolids: [])
-        // Leave the window hidden beyond a normal redraw burst. Merely
-        // ordering it front must wake drawing without a key-window action.
+        // Changes made while hidden draw nothing. Merely ordering the window
+        // front must draw them without a key-window action.
         try await Task.sleep(for: .milliseconds(200))
         let beforeReveal = frames.count
         window.orderFront(nil)
@@ -225,12 +214,12 @@ final class ViewportLiveRedrawTests: XCTestCase {
                              "A revealed window must show its updated camera rather than a stale frame.")
 
         window.contentView = nil
-        XCTAssertFalse(view.rendersContinuously, "A detached viewport must stop requesting frames.")
+        XCTAssertFalse(view.hasPendingFrames, "A detached viewport must stop requesting frames.")
         guard try await waitForIdle(frames) else { return }
         let afterDetach = frames.count
         NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.screensDidWakeNotification, object: nil)
         try await Task.sleep(for: .milliseconds(250))
-        XCTAssertFalse(view.rendersContinuously)
+        XCTAssertFalse(view.hasPendingFrames)
         XCTAssertEqual(frames.count, afterDetach, "Lifecycle notifications must not wake a detached viewport.")
     }
 
@@ -303,21 +292,4 @@ final class ViewportLiveRedrawTests: XCTestCase {
     }
 }
 
-/// SceneKit invokes this callback from its rendering thread, independently of
-/// the main actor that sends input and changes the document's display state.
-private final class ViewportRenderCounter: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = 0
 
-    var count: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
-    }
-
-    func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
-        lock.lock()
-        value += 1
-        lock.unlock()
-    }
-}

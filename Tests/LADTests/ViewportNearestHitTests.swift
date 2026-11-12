@@ -15,7 +15,7 @@ final class ViewportNearestHitTests: XCTestCase {
             let preview = panels()
             let view = try await preparedView(preview, projection: projection)
             let nodes = try (0..<3).map { index in
-                try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:\(index)", recursively: true))
+                try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:\(index)", recursively: true))
             }
             let parent = try XCTUnwrap(nodes[0].parent)
             for order in orders {
@@ -102,9 +102,7 @@ final class ViewportNearestHitTests: XCTestCase {
     private func preparedView(_ preview: PreviewMesh, projection: ViewportProjectionMode,
                               size: NSSize = NSSize(width: 640, height: 480)) async throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(origin: .zero, size: size), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(origin: .zero, size: size))
         view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.front),
                     selectedSolids: [], hiddenSolids: [], projection: projection)
         view.layout()

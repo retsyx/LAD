@@ -78,7 +78,7 @@ final class ViewportTranslucencyRotationTests: XCTestCase {
         for projection in ViewportProjectionMode.allCases {
             let view = try await makeView(preview: preview, projection: projection, colors: colors, hidden: Set(51...58))
             let nodes = try (0..<preview.solids).map {
-                try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:\($0)", recursively: true))
+                try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:\($0)", recursively: true))
             }
             var previous: Pixels?
             var largestPitchDifference = 0.0
@@ -103,26 +103,10 @@ final class ViewportTranslucencyRotationTests: XCTestCase {
     }
 
     @MainActor
-    func testSceneKitWithoutHighlightTechniqueIsComparedForDiagnosis() async throws {
-        let view = try await makeView(preview: nestedBoxes(), projection: .isometric)
-        try view.configureAgentView(named: "front", camera: .init(yawDegrees: -89, elevationDegrees: 0, target: [0, 0, 0]))
-        let solids = try solidNodes(view)
-        view.technique = nil
-        solids[0].renderingOrder = 10; solids[1].renderingOrder = 20
-        let first = try await image(view)
-        solids[0].renderingOrder = 20; solids[1].renderingOrder = 10
-        let second = try await image(view)
-        print("Native SceneKit source-over order difference without highlight technique", maximumCenterDifference(first, second))
-        XCTAssertGreaterThan(first.center.reduce(0, +), 0.1, "The diagnostic must render actual PBR geometry.")
-    }
-
-    @MainActor
     private func makeView(preview: PreviewMesh, projection: ViewportProjectionMode,
                           colors: [Int: PartColor]? = nil, hidden: Set<Int> = []) async throws -> CADSceneView {
         guard MTLCreateSystemDefaultDevice() != nil else { throw XCTSkip("Metal is required for transparency pixel tests.") }
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 300), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
         view.update(mesh: preview, mode: .translucent, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: hidden, projection: projection,
                     solidColors: colors ?? [0: PartColor(red: 0.85, green: 0.10, blue: 0.15),
@@ -138,7 +122,7 @@ final class ViewportTranslucencyRotationTests: XCTestCase {
 
     @MainActor
     private func solidNodes(_ view: CADSceneView) throws -> [SCNNode] {
-        try (0...1).map { try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:\($0)", recursively: true)) }
+        try (0...1).map { try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:\($0)", recursively: true)) }
     }
 
     private struct Pixels {

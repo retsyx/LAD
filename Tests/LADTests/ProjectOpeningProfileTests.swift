@@ -52,13 +52,12 @@ final class ProjectOpeningProfileTests: XCTestCase {
         defer { _ = app.setActivationPolicy(policy) }
         start = clock.systemUptime
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
-        let frames = ProjectOpeningFrames()
-        view.delegate = frames
+        let frames = ViewportRenderCounter(view)
         let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
-        defer { view.delegate = nil; window.orderOut(nil); window.contentView = nil; window.close() }
+        defer { window.orderOut(nil); window.contentView = nil; window.close() }
         timings["viewCreation"] = clock.systemUptime - start
         start = clock.systemUptime
         view.update(mesh: preview, mode: project.displayMode ?? .edges, grid: project.showGrid ?? true,
@@ -90,11 +89,4 @@ final class ProjectOpeningProfileTests: XCTestCase {
     }
 }
 
-private final class ProjectOpeningFrames: NSObject, SCNSceneRendererDelegate {
-    private let lock = NSLock()
-    private var rendered = 0
-    var count: Int { lock.lock(); defer { lock.unlock() }; return rendered }
-    func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
-        lock.lock(); rendered += 1; lock.unlock()
-    }
-}
+

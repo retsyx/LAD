@@ -41,9 +41,7 @@ final class ViewportAssemblyGrabProfileTests: XCTestCase {
         let revision = ProjectRevision(model: model, preview: preview, parts: parts)
         state.revisions = [revision]; state.selectedRevisionID = revision.id
         XCTAssertTrue(state.loadStoredRevision())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 900, height: 700), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 900, height: 700))
         let owner = UUID()
         view.assemblyGrabbingEnabled = state.canManipulateAssembly
         view.onAssemblyGrabBegan = { [weak state] solid, point, projection in
@@ -61,13 +59,13 @@ final class ViewportAssemblyGrabProfileTests: XCTestCase {
         window.title = "LAD assembly grab profile"
         window.isReleasedWhenClosed = false
         window.contentView = view
-        defer { view.delegate = nil; window.orderOut(nil); window.contentView = nil; window.close() }
+        defer { view.onFrameRendered = nil; window.orderOut(nil); window.contentView = nil; window.close() }
         view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top), selectedSolids: [], hiddenSolids: [],
                     solidTransforms: state.assemblyPose?.solidTransforms ?? [:])
         try await waitUntil { !view.isPreparingResources }
-        let node = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:\(body)", recursively: true))
+        let node = try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:\(body)", recursively: true))
         counter.bind(node)
-        view.delegate = counter
+        view.onFrameRendered = { counter.frameRendered() }
         let geometry = node.geometry
         let camera = try XCTUnwrap(view.pointOfView).simdTransform
         let subscription = ObservationRecorder({ state.assemblyPose }) { [weak state, weak view] pose in
@@ -78,7 +76,7 @@ final class ViewportAssemblyGrabProfileTests: XCTestCase {
         defer { subscription.cancel() }
         app.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil); window.displayIfNeeded(); view.layout()
-        try await waitUntil { !view.isPreparingCaptureResources && counter.count > 0 && !view.isPlaying }
+        try await waitUntil { !view.isPreparingCaptureResources && counter.count > 0 && !view.hasPendingFrames }
         let beforeFrames = counter.count
         let start = projected(initialWorld, view: view)
         let coldStart = ProcessInfo.processInfo.systemUptime
@@ -104,7 +102,7 @@ final class ViewportAssemblyGrabProfileTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(20))
         }
         view.mouseUp(with: try mouse(.leftMouseUp, point: finalPoint, view: view))
-        try await waitUntil { !state.isSolvingAssembly && counter.count > beforeFrames && !view.isPlaying }
+        try await waitUntil { !state.isSolvingAssembly && counter.count > beforeFrames && !view.hasPendingFrames }
         XCTAssertNil(state.assemblyMotionError)
         XCTAssertEqual(try XCTUnwrap(state.assemblyPose?.positions[joint.id]), joint.position + 40, accuracy: 0.1)
         XCTAssertEqual(try XCTUnwrap(view.pointOfView).simdTransform, camera)
@@ -152,7 +150,8 @@ final class ViewportAssemblyGrabProfileTests: XCTestCase {
     }
 }
 
-private final class AssemblyGrabProfileCounter: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
+/// Receives each completed live frame on the main actor.
+private final class AssemblyGrabProfileCounter: @unchecked Sendable {
     private struct Input { var point: [Double]; var time: Double }
     private struct Pose { var matrix: [Float]; var inputTime: Double }
     private let lock = NSLock()
@@ -176,7 +175,7 @@ private final class AssemblyGrabProfileCounter: NSObject, SCNSceneRendererDelega
         lock.lock(); defer { lock.unlock() }
         return (inputs.count, solverCosts, renderLatencies, pending.count)
     }
-    func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
+    func frameRendered() {
         lock.lock(); let node = self.node; lock.unlock()
         let transform = node?.presentation.simdWorldTransform
         let rows = transform.map { m in (0..<16).map { m[$0 % 4][$0 / 4] } }

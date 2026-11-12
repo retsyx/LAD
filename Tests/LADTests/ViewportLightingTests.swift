@@ -8,7 +8,7 @@ final class ViewportLightingTests: XCTestCase {
     @MainActor
     func testAmbientIlluminationIsPreservedWhileDirectionalLightsFollowTheCamera() throws {
         let view = makeView()
-        let root = try XCTUnwrap(view.scene?.rootNode)
+        let root = try XCTUnwrap(view.scene.rootNode)
         let camera = try XCTUnwrap(view.pointOfView)
         let ambientNodes = lights(in: root, type: .ambient)
         XCTAssertEqual(ambientNodes.count, 1)
@@ -34,7 +34,7 @@ final class ViewportLightingTests: XCTestCase {
     @MainActor
     func testDirectionalLightAnglesRemainConstantInCameraSpaceAcrossViewsAndProjections() throws {
         let view = makeView()
-        let root = try XCTUnwrap(view.scene?.rootNode)
+        let root = try XCTUnwrap(view.scene.rootNode)
         let camera = try XCTUnwrap(view.pointOfView)
         let directional = lights(in: root, type: .directional)
         XCTAssertEqual(directional.count, 2)
@@ -68,7 +68,7 @@ final class ViewportLightingTests: XCTestCase {
     @MainActor
     func testPanAndZoomTranslationDoNotChangeDirectionalIlluminationAngles() throws {
         let view = makeView()
-        let root = try XCTUnwrap(view.scene?.rootNode)
+        let root = try XCTUnwrap(view.scene.rootNode)
         let camera = try XCTUnwrap(view.pointOfView)
         let directional = lights(in: root, type: .directional)
         XCTAssertEqual(directional.count, 2)
@@ -89,9 +89,7 @@ final class ViewportLightingTests: XCTestCase {
 
     @MainActor
     private func makeView() -> CADSceneView {
-        CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640))
     }
 
     @MainActor

@@ -174,24 +174,23 @@ final class ViewportAssemblyGrabTests: XCTestCase {
         defer { _ = app.setActivationPolicy(policy) }
         app.finishLaunching()
         let view = try makeView()
-        let frames = AssemblyGrabFrameCounter()
-        view.delegate = frames
+        let frames = ViewportRenderCounter(view)
         let window = NSWindow(contentRect: NSRect(x: 50, y: 50, width: 640, height: 480),
                               styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "LAD constrained grab test"
         window.isReleasedWhenClosed = false
         window.contentView = view
-        defer { view.delegate = nil; window.orderOut(nil); window.contentView = nil; window.close() }
+        defer { window.orderOut(nil); window.contentView = nil; window.close() }
         let preview = mesh()
         view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top), selectedSolids: [], hiddenSolids: [])
         app.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.displayIfNeeded(); view.layout()
         try await ready(view)
-        try await waitUntil { frames.count > 0 && !view.isPlaying }
+        try await waitUntil { frames.count > 0 && !view.hasPendingFrames }
         let count = frames.count
         let camera = try XCTUnwrap(view.pointOfView).simdTransform
-        let geometry = view.scene?.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry
+        let geometry = view.scene.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry
         let before = try await CADAgentRenderer.capturePNG(view: view)
         view.assemblyGrabbingEnabled = true
         view.onAssemblyGrabBegan = { _, _, _ in true }
@@ -204,12 +203,12 @@ final class ViewportAssemblyGrabTests: XCTestCase {
         view.mouseDown(with: try mouse(.leftMouseDown, at: point, in: view, modifiers: .command))
         view.mouseDragged(with: try mouse(.leftMouseDragged, at: point.offset(x: 40), in: view))
         view.mouseUp(with: try mouse(.leftMouseUp, at: point.offset(x: 40), in: view))
-        try await waitUntil { frames.count > count && !view.isPlaying }
+        try await waitUntil { frames.count > count && !view.hasPendingFrames }
         XCTAssertEqual(try XCTUnwrap(view.pointOfView).simdTransform, camera)
-        XCTAssertTrue(view.scene?.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry === geometry)
+        XCTAssertTrue(view.scene.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry === geometry)
         let after = try await CADAgentRenderer.capturePNG(view: view)
         XCTAssertNotEqual(after, before)
-        XCTAssertFalse(view.rendersContinuously)
+        XCTAssertFalse(view.hasPendingFrames)
     }
 
     @MainActor
@@ -255,13 +254,12 @@ final class ViewportAssemblyGrabTests: XCTestCase {
         XCTAssertTrue(app.setActivationPolicy(.regular))
         defer { _ = app.setActivationPolicy(policy) }
         app.finishLaunching()
-        let frames = AssemblyGrabFrameCounter()
-        view.delegate = frames
+        let frames = ViewportRenderCounter(view)
         let window = NSWindow(contentRect: NSRect(x: 50, y: 50, width: 640, height: 480), styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "LAD native mechanism grab test"
         window.isReleasedWhenClosed = false
         window.contentView = view
-        defer { view.delegate = nil; window.orderOut(nil); window.contentView = nil; window.close() }
+        defer { window.orderOut(nil); window.contentView = nil; window.close() }
         view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
                     selectedSolids: state.selectedSolids, hiddenSolids: [], solidTransforms: state.assemblyPose?.solidTransforms ?? [:])
         let subscription = ObservationRecorder({ state.assemblyPose }) { [weak state, weak view] pose in
@@ -274,9 +272,9 @@ final class ViewportAssemblyGrabTests: XCTestCase {
         app.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil); window.displayIfNeeded(); view.layout()
         try await ready(view)
-        try await waitUntil { frames.count > 0 && !view.isPlaying }
+        try await waitUntil { frames.count > 0 && !view.hasPendingFrames }
         let previousFrames = frames.count
-        let surface = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:\(arm)", recursively: true))
+        let surface = try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:\(arm)", recursively: true))
         let geometry = surface.geometry
         let camera = try XCTUnwrap(view.pointOfView).simdTransform
         let start = projected([12, 0, 2], in: view)
@@ -290,7 +288,7 @@ final class ViewportAssemblyGrabTests: XCTestCase {
         try await waitUntil { !state.isSolvingAssembly }
         XCTAssertNil(state.assemblyMotionError)
         XCTAssertEqual(try XCTUnwrap(state.assemblyPose?.positions["hinge"]), 40, accuracy: 0.05)
-        try await waitUntil { frames.count > previousFrames && !view.isPlaying }
+        try await waitUntil { frames.count > previousFrames && !view.hasPendingFrames }
         XCTAssertTrue(surface.geometry === geometry)
         XCTAssertEqual(try XCTUnwrap(view.pointOfView).simdTransform, camera)
         XCTAssertEqual(state.selectedSolids, [arm]); XCTAssertTrue(state.selectedFeatures.isEmpty)
@@ -312,9 +310,7 @@ final class ViewportAssemblyGrabTests: XCTestCase {
     @MainActor
     private func makeView() throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
     }
 
     @MainActor
@@ -366,11 +362,4 @@ private extension NSPoint {
     func offset(x: CGFloat = 0, y: CGFloat = 0) -> NSPoint { NSPoint(x: self.x + x, y: self.y + y) }
 }
 
-private final class AssemblyGrabFrameCounter: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = 0
-    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
-    func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
-        lock.lock(); value += 1; lock.unlock()
-    }
-}
+

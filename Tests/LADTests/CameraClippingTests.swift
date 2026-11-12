@@ -12,9 +12,7 @@ final class CameraClippingTests: XCTestCase {
         }
 
         for projection in ViewportProjectionMode.allCases {
-            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 128, height: 128), options: [
-                SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-            ])
+            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 128, height: 128))
             view.update(mesh: nil, mode: .shaded, grid: false, command: nil,
                         selectedSolids: [], hiddenSolids: [], projection: projection)
             let scene = try XCTUnwrap(view.scene)

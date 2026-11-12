@@ -8,7 +8,6 @@ import XCTest
 final class ViewportSilhouetteTests: XCTestCase {
     @MainActor
     func testNestedSelectedItemsRetainTheirIndividualProjectionOutlines() throws {
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let scene = SCNScene()
         scene.background.contents = NSColor.black
         let camera = SCNNode()
@@ -17,23 +16,14 @@ final class ViewportSilhouetteTests: XCTestCase {
         camera.camera?.orthographicScale = 2.5
         camera.position = SCNVector3(0, 0, 6)
         scene.rootNode.addChildNode(camera)
-        for (index, width) in [CGFloat(3), CGFloat(1.5)].enumerated() {
-            let surface = SCNNode(geometry: SCNPlane(width: width, height: width))
-            surface.geometry?.materials = [constantMaterial(.red)]
-            surface.categoryBitMask = CADHighlightTechnique.silhouetteCategory
-            surface.name = CADHighlightTechnique.silhouetteNodeName(index)
-            scene.rootNode.addChildNode(surface)
+        // Overlapping items keep separate projection passes.
+        let batches = try [Float(3), Float(1.5)].map { width in
+            CADViewportFrame.Batch(rect: .full, masks: [try ViewportPassTestRenderer.mask(
+                triangles: square(width), selected: true)])
         }
-        let renderer = SCNRenderer(device: device, options: nil)
-        renderer.scene = scene
-        renderer.pointOfView = camera
-        renderer.technique = try XCTUnwrap(CADHighlightTechnique.make(viewportHeight: 240,
-            selected: NSColor(srgbRed: 0.96, green: 0.63, blue: 0.23, alpha: 1),
-            hover: .green, hoverHalo: .darkGray, ink: .black, silhouetteCount: 2))
-        XCTAssertTrue(renderer.prepare(scene, shouldAbortBlock: nil))
-        let image = renderer.snapshot(atTime: 0, with: CGSize(width: 320, height: 240),
-                                      antialiasingMode: .multisampling4X)
-        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+        let shot = try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: 320, height: 240,
+            referenceHeight: 240, palette: palette(), batches: batches)
+        let bitmap = shot.image, renderer = shot.renderer
         for distance in [0.75, 1.5] {
             for position in [SCNVector3(distance, 0, 0), SCNVector3(0, distance, 0),
                              SCNVector3(-distance, 0, 0), SCNVector3(0, -distance, 0)] {
@@ -50,7 +40,6 @@ final class ViewportSilhouetteTests: XCTestCase {
 
     @MainActor
     func testSelectedCubeUsesOnlyItsProjectedOutlineThroughANearerSolid() throws {
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         for orthographic in [false, true] {
             let scene = SCNScene()
             scene.background.contents = NSColor.black
@@ -65,28 +54,16 @@ final class ViewportSilhouetteTests: XCTestCase {
             camera.look(at: SCNVector3Zero)
             scene.rootNode.addChildNode(camera)
 
-            let cube = SCNNode(geometry: SCNBox(width: 2, height: 2, length: 2, chamferRadius: 0))
-            cube.geometry?.materials = [constantMaterial(.red)]
-            cube.categoryBitMask = CADHighlightTechnique.silhouetteCategory
-            cube.name = CADHighlightTechnique.silhouetteNodeName(0)
-            scene.rootNode.addChildNode(cube)
-
             let occluder = SCNNode(geometry: SCNPlane(width: 20, height: 20))
             occluder.geometry?.materials = [constantMaterial(NSColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 1))]
             occluder.simdPosition = simd_normalize(camera.simdPosition) * 3
             occluder.look(at: camera.position)
             scene.rootNode.addChildNode(occluder)
 
-            let renderer = SCNRenderer(device: device, options: nil)
-            renderer.scene = scene
-            renderer.pointOfView = camera
-            renderer.technique = try XCTUnwrap(CADHighlightTechnique.make(viewportHeight: 288,
-                selected: NSColor(srgbRed: 0.96, green: 0.63, blue: 0.23, alpha: 1),
-                hover: .green, hoverHalo: .darkGray, ink: .black, silhouetteCount: 1))
-            XCTAssertTrue(renderer.prepare(scene, shouldAbortBlock: nil))
-            let image = renderer.snapshot(atTime: 0, with: CGSize(width: 384, height: 288),
-                                          antialiasingMode: .multisampling4X)
-            let bitmap = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+            let cube = try ViewportPassTestRenderer.mask(triangles: box(), selected: true)
+            let shot = try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: 384, height: 288,
+                referenceHeight: 288, palette: palette(), batches: [.init(rect: .full, masks: [cube])])
+            let bitmap = shot.image, renderer = shot.renderer
             let corners = [-1.0, 1.0].flatMap { x in [-1.0, 1.0].flatMap { y in [-1.0, 1.0].map { z in
                 let point = renderer.projectPoint(SCNVector3(x, y, z))
                 return SIMD2<Double>(Double(point.x), Double(bitmap.pixelsHigh) - Double(point.y))
@@ -121,9 +98,7 @@ final class ViewportSilhouetteTests: XCTestCase {
     @MainActor
     func testProductionPartAndFaceHighlightsKeepOccludedOutlinesAndDepthTestTheirFill() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         let preview = squares()
         let selectedFace = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0)
         for wholePart in [false, true] {
@@ -164,9 +139,7 @@ final class ViewportSilhouetteTests: XCTestCase {
     @MainActor
     func testHoverProjectionSlotsFollowTargetModeExitAndGeometryReplacement() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         var preview = squares()
         preview.vertices = [[-2, -1, 0], [-0.25, -1, 0], [-0.25, 1, 0], [-2, 1, 0],
                             [0.25, -1, 0], [2, -1, 0], [2, 1, 0], [0.25, 1, 0]]
@@ -179,7 +152,6 @@ final class ViewportSilhouetteTests: XCTestCase {
         // same camera state throughout repeated target changes.
         let centers = [SCNVector3(-1.125, 0, 0), SCNVector3(1.125, 0, 0)]
         let boundaries = [SCNVector3(-1.125, 1, 0), SCNVector3(1.125, 1, 0)]
-        var originalTechnique: SCNTechnique?
         for target in [0, 1, 0, 1] {
             let projected = view.projectPoint(centers[target])
             XCTAssertEqual(view.feature(at: NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))),
@@ -191,8 +163,6 @@ final class ViewportSilhouetteTests: XCTestCase {
                 "The permanent projection slot must follow the newly hovered face.")
             XCTAssertFalse(hasGold(image, around: boundaries[1 - target], in: view, hover: true),
                 "The previous face must lose its hover outline when the active mask count stays unchanged.")
-            if let originalTechnique { XCTAssertTrue(view.technique === originalTechnique) }
-            else { originalTechnique = view.technique }
         }
         for mode in [ViewportDisplayMode.translucent, .edges, .shaded] {
             view.update(mesh: preview, mode: mode, grid: false, command: nil,
@@ -218,9 +188,7 @@ final class ViewportSilhouetteTests: XCTestCase {
     @MainActor
     func testSelectedPlanarFaceRetainsItsLineProjectionWhenViewedEdgeOn() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         view.update(mesh: squares(), mode: .shaded, grid: false, command: nil,
             selectedSolids: [], hiddenSolids: [1],
             selectedFeatures: [CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0)])
@@ -268,10 +236,10 @@ final class ViewportSilhouetteTests: XCTestCase {
         let projected = view.projectPoint(position)
         let x = Int((CGFloat(projected.x) * CGFloat(image.pixelsWide) / view.bounds.width).rounded())
         let y = image.pixelsHigh - Int((CGFloat(projected.y) * CGFloat(image.pixelsHigh) / view.bounds.height).rounded())
-        guard let value = view.technique?.value(forKey: hover ? "cadHoverColor" : "cadSelectedColor") as? NSValue else { return false }
-        let linear = value.scnVector4Value
-        func gamma(_ component: CGFloat) -> CGFloat {
-            component <= 0.0031308 ? 12.92 * component : 1.055 * pow(component, 1 / 2.4) - 0.055
+        let linear = hover ? CADSceneView.highlightPalette.hover : CADSceneView.highlightPalette.selected
+        func gamma(_ component: Float) -> CGFloat {
+            let value = CGFloat(component)
+            return value <= 0.0031308 ? 12.92 * value : 1.055 * pow(value, 1 / 2.4) - 0.055
         }
         let reference = [gamma(linear.x), gamma(linear.y), gamma(linear.z)]
         return (-3...3).contains { dy in (-3...3).contains { dx in
@@ -284,6 +252,32 @@ final class ViewportSilhouetteTests: XCTestCase {
             return max(abs(color.redComponent - reference[0]), abs(color.greenComponent - reference[1]),
                 abs(color.blueComponent - reference[2])) < 0.04
         } }
+    }
+
+    private func palette() -> CADHighlightPalette {
+        CADHighlightPalette(selected: NSColor(srgbRed: 0.96, green: 0.63, blue: 0.23, alpha: 1),
+                            hover: .green, hoverHalo: .darkGray, ink: .black, background: .black)
+    }
+
+    private func square(_ width: Float) -> [[SIMD3<Float>]] {
+        let h = width / 2
+        return [[SIMD3(-h, -h, 0), SIMD3(h, -h, 0), SIMD3(h, h, 0)], [SIMD3(-h, -h, 0), SIMD3(h, h, 0), SIMD3(-h, h, 0)]]
+    }
+
+    /// Triangles of an axis-aligned 2×2×2 cube centered at the origin.
+    private func box() -> [[SIMD3<Float>]] {
+        var triangles = [[SIMD3<Float>]]()
+        for axis in 0..<3 {
+            for sign in [Float(-1), 1] {
+                func corner(_ u: Float, _ v: Float) -> SIMD3<Float> {
+                    var point = SIMD3<Float>(repeating: 0)
+                    point[axis] = sign; point[(axis + 1) % 3] = u; point[(axis + 2) % 3] = v
+                    return point
+                }
+                triangles += [[corner(-1, -1), corner(1, -1), corner(1, 1)], [corner(-1, -1), corner(1, 1), corner(-1, 1)]]
+            }
+        }
+        return triangles
     }
 
     private func constantMaterial(_ color: NSColor) -> SCNMaterial {

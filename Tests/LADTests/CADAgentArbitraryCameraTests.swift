@@ -42,16 +42,14 @@ final class CADAgentArbitraryCameraTests: XCTestCase {
     @MainActor
     func testExplicitPositionAndTargetAreCapturedExactlyWithoutMovingTheLiveViewport() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let live = CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 300), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let live = CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
         live.update(mesh: assembly(), mode: .translucent, grid: true, command: ViewportCommand(.right),
                     selectedSolids: [0], hiddenSolids: [1], projection: .perspective, solidColors: colors)
         while live.isPreparingCaptureResources { try await Task.sleep(for: .milliseconds(5)) }
         let liveCamera = try XCTUnwrap(live.pointOfView)
         let livePose = liveCamera.simdWorldTransform
         let liveMetadata = live.agentCaptureMetadata
-        let liveMaterial = try XCTUnwrap(live.scene?.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry?.firstMaterial)
+        let liveMaterial = try XCTUnwrap(live.scene.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry?.firstMaterial)
         let liveDiffuse = try XCTUnwrap(liveMaterial.diffuse.contents as? NSColor)
         let position = SIMD3<Double>(35, -20, 30), target = SIMD3<Double>(1, 2, 1)
         let backward = simd_normalize(position - target)

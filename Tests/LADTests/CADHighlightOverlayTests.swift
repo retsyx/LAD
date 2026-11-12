@@ -4,7 +4,7 @@ import SceneKit
 import XCTest
 @testable import LAD
 
-final class CADHighlightTechniqueTests: XCTestCase {
+final class CADHighlightOverlayTests: XCTestCase {
     @MainActor
     func testSelectedCoreMatchesTheSameConstantMaterialColorAndChannelsHaveDifferentWidths() throws {
         let shot = try render()
@@ -54,32 +54,6 @@ final class CADHighlightTechniqueTests: XCTestCase {
     }
 
     @MainActor
-    func testCopyPreservesColorsAndReferenceHeightWithIndependentTechniqueIdentity() throws {
-        _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let source = try XCTUnwrap(CADHighlightTechnique.make(viewportHeight: 192, selected: selectedColor,
-            hover: hoverColor, hoverHalo: haloColor, ink: inkColor))
-        let copy = try XCTUnwrap(CADHighlightTechnique.copy(source))
-        XCTAssertFalse(source === copy, "Independent renderers need separate technique target ownership")
-        XCTAssertTrue((source.library as AnyObject?) === (copy.library as AnyObject?), "Compiled immutable Metal programs may be reused")
-        XCTAssertEqual((copy.value(forKey: "cadReferenceHeight") as? NSNumber)?.doubleValue, 192)
-        for key in ["cadSelectedColor", "cadHoverColor", "cadHoverHaloColor", "cadInkColor"] {
-            let original = try XCTUnwrap(source.value(forKey: key) as? NSValue).scnVector4Value
-            let copied = try XCTUnwrap(copy.value(forKey: key) as? NSValue).scnVector4Value
-            XCTAssertEqual(copied.x, original.x); XCTAssertEqual(copied.y, original.y)
-            XCTAssertEqual(copied.z, original.z); XCTAssertEqual(copied.w, original.w)
-        }
-        CADHighlightTechnique.setViewportHeight(384, on: source)
-        CADHighlightTechnique.setVertexHighlightsEnabled(false, on: source)
-        source.setValue(NSValue(scnVector4: SCNVector4(0, 0, 1, 1)), forKey: "cadSelectedColor")
-        XCTAssertEqual((source.value(forKey: "cadReferenceHeight") as? NSNumber)?.doubleValue, 384)
-        XCTAssertEqual((copy.value(forKey: "cadReferenceHeight") as? NSNumber)?.doubleValue, 192)
-        XCTAssertEqual((source.value(forKey: "cadVertexHighlightsEnabled") as? NSNumber)?.doubleValue, 0)
-        XCTAssertEqual((copy.value(forKey: "cadVertexHighlightsEnabled") as? NSNumber)?.doubleValue, 1)
-        let originalColor = try XCTUnwrap(copy.value(forKey: "cadSelectedColor") as? NSValue).scnVector4Value
-        XCTAssertGreaterThan(originalColor.x, 0.5, "Mutating the live technique must not alter capture colors")
-    }
-
-    @MainActor
     func testTranslucentColorPassDoesNotOccludeHighlightOverlays() throws {
         let visible = try render(scale: 2, translucent: true)
         let selected = try sample(visible, at: SCNVector3(0, 0.5, 0))
@@ -98,15 +72,10 @@ final class CADHighlightTechniqueTests: XCTestCase {
     private var inkColor: NSColor { NSColor(srgbRed: 0.025, green: 0.035, blue: 0.045, alpha: 1) }
     private var controlPosition: SCNVector3 { SCNVector3(-2.35, 1.25, -0.25) }
 
-    private struct Shot {
-        let image: NSBitmapImageRep
-        let renderer: SCNRenderer
-        let scale: Int
-    }
+    private typealias Shot = ViewportPassShot
 
     @MainActor
     private func render(scale: Int = 1, crossing: Bool = false, occluded: Bool = false, translucent: Bool = false) throws -> Shot {
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let scene = SCNScene()
         scene.background.contents = NSColor(srgbRed: 0.08, green: 0.09, blue: 0.11, alpha: 1)
         let camera = SCNNode()
@@ -120,48 +89,46 @@ final class CADHighlightTechniqueTests: XCTestCase {
             let node = SCNNode(geometry: SCNPlane(width: width, height: height))
             let material = SCNMaterial()
             material.lightingModel = .constant; material.diffuse.contents = color
-            if translucent {
-                material.transparency = 0.28
-                material.transparencyMode = .aOne
-                material.isDoubleSided = true
-                material.writesToDepthBuffer = false
-            }
             node.geometry?.materials = [material]; node.position = position
+            if translucent, let geometry = node.geometry {
+                CADSceneView.configureFaceMaterial(material, translucent: true)
+                for category in [CADViewportCategory.visibility, CADViewportCategory.revealage] {
+                    node.addChildNode(CADSceneView.translucentCopy(of: geometry, category: category, visible: true))
+                }
+            }
             scene.rootNode.addChildNode(node)
             return node
         }
         _ = plane(width: 8, height: 6, at: SCNVector3(0, 0, -0.5),
             color: NSColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 1))
-        _ = plane(width: 0.65, height: 0.65, at: controlPosition, color: selectedColor)
+        let control = plane(width: 0.65, height: 0.65, at: controlPosition, color: selectedColor)
+        if translucent {
+            // The control swatch is the reference color, not part of the
+            // translucent design.
+            control.childNodes.forEach { $0.removeFromParentNode() }
+            if let material = control.geometry?.firstMaterial { CADSceneView.configureFaceMaterial(material, translucent: false) }
+            control.categoryBitMask = CADViewportCategory.decorations
+        }
         let selected = crossing ? [[-1.6, 0, 0, 1.6, 0, 0]] : [[-1.6, 0.5, 0, 1.6, 0.5, 0]]
         let hover = crossing ? [[0, -1.2, 0, 0, 1.2, 0]] : [[-1.6, -0.5, 0, 1.6, -0.5, 0]]
-        for (segments, color) in [(selected, NSColor.red), (hover, NSColor.green)] {
-            let geometry = CADStrokeSeedGeometry.make(segments)
-            geometry.firstMaterial?.diffuse.contents = color
-            let node = SCNNode(geometry: geometry)
-            node.categoryBitMask = CADHighlightTechnique.seedCategory
-            scene.rootNode.addChildNode(node)
-        }
         if occluded {
             _ = plane(width: 8, height: 6, at: SCNVector3(0, 0, 0.2),
                 color: NSColor(srgbRed: 0.12, green: 0.14, blue: 0.18, alpha: 1))
         }
-        let renderer = SCNRenderer(device: device, options: nil)
-        renderer.scene = scene; renderer.pointOfView = camera
-        renderer.technique = try XCTUnwrap(CADHighlightTechnique.make(viewportHeight: 192, selected: selectedColor,
-            hover: hoverColor, hoverHalo: haloColor, ink: inkColor, translucentFaces: translucent))
-        renderer.prepare(scene, shouldAbortBlock: nil)
-        let image = renderer.snapshot(atTime: 0, with: CGSize(width: 256 * scale, height: 192 * scale), antialiasingMode: .multisampling4X)
-        return Shot(image: try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation))), renderer: renderer, scale: scale)
+        let palette = CADHighlightPalette(selected: selectedColor, hover: hoverColor, hoverHalo: haloColor, ink: inkColor,
+                                          background: try XCTUnwrap(scene.background.contents as? NSColor))
+        return try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: 256 * scale, height: 192 * scale,
+            referenceHeight: 192, translucent: translucent, palette: palette,
+            seeds: [try ViewportPassTestRenderer.seeds(selected, channel: .selectedEdge),
+                    try ViewportPassTestRenderer.seeds(hover, channel: .hoveredEdge)])
     }
 
+    @MainActor
     private func sample(_ shot: Shot, at point: SCNVector3) throws -> NSColor {
-        let projected = shot.renderer.projectPoint(point)
-        let x = min(shot.image.pixelsWide - 1, max(0, Int(projected.x.rounded(.down))))
-        let y = min(shot.image.pixelsHigh - 1, max(0, shot.image.pixelsHigh - 1 - Int(projected.y.rounded(.down))))
-        return try XCTUnwrap(shot.image.colorAt(x: x, y: y)?.usingColorSpace(.sRGB))
+        try shot.color(at: point)
     }
 
+    @MainActor
     private func coreWidths(_ shot: Shot) throws -> (selected: Int, hover: Int) {
         let selected = try sample(shot, at: SCNVector3(0, 0.5, 0))
         let hover = try sample(shot, at: SCNVector3(0, -0.5, 0))

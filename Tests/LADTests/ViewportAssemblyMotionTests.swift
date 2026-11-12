@@ -36,8 +36,6 @@ final class ViewportAssemblyMotionTests: XCTestCase {
         let surface = try node("solid:1", in: view)
         let ordinaryEdges = try node("edges:1", in: view)
         let featureFace = try node("feature:face:1:0", in: view)
-        let featureEdge = try node("feature:edge:1:0", in: view)
-        let featureVertex = try node("feature:vertex:1:0", in: view)
         let geometry = try XCTUnwrap(surface.geometry)
         let material = try XCTUnwrap(geometry.firstMaterial)
         let edgeGeometry = ordinaryEdges.geometry
@@ -49,14 +47,18 @@ final class ViewportAssemblyMotionTests: XCTestCase {
         XCTAssertTrue(surface.geometry?.firstMaterial === material)
         XCTAssertTrue(ordinaryEdges.geometry === edgeGeometry)
         XCTAssertEqual(try XCTUnwrap(view.pointOfView).simdTransform, camera)
-        for node in [surface, ordinaryEdges, featureFace, featureEdge, featureVertex] {
+        for node in [surface, ordinaryEdges, featureFace] {
             XCTAssertEqual(node.simdTransform.columns.3, SIMD4(3, -2, 0, 1))
         }
-        for index in 0..<2 {
-            let batch = try node(CADHighlightTechnique.silhouetteNodeName(index), in: view)
-            let mask = try XCTUnwrap(batch.childNodes.first { $0.geometry != nil })
-            XCTAssertEqual(mask.simdWorldTransform.columns.3,
-                           SIMD4(3, -2, 0, 1), "Part and face masks inside DRAW_NODE batches must use the body's current pose.")
+        let frame = view.makeFrame(width: 640, height: 480)
+        XCTAssertEqual(frame.seeds.count, 2)
+        for seeds in frame.seeds {
+            XCTAssertEqual(seeds.model.columns.3, SIMD4(3, -2, 0, 1), "Edge and vertex seeds must use the body's current pose.")
+        }
+        let masks = frame.batches.flatMap(\.masks)
+        XCTAssertEqual(masks.count, 2)
+        for mask in masks {
+            XCTAssertEqual(mask.model.columns.3, SIMD4(3, -2, 0, 1), "Part and face outline masks must use the body's current pose.")
         }
         XCTAssertEqual(try node("solid:0", in: view).simdTransform, matrix_identity_float4x4)
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
@@ -113,14 +115,12 @@ final class ViewportAssemblyMotionTests: XCTestCase {
         defer { _ = app.setActivationPolicy(policy) }
         app.finishLaunching()
         let view = try makeView()
-        let frames = AssemblyMotionFrameCounter()
-        view.delegate = frames
+        let frames = ViewportRenderCounter(view)
         let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "LAD assembly motion test"
         window.isReleasedWhenClosed = false
         window.contentView = view
         defer {
-            view.delegate = nil
             window.orderOut(nil)
             window.contentView = nil
             window.close()
@@ -141,21 +141,19 @@ final class ViewportAssemblyMotionTests: XCTestCase {
         try await waitUntil { frames.count > previous }
         try await idle(view, frames: frames)
         XCTAssertEqual(try XCTUnwrap(view.pointOfView).simdTransform, camera)
-        XCTAssertFalse(view.rendersContinuously)
+        XCTAssertFalse(view.hasPendingFrames)
         let idleCount = frames.count
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [], solidTransforms: [1: moved])
         try await Task.sleep(for: .milliseconds(100))
-        XCTAssertFalse(view.isPlaying, "An unchanged pose must not wake SceneKit again.")
+        XCTAssertFalse(view.hasPendingFrames, "An unchanged pose must not draw again.")
         XCTAssertEqual(frames.count, idleCount)
     }
 
     @MainActor
     private func makeView() throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        return CADSceneView(frame: NSRect(x: 50, y: 50, width: 640, height: 480), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        return CADSceneView(frame: NSRect(x: 50, y: 50, width: 640, height: 480))
     }
 
     @MainActor
@@ -164,7 +162,7 @@ final class ViewportAssemblyMotionTests: XCTestCase {
     }
 
     @MainActor
-    private func idle(_ view: CADSceneView, frames: AssemblyMotionFrameCounter) async throws {
+    private func idle(_ view: CADSceneView, frames: ViewportRenderCounter) async throws {
         let deadline = ContinuousClock.now + .seconds(10)
         var previous = frames.count
         var lastChange = ContinuousClock.now
@@ -172,7 +170,7 @@ final class ViewportAssemblyMotionTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(25))
             let current = frames.count
             if current != previous { previous = current; lastChange = ContinuousClock.now }
-            if !view.isPlaying, ContinuousClock.now - lastChange >= .milliseconds(250) { return }
+            if !view.hasPendingFrames, ContinuousClock.now - lastChange >= .milliseconds(250) { return }
         }
         XCTFail("The moving assembly viewport should become idle after rendering its latest pose.")
     }
@@ -192,7 +190,7 @@ final class ViewportAssemblyMotionTests: XCTestCase {
 
     @MainActor
     private func node(_ name: String, in view: CADSceneView) throws -> SCNNode {
-        try XCTUnwrap(view.scene?.rootNode.childNode(withName: name, recursively: true))
+        try XCTUnwrap(view.scene.rootNode.childNode(withName: name, recursively: true))
     }
 
     private func mesh() -> PreviewMesh {
@@ -212,11 +210,4 @@ final class ViewportAssemblyMotionTests: XCTestCase {
     }
 }
 
-private final class AssemblyMotionFrameCounter: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = 0
-    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
-    func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
-        lock.lock(); value += 1; lock.unlock()
-    }
-}
+

@@ -98,7 +98,7 @@ final class ViewportPreparationTests: XCTestCase {
                     selectedSolids: [], hiddenSolids: [])
         XCTAssertTrue(view.isPreparingResources)
         XCTAssertFalse(view.hasRenderableGeometry, "Large CPU preparation must return before creating scene geometry.")
-        XCTAssertNil(view.scene?.rootNode.childNode(withName: "solid:0", recursively: true))
+        XCTAssertNil(view.scene.rootNode.childNode(withName: "solid:0", recursively: true))
         let pose = [1.0, 0, 0, 4, 0, 1, 0, -2, 0, 0, 1, 0, 0, 0, 0, 1]
         view.update(mesh: preview, mode: .translucent, grid: true, command: ViewportCommand(.top),
                     selectedSolids: [1], hiddenSolids: [0], projection: .isometric, solidTransforms: [1: pose])
@@ -167,7 +167,7 @@ final class ViewportPreparationTests: XCTestCase {
         window.contentView = view
         try await waitForPreparation(view)
         XCTAssertTrue(view.hasRenderableGeometry)
-        XCTAssertNotNil(view.scene?.rootNode.childNode(withName: "solid:1", recursively: true))
+        XCTAssertNotNil(view.scene.rootNode.childNode(withName: "solid:1", recursively: true))
         XCTAssertEqual(view.agentCaptureMetadata["usesOrthographicProjection"] as? Bool, false)
     }
 
@@ -256,14 +256,12 @@ final class ViewportPreparationTests: XCTestCase {
     @MainActor
     private func makeView() throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice(), "Metal is required to prepare viewport resources.")
-        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
     }
 
     @MainActor
     private func node(_ name: String, in view: CADSceneView) throws -> SCNNode {
-        try XCTUnwrap(view.scene?.rootNode.childNode(withName: name, recursively: true))
+        try XCTUnwrap(view.scene.rootNode.childNode(withName: name, recursively: true))
     }
 
     private func mesh(_ identity: String) -> PreviewMesh {

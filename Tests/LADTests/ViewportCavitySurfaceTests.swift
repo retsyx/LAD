@@ -40,9 +40,7 @@ final class ViewportCavitySurfaceTests: XCTestCase {
         XCTAssertTrue(inverted.isEmpty, "Cavity display triangles must agree with their exact outward surface normals: \(inverted.prefix(12))")
 
         for mode in [ViewportDisplayMode.shaded, .edges] {
-            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 900, height: 900), options: [
-                SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-            ])
+            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 900, height: 900))
             view.update(mesh: preview, mode: mode, grid: false, command: nil,
                         selectedSolids: [], hiddenSolids: [], projection: .perspective)
             let deadline = ContinuousClock.now + .seconds(30)

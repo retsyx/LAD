@@ -125,9 +125,7 @@ final class ViewportStrokeTests: XCTestCase {
     @MainActor
     func testViewportEdgeHoverAndSelectionReusePreparedCenterlinesWithSelectionPrecedence() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
         let preview = edgePreview()
         let edge = CADFeatureID(kind: .edge, solidIndex: 0, localIndex: 0)
         view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
@@ -137,37 +135,31 @@ final class ViewportStrokeTests: XCTestCase {
         let projected = view.projectPoint(SCNVector3(0, -10, 0))
         let point = NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
         view.mouseMoved(with: try mouse(.mouseMoved, at: point))
-        let overlay = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "feature:edge:0:0", recursively: true))
-        try await visible(overlay)
-        let centerline = try XCTUnwrap(overlay.geometry)
-        XCTAssertEqual(centerline.elements.first?.primitiveType, .line)
-        XCTAssertEqual(overlay.categoryBitMask, CADHighlightTechnique.seedCategory)
-        XCTAssertTrue(overlay.childNodes.isEmpty, "The overlay needs only native centerlines; screen-space passes supply its width.")
-        let material = try XCTUnwrap(centerline.firstMaterial)
-        XCTAssertEqual(material.diffuse.contents as? NSColor, .green)
-        XCTAssertFalse(material.readsFromDepthBuffer,
-                       "Highlight overlays remain visible through other geometry.")
-        XCTAssertFalse(material.writesToDepthBuffer)
+        // Native centerlines only; the unoccluded screen-space passes supply
+        // their width and ignore geometry depth.
+        let hovered = try XCTUnwrap(seeds(in: view).first)
+        XCTAssertEqual(seeds(in: view).count, 1)
+        XCTAssertEqual(hovered.channel, .hoveredEdge)
+        XCTAssertEqual(hovered.buffer.primitive, .line)
+        let centerline = hovered.buffer
 
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [0], hiddenSolids: [], selectedFeatures: [edge])
-        XCTAssertTrue(overlay.geometry === centerline)
-        XCTAssertEqual(material.diffuse.contents as? NSColor, .red)
+        XCTAssertTrue(seeds(in: view).first?.buffer === centerline)
+        XCTAssertEqual(seeds(in: view).map(\.channel), [.selectedEdge])
         view.mouseMoved(with: try mouse(.mouseMoved, at: point))
-        XCTAssertEqual(material.diffuse.contents as? NSColor, .red, "Hover must not soften selected styling.")
+        XCTAssertEqual(seeds(in: view).map(\.channel), [.selectedEdge], "Hover must not soften selected styling.")
         view.mouseExited(with: try mouse(.mouseExited, at: NSPoint(x: -1, y: -1)))
-        XCTAssertFalse(overlay.isHidden, "Leaving the view must preserve the selected edge.")
+        XCTAssertEqual(seeds(in: view).map(\.channel), [.selectedEdge], "Leaving the view must preserve the selected edge.")
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [0], hiddenSolids: [0], selectedFeatures: [edge])
-        XCTAssertTrue(overlay.isHidden, "The highlight must disappear with its owning part.")
+        XCTAssertTrue(seeds(in: view).isEmpty, "The highlight must disappear with its owning part.")
     }
 
     @MainActor
     func testCircularEdgeComparisonRendersNativeVisualReviewArtifacts() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 512, height: 512), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 512, height: 512))
         let preview = circularPreview()
         let colors = [0: PartColor(red: 0.38, green: 0.67, blue: 0.82)]
         view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
@@ -180,8 +172,7 @@ final class ViewportStrokeTests: XCTestCase {
 
         let position = view.projectPoint(SCNVector3(-18, 0, 0))
         view.mouseMoved(with: try mouse(.mouseMoved, at: NSPoint(x: CGFloat(position.x), y: CGFloat(position.y))))
-        let overlay = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "feature:edge:0:0", recursively: true))
-        try await visible(overlay)
+        XCTAssertEqual(seeds(in: view).map(\.channel), [.hoveredEdge])
         let hovered = try await CADAgentRenderer.capturePNG(view: view)
         try hovered.write(to: URL(fileURLWithPath: "/tmp/lad-edge-hover.png"))
         try assertCircularCoverage(hovered, radius: 14, view: view, gold: false, label: "Unselected inner edge during hover")
@@ -196,6 +187,11 @@ final class ViewportStrokeTests: XCTestCase {
         try assertCircularCoverage(selected, radius: 18, view: view, gold: true, label: "Selected outer edge")
         XCTAssertNotEqual(baseline, hovered, "Hover must be visible in an actual native viewport capture.")
         XCTAssertNotEqual(hovered, selected, "Selected and hovered edges must remain visually distinguishable.")
+    }
+
+    @MainActor
+    private func seeds(in view: CADSceneView) -> [CADViewportFrame.Seeds] {
+        view.makeFrame(width: Int(view.bounds.width), height: Int(view.bounds.height)).seeds
     }
 
     @MainActor
@@ -311,13 +307,6 @@ final class ViewportStrokeTests: XCTestCase {
         let deadline = ContinuousClock.now + .seconds(10)
         while view.isPreparingCaptureResources, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertFalse(view.isPreparingCaptureResources)
-    }
-
-    @MainActor
-    private func visible(_ node: SCNNode) async throws {
-        let deadline = ContinuousClock.now + .seconds(10)
-        while node.isHidden, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-        XCTAssertFalse(node.isHidden)
     }
 
     @MainActor

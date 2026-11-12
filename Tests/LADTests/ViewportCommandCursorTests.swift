@@ -14,7 +14,7 @@ final class ViewportCommandCursorTests: XCTestCase {
         host.view.mouseEntered(with: try mouse(.mouseEntered, at: point, host: host))
         host.view.mouseMoved(with: try mouse(.mouseMoved, at: point, host: host))
         let highlight = try host.highlight()
-        try await waitUntil { !highlight.isHidden && !host.view.isPlaying }
+        try await waitUntil { !highlight.isHidden && !host.view.hasPendingFrames }
         let previous = host.frames.count
         let before = try await CADAgentRenderer.capturePNG(view: host.view)
         var selections = 0
@@ -24,7 +24,7 @@ final class ViewportCommandCursorTests: XCTestCase {
         host.view.flagsChanged(with: try flags(.command, host: host))
         XCTAssertTrue(highlight.isHidden, "Pressing Command must clear the stationary feature immediately.")
         XCTAssertTrue(NSCursor.current === NSCursor.closedHand)
-        try await waitUntil { host.frames.count > previous && !host.view.isPlaying }
+        try await waitUntil { host.frames.count > previous && !host.view.hasPendingFrames }
         let after = try await CADAgentRenderer.capturePNG(view: host.view)
         XCTAssertNotEqual(before, after, "The live hover-clear redraw must also appear in a detached capture.")
         XCTAssertEqual(selections, 0)
@@ -239,17 +239,20 @@ final class ViewportCommandCursorTests: XCTestCase {
         let point = view.projectPoint(SCNVector3Zero)
         let center = NSPoint(x: CGFloat(point.x), y: CGFloat(point.y))
         view.mouseMoved(with: try unattachedMouse(.mouseMoved, point: center))
-        let hover = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "feature:face:0:0", recursively: true))
-        let selected = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "feature:vertex:0:0", recursively: true))
-        try await waitUntil { !hover.isHidden && !selected.isHidden }
+        let hover = try XCTUnwrap(view.scene.rootNode.childNode(withName: "feature:face:0:0", recursively: true))
+        // The selected vertex is a seed in the unoccluded highlight overlay.
+        func selectedVertexShown() -> Bool {
+            view.makeFrame(width: 64, height: 64).seeds.contains { $0.channel == .selectedVertex }
+        }
+        try await waitUntil { !hover.isHidden && selectedVertexShown() }
         view.flagsChanged(with: try flags(.command, windowNumber: 0))
         XCTAssertTrue(hover.isHidden)
-        XCTAssertFalse(selected.isHidden)
+        XCTAssertTrue(selectedVertexShown())
         XCTAssertTrue(NSCursor.current === NSCursor.closedHand)
         XCTAssertEqual(changes, 0)
         view.flagsChanged(with: try flags([], windowNumber: 0))
         XCTAssertTrue(NSCursor.current === NSCursor.arrow)
-        XCTAssertFalse(selected.isHidden)
+        XCTAssertTrue(selectedVertexShown())
         XCTAssertFalse(hover.isHidden, "Modifier release repicks the stationary pointer without losing selection.")
         XCTAssertEqual(changes, 0)
         NSCursor.arrow.set()
@@ -268,7 +271,7 @@ final class ViewportCommandCursorTests: XCTestCase {
         view.mouseEntered(with: try unattachedMouse(.mouseEntered, point: center, modifiers: .command))
         XCTAssertTrue(NSCursor.current === NSCursor.closedHand)
         view.mouseMoved(with: try unattachedMouse(.mouseMoved, point: center, modifiers: .command))
-        XCTAssertTrue(view.scene?.rootNode.childNode(withName: "feature:face:0:0", recursively: true)?.isHidden ?? true)
+        XCTAssertTrue(view.scene.rootNode.childNode(withName: "feature:face:0:0", recursively: true)?.isHidden ?? true)
         view.mouseDown(with: try unattachedMouse(.leftMouseDown, point: center, modifiers: .command))
         XCTAssertTrue(view.isGrabbingAssembly)
         view.mouseUp(with: try unattachedMouse(.leftMouseUp, point: center, modifiers: .command))
@@ -283,9 +286,7 @@ final class ViewportCommandCursorTests: XCTestCase {
     private func unattachedView() throws -> CADSceneView {
         _ = NSApplication.shared
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 400), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
         view.assemblyGrabbingEnabled = true
         view.layout()
         return view
@@ -338,7 +339,7 @@ final class ViewportCommandCursorTests: XCTestCase {
         let view: CADSceneView
         let window: CommandCursorWindow
         let editor = ModifierCountingEditor(frame: NSRect(x: 0, y: 0, width: 640, height: 80))
-        let frames = CommandCursorFrameCounter()
+        let frames: ViewportRenderCounter
         private let policy: NSApplication.ActivationPolicy
 
         init(origin: NSPoint = NSPoint(x: 50, y: 50), flipped: Bool = false) throws {
@@ -352,9 +353,7 @@ final class ViewportCommandCursorTests: XCTestCase {
             policy = app.activationPolicy()
             if app.activationPolicy() != .regular { XCTAssertTrue(app.setActivationPolicy(.regular)) }
             app.finishLaunching()
-            view = CADSceneView(frame: NSRect(x: 0, y: 80, width: 640, height: 400), options: [
-                SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-            ])
+            view = CADSceneView(frame: NSRect(x: 0, y: 80, width: 640, height: 400))
             let frame = NSRect(x: 0, y: 0, width: 640, height: 480)
             let container: NSView = flipped ? FlippedCursorContainer(frame: frame) : NSView(frame: frame)
             container.addSubview(view); container.addSubview(editor)
@@ -364,7 +363,7 @@ final class ViewportCommandCursorTests: XCTestCase {
             window.contentView = container
             window.pointerLocation = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
             view.assemblyGrabbingEnabled = true
-            view.delegate = frames
+            frames = ViewportRenderCounter(view)
             view.update(mesh: ViewportCommandCursorTests.mesh(), mode: .edges, grid: false, command: ViewportCommand(.top),
                         selectedSolids: [], hiddenSolids: [])
             app.activate(ignoringOtherApps: true)
@@ -376,7 +375,7 @@ final class ViewportCommandCursorTests: XCTestCase {
             let point = view.projectPoint(SCNVector3Zero)
             return NSPoint(x: CGFloat(point.x), y: CGFloat(point.y))
         }
-        func optionalHighlight() -> SCNNode? { view.scene?.rootNode.childNode(withName: "feature:face:0:0", recursively: true) }
+        func optionalHighlight() -> SCNNode? { view.scene.rootNode.childNode(withName: "feature:face:0:0", recursively: true) }
         func highlight() throws -> SCNNode { try XCTUnwrap(optionalHighlight()) }
         func ready() async throws {
             let deadline = ContinuousClock.now + .seconds(10)
@@ -386,17 +385,16 @@ final class ViewportCommandCursorTests: XCTestCase {
             }
             window.makeKeyAndOrderFront(nil)
             window.makeKey()
-            while (view.isPreparingCaptureResources || !window.isKeyWindow || frames.count == 0 || view.isPlaying), ContinuousClock.now < deadline {
+            while (view.isPreparingCaptureResources || !window.isKeyWindow || frames.count == 0 || view.hasPendingFrames), ContinuousClock.now < deadline {
                 try await Task.sleep(for: .milliseconds(10))
             }
             guard NSApplication.shared.isActive, window.isKeyWindow, !view.isPreparingCaptureResources,
-                  frames.count > 0, !view.isPlaying else {
-                XCTFail("Native host inactive: appActive=\(NSApplication.shared.isActive), key=\(window.isKeyWindow), canKey=\(window.canBecomeKey), visible=\(window.isVisible), policy=\(NSApplication.shared.activationPolicy().rawValue), frames=\(frames.count), playing=\(view.isPlaying)")
+                  frames.count > 0, !view.hasPendingFrames else {
+                XCTFail("Native host inactive: appActive=\(NSApplication.shared.isActive), key=\(window.isKeyWindow), canKey=\(window.canBecomeKey), visible=\(window.isVisible), policy=\(NSApplication.shared.activationPolicy().rawValue), frames=\(frames.count), pending=\(view.hasPendingFrames)")
                 throw LADError.message("The Command cursor host must be active and key before testing modifiers.")
             }
         }
         func close() {
-            view.delegate = nil
             window.orderOut(nil); window.contentView = nil; window.close()
             NSCursor.arrow.set()
             _ = NSApplication.shared.setActivationPolicy(policy)
@@ -430,11 +428,4 @@ private final class ModifierCountingEditor: NSTextView {
     override func flagsChanged(with event: NSEvent) { modifierEvents += 1; super.flagsChanged(with: event) }
 }
 
-private final class CommandCursorFrameCounter: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = 0
-    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
-    func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
-        lock.lock(); value += 1; lock.unlock()
-    }
-}
+

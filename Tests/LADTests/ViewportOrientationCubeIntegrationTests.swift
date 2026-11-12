@@ -47,8 +47,8 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
                 XCTAssertFalse(view.isPreparingResources)
                 let cameraNode = try XCTUnwrap(view.pointOfView)
                 let camera = try XCTUnwrap(cameraNode.camera)
-                // Read the current camera directly; SCNView.projectPoint can
-                // retain its last rendered state while the viewport is idle.
+                // Project with the SceneKit camera itself, independently of
+                // the view's own projection.
                 let projectionMatrix = simd_float4x4(camera.projectionTransform(withViewportSize: view.bounds.size))
                 let transform = projectionMatrix * simd_inverse(cameraNode.simdWorldTransform)
                 for vertex in preview.vertices {
@@ -119,7 +119,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
             for (before, after) in zip(sources, edges.sources) { XCTAssertTrue(before === after) }
             XCTAssertEqual(selectionChanges, 0)
             XCTAssertFalse(view.isPreparingResources)
-            XCTAssertFalse(view.rendersContinuously)
+            XCTAssertFalse(view.hasPendingFrames)
         }
     }
 
@@ -170,8 +170,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
         defer { _ = application.setActivationPolicy(previousPolicy) }
         application.finishLaunching()
         let (view, preview) = try await readyView()
-        let frames = CubeViewportRenderCounter()
-        view.delegate = frames
+        let frames = ViewportRenderCounter(view)
         let container = NSView(frame: view.frame)
         container.addSubview(view)
         let cube = ViewportOrientationCube(frame: NSRect(x: 380, y: 258, width: 92, height: 92))
@@ -190,7 +189,6 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
         window.isReleasedWhenClosed = false
         window.contentView = container
         defer {
-            view.delegate = nil
             view.onCameraOrientationChanged = nil
             window.orderOut(nil)
             window.contentView = nil
@@ -213,7 +211,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(300))
         assertMatrixEqual(try XCTUnwrap(view.pointOfView).simdTransform, initialCamera)
         XCTAssertEqual(frames.count, beforeDrag, "Dragging the cube must not wake viewport rendering.")
-        XCTAssertFalse(view.rendersContinuously)
+        XCTAssertFalse(view.hasPendingFrames)
 
         let fittedDistance = try XCTUnwrap(view.agentCaptureMetadata["cameraDistance"] as? Double)
         let fittedScale = try XCTUnwrap(view.agentCaptureMetadata["orthographicScale"] as? Double)
@@ -247,7 +245,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
                 XCTAssertEqual(try XCTUnwrap(view.agentCaptureMetadata["cameraDistance"] as? Double), fittedDistance, accuracy: 1e-8)
                 XCTAssertEqual(try XCTUnwrap(view.agentCaptureMetadata["orthographicScale"] as? Double), fittedScale, accuracy: 1e-8)
                 XCTAssertGreaterThan(matrixDifference(beforeCamera, try XCTUnwrap(view.pointOfView).simdTransform), 0.1)
-                XCTAssertFalse(view.rendersContinuously, "Every cube target must retain bounded viewport redraw bursts.")
+                XCTAssertFalse(view.hasPendingFrames, "Every cube target must leave nothing pending once drawn.")
                 if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
                     let finalCamera = try XCTUnwrap(view.pointOfView).simdTransform
                     XCTAssertTrue(frames.poses(after: beforeSnap).contains {
@@ -307,7 +305,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
         let detached = try XCTUnwrap(view.pointOfView).simdTransform
         try await Task.sleep(for: .milliseconds(400))
         assertMatrixEqual(try XCTUnwrap(view.pointOfView).simdTransform, detached)
-        XCTAssertFalse(view.rendersContinuously, "Detaching a viewport must cancel animation and playback.")
+        XCTAssertFalse(view.hasPendingFrames, "Detaching a viewport must cancel animation and playback.")
     }
 
     @MainActor
@@ -333,7 +331,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    private func waitForFrame(_ frames: CubeViewportRenderCounter, after previous: Int) async throws -> Bool {
+    private func waitForFrame(_ frames: ViewportRenderCounter, after previous: Int) async throws -> Bool {
         let deadline = ContinuousClock.now + .seconds(5)
         while frames.count <= previous, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
         guard frames.count > previous else {
@@ -344,7 +342,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    private func waitForIdle(_ view: CADSceneView, frames: CubeViewportRenderCounter) async throws -> Bool {
+    private func waitForIdle(_ view: CADSceneView, frames: ViewportRenderCounter) async throws -> Bool {
         let deadline = ContinuousClock.now + .seconds(5)
         var previous = frames.count
         var lastChange = ContinuousClock.now
@@ -352,7 +350,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(25))
             let current = frames.count
             if current != previous { previous = current; lastChange = ContinuousClock.now }
-            if !view.rendersContinuously, ContinuousClock.now - lastChange >= .milliseconds(250) { return true }
+            if !view.hasPendingFrames, ContinuousClock.now - lastChange >= .milliseconds(250) { return true }
         }
         XCTFail("A completed orientation cube redraw must become idle.")
         return false
@@ -362,9 +360,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     private func readyView(projection: ViewportProjectionMode = .perspective,
                            offset: SIMD3<Double> = .zero) async throws -> (CADSceneView, PreviewMesh) {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
         var preview = box()
         preview.vertices = preview.vertices.map { vertex in
             (0..<3).map { vertex[$0] + offset[$0] }
@@ -398,7 +394,7 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
 
     @MainActor
     private func geometry(_ name: String, in view: CADSceneView) throws -> SCNGeometry {
-        try XCTUnwrap(view.scene?.rootNode.childNode(withName: name, recursively: true)?.geometry)
+        try XCTUnwrap(view.scene.rootNode.childNode(withName: name, recursively: true)?.geometry)
     }
 
     @MainActor
@@ -466,28 +462,4 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     }
 }
 
-private final class CubeViewportRenderCounter: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = 0
-    private var renderedPoses = [(Int, simd_float4x4)]()
 
-    var count: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
-    }
-
-    func poses(after frame: Int) -> [simd_float4x4] {
-        lock.lock(); defer { lock.unlock() }
-        return renderedPoses.filter { $0.0 > frame }.map { $0.1 }
-    }
-
-    func renderer(_ renderer: SCNSceneRenderer, didRenderScene scene: SCNScene, atTime time: TimeInterval) {
-        let pose = renderer.pointOfView?.presentation.simdWorldTransform
-        lock.lock()
-        value += 1
-        if let pose { renderedPoses.append((value, pose)) }
-        if renderedPoses.count > 512 { renderedPoses.removeFirst(renderedPoses.count - 512) }
-        lock.unlock()
-    }
-}

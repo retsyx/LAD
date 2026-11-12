@@ -16,9 +16,7 @@ final class ViewportEnclosureSurfaceTests: XCTestCase {
         }
         let label = ProcessInfo.processInfo.environment["LAD_EDGE_OCCLUSION_LABEL"] ?? "current"
         for projection in ViewportProjectionMode.allCases {
-            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 800), options: [
-                SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-            ])
+            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 800))
             view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                 selectedSolids: [], hiddenSolids: [], projection: projection,
                 solidColors: [1: PartColor(red: 0.396, green: 0.667, blue: 0.761)])

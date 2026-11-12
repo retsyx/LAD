@@ -206,11 +206,6 @@ final class ViewportCurvedEdgeTests: XCTestCase {
         let ordinary = SCNNode(geometry: ordinaryGeometry)
         ordinary.categoryBitMask = 2; ordinary.renderingOrder = 1
         scene.rootNode.addChildNode(ordinary)
-        if highlighted {
-            let seed = SCNNode(geometry: CADStrokeSeedGeometry.make(mesh.edges))
-            seed.categoryBitMask = CADHighlightTechnique.seedCategory
-            scene.rootNode.addChildNode(seed)
-        }
         let camera = SCNNode(); camera.camera = SCNCamera()
         camera.camera?.fieldOfView = 38; camera.camera?.projectionDirection = .vertical
         camera.camera?.usesOrthographicProjection = orthographic; camera.camera?.orthographicScale = close ? 2.8 : 4.6
@@ -238,16 +233,13 @@ final class ViewportCurvedEdgeTests: XCTestCase {
         camera.position = SCNVector3(position.x, position.y, position.z)
         camera.look(at: SCNVector3(target.x, target.y, target.z), up: SCNVector3(0,0,1), localFront: SCNVector3(0,0,-1))
         scene.rootNode.addChildNode(camera)
-        let renderer = SCNRenderer(device: try XCTUnwrap(MTLCreateSystemDefaultDevice()), options: nil)
-        renderer.scene = scene; renderer.pointOfView = camera; renderer.autoenablesDefaultLighting = false
-        renderer.usesReverseZ = true
-        renderer.technique = try XCTUnwrap(CADHighlightTechnique.make(viewportHeight: 256,
-            selected: selectedColor, hover: selectedColor.blended(withFraction: 0.25, of: .white) ?? selectedColor,
-            hoverHalo: selectedColor.blended(withFraction: 0.7, of: .white) ?? selectedColor, ink: inkColor))
-        XCTAssertTrue(renderer.prepare(scene, shouldAbortBlock: nil))
+        let palette = CADHighlightPalette(selected: selectedColor,
+            hover: selectedColor.blended(withFraction: 0.25, of: .white) ?? selectedColor,
+            hoverHalo: selectedColor.blended(withFraction: 0.7, of: .white) ?? selectedColor, ink: inkColor, background: .white)
         let size = CGSize(width: 640, height: 512)
-        let image = renderer.snapshot(atTime: 0, with: size, antialiasingMode: .multisampling4X)
-        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: XCTUnwrap(image.tiffRepresentation)))
+        let seeds = highlighted ? [try ViewportPassTestRenderer.seeds(mesh.edges, channel: .selectedEdge)] : []
+        let bitmap = try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: Int(size.width),
+            height: Int(size.height), referenceHeight: 256, palette: palette, seeds: seeds).image
         if !occluder {
             let background = try XCTUnwrap(bitmap.colorAt(x: 4, y: 4)?.usingColorSpace(.sRGB))
             XCTAssertEqual(background.redComponent, 1, accuracy: 0.03)
@@ -270,23 +262,17 @@ final class ViewportCurvedEdgeTests: XCTestCase {
         fill.isDoubleSided = true; face.materials = [fill]
         scene.rootNode.addChildNode(SCNNode(geometry: face))
         let points = (0...16).map { index -> [Double] in let x = -1.5 + Double(index) * 3 / 16; return [x, 0, x * 0.7] }
-        let seed = SCNNode(geometry: CADStrokeSeedGeometry.make(segments(points)))
-        seed.categoryBitMask = CADHighlightTechnique.seedCategory
-        scene.rootNode.addChildNode(seed)
         let camera = SCNNode(); camera.camera = SCNCamera(); camera.position = SCNVector3(0,0,8)
         camera.camera?.fieldOfView = 38; camera.camera?.projectionDirection = .vertical
         camera.camera?.usesOrthographicProjection = orthographic; camera.camera?.orthographicScale = 1.8
         camera.camera?.zNear = 0.1; camera.camera?.zFar = 100; camera.camera?.wantsHDR = false
         scene.rootNode.addChildNode(camera)
-        let renderer = SCNRenderer(device: try XCTUnwrap(MTLCreateSystemDefaultDevice()), options: nil)
-        renderer.scene = scene; renderer.pointOfView = camera; renderer.autoenablesDefaultLighting = false
-        renderer.technique = try XCTUnwrap(CADHighlightTechnique.make(viewportHeight: 256,
-            selected: NSColor(srgbRed: 0.92, green: 0.61, blue: 0.24, alpha: 1),
-            hover: .white, hoverHalo: .white, ink: .black))
-        XCTAssertTrue(renderer.prepare(scene, shouldAbortBlock: nil))
+        let palette = CADHighlightPalette(selected: NSColor(srgbRed: 0.92, green: 0.61, blue: 0.24, alpha: 1),
+            hover: .white, hoverHalo: .white, ink: .black, background: .white)
         let size = CGSize(width: 640, height: 512)
-        let image = renderer.snapshot(atTime: 0, with: size, antialiasingMode: .multisampling4X)
-        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: XCTUnwrap(image.tiffRepresentation)))
+        let bitmap = try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: Int(size.width),
+            height: Int(size.height), referenceHeight: 256, palette: palette,
+            seeds: [try ViewportPassTestRenderer.seeds(segments(points), channel: .selectedEdge)]).image
         return Shot(image: bitmap, matrix: simd_float4x4(try XCTUnwrap(camera.camera).projectionTransform(withViewportSize: size)) * simd_inverse(camera.simdWorldTransform))
     }
 

@@ -7,9 +7,7 @@ import XCTest
 final class CameraProjectionTests: XCTestCase {
     @MainActor
     func testProjectionSwitchMatchesSceneKitScaleAndRestoresPerspective() throws {
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640))
         view.update(mesh: nil, mode: .edges, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [], projection: .isometric)
         let cameraNode = try XCTUnwrap(view.pointOfView)
@@ -33,9 +31,7 @@ final class CameraProjectionTests: XCTestCase {
 
     @MainActor
     func testProjectionRoundTripPreservesNavigatedPoseAndTargetPlaneFraming() throws {
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640))
         view.update(mesh: nil, mode: .edges, grid: false, command: ViewportCommand(.front),
                     selectedSolids: [], hiddenSolids: [], projection: .perspective)
         let cameraNode = try XCTUnwrap(view.pointOfView)
@@ -88,9 +84,7 @@ final class CameraProjectionTests: XCTestCase {
 
     @MainActor
     func testInitialMeshAppliesSavedOrthographicProjection() throws {
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640))
         let preview = PreviewMesh(vertices: [[0, 0, 0], [20, 0, 0], [0, 10, 0]], triangles: [[0, 1, 2]], edges: [],
             bounds: [0, 0, 0, 20, 10, 5], volume: 1, area: 1, solids: 1, faces: 1,
             buildSeconds: 0, threads: 1, stepPath: "/tmp/initial-orthographic-projection")
@@ -110,8 +104,8 @@ final class CameraProjectionTests: XCTestCase {
 
     @MainActor
     private func project(_ point: SIMD3<Float>, in view: CADSceneView, cameraNode: SCNNode, camera: SCNCamera) -> SIMD2<Double> {
-        // Read the camera directly; SCNView.projectPoint can retain its last
-        // rendered state until another live frame is drawn.
+        // Project with the SceneKit camera itself, independently of the
+        // view's own projection.
         let projection = simd_float4x4(camera.projectionTransform(withViewportSize: view.bounds.size))
         let clip = projection * simd_inverse(cameraNode.simdWorldTransform) * SIMD4(point, 1)
         return SIMD2((Double(clip.x / clip.w) * 0.5 + 0.5) * Double(view.bounds.width),

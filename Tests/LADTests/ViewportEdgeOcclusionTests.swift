@@ -72,7 +72,6 @@ final class ViewportEdgeOcclusionTests: XCTestCase {
     private func render(orthographic: Bool, near: Double, scale: Int,
                         cover: Bool = true, coplanar: Bool = false,
                         nearParallel: Bool = false) throws -> NSBitmapImageRep {
-        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let scene = SCNScene()
         scene.background.contents = NSColor.black
         let camera = SCNNode()
@@ -131,18 +130,9 @@ final class ViewportEdgeOcclusionTests: XCTestCase {
         edges.renderingOrder = 1
         scene.rootNode.addChildNode(edges)
 
-        let renderer = SCNRenderer(device: device, options: nil)
-        renderer.scene = scene
-        renderer.pointOfView = camera
-        renderer.usesReverseZ = true
-        renderer.autoenablesDefaultLighting = false
-        renderer.technique = try XCTUnwrap(CADHighlightTechnique.make(viewportHeight: 240,
-            selected: .yellow, hover: .yellow, hoverHalo: .white, ink: .black,
-            vertexHighlights: false))
-        XCTAssertTrue(renderer.prepare(scene, shouldAbortBlock: nil))
-        let image = renderer.snapshot(atTime: 0, with: CGSize(width: 320 * scale, height: 240 * scale),
-            antialiasingMode: .multisampling4X)
-        return try XCTUnwrap(NSBitmapImageRep(data: XCTUnwrap(image.tiffRepresentation)))
+        let palette = CADHighlightPalette(selected: .yellow, hover: .yellow, hoverHalo: .white, ink: .black, background: .black)
+        return try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: 320 * scale, height: 240 * scale,
+            referenceHeight: 240, palette: palette).image
     }
 
     private func magentaPixels(in image: NSBitmapImageRep) -> Int {

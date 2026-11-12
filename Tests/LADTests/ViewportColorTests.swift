@@ -146,9 +146,7 @@ final class ViewportColorTests: XCTestCase {
     @MainActor
     private func makeView() throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
     }
 
     @MainActor
@@ -162,7 +160,7 @@ final class ViewportColorTests: XCTestCase {
 
     @MainActor
     private func node(_ name: String, in view: CADSceneView) throws -> SCNNode {
-        try XCTUnwrap(view.scene?.rootNode.childNode(withName: name, recursively: true))
+        try XCTUnwrap(view.scene.rootNode.childNode(withName: name, recursively: true))
     }
 
     private func assertColor(_ material: SCNMaterial, equals expected: PartColor,

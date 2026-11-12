@@ -52,7 +52,7 @@ final class CADAgentRendererTests: XCTestCase {
         try await ready(view)
         let camera = try XCTUnwrap(view.pointOfView)
         let pose = camera.simdTransform
-        let material = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry?.firstMaterial)
+        let material = try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:0", recursively: true)?.geometry?.firstMaterial)
         let diffuse = try XCTUnwrap(material.diffuse.contents as? NSColor)
         let transparency = material.transparency
         let captured = try await CADAgentRenderer.captureWithMetadata(view: view)
@@ -233,9 +233,7 @@ final class CADAgentRendererTests: XCTestCase {
     @MainActor
     private func makeView() throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 300), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        return CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
     }
 
     @MainActor

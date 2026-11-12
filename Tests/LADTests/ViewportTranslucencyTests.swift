@@ -8,9 +8,7 @@ final class ViewportTranslucencyTests: XCTestCase {
     @MainActor
     func testProductionPhysicallyBasedFacesBlendTheirCompleteShading() async throws {
         let preview = nestedBoxes()
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
         view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
         let deadline = ContinuousClock.now + .seconds(10)
         while view.isPreparingResources, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
@@ -65,9 +63,7 @@ final class ViewportTranslucencyTests: XCTestCase {
     func testProductionPhysicallyBasedShellRevealsEnclosedPart() async throws {
         let preview = nestedBoxes()
         let colors = [0: PartColor(red: 1, green: 0, blue: 0), 1: PartColor(red: 0, green: 0, blue: 1)]
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         view.update(mesh: preview, mode: .translucent, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [], solidColors: colors)
         let deadline = ContinuousClock.now + .seconds(10)
@@ -81,7 +77,7 @@ final class ViewportTranslucencyTests: XCTestCase {
         camera.camera?.automaticallyAdjustsZRange = false
         camera.camera?.zNear = 0.1; camera.camera?.zFar = 100
         for solid in 0...1 {
-            let material = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:\(solid)", recursively: true)?.geometry?.firstMaterial)
+            let material = try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:\(solid)", recursively: true)?.geometry?.firstMaterial)
             XCTAssertEqual(material.lightingModel, .physicallyBased,
                 "This regression must exercise the production PBR lighting and specular path.")
         }
@@ -133,9 +129,7 @@ final class ViewportTranslucencyTests: XCTestCase {
     @MainActor
     private func assertTranslucency(preview: PreviewMesh) async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
-        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [])
         let deadline = ContinuousClock.now + .seconds(10)
@@ -152,11 +146,11 @@ final class ViewportTranslucencyTests: XCTestCase {
         camera.automaticallyAdjustsZRange = false
         camera.zNear = 0.1
         camera.zFar = 100
-        view.scene?.background.contents = NSColor.black
+        view.scene.background.contents = NSColor.black
 
         func prepareColors() throws {
             for solid in 0...1 {
-                let material = try XCTUnwrap(view.scene?.rootNode.childNode(withName: "solid:\(solid)", recursively: true)?.geometry?.firstMaterial)
+                let material = try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:\(solid)", recursively: true)?.geometry?.firstMaterial)
                 material.lightingModel = .constant
                 material.diffuse.contents = solid == 0 ? NSColor.red : NSColor.blue
                 material.emission.contents = NSColor.black

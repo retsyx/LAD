@@ -109,9 +109,7 @@ final class ViewportPartsTests: XCTestCase {
 
     @MainActor
     private func makeView() -> CADSceneView {
-        CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640), options: [
-            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
-        ])
+        CADSceneView(frame: NSRect(x: 0, y: 0, width: 960, height: 640))
     }
 
     private func optionClick(at point: NSPoint, count: Int = 1) throws -> NSEvent {
@@ -129,7 +127,7 @@ final class ViewportPartsTests: XCTestCase {
 
     @MainActor
     private func node(_ name: String, in view: CADSceneView) throws -> SCNNode {
-        try XCTUnwrap(view.scene?.rootNode.childNode(withName: name, recursively: true))
+        try XCTUnwrap(view.scene.rootNode.childNode(withName: name, recursively: true))
     }
 
     private func mesh(owners: [Int]? = [0, 0, 1, 1]) -> PreviewMesh {
