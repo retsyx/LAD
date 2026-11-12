@@ -199,9 +199,16 @@ private final class CADNativeServer: @unchecked Sendable {
         return !stopped && process.isRunning
     }
 
+    /// One line of the worker's stdin: a staged request and its output folder.
+    private struct Message: Encodable {
+        var id: Int
+        var request: String
+        var output: String
+        var threads: Int
+    }
+
     func send(id: Int, request: URL, output: URL, threads: Int) async throws -> CADNativeWorker.Reply {
-        var line = try JSONSerialization.data(withJSONObject: ["id": id, "request": request.path,
-                                                              "output": output.path, "threads": threads])
+        var line = try JSONEncoder().encode(Message(id: id, request: request.path, output: output.path, threads: threads))
         line.append(0x0A)
         return try await withCheckedThrowingContinuation { continuation in
             lock.lock()

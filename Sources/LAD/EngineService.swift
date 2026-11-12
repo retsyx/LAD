@@ -87,22 +87,17 @@ final class EngineService {
 
     private func buildModel(_ spec: ModelSpec, python: String, threads: Int, deferSTEP: Bool, validatedHash: String? = nil) async throws -> PreviewMesh {
         let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: deferSTEP, validatedHash: validatedHash) { folder in
-            var definition = spec
-            definition.sourceSTEP = nil
-            definition.sourceName = nil
-            definition.reorganizePartIDs = nil
-            definition.inputAssets = nil
-            var payload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(definition)) as! [String: Any]
+            var sourceAsset: String?
             if let source = spec.sourceSTEP {
                 try Self.validateSTEP(source)
                 try source.write(to: folder.appendingPathComponent("source.step"), options: .atomic)
-                payload["sourceAsset"] = "source.step"
+                sourceAsset = "source.step"
             }
+            var staged: [EngineWorkerRequest.InputAsset] = []
             if let assets = spec.inputAssets, !assets.isEmpty {
                 guard assets.count <= 256, Set(assets.map(\.id)).count == assets.count else {
                     throw LADError.message("The design contains too many or duplicate imported geometry inputs.")
                 }
-                var staged: [[String: String]] = []
                 for (index, asset) in assets.enumerated() {
                     guard CADInputAsset.supportedFormats.contains(asset.format), !asset.data.isEmpty,
                           asset.data.count <= ProjectStore.maximumSTEPBytes else {
@@ -110,19 +105,18 @@ final class EngineService {
                     }
                     let name = String(format: "input-%03d.%@", index, asset.format)
                     try asset.data.write(to: folder.appendingPathComponent(name), options: .atomic)
-                    staged.append(["id": asset.id, "name": asset.name, "format": asset.format, "path": name])
+                    staged.append(.init(id: asset.id, name: asset.name, format: asset.format, path: name))
                 }
-                payload["inputAssets"] = staged
             }
-            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+            try EngineWorkerRequest.build(title: spec.title, summary: spec.summary, units: spec.units, script: spec.script,
+                                          sourceAsset: sourceAsset, inputAssets: staged).write(to: folder)
         }
         return try await readPreview(output, deferSTEP: deferSTEP)
     }
 
     func runtimeInfo(python: String, threads: Int) async throws -> CADRuntime {
         let output = try await runNative(python: python, threads: threads, action: "inspect the CAD runtime") { folder in
-            try JSONSerialization.data(withJSONObject: ["operation": "runtime"])
-                .write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+            try EngineWorkerRequest.runtime.write(to: folder)
         }
         let data = try await Task.detached(priority: .userInitiated) {
             try EngineArtifact.read(output.folder.appendingPathComponent("result.json"), in: output.folder, maximumBytes: 65_536)
@@ -228,13 +222,10 @@ final class EngineService {
             if let cached = cachedSTEP(for: cacheKey) { return cached[0] }
             let source = try nativeSource(preview)
             let output = try await runNative(python: python, threads: threads, action: "export this design") { folder in
-                var payload = try Self.stageNative(source, into: folder)
-                payload["operation"] = "export"
-                if let selection { payload["solidIndices"] = selection }
-                if !transforms.isEmpty { payload["solidTransforms"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(transforms)) }
-                if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
-                if arrangeFor3DPrinting { payload["arrangeFor3DPrinting"] = true }
-                try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+                try EngineWorkerRequest.export(Self.stageNative(source, into: folder), .init(
+                    solidIndices: selection, solidTransforms: transforms,
+                    solidColors: colors.map { .init(solidIndex: $0.solidIndex, color: $0.color) },
+                    arrangeFor3DPrinting: arrangeFor3DPrinting)).write(to: folder)
             }
             let data = try await Task.detached(priority: .userInitiated) {
                 let data = try EngineArtifact.read(output.folder.appendingPathComponent("model.step"), in: output.folder,
@@ -280,14 +271,10 @@ final class EngineService {
         if let cached = cachedSTEP(for: cacheKey) { return cached }
         let source = try nativeSource(preview)
         let output = try await runNative(python: python, threads: threads, action: "export these design parts") { folder in
-            var payload = try Self.stageNative(source, into: folder)
-            payload["operation"] = "export"
-            payload["individualParts"] = parts
-            if let selection { payload["solidIndices"] = selection }
-            if !transforms.isEmpty { payload["solidTransforms"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(transforms)) }
-            if !colors.isEmpty { payload["solidColors"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(colors)) }
-            if arrangeFor3DPrinting { payload["arrangeFor3DPrinting"] = true }
-            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+            try EngineWorkerRequest.export(Self.stageNative(source, into: folder), .init(
+                solidIndices: selection, solidTransforms: transforms,
+                solidColors: colors.map { .init(solidIndex: $0.solidIndex, color: $0.color) },
+                arrangeFor3DPrinting: arrangeFor3DPrinting, individualParts: parts)).write(to: folder)
         }
         struct ExportedPart: Decodable { var path: String; var solidIndices: [Int] }
         struct ExportedParts: Decodable { var partFiles: [ExportedPart] }
@@ -378,11 +365,7 @@ final class EngineService {
         let records = try poses.map { try AssemblySolidTransform.validatedRecords($0, solidCount: preview.solids) }
         let source = try nativeSource(preview)
         let output = try await runNative(python: python, threads: threads, action: "check this motion") { folder in
-            var payload = try Self.stageNative(source, into: folder)
-            payload["operation"] = "clearance"
-            payload["pairs"] = pairs
-            payload["poses"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(records))
-            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+            try EngineWorkerRequest.clearance(Self.stageNative(source, into: folder), pairs: pairs, poses: records).write(to: folder)
         }
         struct Report: Decodable { var samples: [[Clearance]] }
         let report = try await Task.detached(priority: .userInitiated) {
@@ -411,12 +394,8 @@ final class EngineService {
         let records = try transforms.map { try AssemblySolidTransform.validatedRecords($0, solidCount: preview.solids) }
         let source = try nativeSource(preview)
         let output = try await runNative(python: python, threads: threads, action: "measure these items") { folder in
-            var payload = try Self.stageNative(source, into: folder)
-            payload["operation"] = "measure"
-            payload["features"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(features))
-            payload["solidIndices"] = solids.sorted()
-            if let records { payload["solidTransforms"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(records)) }
-            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+            try EngineWorkerRequest.measure(Self.stageNative(source, into: folder), features: features,
+                                            solidIndices: solids.sorted(), solidTransforms: records).write(to: folder)
         }
         let exact = try await Task.detached(priority: .userInitiated) {
             let data = try EngineArtifact.read(output.folder.appendingPathComponent("result.json"), in: output.folder, maximumBytes: 32_000_000)
@@ -444,12 +423,10 @@ final class EngineService {
         return NativeSource(url: URL(fileURLWithPath: path), validated: preview.validatedHash != nil, artifacts: artifacts)
     }
 
-    /// Stage a build's solid into a request and return the request fields that
-    /// name it. An APFS clone shares the file's blocks, so staging neither reads
-    /// a large solid into memory nor duplicates it on disk. The identity lets
-    /// the long-lived worker reuse the solid it already read; a solid the worker
-    /// validated when building is not checked again.
-    nonisolated private static func stageNative(_ source: NativeSource, into folder: URL) throws -> [String: Any] {
+    /// Stage a build's solid into a request and return the request's reference
+    /// to it. An APFS clone shares the file's blocks, so staging neither reads
+    /// a large solid into memory nor duplicates it on disk.
+    nonisolated private static func stageNative(_ source: NativeSource, into folder: URL) throws -> EngineWorkerRequest.NativeSource {
         try withExtendedLifetime(source.artifacts) {
             let marker = Data("DBRep_DrawableShape\n".utf8)
             guard let header = try? EngineArtifact.boundaries(source.url, in: source.url.deletingLastPathComponent(),
@@ -460,7 +437,7 @@ final class EngineService {
                 throw EngineExportError.nativeArtifactUnavailable
             }
         }
-        return ["brepAsset": "source.brep", "nativeIdentity": source.url.path, "validatedNative": source.validated]
+        return EngineWorkerRequest.NativeSource(identity: source.url.path, validated: source.validated)
     }
 
     /// Native requests run on the long-lived worker. They never cancel a build
