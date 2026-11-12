@@ -18,7 +18,7 @@ final class PartColorStorageTests: XCTestCase {
         XCTAssertEqual(restored.selectedRevisionID, original.selectedRevisionID)
         XCTAssertEqual(restored.messages, original.messages)
         XCTAssertEqual(restored.showGrid, false)
-        XCTAssertTrue(restored.revisions.allSatisfy { $0.preview == nil && $0.stepData == nil })
+        XCTAssertTrue(restored.revisions.allSatisfy { $0.preview == nil })
 
         let manifest = try archive(data)
         XCTAssertEqual((manifest["recentPartColors"] as? [[String: Any]])?.count, 3)

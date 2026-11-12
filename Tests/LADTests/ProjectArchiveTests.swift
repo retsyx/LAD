@@ -59,7 +59,7 @@ final class ProjectArchiveTests: XCTestCase {
         let example = try ProjectStore.read(from: file)
         XCTAssertEqual(example.revisions.count, 2)
         XCTAssertEqual(example.messages.count, 4)
-        XCTAssertTrue(example.revisions.allSatisfy { $0.preview == nil && $0.stepData == nil && !$0.model.script.isEmpty })
+        XCTAssertTrue(example.revisions.allSatisfy { $0.preview == nil && !$0.model.script.isEmpty })
         XCTAssertTrue(example.revisions.allSatisfy { $0.parts?.isEmpty == false })
         XCTAssertEqual(example.selectedRevisionID, example.revisions.last?.id)
     }
@@ -72,7 +72,7 @@ final class ProjectArchiveTests: XCTestCase {
         var value = project(attachments: [attachment])
         let model = program(text, sourceSTEP: step)
         value.revisions = (0..<2).map { index in
-            ProjectRevision(model: model, date: Date(timeIntervalSinceReferenceDate: Double(index)), stepData: step)
+            ProjectRevision(model: model, date: Date(timeIntervalSinceReferenceDate: Double(index)))
         }
         value.selectedRevisionID = value.revisions.last?.id
         let json = try archive(value)
@@ -96,8 +96,7 @@ final class ProjectArchiveTests: XCTestCase {
         let restored = try ProjectStore.decode(ProjectStore.encode(value))
         XCTAssertEqual(restored.messages, value.messages)
         XCTAssertEqual(restored.revisions.map(\.model), value.revisions.map(\.model))
-        XCTAssertTrue(restored.revisions.allSatisfy { $0.stepData == nil })
-    }
+        }
 
     func testRepeatedPCBReferencesKeepMetadataAndChangedBytesStoreSeparately() throws {
         let pcb = "(kicad_pcb (version 20240108) (general (thickness 1.6)))\n"
@@ -126,9 +125,9 @@ final class ProjectArchiveTests: XCTestCase {
         let firstModel = program("result = imported_model", sourceSTEP: imported)
         let secondModel = program("result = imported_model.translate((0, 0, 5))", sourceSTEP: imported)
         var value = project()
-        value.revisions = [ProjectRevision(model: .bracket, stepData: output),
-                           ProjectRevision(model: firstModel, stepData: output),
-                           ProjectRevision(model: secondModel, stepData: output)]
+        value.revisions = [ProjectRevision(model: .bracket),
+                           ProjectRevision(model: firstModel),
+                           ProjectRevision(model: secondModel)]
         value.selectedRevisionID = value.revisions.last?.id
         let json = try archive(value)
         let assets = try XCTUnwrap(json["assets"] as? [String: String])
@@ -141,8 +140,7 @@ final class ProjectArchiveTests: XCTestCase {
         let restored = try ProjectStore.decode(ProjectStore.encode(value))
         XCTAssertEqual(restored.revisions.map(\.model), value.revisions.map(\.model))
         XCTAssertEqual(restored.messages, value.messages)
-        XCTAssertTrue(restored.revisions.allSatisfy { $0.stepData == nil })
-    }
+        }
 
     func testRejectsFormerArchiveVersions() throws {
         let json = try archive(project())
@@ -216,14 +214,14 @@ final class ProjectArchiveTests: XCTestCase {
         var wider = ModelSpec.bracket
         wider.script = wider.script.replacingOccurrences(of: "box(80, 50, 6", with: "box(100, 50, 6")
         let date = Date(timeIntervalSinceReferenceDate: 810_000_000.5)
-        var first = ProjectRevision(model: .bracket, date: date, preview: preview(parts: parts), stepData: step,
+        var first = ProjectRevision(model: .bracket, date: date, preview: preview(parts: parts),
                                    partLayout: originalLayout, hiddenSolids: [])
         first.parts = parts
         first.runtime = CADRuntime(python: "3.11.13", cadquery: "2.6.1", ocp: "7.8.1.1")
         // The second revision exercises extracting the semantic hierarchy from
         // a live preview before that derived preview is discarded.
         let second = ProjectRevision(model: wider, date: date.addingTimeInterval(5), preview: preview(parts: parts),
-                                    stepData: step + Data("\n".utf8), partLayout: editedLayout, hiddenSolids: [0])
+                                    partLayout: editedLayout, hiddenSolids: [0])
         var value = project()
         value.revisions = [first, second]
         value.selectedRevisionID = second.id
@@ -244,7 +242,6 @@ final class ProjectArchiveTests: XCTestCase {
         XCTAssertEqual(restored.revisions.map(\.date), value.revisions.map(\.date))
         XCTAssertEqual(restored.revisions.map(\.runtime), value.revisions.map(\.runtime))
         XCTAssertEqual(restored.revisions.map(\.model), value.revisions.map(\.model))
-        XCTAssertTrue(restored.revisions.allSatisfy { $0.stepData == nil })
         XCTAssertTrue(restored.revisions.allSatisfy { $0.preview == nil })
         XCTAssertEqual(restored.revisions.map(\.parts), [parts, parts])
         XCTAssertEqual(restored.revisions.map(\.partLayout), [originalLayout, editedLayout])
@@ -253,13 +250,11 @@ final class ProjectArchiveTests: XCTestCase {
         XCTAssertEqual(restored.revisions.map(\.hiddenSolids), [[], [0]])
         XCTAssertEqual(value.revisions[0].preview?.stepPath, "/tmp/old-display-cache/model.step")
         XCTAssertEqual(value.revisions[0].preview?.vertices.count, 4, "Saving must not remove the live display cache")
-        XCTAssertEqual(value.revisions[0].stepData, step, "Saving must not remove live export bytes")
     }
 
     func testUnnamedLiveModelKeepsGenericPartOwnershipWhenPreviewIsDropped() throws {
         var value = project()
         value.revisions[0].preview = preview(parts: nil)
-        value.revisions[0].stepData = step
         value.revisions[0].hiddenSolids = [0]
         let restored = try ProjectStore.decode(ProjectStore.encode(value))
         let expected = [PartNode(id: "solid/0", name: "Part 1", solidIndices: [0])]
@@ -324,8 +319,7 @@ final class ProjectArchiveTests: XCTestCase {
     }
 
     func testRejectsInlineFilePayloadsAndDerivedDisplayFields() throws {
-        var value = project(attachments: [source("source text")])
-        value.revisions[0].stepData = step
+        let value = project(attachments: [source("source text")])
         let json = try archive(value)
         let corruptions: [(inout [String: Any]) throws -> Void] = [
             { json in try self.updateAttachment(&json) { $0["content"] = "inline source" } },
@@ -404,8 +398,7 @@ final class ProjectArchiveTests: XCTestCase {
         XCTAssertEqual(restored.messages.count, referenceCount)
         XCTAssertTrue(restored.revisions.allSatisfy { $0.model.sourceSTEP == payload && $0.model.script == model.script })
         XCTAssertTrue(restored.messages.allSatisfy { $0.attachments == [attachment] })
-        XCTAssertTrue(restored.revisions.allSatisfy { $0.stepData == nil })
-    }
+        }
 
     func testArchiveEnvelopeCanContainMaximumGeometryInputAndMetadata() {
         let encodedInputBytes = ((ProjectStore.maximumSTEPBytes + 2) / 3) * 4

@@ -954,7 +954,6 @@ enum ProjectPackage {
                 }
             }
             if result.revisions[index].preview != nil { result.revisions[index].preview = nil }
-            if result.revisions[index].stepData != nil { result.revisions[index].stepData = nil }
         }
         for task in result.taskAudits?.indices ?? 0..<0 {
             for event in result.taskAudits![task].events.indices where result.taskAudits![task].events[event].imageData != nil {

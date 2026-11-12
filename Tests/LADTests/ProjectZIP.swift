@@ -1,5 +1,6 @@
 import Foundation
 import zlib
+@testable import LAD
 
 /// A portable, single-entry ZIP container. Decompression stays in memory; no
 /// archive-controlled paths are ever extracted to disk.

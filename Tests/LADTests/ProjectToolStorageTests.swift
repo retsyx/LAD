@@ -17,7 +17,7 @@ final class ProjectToolStorageTests: XCTestCase {
                                          input: text, output: text, durationSeconds: 0.4)
         let audit = ProjectTaskAudit(userMessageID: user.id, model: "test-model", reasoningEffort: "high",
                                      status: "completed", events: [event])
-        let revisions = [ProjectRevision(model: model, stepData: step), ProjectRevision(model: model, stepData: step)]
+        let revisions = [ProjectRevision(model: model), ProjectRevision(model: model)]
         let project = LADProject(messages: [user], revisions: revisions, selectedRevisionID: revisions.last?.id, taskAudits: [audit])
         let encoded = try ProjectStore.encode(project)
         let manifest = try manifest(encoded)
@@ -43,7 +43,7 @@ final class ProjectToolStorageTests: XCTestCase {
         let restored = try ProjectStore.decode(encoded)
         XCTAssertEqual(restored.taskAudits, [audit])
         XCTAssertEqual(restored.revisions.map(\.model), revisions.map(\.model))
-        XCTAssertTrue(restored.revisions.allSatisfy { $0.preview == nil && $0.stepData == nil })
+        XCTAssertTrue(restored.revisions.allSatisfy { $0.preview == nil })
     }
 
     func testAuditKeepsLongCompleteOutputsAndDistinguishesEmptyFromMissingText() throws {

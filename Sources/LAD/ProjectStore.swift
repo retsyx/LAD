@@ -9,23 +9,8 @@ enum ProjectStore {
     static let maximumActivityTextBytes = 256_000_000
     private static let coordinateLimit = 1_000_000.0
 
-    static func encode(_ project: LADProject) throws -> Data {
-        try validate(project)
-        let data = try ProjectZIP.encode(ProjectArchive.encode(project))
-        guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 1,024 MB design limit.") }
-        return data
-    }
-
-    static func decode(_ data: Data) throws -> LADProject {
-        guard data.count <= maximumFileBytes else { throw invalid("File exceeds the 1,024 MB design limit.") }
-        let payload = ProjectZIP.isZIP(data) ? try ProjectZIP.decode(data) : data
-        let project = try ProjectArchive.decode(payload)
-        try validate(project)
-        return project
-    }
-
-    /// Disk documents are directory packages only. The Data codec above is an
-    /// internal snapshot codec and is never an opening compatibility fallback.
+    /// Disk documents are directory packages only. The former single-file
+    /// archive codec lives with the tests and the development converter.
     static func read(from url: URL, caching: Bool = true) throws -> LADProject {
         try ProjectPackage.read(from: url, caching: caching)
     }
@@ -156,7 +141,7 @@ enum ProjectStore {
                 }
             }
             if let previous = oldRevisions[revision.id], ProjectPackage.sameRevision(revision, previous),
-               revision.preview == nil, revision.stepData == nil { continue }
+               revision.preview == nil { continue }
             try validateRevision(revision)
         }
     }
@@ -180,7 +165,6 @@ enum ProjectStore {
             }) else { throw invalid("The saved assembly positions are invalid.") }
         }
         if let preview = revision.preview { try validatePreview(preview) }
-        if let step = revision.stepData { try validateSTEP(step) }
         let parts = revision.parts ?? revision.preview?.parts
         let indices = parts?.flatMap(\.allSolidIndices) ?? []
         guard indices.allSatisfy({ (0..<4_096).contains($0) }) else { throw invalid("The saved parts contain invalid solid indices.") }

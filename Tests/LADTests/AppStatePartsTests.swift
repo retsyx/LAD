@@ -220,7 +220,6 @@ final class AppStatePartsTests: XCTestCase {
         state.selectedRevisionID = revision.id
 
         XCTAssertTrue(state.loadStoredRevision())
-        XCTAssertNil(state.revisions[0].stepData)
         XCTAssertEqual(state.mesh?.brepPath, preview.brepPath)
         XCTAssertEqual(state.mesh?.stepPath, "")
         XCTAssertFalse(state.isWorking)
@@ -260,7 +259,6 @@ final class AppStatePartsTests: XCTestCase {
         XCTAssertEqual(state.hiddenSolids, [0])
         XCTAssertEqual(state.revisions.count, 2)
         XCTAssertEqual(state.messages, history)
-        XCTAssertTrue(state.revisions.allSatisfy { $0.stepData == nil })
         XCTAssertNil(state.saveStatus)
     }
 

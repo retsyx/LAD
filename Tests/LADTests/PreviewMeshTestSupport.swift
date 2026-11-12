@@ -100,3 +100,24 @@ extension CADStrokeGeometry {
         make(try! prepare(segments, surfaces: surfaces), color: color, viewportHeight: viewportHeight)
     }
 }
+
+extension CADStrokeSurface {
+    /// Fixtures are never canceled.
+    static func matching(_ mesh: PreviewMesh) -> [CADStrokeSurface] { try! matchingCancellable(mesh) }
+}
+
+extension EngineService {
+    /// Re-import STEP output for verification, without a generated program.
+    func previewSTEP(_ stepData: Data, parts: [PartNode]?, python: String, threads: Int) async throws -> PreviewMesh {
+        let output = try await run(python: python, threads: threads, scriptMode: false, action: "regenerate this design’s preview") { folder in
+            try Self.validateSTEP(stepData)
+            try stepData.write(to: folder.appendingPathComponent("preview.step"), options: .atomic)
+            var payload: [String: Any] = ["operation": "preview", "stepAsset": "preview.step"]
+            if let parts {
+                payload["parts"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(parts))
+            }
+            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
+        }
+        return try await readPreview(output, deferSTEP: false)
+    }
+}

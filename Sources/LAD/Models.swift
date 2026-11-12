@@ -189,7 +189,6 @@ struct ProjectRevision: Codable, Sendable, Identifiable {
     var model: ModelSpec
     var date = Date()
     var preview: PreviewMesh? = nil
-    var stepData: Data? = nil
     var partLayout: PartLayout? = nil
     var hiddenSolids: [Int]? = nil
     /// Stable default hierarchy, independent of the regenerable display mesh.

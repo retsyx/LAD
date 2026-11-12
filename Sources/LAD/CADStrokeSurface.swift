@@ -9,15 +9,8 @@ struct CADStrokeSurface: Sendable {
     /// Match coordinates instead of mesh indices: OpenCascade duplicates
     /// vertices at face boundaries and supplies already located world points.
     /// Only requested segments enter the lookup; each triangle is visited once.
-    static func matching(_ mesh: PreviewMesh) -> [CADStrokeSurface] {
-        matching(mesh, checkCancellation: {})
-    }
-
     static func matchingCancellable(_ mesh: PreviewMesh) throws -> [CADStrokeSurface] {
-        try matching(mesh, checkCancellation: { try Task.checkCancellation() })
-    }
-
-    private static func matching(_ mesh: PreviewMesh, checkCancellation: () throws -> Void) rethrows -> [CADStrokeSurface] {
+        func checkCancellation() throws { try Task.checkCancellation() }
         try checkCancellation()
         let segmentCount = mesh.edgeSegmentCount, triangleCount = mesh.triangleCount
         var result = [CADStrokeSurface](repeating: CADStrokeSurface(), count: segmentCount)

@@ -78,7 +78,7 @@ final class CADAgentVersionToolsTests: XCTestCase {
                                   volume: 1, area: 6, solids: 1, faces: 6, buildSeconds: 0, threads: 1,
                                   stepPath: "/private/derived-preview.step", parts: [part], brepPath: "/private/derived-cache.brep")
         var revision = ProjectRevision(model: model("Historical", script: program, source: source, assets: [asset]),
-                                       preview: preview, stepData: Data("never stage generated STEP".utf8),
+                                       preview: preview,
                                        partLayout: PartLayout(nodes: [part]), hiddenSolids: [0],
                                        runtime: CADRuntime(python: "3.12", cadquery: "2.6", ocp: "7.8"), name: "Before")
         revision.jointPositions = ["hinge": 42]

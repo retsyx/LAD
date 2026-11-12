@@ -13,7 +13,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         let fixture = try await Fixture()
         defer { fixture.cleanUp() }
         let parts = try XCTUnwrap(fixture.preview.parts)
-        let revision = ProjectRevision(model: fixture.model, preview: fixture.preview, stepData: fixture.staleSTEP,
+        let revision = ProjectRevision(model: fixture.model, preview: fixture.preview,
             partLayout: PartLayout(nodes: parts), parts: parts, partColors: ["first": red, "second": blue])
         fixture.state.revisions = [revision]
         fixture.state.selectedRevisionID = revision.id
@@ -46,7 +46,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         var layout = PartLayout(nodes: parts)
         try layout.rename("first", to: "Base")
         try layout.rename("second", to: "Lid")
-        let revision = ProjectRevision(model: fixture.model, preview: fixture.preview, stepData: fixture.staleSTEP,
+        let revision = ProjectRevision(model: fixture.model, preview: fixture.preview,
             partLayout: layout, parts: parts, partColors: ["first": red, "second": blue])
         fixture.state.revisions = [revision]
         fixture.state.selectedRevisionID = revision.id
@@ -100,7 +100,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
             volume: fixture.preview.volume, area: fixture.preview.area, solids: fixture.preview.solids,
             faces: fixture.preview.faces, buildSeconds: 0, threads: 2,
             stepPath: fixture.directory.appendingPathComponent("unregistered.step").path, parts: savedParts)
-        let revision = ProjectRevision(model: fixture.model, preview: cached, stepData: fixture.staleSTEP,
+        let revision = ProjectRevision(model: fixture.model, preview: cached,
             partLayout: layout, parts: savedParts, partColors: ["first": red, "second": blue])
         fixture.state.revisions = [revision]
         fixture.state.selectedRevisionID = revision.id
@@ -123,7 +123,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         let fixture = try await Fixture()
         defer { fixture.cleanUp() }
         let parts = try XCTUnwrap(fixture.preview.parts)
-        let revision = ProjectRevision(model: fixture.model, preview: fixture.preview, stepData: fixture.staleSTEP,
+        let revision = ProjectRevision(model: fixture.model, preview: fixture.preview,
             partLayout: PartLayout(nodes: parts), parts: parts, partColors: ["first": red, "second": green])
         fixture.state.revisions = [revision]
         fixture.state.selectedRevisionID = revision.id
@@ -189,7 +189,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
             volume: fixture.preview.volume, area: fixture.preview.area, solids: count, faces: fixture.preview.faces,
             buildSeconds: 0, threads: 2, stepPath: fixture.directory.appendingPathComponent("unregistered.step").path,
             parts: savedParts)
-        let revision = ProjectRevision(model: fixture.model, preview: cachedPreview, stepData: fixture.staleSTEP,
+        let revision = ProjectRevision(model: fixture.model, preview: cachedPreview,
             partLayout: PartLayout(nodes: savedParts),
             parts: savedParts, partColors: ["first": red, "second": blue])
         fixture.state.revisions = [revision]

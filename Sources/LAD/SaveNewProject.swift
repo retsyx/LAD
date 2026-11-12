@@ -28,7 +28,6 @@ enum SaveNewProject {
         if revision.partLayout == nil { revision.partLayout = revision.parts.map { PartLayout(nodes: $0) } }
         revision.runtime = revision.runtime ?? revision.preview?.runtime
         revision.preview = nil
-        revision.stepData = nil
         return LADProject(messages: [], revisions: [revision], selectedRevisionID: revision.id,
                           projectID: UUID(), codexSettings: original.codexSettings,
                           projectName: original.projectName, showGrid: original.showGrid,

@@ -193,7 +193,7 @@ final class ProjectPackageTests: XCTestCase {
         let restored = try ProjectStore.read(from: url)
         XCTAssertEqual(restored.messages, value.messages)
         XCTAssertEqual(restored.revisions.map(\.model), value.revisions.map(\.model))
-        XCTAssertTrue(restored.revisions.allSatisfy { $0.preview == nil && $0.stepData == nil })
+        XCTAssertTrue(restored.revisions.allSatisfy { $0.preview == nil })
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.appendingPathComponent("recovery").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.appendingPathComponent("cache").path))
     }

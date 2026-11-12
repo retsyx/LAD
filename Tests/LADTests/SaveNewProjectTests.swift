@@ -52,7 +52,7 @@ final class SaveNewProjectTests: XCTestCase {
         ])]
         let layout = PartLayout(nodes: parts, collapsedNodeIDs: ["case"])
         let runtime = CADRuntime(python: "3.11.18", cadquery: "2.8.0", ocp: "7.9.3")
-        let historical = ProjectRevision(model: model, date: date(10), stepData: step,
+        let historical = ProjectRevision(model: model, date: date(10),
                                          partLayout: layout, hiddenSolids: [0], parts: parts, runtime: runtime,
                                          userMessageID: user.id, responseMessageID: response.id,
                                          partColors: ["base": PartColor(red: 0.2, green: 0.4, blue: 0.6)],
@@ -83,7 +83,6 @@ final class SaveNewProjectTests: XCTestCase {
         XCTAssertEqual(saved.partColors, historical.partColors)
         XCTAssertEqual(saved.runtime, runtime)
         XCTAssertEqual(saved.validatedHash, historical.validatedHash)
-        XCTAssertNil(saved.stepData)
         XCTAssertNil(saved.preview)
         XCTAssertEqual(restored.selectedRevisionID, historical.id)
         XCTAssertTrue(restored.messages.isEmpty)
@@ -101,7 +100,6 @@ final class SaveNewProjectTests: XCTestCase {
         XCTAssertEqual(original.selectedRevisionID, latest.id)
         XCTAssertEqual(original.revisions.count, 2)
         XCTAssertEqual(original.messages.count, 4)
-        XCTAssertNotNil(original.revisions[0].stepData)
         let manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectZIP.decode(ProjectStore.encode(snapshot))) as? [String: Any])
         let assets = try XCTUnwrap(manifest["assets"] as? [String: String])
         XCTAssertNil(assets[historicalSource.sha256])
@@ -138,7 +136,7 @@ final class SaveNewProjectTests: XCTestCase {
         ])]
         let layout = PartLayout(nodes: parts, collapsedNodeIDs: ["case"])
         let runtime = CADRuntime(python: "3.11.0", cadquery: "2.6.0", ocp: "7.8.1")
-        var latest = ProjectRevision(model: model, date: date(20), stepData: step + Data("/* derived */".utf8),
+        var latest = ProjectRevision(model: model, date: date(20),
                                     partLayout: layout, hiddenSolids: [0], parts: parts, runtime: runtime)
         latest.userMessageID = user.id
         latest.responseMessageID = response.id
@@ -166,7 +164,6 @@ final class SaveNewProjectTests: XCTestCase {
         XCTAssertEqual(saved.hiddenSolids, [0])
         XCTAssertEqual(saved.runtime, runtime)
         XCTAssertNil(saved.preview)
-        XCTAssertNil(saved.stepData)
         XCTAssertEqual(restored.codexSettings, settings)
         XCTAssertEqual(restored.projectName, "Workshop enclosure")
         XCTAssertEqual(restored.showGrid, false)
@@ -181,7 +178,6 @@ final class SaveNewProjectTests: XCTestCase {
         XCTAssertNil(assets[currentSource.sha256])
         XCTAssertNil(assets[digest(Data(oldModel.script.utf8))])
         XCTAssertEqual(original.messages.count, 5)
-        XCTAssertNotNil(original.revisions.last?.stepData)
     }
 
     func testEmptyProjectCannotBeSaved() {

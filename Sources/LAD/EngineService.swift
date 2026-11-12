@@ -171,21 +171,6 @@ final class EngineService {
         return MeshOutput(metadata: values.0, record: values.1, preview: preview, native: values.2, step: values.3)
     }
 
-    /// Prepare display data for an imported STEP source without evaluating a
-    /// generated CAD program.
-    func previewSTEP(_ stepData: Data, parts: [PartNode]?, python: String, threads: Int) async throws -> PreviewMesh {
-        let output = try await run(python: python, threads: threads, scriptMode: false, action: "regenerate this design’s preview") { folder in
-            try Self.validateSTEP(stepData)
-            try stepData.write(to: folder.appendingPathComponent("preview.step"), options: .atomic)
-            var payload: [String: Any] = ["operation": "preview", "stepAsset": "preview.step"]
-            if let parts {
-                payload["parts"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(parts))
-            }
-            try JSONSerialization.data(withJSONObject: payload).write(to: folder.appendingPathComponent("request.json"), options: .atomic)
-        }
-        return try await readPreview(output, deferSTEP: false)
-    }
-
     /// Export an already built native solid, with no program replay or meshing.
     /// Repeated exports reuse bytes only for the same geometry, subset, RGB and arrangement.
     func exportSTEP(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, solidColors: [Int: PartColor] = [:],
@@ -494,7 +479,7 @@ final class EngineService {
         return RunResult(artifacts: artifacts, token: UUID())
     }
 
-    nonisolated private static func validateSTEP(_ data: Data) throws {
+    nonisolated static func validateSTEP(_ data: Data) throws {
         try validateSTEP(size: data.count, header: data.prefix(512), footer: data.suffix(512))
     }
 
@@ -506,13 +491,13 @@ final class EngineService {
         }
     }
 
-    private struct RunResult: Sendable {
+    struct RunResult: Sendable {
         var artifacts: EngineBuildArtifacts
         var token: UUID
         var folder: URL { artifacts.folder }
     }
 
-    private func run(python: String, threads: Int, scriptMode: Bool, deferSTEP: Bool = false, validatedHash: String? = nil,
+    func run(python: String, threads: Int, scriptMode: Bool, deferSTEP: Bool = false, validatedHash: String? = nil,
                      action: String = "build this design",
                      prepare: @escaping @Sendable (URL) throws -> Void) async throws -> RunResult {
         try Task.checkCancellation()
@@ -580,7 +565,7 @@ final class EngineService {
         return RunResult(artifacts: artifacts, token: token)
     }
 
-    private func readPreview(_ output: RunResult, deferSTEP: Bool) async throws -> PreviewMesh {
+    func readPreview(_ output: RunResult, deferSTEP: Bool) async throws -> PreviewMesh {
         let folder = output.folder, artifacts = output.artifacts
         let resultURL = folder.appendingPathComponent("result.json")
         let decoding = Task.detached(priority: .userInitiated) {

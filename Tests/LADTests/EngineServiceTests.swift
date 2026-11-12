@@ -241,7 +241,6 @@ final class EngineServiceTests: XCTestCase {
             let saved = try XCTUnwrap(ProjectStore.decode(ProjectStore.encode(project)).revisions.first)
             XCTAssertEqual(saved.model.script, spec.script)
             XCTAssertNil(saved.preview)
-            XCTAssertNil(saved.stepData)
             let replay = try await engine.buildPreview(saved.model, python: EngineService.defaultPython, threads: 2,
                                                       validatedHash: saved.validatedHash)
             XCTAssertEqual(replay.validatedHash, receipt)

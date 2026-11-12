@@ -25,7 +25,6 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertNil(restored.revisions[1].preview)
         XCTAssertEqual(restored.revisions[1].partLayout, layout)
         XCTAssertEqual(restored.revisions[1].hiddenSolids, [0])
-        XCTAssertNil(restored.revisions[1].stepData)
         XCTAssertEqual(restored.messages, value.messages)
         XCTAssertEqual(restored.revisions[0].partLayout?.nodes, restored.revisions[0].parts)
         XCTAssertNil(restored.revisions[0].preview?.parts)
@@ -86,8 +85,8 @@ final class ProjectStoreTests: XCTestCase {
         var wider = ModelSpec.bracket
         wider.title = "Wide bracket"
         wider.script = wider.script.replacingOccurrences(of: "box(80, 50, 6", with: "box(100, 50, 6")
-        let revisions = [ProjectRevision(model: .bracket, date: date, preview: preview(), stepData: step),
-                         ProjectRevision(model: wider, date: date.addingTimeInterval(4), preview: preview(), stepData: step + Data("\n".utf8))]
+        let revisions = [ProjectRevision(model: .bracket, date: date, preview: preview()),
+                         ProjectRevision(model: wider, date: date.addingTimeInterval(4), preview: preview())]
         return LADProject(messages: messages, revisions: revisions, selectedRevisionID: revisions[1].id)
     }
 
@@ -108,7 +107,6 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertEqual(restored.revisions.map(\.date), original.revisions.map(\.date))
         XCTAssertEqual(restored.revisions.map(\.model), original.revisions.map(\.model))
         for actual in restored.revisions {
-            XCTAssertNil(actual.stepData, "Generated STEP bytes must not be stored in the project.")
             XCTAssertNil(actual.preview, "Derived display data must not be stored in the project.")
             XCTAssertEqual(actual.parts?.flatMap(\.allSolidIndices), [0])
         }
@@ -127,14 +125,11 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertTrue(try file.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true)
         XCTAssertEqual(try JSONSerialization.jsonObject(with: ProjectStore.readArchive(from: file)) as? [String: Any] != nil, true)
         let restored = try ProjectStore.read(from: file)
-        XCTAssertNil(restored.revisions.last?.stepData)
         var withoutGeometry = original
         withoutGeometry.revisions[0].preview = nil
-        withoutGeometry.revisions[0].stepData = nil
         withoutGeometry.revisions[1].preview?.triangleSolids = nil
         let decoded = try roundtrip(withoutGeometry)
         XCTAssertNil(decoded.revisions[0].preview)
-        XCTAssertNil(decoded.revisions[0].stepData)
         XCTAssertNil(decoded.revisions[1].preview?.triangleSolids)
     }
 
@@ -161,8 +156,7 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertEqual(restored.formatVersion, 1)
         XCTAssertEqual(restored.messages, original.messages)
         XCTAssertEqual(restored.revisions.map(\.id), original.revisions.map(\.id))
-        XCTAssertTrue(restored.revisions.allSatisfy { $0.stepData == nil })
-    }
+        }
 
     func testRejectsFormerInlineDocumentInsteadOfRestoringIt() throws {
         let bytes = try JSONEncoder().encode(project())
@@ -228,14 +222,6 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertNoThrow(try roundtrip(value))
     }
 
-    func testRejectsMalformedSessionSTEPAssets() throws {
-        var value = project()
-        value.revisions[0].stepData = Data("This is not STEP geometry".utf8)
-        XCTAssertThrowsError(try ProjectStore.encode(value))
-        value = project(); value.revisions[0].stepData = Data("ISO-10303-21;\ntruncated".utf8)
-        XCTAssertThrowsError(try ProjectStore.encode(value))
-    }
-
     func testRejectsOversizeFileBeforeReadingItsContents() throws {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-oversize-\(UUID()).lad")
         FileManager.default.createFile(atPath: file.path, contents: nil)
@@ -298,7 +284,6 @@ final class ProjectStoreTests: XCTestCase {
         original.revisions[1].model = ModelSpec(title: "Lofted adapter", summary: "A loft between a rectangular base and circular top.", units: "mm", script: program)
         let restored = try roundtrip(original)
         XCTAssertEqual(restored.revisions[1].model.script, program)
-        XCTAssertNil(restored.revisions[1].stepData)
         XCTAssertEqual(restored.revisions[0].model, .bracket)
         XCTAssertFalse(restored.revisions[0].model.script.isEmpty)
     }
@@ -348,8 +333,6 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertEqual(restored.revisions.map(\.model), original.revisions.map(\.model))
         XCTAssertEqual(restored.revisions.map { $0.model.sourceSTEP }, [step, step])
         XCTAssertEqual(restored.revisions.map { $0.model.sourceName }, ["controller.kicad_pcb", "controller.kicad_pcb"])
-        XCTAssertNil(restored.revisions[1].stepData)
-        XCTAssertNotEqual(restored.revisions[1].model.sourceSTEP, restored.revisions[1].stepData)
 
         // A program may retain source provenance without an imported STEP input.
         var metadataOnly = project()

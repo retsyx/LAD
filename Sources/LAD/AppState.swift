@@ -1904,7 +1904,7 @@ final class AppState {
                     let hiddenIDs = Set(migrated.nodes.flatMap(\.flattened).filter {
                         !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: oldHidden)
                     }.map(\.id))
-                    revisions[index].preview = preview; revisions[index].stepData = nil
+                    revisions[index].preview = preview
                     revisions[index].validatedHash = preview.validatedHash
                     if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
                     revisions[index].parts = defaults
@@ -2113,7 +2113,6 @@ final class AppState {
                 }
                 guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
                       !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
-                revisions[index].stepData = nil
                 let writing = Task.detached(priority: .userInitiated) {
                     try Task.checkCancellation()
                     if exportIndividualParts {
@@ -2420,7 +2419,6 @@ final class AppState {
         revisions[index].preview = preview
         revisions[index].validatedHash = preview.validatedHash
         if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
-        revisions[index].stepData = nil
         mesh = preview; builtRevisionID = revisions[index].id
         hiddenSolids = restored.hidden; selectedSolids = restored.selected
         selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: selectedPartNodeIDs, in: partTree)

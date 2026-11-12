@@ -474,7 +474,7 @@ enum ProjectArchive {
                                           sourceName: model.sourceName, reorganizePartIDs: model.reorganizePartIDs,
                                           inputAssets: try inputAssets?.map { try $0.restored(reader: &reader) })
             var revision = ProjectRevision(id: id, model: restoredModel, date: date,
-                                          preview: nil, stepData: nil, partLayout: partLayout,
+                                          preview: nil, partLayout: partLayout,
                                           hiddenSolids: hiddenSolids)
             revision.parts = parts
             revision.runtime = runtime

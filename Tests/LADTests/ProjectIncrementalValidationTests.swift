@@ -80,8 +80,7 @@ final class ProjectIncrementalValidationTests: XCTestCase {
             { $0.parts![0].solidIndices = [-1] },
             { $0.partLayout = PartLayout(nodes: [PartNode(id: "body", name: "Body", solidIndices: [0])], collapsedNodeIDs: ["body"]) },
             { $0.hiddenSolids = [1] },
-            { $0.name = "invalid\nname" },
-            { $0.stepData = Data("invalid STEP".utf8) }
+            { $0.name = "invalid\nname" }
         ]
         for corrupt in corruptions {
             var changed = previous
