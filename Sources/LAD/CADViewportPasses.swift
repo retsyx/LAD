@@ -8,6 +8,7 @@ import simd
 enum CADViewportCategory {
     static let faces = 1
     static let decorations = 2
+    /// Opaque highlight fills of highlighted faces.
     static let featureFaces = 4
     /// Translucent mode's depth-only copies of each solid's faces.
     static let visibility = 8
@@ -15,10 +16,13 @@ enum CADViewportCategory {
     static let revealage = 16
     /// The geometry-free node that records each frame's camera matrices.
     static let probe = 32
+    /// Translucent mode's highlight fills, which replace a highlighted face's
+    /// share of the accumulated face color.
+    static let featureAccumulation = 64
 
     static let opaqueScene = faces | decorations | featureFaces | probe
-    static let translucentDecorations = visibility | decorations | featureFaces | probe
-    static let translucentAccumulation = faces
+    static let translucentDecorations = visibility | decorations | probe
+    static let translucentAccumulation = faces | featureAccumulation
     static let translucentRevealage = revealage
 }
 

@@ -144,6 +144,12 @@ final class CADSceneView: NSView {
     #pragma body
     _output.color.a = 1.0;
     """
+    /// Removes exactly what `translucentFragment` adds for the same shading.
+    private static let translucentRemovalFragment = """
+    #pragma opaque
+    #pragma body
+    _output.color *= \(-CADTranslucency.alpha);
+    """
     /// Each translucent face layer multiplies the remaining transmittance.
     private static let revealageFragment = """
     #pragma body
@@ -691,20 +697,16 @@ final class CADSceneView: NSView {
     static func translucentCopy(of geometry: SCNGeometry, category: Int, visible: Bool) -> SCNNode {
         let copy = SCNGeometry(sources: geometry.sources, elements: geometry.elements)
         let material = SCNMaterial()
+        material.lightingModel = .constant
         material.isDoubleSided = true
         if category == CADViewportCategory.visibility {
-            // Nearest solid depth belongs only to ordinary decorations. Highlighted
-            // face overlays test against it at equal depth, so this copy shares
-            // their lighting model and SceneKit's vertex transform; a constant
-            // material rasterizes slightly different depths, which fight.
-            material.lightingModel = .physicallyBased
+            // Nearest solid depth belongs only to ordinary decorations.
             material.colorBufferWriteMask = []
             material.writesToDepthBuffer = true
             material.readsFromDepthBuffer = true
         } else {
             // Multiplicative transmittance is independent of draw order and
             // never rejected by depth.
-            material.lightingModel = .constant
             material.shaderModifiers = [.fragment: Self.revealageFragment]
             material.blendMode = .multiply
             material.writesToDepthBuffer = false
@@ -714,6 +716,27 @@ final class CADSceneView: NSView {
         let node = SCNNode(geometry: copy)
         node.categoryBitMask = category
         node.isHidden = !visible
+        return node
+    }
+
+    private static let translucentFillName = "translucentFill"
+    private static let translucentRemovalName = "translucentRemoval"
+
+    /// A highlighted face's translucent fill. Translucent mode replaces the
+    /// face's share of the accumulated color: the fill adds its highlight
+    /// shading and the removal copy subtracts its part's shading, leaving the
+    /// rest of the part and all transmittance unchanged. Both share the
+    /// overlay's geometry buffers and draw only in the accumulation pass.
+    private static func translucentFeatureCopy(of geometry: SCNGeometry, shadedAs source: SCNMaterial, removal: Bool) -> SCNNode {
+        let copy = SCNGeometry(sources: geometry.sources, elements: geometry.elements)
+        let material = (source.copy() as? SCNMaterial) ?? SCNMaterial()
+        material.fillMode = .fill
+        configureFaceMaterial(material, translucent: true)
+        if removal { material.shaderModifiers = [.fragment: translucentRemovalFragment] }
+        copy.materials = [material]
+        let node = SCNNode(geometry: copy)
+        node.name = removal ? translucentRemovalName : translucentFillName
+        node.categoryBitMask = CADViewportCategory.featureAccumulation
         return node
     }
 
@@ -864,6 +887,11 @@ final class CADSceneView: NSView {
                 node.renderingOrder = 3
                 node.isHidden = true
                 node.simdTransform = ViewportRigidTransform.sceneMatrix(solidMatrices[feature.solidIndex] ?? matrix_identity_double4x4)
+                if let overlay = geometry.firstMaterial,
+                   let part = solidNodes[feature.solidIndex]?.geometry?.firstMaterial {
+                    node.addChildNode(Self.translucentFeatureCopy(of: geometry, shadedAs: overlay, removal: false))
+                    node.addChildNode(Self.translucentFeatureCopy(of: geometry, shadedAs: part, removal: true))
+                }
                 featureNode.addChildNode(node)
                 featureNodes[feature] = node
                 featureMasks[feature] = mask
@@ -897,7 +925,9 @@ final class CADSceneView: NSView {
         for (feature, node) in featureNodes {
             let isSelected = selected.contains(feature)
             if featureSelectionStyles[feature] != isSelected {
-                node.geometry?.firstMaterial?.diffuse.contents = isSelected ? Self.selectionColor : Self.hoveredFeatureColor
+                let color = isSelected ? Self.selectionColor : Self.hoveredFeatureColor
+                node.geometry?.firstMaterial?.diffuse.contents = color
+                node.childNode(withName: Self.translucentFillName, recursively: false)?.geometry?.firstMaterial?.diffuse.contents = color
                 featureSelectionStyles[feature] = isSelected
                 changed = true
             }
@@ -1096,6 +1126,7 @@ final class CADSceneView: NSView {
             node.geometry?.firstMaterial?.readsFromDepthBuffer = mode != .wireframe
             node.geometry?.firstMaterial?.transparency = translucent ? 0.8 : 1
         }
+        var restyled = Set<Int>()
         for node in modelNode.childNodes {
             guard let solid = solidIndex(of: node) else { continue }
             let selected = selectedSolids.contains(solid)
@@ -1122,6 +1153,15 @@ final class CADSceneView: NSView {
                 : assignedColor(for: solid) ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
             node.geometry?.firstMaterial?.emission.contents = selected && mode != .wireframe
                 ? NSColor(srgbRed: 0.12, green: 0.05, blue: 0.005, alpha: 1) : NSColor.black
+            restyled.insert(solid)
+        }
+        // A translucent fill removes exactly its part's current shading.
+        for (feature, node) in featureNodes where restyled.contains(feature.solidIndex) {
+            guard let part = solidNodes[feature.solidIndex]?.geometry?.firstMaterial,
+                  let removal = node.childNode(withName: Self.translucentRemovalName, recursively: false)?.geometry?.firstMaterial
+            else { continue }
+            removal.diffuse.contents = part.diffuse.contents
+            removal.emission.contents = part.emission.contents
         }
         return true
     }

@@ -103,19 +103,21 @@ final class ViewportTranslucencyTests: XCTestCase {
             "Selected gold PBR faces must remain translucent while preserving the enclosed part's custom color.")
     }
 
-    /// The highlighted face fill is depth-tested against the depth-only face
-    /// copies. Both must rasterize identical depths, or an obliquely viewed
-    /// surface shows blocky and fan-shaped gaps in its fill.
+    /// Translucent mode recolors a highlighted face exactly as whole-part
+    /// selection recolors its part: the rest of the part, everything behind
+    /// it and its transmittance stay unchanged, without depth fighting on an
+    /// obliquely viewed surface.
     @MainActor
-    func testSelectedFaceFillCoversAnObliqueTranslucentSurface() async throws {
+    func testHighlightedFaceIsTranslucentLikeASelectedPart() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let face = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0)
-        let preview = tessellatedPlate(divisions: 24)
+        let preview = plateOverSquare(divisions: 24)
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
         for projection in ViewportProjectionMode.allCases {
-            func capture(_ selected: [CADFeatureID]) async throws -> NSBitmapImageRep {
-                view.update(mesh: preview, mode: .translucent, grid: false, command: nil,
-                            selectedSolids: [], hiddenSolids: [], projection: projection, selectedFeatures: selected)
+            func capture(parts: Set<Int> = [], features: [CADFeatureID] = [], hidden: Set<Int> = [],
+                         colors: [Int: PartColor] = [1: PartColor(red: 0, green: 0, blue: 1)]) async throws -> NSBitmapImageRep {
+                view.update(mesh: preview, mode: .translucent, grid: false, command: nil, selectedSolids: parts,
+                            hiddenSolids: hidden, projection: projection, solidColors: colors, selectedFeatures: features)
                 let deadline = ContinuousClock.now + .seconds(10)
                 while view.isPreparingCaptureResources, ContinuousClock.now < deadline {
                     try await Task.sleep(for: .milliseconds(5))
@@ -127,24 +129,59 @@ final class ViewportTranslucencyTests: XCTestCase {
                 let png = try await CADAgentRenderer.capturePNG(view: view)
                 return try XCTUnwrap(NSBitmapImageRep(data: png))
             }
-            let plain = try await capture([])
-            let highlighted = try await capture([face])
-            var samples = 0, filled = 0
-            for v in stride(from: -1.8, through: 1.8, by: 0.06) {
-                for u in stride(from: -1.8, through: 1.8, by: 0.06) {
-                    let projected = view.projectPoint(SCNVector3(u, v, 0))
-                    let x = Int((CGFloat(projected.x) * CGFloat(plain.pixelsWide) / view.bounds.width).rounded(.down))
-                    let y = plain.pixelsHigh - 1 - Int((CGFloat(projected.y) * CGFloat(plain.pixelsHigh) / view.bounds.height).rounded(.down))
-                    guard x >= 0, y >= 0, x < plain.pixelsWide, y < plain.pixelsHigh,
-                          let before = plain.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
-                          let after = highlighted.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
-                    samples += 1
-                    if after.redComponent - after.blueComponent > before.redComponent - before.blueComponent + 0.2 { filled += 1 }
+            let plain = try await capture()
+            let part = try await capture(parts: [0])
+            let selected = try await capture(features: [face])
+            let recolored = try await capture(features: [face], colors: [0: PartColor(red: 0, green: 1, blue: 0),
+                                                                           1: PartColor(red: 0, green: 0, blue: 1)])
+            let uncovered = try await capture(features: [face], hidden: [1])
+            func pixel(_ image: NSBitmapImageRep, _ u: Double, _ v: Double, _ w: Double = 0) throws -> NSColor {
+                let projected = view.projectPoint(SCNVector3(u, v, w))
+                let x = Int((CGFloat(projected.x) * CGFloat(image.pixelsWide) / view.bounds.width).rounded(.down))
+                let y = image.pixelsHigh - 1 - Int((CGFloat(projected.y) * CGFloat(image.pixelsHigh) / view.bounds.height).rounded(.down))
+                return try XCTUnwrap(image.colorAt(x: min(max(x, 0), image.pixelsWide - 1),
+                                                   y: min(max(y, 0), image.pixelsHigh - 1))?.usingColorSpace(.sRGB))
+            }
+            func difference(_ a: NSColor, _ b: NSColor) -> CGFloat {
+                max(abs(a.redComponent - b.redComponent), abs(a.greenComponent - b.greenComponent),
+                    abs(a.blueComponent - b.blueComponent))
+            }
+            // Stay clear of the outlines along the plate's rim and the face boundary.
+            var faceSamples = 0, otherSamples = 0, behindSamples = 0
+            var unlike = 0, untinted = 0, recoloredUnlike = 0, changedOther = 0, hiddenBehind = 0
+            for v in stride(from: -1.7, through: 1.7, by: 0.06) {
+                for u in stride(from: -1.7, through: 1.7, by: 0.06) where abs(u) > 0.25 {
+                    let before = try pixel(plain, u, v), after = try pixel(selected, u, v)
+                    if u > 0 {
+                        otherSamples += 1
+                        if difference(before, after) > 0.02 { changedOther += 1 }
+                        continue
+                    }
+                    faceSamples += 1
+                    let whole = try pixel(part, u, v)
+                    if difference(after, whole) > 0.02 { unlike += 1 }
+                    if difference(try pixel(recolored, u, v), whole) > 0.02 { recoloredUnlike += 1 }
+                    if after.redComponent - after.blueComponent < before.redComponent - before.blueComponent + 0.05 { untinted += 1 }
                 }
             }
-            XCTAssertGreaterThan(samples, 2_000)
-            XCTAssertEqual(filled, samples,
-                "The \(projection) translucent face fill must cover the whole selected surface without depth fighting.")
+            // Points of the square part, seen through the selected face away
+            // from its outlines in both projections.
+            for v in stride(from: -0.4, through: 0.8, by: 0.05) {
+                for u in stride(from: -1.4, through: -0.7, by: 0.05) {
+                    behindSamples += 1
+                    if try pixel(selected, u, v, -0.6).blueComponent < pixel(uncovered, u, v, -0.6).blueComponent + 0.1 {
+                        hiddenBehind += 1
+                    }
+                }
+            }
+            XCTAssertGreaterThan(faceSamples, 600)
+            XCTAssertGreaterThan(otherSamples, 600)
+            XCTAssertGreaterThan(behindSamples, 300)
+            XCTAssertEqual(unlike, 0, "A \(projection) translucent face fill must match whole-part selection across the face.")
+            XCTAssertEqual(untinted, 0, "The \(projection) translucent face fill must visibly tint the whole face.")
+            XCTAssertEqual(recoloredUnlike, 0, "A part color change must keep the \(projection) face fill exact.")
+            XCTAssertEqual(changedOther, 0, "The part's other faces must keep their own \(projection) translucent color.")
+            XCTAssertEqual(hiddenBehind, 0, "A part behind the \(projection) face fill must remain visible through it.")
         }
     }
 
@@ -239,9 +276,10 @@ final class ViewportTranslucencyTests: XCTestCase {
                     triangleSolids: [0, 0, 1, 1])
     }
 
-    /// One planar face of a single solid, finely triangulated like a CAD plate.
-    private func tessellatedPlate(divisions: Int) -> PreviewMesh {
-        var vertices = [[Double]](), triangles = [[Int]]()
+    /// A finely triangulated plate whose halves are two planar faces, over a
+    /// smaller square part beneath the first face.
+    private func plateOverSquare(divisions: Int) -> PreviewMesh {
+        var vertices = [[Double]](), triangles = [[Int]](), faces = [Int]()
         for row in 0...divisions {
             for column in 0...divisions {
                 vertices.append([-2 + 4 * Double(column) / Double(divisions), -2 + 4 * Double(row) / Double(divisions), 0])
@@ -251,17 +289,26 @@ final class ViewportTranslucencyTests: XCTestCase {
             for column in 0..<divisions {
                 let corner = row * (divisions + 1) + column, above = corner + divisions + 1
                 triangles += [[corner, corner + 1, above + 1], [corner, above + 1, above]]
+                faces += Array(repeating: column < divisions / 2 ? 0 : 1, count: 2)
             }
         }
+        let square = vertices.count
+        vertices += [[-1.6, -1, -0.6], [-0.4, -1, -0.6], [-0.4, 1, -0.6], [-1.6, 1, -0.6]]
+        triangles += [[square, square + 1, square + 2], [square, square + 2, square + 3]]
+        faces += [2, 2]
+        let solids = Array(repeating: 0, count: triangles.count - 2) + [1, 1]
         var preview = PreviewMesh(vertices: vertices, triangles: triangles, edges: [],
-            bounds: [-2, -2, 0, 2, 2, 0], volume: 1, area: 16, solids: 1, faces: 1,
-            buildSeconds: 0, threads: 1, stepPath: "/tmp/viewport-translucency-plate.step",
-            triangleSolids: [Int](repeating: 0, count: triangles.count))
+            bounds: [-2, -2, -0.6, 2, 2, 0], volume: 1, area: 18.4, solids: 2, faces: 3,
+            buildSeconds: 0, threads: 1, stepPath: "/tmp/viewport-translucency-plate.step", triangleSolids: solids)
+        func face(_ solid: Int, _ local: Int, area: Double, center: [Double]) -> CADFace {
+            CADFace(id: CADFeatureID(kind: .face, solidIndex: solid, localIndex: local), type: "PLANE", area: area,
+                    center: center, normal: [0, 0, 1])
+        }
         preview.topology = CADTopology(vertices: [], edges: [], faces: [
-            CADFace(id: CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0), type: "PLANE", area: 16,
-                    center: [0, 0, 0], normal: [0, 0, 1])
+            face(0, 0, area: 8, center: [-1, 0, 0]), face(0, 1, area: 8, center: [1, 0, 0]),
+            face(1, 0, area: 2.4, center: [-1, 0, -0.6])
         ], parts: [])
-        preview.triangleFaces = [Int](repeating: 0, count: triangles.count)
+        preview.triangleFaces = faces
         return preview
     }
 
