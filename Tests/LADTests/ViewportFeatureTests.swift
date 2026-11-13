@@ -155,6 +155,59 @@ final class ViewportFeatureTests: XCTestCase {
     }
 
     @MainActor
+    func testRightClickingTheOnlySelectedFlatFaceOffersDXFExport() async throws {
+        let title = "Export as DXF…"
+        let view = try makeView()
+        view.update(mesh: mesh(), mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [0], hiddenSolids: [], selectedFeatures: [face])
+        try await waitForPreparation(view)
+        view.canExport = true
+        var exported = [CADFeatureID]()
+        view.onExportFaceDXF = { exported.append($0) }
+        func point(_ world: SCNVector3) -> NSPoint {
+            let projected = view.projectPoint(world)
+            return NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+        }
+        func menu(at point: NSPoint) throws -> NSMenu {
+            try XCTUnwrap(view.menu(for: XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: point,
+                modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))))
+        }
+        let center = point(SCNVector3(0, 0, 0))
+        let faceMenu = try menu(at: center)
+        let item = try XCTUnwrap(faceMenu.item(withTitle: title))
+        XCTAssertEqual(faceMenu.index(of: item), 0)
+        XCTAssertTrue(item.isEnabled, "Whole-part selections do not hide the single selected face's export.")
+        // The test runner has no NSApp to dispatch menu actions.
+        _ = (item.target as? NSObject)?.perform(try XCTUnwrap(item.action), with: item)
+        XCTAssertEqual(exported, [face])
+
+        let nearEdge = point(SCNVector3(0, -9.8, 0))
+        XCTAssertEqual(view.feature(at: nearEdge), edge)
+        XCTAssertNotNil(try menu(at: nearEdge).item(withTitle: title),
+                        "The face under the cursor decides, even where a click would pick its edge.")
+        XCTAssertNil(try menu(at: NSPoint(x: 4, y: 4)).item(withTitle: title))
+        view.canExport = false
+        XCTAssertFalse(try XCTUnwrap(menu(at: center).item(withTitle: title)).isEnabled)
+        view.canExport = true
+
+        for selection in [[], [edge], [face, vertex]] {
+            view.update(mesh: mesh(), mode: .edges, grid: false, command: nil,
+                        selectedSolids: [], hiddenSolids: [], selectedFeatures: selection)
+            XCTAssertNil(try menu(at: center).item(withTitle: title), "Selection: \(selection)")
+        }
+        var curved = mesh()
+        curved.stepPath = "/tmp/viewport-native-curved-face"
+        curved.topology?.faces[0].type = "CYLINDER"
+        curved.topology?.faces[0].normal = nil
+        view.update(mesh: curved, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [], selectedFeatures: [face])
+        try await waitForPreparation(view)
+        XCTAssertFalse(try XCTUnwrap(menu(at: center).item(withTitle: title)).isEnabled,
+                       "Curved faces have no exact flat drawing.")
+        XCTAssertEqual(exported, [face])
+    }
+
+    @MainActor
     func testFeatureHighlightReusesPreviewSourcesAndSurvivesSelectionAndVisibilityChanges() async throws {
         let view = try makeView()
         let preview = mesh()

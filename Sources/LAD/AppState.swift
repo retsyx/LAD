@@ -2164,6 +2164,59 @@ final class AppState {
         return ([data], [])
     }
 
+    /// Only flat faces have an exact 2D drawing.
+    func canExportFaceDXF(_ face: CADFeatureID) -> Bool {
+        canExport && face.kind == .face && mesh?.topology?.face(for: face)?.type == "PLANE"
+    }
+
+    func exportFaceDXF(_ face: CADFeatureID) {
+        guard canExportFaceDXF(face) else { return }
+        let revisionID = selectedRevisionID, sessionID = projectSessionID, previewPath = mesh?.stepPath
+        let panel = NSSavePanel()
+        panel.identifier = NSUserInterfaceItemIdentifier("LAD.ExportFaceDXF")
+        panel.title = "Export face as DXF"
+        panel.allowedContentTypes = [UTType(filenameExtension: "dxf") ?? .data]
+        panel.nameFieldStringValue = FaceDXFExport.fileName(design: projectDisplayName,
+                                                            part: FaceDXFExport.partName(for: face.solidIndex, in: partTree))
+        // Face indices belong to the displayed geometry; never apply them to a replacement.
+        guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url, revisionID == selectedRevisionID,
+              sessionID == projectSessionID, mesh?.stepPath == previewPath else { return }
+        exportFaceDXF(face, to: url)
+    }
+
+    /// Draw the face from the displayed native geometry at its current pose.
+    func exportFaceDXF(_ face: CADFeatureID, to url: URL) {
+        guard canExportFaceDXF(face), let preview = posedPreview, let revisionID = selectedRevisionID else { return }
+        let token = UUID(), sessionID = projectSessionID
+        operationID = token
+        let runtime = python, cores = threads
+        isWorking = true; activity = "Exporting DXF…"; error = nil
+        operation = Task {
+            do {
+                let data = try await engine.exportFaceDXF(preview, face: face, python: runtime, threads: cores)
+                guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
+                      !Task.isCancelled else { return }
+                let writing = Task.detached(priority: .userInitiated) {
+                    try Task.checkCancellation()
+                    try data.write(to: url, options: .atomic)
+                }
+                try await withTaskCancellationHandler {
+                    try await writing.value
+                } onCancel: { writing.cancel() }
+                guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
+                      !Task.isCancelled else { return }
+                notice = "DXF exported · \(url.lastPathComponent)"
+                activity = "Ready"; isWorking = false; operation = nil
+            } catch is CancellationError {
+                if operationID == token { isWorking = false; activity = "Ready"; operation = nil }
+            } catch {
+                guard operationID == token, projectSessionID == sessionID else { return }
+                self.error = "Export failed. \(error.localizedDescription)"
+                activity = "Export needs attention"; isWorking = false; operation = nil
+            }
+        }
+    }
+
     private func safeName(_ name: String) -> String {
         let safe = name.components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " -_")).inverted).joined()
         return safe.isEmpty ? "Design" : String(safe.prefix(100))

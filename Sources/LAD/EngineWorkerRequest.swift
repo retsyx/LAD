@@ -39,13 +39,15 @@ enum EngineWorkerRequest: Encodable, Sendable {
     case build(title: String, summary: String, units: String, script: String, sourceAsset: String?, inputAssets: [InputAsset])
     case runtime
     case export(NativeSource, Export)
+    /// One planar face as a 2D DXF drawing, seen from outside its solid.
+    case faceDXF(NativeSource, face: CADFeatureID, solidTransforms: [AssemblySolidTransform])
     case measure(NativeSource, features: [CADFeatureID], solidIndices: [Int], solidTransforms: [AssemblySolidTransform]?)
     /// Exact clearance of each pair of solid groups at each pose.
     case clearance(NativeSource, pairs: [[[Int]]], poses: [[AssemblySolidTransform]])
 
     private enum Key: String, CodingKey {
         case operation, title, summary, units, script, sourceAsset, inputAssets, brepAsset, nativeIdentity, validatedNative,
-             solidIndices, solidTransforms, solidColors, arrangeFor3DPrinting, individualParts, features, pairs, poses
+             solidIndices, solidTransforms, solidColors, arrangeFor3DPrinting, individualParts, feature, features, pairs, poses
     }
 
     func encode(to encoder: Encoder) throws {
@@ -73,6 +75,10 @@ enum EngineWorkerRequest: Encodable, Sendable {
             if !export.solidColors.isEmpty { try values.encode(export.solidColors, forKey: .solidColors) }
             if export.arrangeFor3DPrinting { try values.encode(true, forKey: .arrangeFor3DPrinting) }
             try values.encodeIfPresent(export.individualParts, forKey: .individualParts)
+        case let .faceDXF(source, face, solidTransforms):
+            try encodeSource(source, operation: "dxf")
+            try values.encode(face, forKey: .feature)
+            if !solidTransforms.isEmpty { try values.encode(solidTransforms, forKey: .solidTransforms) }
         case let .measure(source, features, solidIndices, solidTransforms):
             try encodeSource(source, operation: "measure")
             try values.encode(features, forKey: .features)

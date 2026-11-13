@@ -38,6 +38,14 @@ final class EngineWorkerRequestTests: XCTestCase {
             "solidColors": [["solidIndex": 2, "color": ["red": 1, "green": 0.5, "blue": 0]]],
             "arrangeFor3DPrinting": true, "individualParts": [[0], [2]]
         ]))
+        let face = CADFeatureID(kind: .face, solidIndex: 1, localIndex: 4)
+        XCTAssertEqual(try object(.faceDXF(source, face: face, solidTransforms: [])), with([
+            "operation": "dxf", "feature": ["kind": "face", "solidIndex": 1, "localIndex": 4]
+        ]))
+        XCTAssertEqual(try object(.faceDXF(source, face: face, solidTransforms: [pose])), with([
+            "operation": "dxf", "feature": ["kind": "face", "solidIndex": 1, "localIndex": 4],
+            "solidTransforms": [["solid": 1, "matrix": pose.matrix]]
+        ]))
         let feature = CADFeatureID(kind: .edge, solidIndex: 0, localIndex: 3)
         XCTAssertEqual(try object(.measure(source, features: [feature], solidIndices: [], solidTransforms: nil)), with([
             "operation": "measure", "features": [["kind": "edge", "solidIndex": 0, "localIndex": 3]], "solidIndices": []

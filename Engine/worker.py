@@ -42,7 +42,7 @@ _validation_input = ContextVar("validation_input", default=None)
 _serving = False
 _native_shapes = {}
 NATIVE_CACHE_SIZE = 2
-NATIVE_OPERATIONS = {"runtime", "export", "measure", "clearance"}
+NATIVE_OPERATIONS = {"runtime", "export", "dxf", "measure", "clearance"}
 # Fields every native operation accepts beside its own (see read_brep).
 NATIVE_SOURCE_FIELDS = {"brepAsset", "nativeIdentity", "validatedNative"}
 
@@ -2813,6 +2813,59 @@ def export_brep(spec, asset_directory, output, cq, threads):
     return report
 
 
+def face_drawing_plane(face, cq):
+    """Frame a planar face as seen from outside its solid.
+
+    Local Z is the oriented outward normal. Local Y follows world +Z projected
+    onto the face, so side faces read upright; horizontal faces keep world +X to
+    the right. The origin is the world origin's projection onto the face's
+    plane, so axis-aligned faces keep their world coordinates.
+    """
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    normal = face.normalAt()
+    up = cq.Vector(0, 0, 1) - normal * normal.z
+    x_dir = up.normalized().cross(normal) if up.Length > 1e-7 else cq.Vector(1, 0, 0)
+    point = cq.Vector(BRepAdaptor_Surface(face.wrapped).Plane().Location())
+    return cq.Plane(normal * point.dot(normal), x_dir, normal)
+
+
+def export_face_dxf(spec, asset_directory, output, cq, threads):
+    """Draw one planar face as an exact 2D DXF, without replaying or meshing.
+
+    Face indices follow the native topology order of previews and measurements.
+    Lines, circles, arcs and ellipses remain analytic; other curves become
+    exact splines.
+    """
+    if set(spec) - NATIVE_SOURCE_FIELDS - {"operation", "feature", "solidTransforms"}:
+        raise ModelError("The DXF export request contains unsupported fields.")
+    feature = spec.get("feature")
+    if not isinstance(feature, dict) or set(feature) != {"kind", "solidIndex", "localIndex"} or feature["kind"] != "face":
+        raise ModelError("DXF export requires one selected face.")
+    owner, local = feature["solidIndex"], feature["localIndex"]
+    if isinstance(owner, bool) or not isinstance(owner, int) or isinstance(local, bool) or not isinstance(local, int):
+        raise ModelError("The selected face reference is invalid.")
+    shape = read_brep(spec, asset_directory, cq, threads)
+    solids = posed_solids(_shape_entities(shape, "Solid"), spec.get("solidTransforms", []), cq)
+    faces = _shape_entities(solids[owner], "Face") if 0 <= owner < len(solids) else []
+    if not 0 <= local < len(faces):
+        raise ModelError("The selected face is missing.")
+    face = faces[local]
+    if face.geomType() != "PLANE":
+        raise ModelError("Only a flat face can be exported as a DXF drawing.")
+    from cadquery.occ_impl.exporters.dxf import DxfDocument
+    from ezdxf import zoom
+    document = DxfDocument()
+    # The exporter moves a workplane's contents from its plane onto the
+    # drawing's XY plane. A bare shape would also skip its spline conversion.
+    document.add_shape(cq.Workplane(face_drawing_plane(face, cq)).add(face))
+    zoom.extents(document.msp)
+    path = output / "face.dxf"
+    document.document.saveas(path)
+    if not 100 <= path.stat().st_size <= MAX_GEOMETRY_BYTES:
+        raise ModelError("The DXF drawing is invalid or exceeds 512 MB.")
+    return {"entities": len(document.msp)}
+
+
 def measure_brep(spec, asset_directory, cq, threads):
     """Exact selected properties and separation on native rigidly posed solids.
 
@@ -3067,9 +3120,10 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
     is_preview = isinstance(spec, dict) and spec.get("operation") == "preview"
     is_export = isinstance(spec, dict) and spec.get("operation") == "export"
     is_parts_export = is_export and "individualParts" in spec
+    is_drawing = isinstance(spec, dict) and spec.get("operation") == "dxf"
     is_measurement = isinstance(spec, dict) and spec.get("operation") in ("measure", "clearance")
     is_runtime = spec == {"operation": "runtime"}
-    if not is_preview and not is_export and not is_measurement and not is_runtime:
+    if not is_preview and not is_export and not is_drawing and not is_measurement and not is_runtime:
         if size > 2 * 1024 * 1024:
             raise ModelError("Design specification exceeds the 2 MiB size limit.")
         validate_spec(spec)
@@ -3087,6 +3141,8 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
         preview = measure_brep(spec, request.parent.resolve(), cq, threads)
     elif is_export:
         preview = export_brep(spec, request.parent.resolve(), output, cq, threads)
+    elif is_drawing:
+        preview = export_face_dxf(spec, request.parent.resolve(), output, cq, threads)
     elif is_preview:
         preview = preview_step(spec, request.parent.resolve(), output, cq, threads)
     else:
@@ -3117,16 +3173,16 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
         finally:
             _validated_replay.reset(token)
         preview["validatedHash"] = fingerprint
-    if not is_export and not is_measurement and not is_preview and not is_runtime:
+    if not is_export and not is_drawing and not is_measurement and not is_preview and not is_runtime:
         # Both STEP imports and generated previews retain the identical native
         # topology so later measurements cannot be remapped by a STEP roundtrip.
         brep = (output / "model.brep").resolve()
         write_brep(shape, brep)
         preview["brepPath"] = str(brep)
-    if not is_runtime and not is_measurement and not is_parts_export and (not defer_step or is_preview or is_export) and (not step.is_file() or step.stat().st_size < 100):
+    if not is_runtime and not is_measurement and not is_drawing and not is_parts_export and (not defer_step or is_preview or is_export) and (not step.is_file() or step.stat().st_size < 100):
         raise ModelError("STEP export did not produce a design file.")
     preview.update(buildSeconds=time.perf_counter() - started, threads=threads, runtime=runtime_info(cq))
-    if not is_parts_export:
+    if not is_parts_export and not is_drawing:
         preview["stepPath"] = str(step)
     write_preview_result(preview, output)
     return preview

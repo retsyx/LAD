@@ -379,6 +379,46 @@ final class EngineService {
         return data
     }
 
+    /// Draw one planar face of an already built native solid as a 2D DXF in
+    /// millimeters, with no program replay or meshing. Feature indices belong
+    /// to this preview's own geometry, so there is no replay fallback.
+    func exportFaceDXF(_ preview: PreviewMesh, face: CADFeatureID, solidTransforms: [Int: [Double]]? = nil,
+                       python: String, threads: Int) async throws -> Data {
+        defer { withExtendedLifetime(preview.buildArtifacts) {} }
+        try Task.checkCancellation()
+        guard face.kind == .face, (0..<preview.solids).contains(face.solidIndex), face.localIndex >= 0 else {
+            throw LADError.message("Select a face of an available part to export.")
+        }
+        let transforms = try AssemblySolidTransform.validatedRecords(solidTransforms ?? preview.assemblyPose?.solidTransforms ?? [:], solidCount: preview.solids)
+        let source = try nativeSource(preview)
+        let output = try await runNative(python: python, threads: threads, action: "export this face") { folder in
+            try EngineWorkerRequest.faceDXF(Self.stageNative(source, into: folder), face: face,
+                                            solidTransforms: transforms).write(to: folder)
+        }
+        let data = try await Task.detached(priority: .userInitiated) {
+            let data = try EngineArtifact.read(output.folder.appendingPathComponent("face.dxf"), in: output.folder,
+                                               maximumBytes: Self.maximumDXFBytes)
+            try Self.validateDXF(data)
+            return data
+        }.value
+        try Task.checkCancellation()
+        return data
+    }
+
+    nonisolated static let maximumDXFBytes = 512_000_000
+
+    /// An ASCII DXF opens its first section and ends with an EOF marker.
+    nonisolated static func validateDXF(_ data: Data) throws {
+        func lines(_ bytes: Data) -> [String] {
+            String(decoding: bytes, as: UTF8.self).split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        guard data.count <= maximumDXFBytes, lines(data.prefix(64)).prefix(2) == ["0", "SECTION"],
+              lines(data.suffix(64)).suffix(2) == ["0", "EOF"] else {
+            throw LADError.message("The DXF drawing is invalid or exceeds 512 MB.")
+        }
+    }
+
     /// Every engine shares one byte-bounded cache, so several windows and
     /// agent sessions cannot each retain their own 512 MB of exports.
     private func cachedSTEP(for key: STEPExportKey) -> [Data]? {

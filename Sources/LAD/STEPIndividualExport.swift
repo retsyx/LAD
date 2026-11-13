@@ -103,7 +103,7 @@ enum STEPIndividualExport {
         }
     }
 
-    private static func filenameStem(_ name: String, fallback: String) -> String {
+    static func filenameStem(_ name: String, fallback: String) -> String {
         let unsafe = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/:"))
         var stem = name.precomposedStringWithCanonicalMapping.unicodeScalars
             .map { unsafe.contains($0) ? " " : String($0) }.joined()

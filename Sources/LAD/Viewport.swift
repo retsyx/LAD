@@ -97,6 +97,8 @@ struct CADViewport: NSViewRepresentable {
     var onDeselectAll: (() -> Void)? = nil
     var onHideSelected: (() -> Void)? = nil
     var onShowAll: (() -> Void)? = nil
+    var canExport = false
+    var onExportFaceDXF: ((CADFeatureID) -> Void)? = nil
     var onViewReady: ((CADSceneView) -> Void)? = nil
     var assemblyGrabbingEnabled = false
     var onAssemblyGrabBegan: ((Int, [Double], AssemblyGrabProjection) -> Bool)? = nil
@@ -114,6 +116,8 @@ struct CADViewport: NSViewRepresentable {
         view.onDeselectAll = onDeselectAll
         view.onHideSelected = onHideSelected
         view.onShowAll = onShowAll
+        view.canExport = canExport
+        view.onExportFaceDXF = onExportFaceDXF
         view.onActivated = onViewReady
         view.onAssemblyGrabBegan = onAssemblyGrabBegan
         view.onAssemblyGrabMoved = onAssemblyGrabMoved
@@ -361,6 +365,9 @@ final class CADSceneView: NSView {
     var onDeselectAll: (() -> Void)?
     var onHideSelected: (() -> Void)?
     var onShowAll: (() -> Void)?
+    /// Whether the design can currently be exported; menu state only.
+    var canExport = false
+    var onExportFaceDXF: ((CADFeatureID) -> Void)?
     var onActivated: ((CADSceneView) -> Void)?
     var assemblyGrabbingEnabled = false {
         didSet {
@@ -1840,6 +1847,15 @@ final class CADSceneView: NSView {
     override func menu(for event: NSEvent) -> NSMenu? {
         // Opening a context menu preserves both part and feature selections.
         let menu = NSMenu(title: "Viewport")
+        if selectedFeatures.count == 1, let face = selectedFeatures.first, face.kind == .face,
+           self.face(at: convert(event.locationInWindow, from: nil)) == face {
+            let export = menu.addItem(withTitle: "Export as DXF…", action: #selector(menuExportFaceDXF(_:)), keyEquivalent: "")
+            export.target = self
+            export.representedObject = face
+            // A drawing is flat; curved faces have no exact 2D outline.
+            export.isEnabled = canExport && topology?.face(for: face)?.type == "PLANE"
+            menu.addItem(.separator())
+        }
         let fit = menu.addItem(withTitle: "Fit Design", action: #selector(menuFit), keyEquivalent: "")
         fit.target = self
         let reset = menu.addItem(withTitle: "Reset Isometric View", action: #selector(menuReset), keyEquivalent: "")
@@ -1875,6 +1891,10 @@ final class CADSceneView: NSView {
     @objc private func menuDeselect() { deselectAll() }
     @objc private func menuHideSelected() { onHideSelected?() }
     @objc private func menuShowAll() { onShowAll?() }
+    @objc private func menuExportFaceDXF(_ sender: NSMenuItem) {
+        guard let face = sender.representedObject as? CADFeatureID else { return }
+        onExportFaceDXF?(face)
+    }
     @objc private func menuView(_ sender: NSMenuItem) {
         switch sender.tag {
         case 1: perform(.front)
@@ -1897,12 +1917,7 @@ final class CADSceneView: NSView {
         let cursor = SIMD2(Double(point.x), Double(point.y))
         if projectedFeatures == nil { projectedFeatures = projectFeatures(topology) }
         guard let projectedFeatures else { return nil }
-        func faceAtCursor() -> CADFeatureID? {
-            guard let hit = visibleHit(at: point), let solid = solidIndex(of: hit.node),
-                  let faces = faceIDsBySolid[solid], faces.indices.contains(hit.faceIndex) else { return nil }
-            return faces[hit.faceIndex]
-        }
-        return ViewportFeaturePicking.pick(at: cursor, vertices: projectedFeatures.vertices, edges: projectedFeatures.edges, face: faceAtCursor(),
+        return ViewportFeaturePicking.pick(at: cursor, vertices: projectedFeatures.vertices, edges: projectedFeatures.edges, face: face(at: point),
                                           orthographic: rig.usesOrthographicProjection,
                                           isVisible: { [self] world, screen in
             // Test at the candidate's screen position so a nearby visible
@@ -1913,6 +1928,13 @@ final class CADSceneView: NSView {
             let unitsPerPoint = 2 * rig.orthographicScale / max(bounds.height, 1)
             return simd_dot(hitWorld - world, rig.backward) <= max(rig.radius * 1e-5, unitsPerPoint * 1.5)
         })
+    }
+
+    /// The nearest visible native face, ignoring nearby vertices and edges.
+    private func face(at point: NSPoint) -> CADFeatureID? {
+        guard let hit = visibleHit(at: point), let solid = solidIndex(of: hit.node),
+              let faces = faceIDsBySolid[solid], faces.indices.contains(hit.faceIndex) else { return nil }
+        return faces[hit.faceIndex]
     }
 
     private func projectFeatures(_ topology: CADTopology) -> ProjectedFeatures {
