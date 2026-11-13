@@ -227,6 +227,14 @@ final class ViewportFeatureTests: XCTestCase {
         XCTAssertTrue(try node("feature:face:0:0", in: view) === highlight)
         XCTAssertTrue(try node("solid:0", in: view) === surface)
         XCTAssertFalse(highlight.isHidden)
+        XCTAssertTrue(try XCTUnwrap(highlight.parent).isHidden,
+                      "A shaded face fill would cover the surrounding wires in wireframe mode.")
+        XCTAssertEqual(view.makeFrame(width: 640, height: 480).batches.flatMap(\.masks).count, 1,
+                       "The selected face keeps its outline in wireframe mode.")
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [], selectedFeatures: [face])
+        XCTAssertFalse(highlight.isHidden)
+        XCTAssertFalse(try XCTUnwrap(highlight.parent).isHidden)
         view.update(mesh: preview, mode: .edges, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [0], selectedFeatures: [face])
         XCTAssertTrue(highlight.isHidden)

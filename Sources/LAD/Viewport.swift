@@ -815,7 +815,10 @@ final class CADSceneView: NSView {
         if modelNode.isHidden != hidden { modelNode.isHidden = hidden }
         let edgesHidden = hidden || mode == .shaded
         if edgeNode.isHidden != edgesHidden { edgeNode.isHidden = edgesHidden }
-        if featureNode.isHidden != hidden { featureNode.isHidden = hidden }
+        // Wireframe draws no faces, so highlighted faces keep only their
+        // overlay outline instead of a fill that covers the wires around them.
+        let featuresHidden = hidden || mode == .wireframe
+        if featureNode.isHidden != featuresHidden { featureNode.isHidden = featuresHidden }
     }
 
     private func resetFeatureResources() {
