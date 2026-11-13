@@ -65,6 +65,21 @@ final class ViewportVertexTests: XCTestCase {
     }
 
     @MainActor
+    func testSeamOnlyVertexIsNeitherPickedNorHovered() async throws {
+        let view = try makeView()
+        var preview = cornerPreview()
+        preview.topology?.vertices[0].seam = true
+        view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [], hiddenSolids: [], projection: .isometric, solidColors: [:])
+        view.layout()
+        try await ready(view)
+        let point = projectedCorner(in: view)
+        XCTAssertEqual(view.feature(at: point), edge, "A seam-only vertex marks nothing visible, so its neighbor is picked.")
+        view.mouseMoved(with: try mouse(.mouseMoved, at: point))
+        XCTAssertEqual(seeds(in: view).map(\.channel), [.hoveredEdge])
+    }
+
+    @MainActor
     private func seeds(in view: CADSceneView) -> [CADViewportFrame.Seeds] {
         view.makeFrame(width: Int(view.bounds.width), height: Int(view.bounds.height)).seeds
     }

@@ -19,6 +19,8 @@ struct CADFeatureID: Codable, Hashable, Sendable, Identifiable {
 struct CADVertex: Codable, Sendable {
     var id: CADFeatureID
     var position: [Double]
+    /// Bounds only seams, such as a sphere's pole; neither drawn nor picked.
+    var seam: Bool? = nil
 }
 
 struct CADEdge: Codable, Sendable {
@@ -38,6 +40,9 @@ struct CADEdge: Codable, Sendable {
     var endPoint: [Double]? = nil
     var sweepDegrees: Double? = nil
     var closed: Bool? = nil
+    /// Joins the parametric sides of one smooth periodic or closed face. A
+    /// seam keeps its identity and measurements without a display polyline.
+    var seam: Bool? = nil
 }
 
 struct CADFace: Codable, Sendable {

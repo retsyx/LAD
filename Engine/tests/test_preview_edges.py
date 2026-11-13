@@ -7,7 +7,7 @@ import unittest
 import cadquery as cq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from worker import _preview_edge_polyline, make_preview
+from worker import _PreviewMeshEdge, _preview_edge_polyline, _preview_mesh_edge, make_preview
 
 
 class PreviewEdgeTests(unittest.TestCase):
@@ -74,8 +74,8 @@ class PreviewEdgeTests(unittest.TestCase):
     def test_missing_polygon_fallback_closes_only_native_closed_curves(self):
         closed = cq.Edge.makeCircle(2.2)
         opened = cq.Edge.makeCircle(2.2, angle1=15, angle2=135)
-        closed_points = _preview_edge_polyline(closed, {}, 0.075)
-        open_points = _preview_edge_polyline(opened, {}, 0.075)
+        closed_points = _preview_edge_polyline(closed, None, 0.075)
+        open_points = _preview_edge_polyline(opened, None, 0.075)
         self.assertEqual(closed_points[0], closed_points[-1])
         self.assertNotEqual(open_points[0], open_points[-1])
         self.assertAlmostEqual(math.dist(open_points[0], opened.startPoint().toTuple()), 0, places=9)
@@ -85,9 +85,47 @@ class PreviewEdgeTests(unittest.TestCase):
         wanted = cq.Edge.makeLine((0, 0, 0), (1, 0, 0))
         other = cq.Edge.makeLine((0, 1, 0), (1, 1, 0))
         exact = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
-        polygons = {hash(wanted.wrapped): [(other.wrapped, [[99, 99, 99], [100, 100, 100]]),
-                                           (wanted.wrapped, exact)]}
-        self.assertIs(_preview_edge_polyline(wanted, polygons, 0.075), exact)
+        colliding, record = _PreviewMeshEdge(other.wrapped, False), _PreviewMeshEdge(wanted.wrapped, False)
+        colliding.polyline, record.polyline = [[99, 99, 99], [100, 100, 100]], exact
+        found = _preview_mesh_edge(wanted, {hash(wanted.wrapped): [colliding, record]})
+        self.assertIs(found, record)
+        self.assertIs(_preview_edge_polyline(wanted, found.polyline, 0.075), exact)
+
+    def test_seams_and_seam_only_vertices_keep_identity_but_are_not_drawn_or_picked(self):
+        sphere = cq.Solid.makeSphere(3, angleDegrees1=-90, angleDegrees2=90)
+        cases = {
+            # (shape, expected seam edge count, expected seam-only vertex count)
+            "sphere": (sphere, 1, 2),
+            "cylinder": (cq.Solid.makeCylinder(2, 3), 1, 0),
+            "cone apex": (cq.Solid.makeCone(3, 0, 4), 1, 1),
+            "torus": (cq.Solid.makeTorus(5, 1), 2, 1),
+            "trimmed sphere": (sphere.translate((0, 0, 2.5)).fuse(cq.Solid.makeBox(6, 6, 2, pnt=cq.Vector(-3, -3, -1))).clean(), 1, 1),
+            "box": (cq.Solid.makeBox(1, 2, 3), 0, 0),
+        }
+        for name, (shape, seam_count, vertex_count) in cases.items():
+            with self.subTest(shape=name):
+                preview = make_preview(shape)
+                topology = preview["topology"]
+                native = shape.Solids()[0]
+                self.assertEqual([edge["id"]["localIndex"] for edge in topology["edges"]], list(range(len(native.Edges()))),
+                                 "Hiding a seam must not shift native edge identities.")
+                self.assertEqual(len(topology["vertices"]), len(native.Vertices()))
+                seams = [edge for edge in topology["edges"] if edge.get("seam")]
+                self.assertEqual(len(seams), seam_count)
+                for edge in seams:
+                    self.assertEqual(edge["polyline"], [])
+                    self.assertGreater(edge["length"], 0, "A seam keeps its exact measurements.")
+                    self.assertNotIn(topology["edges"].index(edge), preview["edgeFeatures"])
+                self.assertTrue(all(edge["polyline"] for edge in topology["edges"] if not edge.get("seam")))
+                hidden = [vertex for vertex in topology["vertices"] if vertex.get("seam")]
+                self.assertEqual(len(hidden), vertex_count)
+                def bounds(vertex, seam):
+                    return any(math.dist(vertex["position"], point) < 1e-6 for edge in topology["edges"]
+                               if bool(edge.get("seam")) == seam for point in (edge["startPoint"], edge["endPoint"]))
+                for vertex in topology["vertices"]:
+                    self.assertEqual(bool(vertex.get("seam")), bounds(vertex, True) and not bounds(vertex, False),
+                                     "Only vertices bounding nothing but seams are hidden.")
+                self.assert_display_mapping(preview)
 
     def assert_display_mapping(self, preview):
         self.assertEqual(len(preview["edges"]), len(preview["edgeSolids"]))

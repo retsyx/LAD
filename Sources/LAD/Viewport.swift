@@ -1997,7 +1997,7 @@ final class CADSceneView: NSView {
             guard depth > 0, screen.x.isFinite, screen.y.isFinite else { return nil }
             return .init(id: id, world: world, screen: screen, depth: depth)
         }
-        let vertices = topology.vertices.compactMap { projected($0.position, id: $0.id) }
+        let vertices = topology.vertices.compactMap { $0.seam == true ? nil : projected($0.position, id: $0.id) }
         var edges = [ViewportFeaturePicking.Edge]()
         edges.reserveCapacity(topology.edges.count * 4)
         for edge in topology.edges where !hiddenSolids.contains(edge.id.solidIndex) {

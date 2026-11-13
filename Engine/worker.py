@@ -969,11 +969,27 @@ def face_metadata(face, solid_index, local_index):
     return item
 
 
-def _preview_edge_polyline(edge, mesh_polylines, tolerance):
+class _PreviewMeshEdge:
+    """A solid's edge as its adjacent face meshes found it."""
+    __slots__ = ("native", "polyline", "seam")
+
+    def __init__(self, native, seam):
+        self.native, self.polyline, self.seam = native, None, seam
+
+
+def _preview_mesh_edge(edge, mesh_edges):
+    """Find an edge's face-mesh record. Native hashes ignore orientation and
+    can collide; IsSame resolves collisions and keeps located instances apart."""
+    for record in mesh_edges.get(hash(edge.wrapped), ()):
+        if record.native.IsSame(edge.wrapped):
+            return record
+    return None
+
+
+def _preview_edge_polyline(edge, mesh_polyline, tolerance):
     """Use the face mesher's boundary, with analytic sampling only as fallback."""
-    for native, polyline in mesh_polylines.get(hash(edge.wrapped), ()):
-        if native.IsSame(edge.wrapped):
-            return polyline
+    if mesh_polyline is not None:
+        return mesh_polyline
     count = 2 if edge.geomType() == "LINE" else min(256, max(16, math.ceil(edge.Length() / max(tolerance * 8, 0.1))))
     sampled, _ = edge.sample(count)
     polyline = [list(point.toTuple()) for point in sampled]
@@ -982,6 +998,36 @@ def _preview_edge_polyline(edge, mesh_polylines, tolerance):
     if edge.IsClosed() and len(polyline) > 1 and polyline[-1] != polyline[0]:
         polyline.append(polyline[0].copy())
     return polyline
+
+
+def _preview_seam_vertices(solid, seams):
+    """Return local indices of a solid's vertices that bound only its seams.
+
+    A sphere's poles or a cone's apex mark nothing visible once their seams
+    are hidden. Degenerate pole edges do not count; any other edge keeps its
+    endpoints selectable. Look up only the seams' endpoints in native maps.
+    """
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_VERTEX
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape, TopTools_IndexedMapOfShape
+    vertices = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(solid.wrapped, TopAbs_VERTEX, vertices)
+    ancestors = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(solid.wrapped, TopAbs_VERTEX, TopAbs_EDGE, ancestors)
+    hidden, checked = set(), set()
+    for seam in seams:
+        for vertex in (TopExp.FirstVertex_s(seam), TopExp.LastVertex_s(seam)):
+            index = vertices.FindIndex(vertex)
+            if not index or index in checked or not ancestors.Contains(vertex):
+                continue
+            checked.add(index)
+            # The native list iterates begin-to-end without an exception.
+            if not any(not BRep_Tool.Degenerated_s(TopoDS.Edge_s(edge)) and not any(edge.IsSame(other) for other in seams)
+                       for edge in ancestors.FindFromKey(vertex)):
+                hidden.add(index - 1)
+    return hidden
 
 
 def _preview_face_normals(face, poly, location):
@@ -1943,14 +1989,15 @@ def make_preview(shape, preview_stats=None):
     # per-face vertex boundaries and correct face orientation.
     vertices, normals, triangles, triangle_solids, triangle_faces = [], [], [], [], []
     topology = {"vertices": [], "edges": [], "faces": [], "parts": []}
-    mesh_polylines = [{} for _ in solids]
+    mesh_edges = [{} for _ in solids]
     mesh_edge_segments = 0
     for solid_index, solid in enumerate(solids):
         topology["parts"].append(prepared["solidProperties"][solid_index] if prepared is not None
                                  else part_metadata(solid, solid_index, bounds=solid_bounds[solid_index]))
-        topology["vertices"].extend({"id": feature_id("vertex", solid_index, local_index),
-                                      "position": list(vertex.toTuple())}
-                                     for local_index, vertex in enumerate(_shape_entities(solid, "Vertex")))
+        solid_vertices = [{"id": feature_id("vertex", solid_index, local_index), "position": list(vertex.toTuple())}
+                          for local_index, vertex in enumerate(_shape_entities(solid, "Vertex"))]
+        topology["vertices"].extend(solid_vertices)
+        seam_candidates = []
         # Keep the native face order and node positions, including separate
         # boundaries for hard lighting normals and the original stroke nodes.
         for local_index, (face, face_edges, poly, location, points, face_normals, face_triangles) in enumerate(mesh[solid_index]):
@@ -1970,12 +2017,23 @@ def make_preview(shape, preview_stats=None):
             # own finer curved face, making depth-tested rims appear dashed.
             # Reuse the exact edge polygon from this face's triangulation so
             # strokes and adjacent surface triangles have identical boundaries.
-            # Native hashes ignore orientation; IsSame resolves collisions and
-            # keeps repeated/located instances separate within each owner.
-            polylines = mesh_polylines[solid_index]
+            # A seam joins the two parametric sides of one periodic or closed
+            # face, such as a sphere's meridian. It bounds no other face and
+            # the surface is smooth across it, so it is neither drawn nor
+            # picked; its arbitrary placement would otherwise read as a crease.
+            edges = mesh_edges[solid_index]
             for edge in face_edges:
-                bucket = polylines.setdefault(hash(edge.wrapped), [])
-                if any(native.IsSame(edge.wrapped) for native, _ in bucket):
+                bucket = edges.setdefault(hash(edge.wrapped), [])
+                record = next((known for known in bucket if known.native.IsSame(edge.wrapped)), None)
+                if record is None:
+                    record = _PreviewMeshEdge(edge.wrapped, BRep_Tool.IsClosed_s(edge.wrapped, face.wrapped))
+                    bucket.append(record)
+                    if record.seam:
+                        seam_candidates.append(record)
+                else:
+                    # A face lists each edge once, so this is a second face.
+                    record.seam = False
+                if record.polyline is not None or record.seam:
                     continue
                 polygon = BRep_Tool.PolygonOnTriangulation_s(edge.wrapped, poly, location)
                 if polygon is None or polygon.NbNodes() < 2:
@@ -1990,15 +2048,25 @@ def make_preview(shape, preview_stats=None):
                 mesh_edge_segments += len(points) - 1
                 if mesh_edge_segments > MAX_EDGE_SEGMENTS:
                     raise ModelError("Preview exceeds the edge size limit; simplify the design.")
-                bucket.append((edge.wrapped, points))
+                record.polyline = points
+        seams = [record.native for record in seam_candidates if record.seam]
+        if seams:
+            for local_index in _preview_seam_vertices(solid, seams):
+                solid_vertices[local_index]["seam"] = True
     segments, edge_solids, edge_features = [], [], []
     for solid_index, solid in enumerate(solids):
         for local_index, edge in enumerate(_shape_entities(solid, "Edge")):
             # Keep shared edges per owner so hiding a part removes all its
             # boundaries without also hiding a visible neighboring body.
-            points = _preview_edge_polyline(edge, mesh_polylines[solid_index], tolerance)
+            # Seams keep their topology identity with no display polyline.
+            record = _preview_mesh_edge(edge, mesh_edges[solid_index])
+            seam = record is not None and record.seam
+            points = [] if seam else _preview_edge_polyline(edge, None if record is None else record.polyline, tolerance)
             edge_index = len(topology["edges"])
-            topology["edges"].append(edge_metadata(edge, solid_index, local_index, points))
+            item = edge_metadata(edge, solid_index, local_index, points)
+            if seam:
+                item["seam"] = True
+            topology["edges"].append(item)
             for start, end in zip(points, points[1:]):
                 segments.append(start + end)
                 edge_solids.append(solid_index)

@@ -147,6 +147,9 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
                 face_index += 1
         self.assertEqual(offset, len(points))
         for edge_index, edge in enumerate(preview['topology']['edges']):
+            if edge.get('seam'):
+                self.assertEqual(edge['polyline'], [], 'Seams are not drawn.')
+                continue
             displayed = [tuple(point) for point in edge['polyline']]
             self.assertTrue(any(displayed == path or displayed == path[::-1]
                                 for path in edge_paths[edge_index]), 'CAD strokes must reuse native boundary nodes.')
