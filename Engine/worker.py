@@ -2818,15 +2818,17 @@ def face_drawing_plane(face, cq):
 
     Local Z is the oriented outward normal. Local Y follows world +Z projected
     onto the face, so side faces read upright; horizontal faces keep world +X to
-    the right. The origin is the world origin's projection onto the face's
-    plane, so axis-aligned faces keep their world coordinates.
+    the right. The origin is the face's area centroid, the same center its
+    measurements report. Projecting it onto the exact plane keeps axis-aligned
+    drawings at exactly zero depth.
     """
     from OCP.BRepAdaptor import BRepAdaptor_Surface
     normal = face.normalAt()
     up = cq.Vector(0, 0, 1) - normal * normal.z
     x_dir = up.normalized().cross(normal) if up.Length > 1e-7 else cq.Vector(1, 0, 0)
     point = cq.Vector(BRepAdaptor_Surface(face.wrapped).Plane().Location())
-    return cq.Plane(normal * point.dot(normal), x_dir, normal)
+    center = cq.Vector(*_shape_measurements(face)[1])
+    return cq.Plane(center - normal * (center - point).dot(normal), x_dir, normal)
 
 
 def export_face_dxf(spec, asset_directory, output, cq, threads):

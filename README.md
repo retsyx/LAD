@@ -118,7 +118,7 @@ Drop a `.lad` file on a design window's title bar, viewer, parts tree or convers
 | Save design as | `⇧⌘S` |
 | Export STEP | `⇧⌘E` |
 | Export selected parts as STEP | **Export STEP…** in the parts tree context menu |
-| Export a flat face as a DXF drawing | Right-click the only selected face, then **Export as DXF…** |
+| Export a flat face as a DXF drawing | Right-click the only selected face, then **Export DXF…** |
 
 The parts tree on the left preserves named, nested CadQuery assemblies. Codex organizes new designs into groups such as Case and PCB, with individual solid parts beneath them. Older designs without assembly names receive numbered part entries. You can create folders, rename labels inline using the tree’s **Rename** command (Return applies, Escape cancels), and move parts or entire folders; these changes remain with the design and are retained when Codex updates matching parts. **Ungroup** removes a folder while keeping its contents in the parent folder; empty folders have **Remove Folder** instead. Selecting a folder selects all its descendants; each eye button changes visibility for its part or entire folder. A minus badge marks folders containing both visible and hidden parts. Hidden parts remain in the tree so they can be shown again. Visibility affects the preview only. The main STEP export includes the complete design; **Export STEP…** in the tree context menu exports just the selected parts, including selected folders' descendants, at their original coordinates.
 

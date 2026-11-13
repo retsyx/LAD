@@ -1849,7 +1849,7 @@ final class CADSceneView: NSView {
         let menu = NSMenu(title: "Viewport")
         if selectedFeatures.count == 1, let face = selectedFeatures.first, face.kind == .face,
            self.face(at: convert(event.locationInWindow, from: nil)) == face {
-            let export = menu.addItem(withTitle: "Export as DXF…", action: #selector(menuExportFaceDXF(_:)), keyEquivalent: "")
+            let export = menu.addItem(withTitle: "Export DXF…", action: #selector(menuExportFaceDXF(_:)), keyEquivalent: "")
             export.target = self
             export.representedObject = face
             // A drawing is flat; curved faces have no exact 2D outline.

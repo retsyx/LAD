@@ -156,7 +156,7 @@ final class ViewportFeatureTests: XCTestCase {
 
     @MainActor
     func testRightClickingTheOnlySelectedFlatFaceOffersDXFExport() async throws {
-        let title = "Export as DXF…"
+        let title = "Export DXF…"
         let view = try makeView()
         view.update(mesh: mesh(), mode: .edges, grid: false, command: ViewportCommand(.top),
                     selectedSolids: [0], hiddenSolids: [], selectedFeatures: [face])

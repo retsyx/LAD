@@ -88,33 +88,38 @@ class FaceDXFExportTests(unittest.TestCase):
         for actual, expected in zip(list(extents.extmin)[:2] + list(extents.extmax)[:2], minimum + maximum):
             self.assertAlmostEqual(actual, expected, places=6)
 
-    def test_top_face_keeps_world_coordinates_and_analytic_curves(self):
+    def test_top_face_is_centered_on_its_centroid_with_analytic_curves(self):
         solid = plate()
-        entities = self.drawing([solid], 0, face_index(solid, (0, 0, 1)))
+        index = face_index(solid, (0, 0, 1))
+        cx, cy, _ = worker._shape_entities(solid, 'Face')[index].Center().toTuple()
+        self.assertGreater(abs(cx - 30) + abs(cy - 20), 0.1, 'The cutouts move the area centroid off the bounding-box center')
+        entities = self.drawing([solid], 0, index)
         self.assertEqual({entity.dxftype() for entity in entities}, {'LINE', 'ARC', 'CIRCLE', 'SPLINE'})
         self.assert_closed_outline(entities)
-        self.assert_bounds(entities, [0, 0], [60, 40])
+        self.assert_bounds(entities, [-cx, -cy], [60 - cx, 40 - cy])
         circle = next(entity for entity in entities if entity.dxftype() == 'CIRCLE')
-        self.assertAlmostEqual((circle.dxf.center - (12, 20, 0)).magnitude, 0, places=9)
+        self.assertAlmostEqual((circle.dxf.center - (12 - cx, 20 - cy, 0)).magnitude, 0, places=9)
         self.assertAlmostEqual(circle.dxf.radius, 4, places=9)
         notch = next(entity for entity in entities if entity.dxftype() == 'ARC' and abs(entity.dxf.radius - 6) < 1e-9)
-        self.assertAlmostEqual((notch.dxf.center - (30, 40, 0)).magnitude, 0, places=9)
+        self.assertAlmostEqual((notch.dxf.center - (30 - cx, 40 - cy, 0)).magnitude, 0, places=9)
         # The notch is cut into the plate below the top boundary.
-        self.assertLess(min(point.y for point in notch.flattening(0.01)), 40 - 6 + 1e-6)
+        self.assertLess(min(point.y for point in notch.flattening(0.01)), 40 - 6 - cy + 1e-6)
 
     def test_other_faces_are_drawn_from_outside_without_mirroring(self):
         solid = plate()
-        bottom = self.drawing([solid], 0, face_index(solid, (0, 0, -1)))
+        index = face_index(solid, (0, 0, -1))
+        cx, cy, _ = worker._shape_entities(solid, 'Face')[index].Center().toTuple()
+        bottom = self.drawing([solid], 0, index)
         self.assert_closed_outline(bottom)
         # Seen from below with +X to the right, world +Y points down the page.
-        self.assert_bounds(bottom, [0, -40], [60, 0])
+        self.assert_bounds(bottom, [-cx, cy - 40], [60 - cx, cy])
         circle = next(entity for entity in bottom if entity.dxftype() == 'CIRCLE')
-        self.assertAlmostEqual((circle.dxf.center - (12, -20, 0)).magnitude, 0, places=9)
+        self.assertAlmostEqual((circle.dxf.center - (12 - cx, cy - 20, 0)).magnitude, 0, places=9)
         # Side faces stand upright: world +Z is the drawing's +Y.
         front = self.drawing([solid], 0, face_index(solid, (0, -1, 0)))
-        self.assert_bounds(front, [0, 0], [60, 5])
+        self.assert_bounds(front, [-30, -2.5], [30, 2.5])
         right = self.drawing([solid], 0, face_index(solid, (1, 0, 0)))
-        self.assert_bounds(right, [0, 0], [40, 5])
+        self.assert_bounds(right, [-20, -2.5], [20, 2.5])
 
     def test_oblique_and_posed_faces_keep_their_true_shape(self):
         import cadquery as cq
@@ -126,12 +131,20 @@ class FaceDXFExportTests(unittest.TestCase):
         lengths = sorted((entity.dxf.end - entity.dxf.start).magnitude for entity in entities)
         for actual, expected in zip(lengths, [10, 10, 20, 20]):
             self.assertAlmostEqual(actual, expected, places=9)
+        from ezdxf.math import Vec3
+        corners = [point for entity in entities for point in (entity.dxf.start, entity.dxf.end)]
+        self.assertAlmostEqual(Vec3.sum(corners).magnitude / len(corners), 0, places=9,
+                               msg='A rectangle is centered on its middle')
 
         solids = [cq.Solid.makeBox(1, 1, 1), plate()]
         top = face_index(solids[1], (0, 0, 1))
-        pose = {'solid': 1, 'matrix': [1, 0, 0, 100, 0, 1, 0, -50, 0, 0, 1, 7, 0, 0, 0, 1]}
+        cx, cy, _ = worker._shape_entities(solids[1], 'Face')[top].Center().toTuple()
+        # A quarter turn about Z, then a translation, at the current assembly pose.
+        pose = {'solid': 1, 'matrix': [0, -1, 0, 100, 1, 0, 0, -50, 0, 0, 1, 7, 0, 0, 0, 1]}
         posed = self.drawing(solids, 1, top, solidTransforms=[pose])
-        self.assert_bounds(posed, [100, -50], [160, -10])
+        self.assert_bounds(posed, [cy - 40, -cx], [cy, 60 - cx])
+        circle = next(entity for entity in posed if entity.dxftype() == 'CIRCLE')
+        self.assertAlmostEqual((circle.dxf.center - (cy - 20, 12 - cx, 0)).magnitude, 0, places=9)
 
     def test_curved_and_invalid_faces_fail_without_writing_a_drawing(self):
         import cadquery as cq

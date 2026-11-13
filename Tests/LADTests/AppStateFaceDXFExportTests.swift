@@ -79,13 +79,13 @@ final class AppStateFaceDXFExportTests: XCTestCase {
         XCTAssertEqual(state.notice, "DXF exported · Face DXF fixture - Lid.dxf")
         let drawing = try Data(contentsOf: url)
         XCTAssertNoThrow(try EngineService.validateDXF(drawing))
-        // The lid's top face keeps its world XY coordinates in the drawing.
+        // The lid's 5 x 2 top face is centered on its centroid, with world X and Y as the drawing's axes.
         let points = entityPoints(in: String(decoding: drawing, as: UTF8.self))
         XCTAssertEqual(points.count, 8, "Four lines, each with a start and an end.")
-        XCTAssertEqual(points.map(\.x).min() ?? .nan, 20, accuracy: 1e-9)
-        XCTAssertEqual(points.map(\.x).max() ?? .nan, 25, accuracy: 1e-9)
-        XCTAssertEqual(points.map(\.y).min() ?? .nan, 7, accuracy: 1e-9)
-        XCTAssertEqual(points.map(\.y).max() ?? .nan, 9, accuracy: 1e-9)
+        XCTAssertEqual(points.map(\.x).min() ?? .nan, -2.5, accuracy: 1e-9)
+        XCTAssertEqual(points.map(\.x).max() ?? .nan, 2.5, accuracy: 1e-9)
+        XCTAssertEqual(points.map(\.y).min() ?? .nan, -1, accuracy: 1e-9)
+        XCTAssertEqual(points.map(\.y).max() ?? .nan, 1, accuracy: 1e-9)
         XCTAssertEqual(state.revisions.map(\.id), [revision.id])
     }
 
