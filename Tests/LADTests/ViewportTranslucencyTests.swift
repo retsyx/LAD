@@ -103,6 +103,51 @@ final class ViewportTranslucencyTests: XCTestCase {
             "Selected gold PBR faces must remain translucent while preserving the enclosed part's custom color.")
     }
 
+    /// The highlighted face fill is depth-tested against the depth-only face
+    /// copies. Both must rasterize identical depths, or an obliquely viewed
+    /// surface shows blocky and fan-shaped gaps in its fill.
+    @MainActor
+    func testSelectedFaceFillCoversAnObliqueTranslucentSurface() async throws {
+        _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let face = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0)
+        let preview = tessellatedPlate(divisions: 24)
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        for projection in ViewportProjectionMode.allCases {
+            func capture(_ selected: [CADFeatureID]) async throws -> NSBitmapImageRep {
+                view.update(mesh: preview, mode: .translucent, grid: false, command: nil,
+                            selectedSolids: [], hiddenSolids: [], projection: projection, selectedFeatures: selected)
+                let deadline = ContinuousClock.now + .seconds(10)
+                while view.isPreparingCaptureResources, ContinuousClock.now < deadline {
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                XCTAssertFalse(view.isPreparingCaptureResources)
+                let camera = try XCTUnwrap(view.pointOfView)
+                camera.position = SCNVector3(0.7, -4.5, 2.2)
+                camera.look(at: SCNVector3Zero, up: SCNVector3(0, 0, 1), localFront: SCNVector3(0, 0, -1))
+                let png = try await CADAgentRenderer.capturePNG(view: view)
+                return try XCTUnwrap(NSBitmapImageRep(data: png))
+            }
+            let plain = try await capture([])
+            let highlighted = try await capture([face])
+            var samples = 0, filled = 0
+            for v in stride(from: -1.8, through: 1.8, by: 0.06) {
+                for u in stride(from: -1.8, through: 1.8, by: 0.06) {
+                    let projected = view.projectPoint(SCNVector3(u, v, 0))
+                    let x = Int((CGFloat(projected.x) * CGFloat(plain.pixelsWide) / view.bounds.width).rounded(.down))
+                    let y = plain.pixelsHigh - 1 - Int((CGFloat(projected.y) * CGFloat(plain.pixelsHigh) / view.bounds.height).rounded(.down))
+                    guard x >= 0, y >= 0, x < plain.pixelsWide, y < plain.pixelsHigh,
+                          let before = plain.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
+                          let after = highlighted.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                    samples += 1
+                    if after.redComponent - after.blueComponent > before.redComponent - before.blueComponent + 0.2 { filled += 1 }
+                }
+            }
+            XCTAssertGreaterThan(samples, 2_000)
+            XCTAssertEqual(filled, samples,
+                "The \(projection) translucent face fill must cover the whole selected surface without depth fighting.")
+        }
+    }
+
     @MainActor
     func testRepresentativePreviewUsesProductionTranslucency() async throws {
         guard let path = ProcessInfo.processInfo.environment["LAD_TRANSLUCENCY_PREVIEW"] else {
@@ -192,6 +237,32 @@ final class ViewportTranslucencyTests: XCTestCase {
                     bounds: [-2, -2, 0, 2, 2, 1], volume: 1, area: 32, solids: 2, faces: 2,
                     buildSeconds: 0, threads: 1, stepPath: "/tmp/viewport-translucency-test.step",
                     triangleSolids: [0, 0, 1, 1])
+    }
+
+    /// One planar face of a single solid, finely triangulated like a CAD plate.
+    private func tessellatedPlate(divisions: Int) -> PreviewMesh {
+        var vertices = [[Double]](), triangles = [[Int]]()
+        for row in 0...divisions {
+            for column in 0...divisions {
+                vertices.append([-2 + 4 * Double(column) / Double(divisions), -2 + 4 * Double(row) / Double(divisions), 0])
+            }
+        }
+        for row in 0..<divisions {
+            for column in 0..<divisions {
+                let corner = row * (divisions + 1) + column, above = corner + divisions + 1
+                triangles += [[corner, corner + 1, above + 1], [corner, above + 1, above]]
+            }
+        }
+        var preview = PreviewMesh(vertices: vertices, triangles: triangles, edges: [],
+            bounds: [-2, -2, 0, 2, 2, 0], volume: 1, area: 16, solids: 1, faces: 1,
+            buildSeconds: 0, threads: 1, stepPath: "/tmp/viewport-translucency-plate.step",
+            triangleSolids: [Int](repeating: 0, count: triangles.count))
+        preview.topology = CADTopology(vertices: [], edges: [], faces: [
+            CADFace(id: CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0), type: "PLANE", area: 16,
+                    center: [0, 0, 0], normal: [0, 0, 1])
+        ], parts: [])
+        preview.triangleFaces = [Int](repeating: 0, count: triangles.count)
+        return preview
     }
 
     private func nestedBoxes() -> PreviewMesh {

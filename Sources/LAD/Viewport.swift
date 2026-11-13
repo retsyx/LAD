@@ -691,16 +691,20 @@ final class CADSceneView: NSView {
     static func translucentCopy(of geometry: SCNGeometry, category: Int, visible: Bool) -> SCNNode {
         let copy = SCNGeometry(sources: geometry.sources, elements: geometry.elements)
         let material = SCNMaterial()
-        material.lightingModel = .constant
         material.isDoubleSided = true
         if category == CADViewportCategory.visibility {
-            // Nearest solid depth belongs only to ordinary decorations.
+            // Nearest solid depth belongs only to ordinary decorations. Highlighted
+            // face overlays test against it at equal depth, so this copy shares
+            // their lighting model and SceneKit's vertex transform; a constant
+            // material rasterizes slightly different depths, which fight.
+            material.lightingModel = .physicallyBased
             material.colorBufferWriteMask = []
             material.writesToDepthBuffer = true
             material.readsFromDepthBuffer = true
         } else {
             // Multiplicative transmittance is independent of draw order and
             // never rejected by depth.
+            material.lightingModel = .constant
             material.shaderModifiers = [.fragment: Self.revealageFragment]
             material.blendMode = .multiply
             material.writesToDepthBuffer = false
