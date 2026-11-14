@@ -1,4 +1,48 @@
 import AppKit
+import Observation
+
+/// A design window's conversation search, shared by its header toggle, search
+/// bar and Find menu commands. It is transient and never saved with the design.
+@MainActor @Observable
+final class ConversationSearchController {
+    struct Step: Equatable {
+        let id = UUID()
+        let forward: Bool
+    }
+
+    private(set) var isVisible = false
+    var query = ""
+    var index = 0
+    /// Matches in the window's current conversation, reported by its view.
+    var matchCount = 0
+    /// Requests the window's conversation handles once each.
+    private(set) var focusRequest = 0
+    private(set) var stepRequest: Step?
+
+    var isActive: Bool { isVisible && ConversationSearch.isActive(query) }
+    var canStep: Bool { isActive && matchCount > 0 }
+
+    /// Shows the search bar and focuses its field.
+    func show() {
+        isVisible = true
+        focusRequest &+= 1
+    }
+
+    /// Hiding ends the search, removing its highlights.
+    func hide() {
+        isVisible = false
+        query = ""
+        index = 0
+        stepRequest = nil
+    }
+
+    func toggle() { isVisible ? hide() : show() }
+
+    func step(forward: Bool) {
+        guard canStep else { return }
+        stepRequest = Step(forward: forward)
+    }
+}
 
 /// One occurrence of the search text in a conversation message.
 struct ConversationSearchMatch: Equatable {

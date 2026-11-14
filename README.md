@@ -109,8 +109,10 @@ Drop a `.lad` file on a design window's title bar, viewer, parts tree or convers
 | Pan | Middle-drag or Shift + right-drag |
 | Zoom toward the current mouse location | Scroll |
 | Zoom toward the gesture anchor | Trackpad pinch |
-| Fit design | `F`, toolbar, or `⌘F` |
+| Fit design | `F`, toolbar, or Design menu |
 | Isometric / front / top / right | `0` / `1` / `2` / `3` with viewport focused, or Design menu |
+| Search the conversation | `⌘F` (**Edit → Find**) or the magnifying-glass button in the Design pane; `Escape` hides the search |
+| Next / previous search match | `⌘G` / `⇧⌘G`, or `Return` / `⇧Return` in the search field |
 | Submit prompt | `Return` |
 | New line in prompt | `⌥Return` |
 | Add next queued request to the current request, or submit prompt when the queue is empty | `⌘Return` |

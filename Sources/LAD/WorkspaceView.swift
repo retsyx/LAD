@@ -80,6 +80,12 @@ struct WorkspaceView: View {
     @State private var previewImageAttachment: SourceAttachment?
     @StateObject private var activityPanel = ProjectActivityPanelController()
     @StateObject private var viewportReference = WorkspaceViewportReference()
+    @State private var conversationSearch: ConversationSearchController
+
+    init(state: AppState, conversationSearch: ConversationSearchController? = nil) {
+        self.state = state
+        _conversationSearch = State(initialValue: conversationSearch ?? ConversationSearchController())
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -90,6 +96,7 @@ struct WorkspaceView: View {
                 WorkspaceViewer(state: state, viewportReference: viewportReference)
                     .frame(minWidth: 540, maxWidth: .infinity, maxHeight: .infinity)
                 WorkspaceConversation(state: state, activityPanel: activityPanel, viewportReference: viewportReference,
+                                      search: conversationSearch,
                                       promptFocused: $promptFocused, previewImageAttachment: $previewImageAttachment)
                     .frame(minWidth: 340, idealWidth: 390, maxWidth: 520, maxHeight: .infinity)
             }
@@ -101,11 +108,13 @@ struct WorkspaceView: View {
             state.presentSaveConflict(in: $0)
         })
         .toolbarBackground(Palette.panel, for: .windowToolbar)
+        .focusedSceneValue(\.conversationSearch, conversationSearch)
         .onChange(of: state.projectEditingID) { _, _ in
             cancelProjectRename()
             isProgramExpanded = false
             previewImageAttachment = nil
             activityPanel.close()
+            conversationSearch.hide()
         }
         .onDisappear { activityPanel.close() }
         .onChange(of: state.canRenameProject) { _, allowed in
@@ -326,6 +335,7 @@ private struct WorkspaceConversation: View {
     let state: AppState
     @ObservedObject var activityPanel: ProjectActivityPanelController
     @ObservedObject var viewportReference: WorkspaceViewportReference
+    let search: ConversationSearchController
     @Binding var promptFocused: Bool
     @Binding var previewImageAttachment: SourceAttachment?
 
@@ -335,6 +345,12 @@ private struct WorkspaceConversation: View {
                 Image(systemName: "sparkle").foregroundStyle(Palette.accent)
                 Text("Design").font(.system(size: 13, weight: .semibold))
                 Spacer()
+                Button { search.toggle() } label: {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(search.isVisible ? Palette.accent : Palette.muted)
+                }
+                .buttonStyle(.plain).help(search.isVisible ? "Hide search" : "Search conversation (⌘F)")
+                .accessibilityLabel("Search Conversation").accessibilityValue(search.isVisible ? "Shown" : "Hidden")
                 Button { activityPanel.toggle(state: state, owner: viewportReference.window ?? viewportReference.view?.window) } label: {
                     Image(systemName: "list.bullet.rectangle")
                         .foregroundStyle(activityPanel.isVisible ? Palette.accent : Palette.muted)
@@ -343,7 +359,7 @@ private struct WorkspaceConversation: View {
                 .accessibilityLabel("Tool Activity").accessibilityValue(activityPanel.isVisible ? "Shown" : "Hidden")
             }.padding(.horizontal, 20).padding(.vertical, 19)
             Rectangle().fill(Palette.line).frame(height: 1)
-            WorkspaceMessageList(state: state, onPreview: { previewImageAttachment = $0 })
+            WorkspaceMessageList(state: state, search: search, onPreview: { previewImageAttachment = $0 })
             if let error = state.error { errorPanel(error) }
             if !state.queuedRequests.isEmpty {
                 ProjectRequestQueueView(state: state).padding(.horizontal, 16).padding(.top, 6)
@@ -375,28 +391,27 @@ private struct WorkspaceConversation: View {
 
 private struct WorkspaceMessageList: View {
     let state: AppState
+    let search: ConversationSearchController
     let onPreview: (SourceAttachment) -> Void
-    @State private var searchQuery = ""
-    @State private var searchIndex = 0
     @State private var textWidth = ConversationTextWidth()
 
     private static let textFontSize: CGFloat = 12
     private static let textLineSpacing: CGFloat = 5
     private static let userMessagePadding: CGFloat = 13
 
-    private var isSearching: Bool { ConversationSearch.isActive(searchQuery) }
+    private var searchMatches: [ConversationSearchMatch] {
+        search.isActive ? ConversationSearch.matches(in: state.messages, for: search.query) : []
+    }
 
     var body: some View {
-        let matches = ConversationSearch.matches(in: state.messages, for: searchQuery)
-        let current = matches.isEmpty ? nil : min(searchIndex, matches.count - 1)
+        let matches = searchMatches
+        let current = matches.isEmpty ? nil : min(search.index, matches.count - 1)
         let highlights = Dictionary(grouping: matches, by: \.messageID)
         return ScrollViewReader { proxy in
             VStack(spacing: 0) {
-                ConversationSearchBar(query: $searchQuery, isActive: isSearching, matchCount: matches.count, current: current,
-                                      onStep: { forward in
-                                          revealMatch(ConversationSearch.step(from: current ?? -1, count: matches.count,
-                                                                              forward: forward), proxy: proxy)
-                                      })
+                if search.isVisible {
+                    ConversationSearchBar(search: search, current: current)
+                }
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
                         HStack(spacing: 8) {
@@ -424,26 +439,30 @@ private struct WorkspaceMessageList: View {
             }
             // Keep a found match in place while the conversation continues.
             .onChange(of: state.messages.count) { _, _ in
-                if !isSearching { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+                if !search.isActive { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
             .onChange(of: state.messages.last?.content) { _, _ in
-                if state.isWorking, !isSearching { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+                if state.isWorking, !search.isActive { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
             .onChange(of: state.isWorking) { _, _ in
-                if !isSearching { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+                if !search.isActive { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
-            .onChange(of: searchQuery) { _, _ in revealMatch(0, proxy: proxy) }
-            .onChange(of: state.projectEditingID) { _, _ in
-                searchQuery = ""
-                searchIndex = 0
+            .onChange(of: matches.count, initial: true) { _, count in search.matchCount = count }
+            .onChange(of: search.query) { _, _ in revealMatch(0, proxy: proxy) }
+            .onChange(of: search.stepRequest) { _, step in
+                guard let step else { return }
+                let matches = searchMatches
+                guard !matches.isEmpty else { return }
+                revealMatch(ConversationSearch.step(from: min(search.index, matches.count - 1), count: matches.count,
+                                                    forward: step.forward), proxy: proxy)
             }
         }
     }
 
     /// Selects a match and scrolls its line into view.
     private func revealMatch(_ index: Int, proxy: ScrollViewProxy) {
-        searchIndex = index
-        let matches = ConversationSearch.matches(in: state.messages, for: searchQuery)
+        search.index = index
+        let matches = searchMatches
         guard matches.indices.contains(index),
               let message = state.messages.first(where: { $0.id == matches[index].messageID }) else { return }
         let width = textWidth.value - (message.role == "user" ? 2 * Self.userMessagePadding : 0)
@@ -531,42 +550,47 @@ private final class ConversationTextWidth {
 }
 
 private struct ConversationSearchBar: View {
-    @Binding var query: String
-    let isActive: Bool
-    let matchCount: Int
+    @Bindable var search: ConversationSearchController
     let current: Int?
-    let onStep: (_ forward: Bool) -> Void
+    @FocusState private var fieldFocused: Bool
 
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(Palette.muted)
-            TextField("Search conversation", text: $query)
-                .textFieldStyle(.plain).font(.system(size: 12)).foregroundStyle(.primary)
+            TextField("Search conversation", text: $search.query)
+                .textFieldStyle(.plain).font(.system(size: 12))
+                .focused($fieldFocused)
                 .onSubmit {
-                    guard matchCount > 0 else { return }
                     let event = NSApp.currentEvent
-                    onStep(!(event?.type == .keyDown && event?.modifierFlags.contains(.shift) == true))
+                    search.step(forward: !(event?.type == .keyDown && event?.modifierFlags.contains(.shift) == true))
                 }
-                .onExitCommand { query = "" }
+                .onExitCommand { search.hide() }
                 .accessibilityLabel("Search conversation")
                 .accessibilityIdentifier("conversationSearchField")
-            if isActive {
-                Text(current.map { "\($0 + 1) of \(matchCount)" } ?? "No matches")
-                    .font(.system(size: 10)).monospacedDigit().foregroundStyle(Palette.muted).fixedSize()
-                    .accessibilityIdentifier("conversationSearchCount")
-                Button { onStep(false) } label: { Image(systemName: "chevron.up") }
-                    .help("Previous match (⇧Return)").accessibilityLabel("Previous match")
-                    .disabled(matchCount == 0)
-                Button { onStep(true) } label: { Image(systemName: "chevron.down") }
-                    .help("Next match (Return)").accessibilityLabel("Next match")
-                    .disabled(matchCount == 0)
+            Group {
+                if search.isActive {
+                    Text(current.map { "\($0 + 1) of \(search.matchCount)" } ?? "No matches")
+                        .font(.system(size: 10)).monospacedDigit().fixedSize()
+                        .accessibilityIdentifier("conversationSearchCount")
+                    Button { search.step(forward: false) } label: { Image(systemName: "chevron.up") }
+                        .help("Previous match (⇧⌘G)").accessibilityLabel("Previous match")
+                        .disabled(!search.canStep)
+                    Button { search.step(forward: true) } label: { Image(systemName: "chevron.down") }
+                        .help("Next match (⌘G)").accessibilityLabel("Next match")
+                        .disabled(!search.canStep)
+                }
+                if !search.query.isEmpty {
+                    Button { search.query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .help("Clear search").accessibilityLabel("Clear search")
+                }
             }
-            if !query.isEmpty {
-                Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
-                    .help("Clear search").accessibilityLabel("Clear search")
-            }
+            .buttonStyle(.plain).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.muted)
         }
-        .buttonStyle(.plain).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.muted)
+        // Runs when the bar appears and for each later Find request.
+        .task(id: search.focusRequest) {
+            await Task.yield()
+            if !Task.isCancelled { fieldFocused = true }
+        }
         .padding(.horizontal, 10).padding(.vertical, 7)
         .background(Palette.background.opacity(0.75), in: RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Palette.line, lineWidth: 1))

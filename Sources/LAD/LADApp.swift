@@ -21,11 +21,21 @@ private struct ProjectStateFocusedValueKey: FocusedValueKey {
     typealias Value = AppState
 }
 
+private struct ConversationSearchFocusedValueKey: FocusedValueKey {
+    typealias Value = ConversationSearchController
+}
+
 extension FocusedValues {
     /// The design shown in the key window, for menu commands.
     var projectState: AppState? {
         get { self[ProjectStateFocusedValueKey.self] }
         set { self[ProjectStateFocusedValueKey.self] = newValue }
+    }
+
+    /// The key window's own conversation search, for the Find commands.
+    var conversationSearch: ConversationSearchController? {
+        get { self[ConversationSearchFocusedValueKey.self] }
+        set { self[ConversationSearchFocusedValueKey.self] = newValue }
     }
 }
 
@@ -133,6 +143,7 @@ private struct ProjectCommands: Commands {
     let helpWindow: LADHelpWindowController
     @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.projectState) private var state: AppState?
+    @FocusedValue(\.conversationSearch) private var search: ConversationSearchController?
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -161,13 +172,23 @@ private struct ProjectCommands: Commands {
             Button("Export STEP…") { state?.exportSTEP() }
                 .keyboardShortcut("e", modifiers: [.command, .shift]).disabled(state?.canExport != true)
         }
+        CommandGroup(after: .textEditing) {
+            Menu("Find") {
+                Button("Find…") { search?.show() }.keyboardShortcut("f")
+                    .disabled(search == nil)
+                Button("Find Next") { search?.step(forward: true) }.keyboardShortcut("g")
+                    .disabled(search?.canStep != true)
+                Button("Find Previous") { search?.step(forward: false) }.keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(search?.canStep != true)
+            }
+        }
         CommandGroup(replacing: .help) {
             Button("LAD Help") { helpWindow.showWindow(nil) }
                 .keyboardShortcut("?", modifiers: .command)
         }
         CommandMenu("Design") {
             Button("Fit to View") { state?.viewportCommand = ViewportCommand(.fit) }
-                .keyboardShortcut("f", modifiers: .command).disabled(state == nil)
+                .disabled(state == nil)
             Button("Isometric") { state?.viewportCommand = ViewportCommand(.isometric) }
                 .keyboardShortcut("0").disabled(state == nil)
             Button("Front") { state?.viewportCommand = ViewportCommand(.front) }

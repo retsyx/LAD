@@ -61,19 +61,65 @@ final class ConversationSearchTests: XCTestCase {
     }
 
     @MainActor
+    func testControllerHidingEndsTheSearchAndSteppingNeedsVisibleMatches() {
+        let search = ConversationSearchController()
+        XCTAssertFalse(search.isVisible, "The search bar is hidden by default.")
+        search.query = "bracket"
+        search.matchCount = 2
+        search.step(forward: true)
+        XCTAssertNil(search.stepRequest, "A hidden search has nothing to step through.")
+
+        search.toggle()
+        XCTAssertTrue(search.isVisible)
+        XCTAssertEqual(search.focusRequest, 1)
+        XCTAssertTrue(search.canStep)
+        search.step(forward: false)
+        XCTAssertEqual(search.stepRequest?.forward, false)
+        let previous = search.stepRequest
+        search.step(forward: false)
+        XCTAssertNotEqual(search.stepRequest, previous, "Each request is distinct, including repeated directions.")
+        search.show()
+        XCTAssertTrue(search.isVisible)
+        XCTAssertEqual(search.focusRequest, 2, "Find refocuses a visible search field.")
+        XCTAssertEqual(search.query, "bracket", "Find keeps the current search text.")
+
+        search.matchCount = 0
+        XCTAssertFalse(search.canStep, "Find Next and Find Previous need matches.")
+        search.matchCount = 2
+        search.index = 1
+        search.toggle()
+        XCTAssertFalse(search.isVisible)
+        XCTAssertEqual(search.query, "")
+        XCTAssertEqual(search.index, 0)
+        XCTAssertNil(search.stepRequest)
+        XCTAssertFalse(search.isActive)
+    }
+
+    @MainActor
     func testSearchFieldRevealsAndStepsThroughMatchesWithoutFollowingNewMessages() async throws {
-        let fixture = try Fixture()
+        let search = ConversationSearchController()
+        let fixture = try Fixture(search: search)
         defer { fixture.close() }
         let scroll = try await conversationScroll(in: fixture.host)
-        let field = try await searchField(in: fixture.host)
+        await settle(fixture.host)
+        XCTAssertNil(existingSearchField(in: fixture.host), "The search bar is hidden by default.")
         try await scrollToBottom(scroll, host: fixture.host)
         let bottom = distanceFromTop(scroll)
         XCTAssertGreaterThan(bottom, 1_000, "The fixture conversation must be taller than its pane.")
 
-        XCTAssertTrue(fixture.window.makeFirstResponder(field))
+        // Find (and the header toggle) shows the bar and focuses its field,
+        // even while the composer has focus.
+        let composer = try XCTUnwrap(descendants(fixture.host).compactMap { $0 as? NSTextView }
+            .first { $0.isEditable && !$0.isFieldEditor })
+        XCTAssertTrue(fixture.window.makeFirstResponder(composer))
+        search.show()
+        let field = try await searchField(in: fixture.host)
+        try await waitForFocus(on: field, in: fixture.window, host: fixture.host)
         let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
         editor.insertText("bracket", replacementRange: editor.selectedRange())
         try await waitForScroll(scroll, host: fixture.host, description: "the first match near the top") { $0 < 300 }
+        XCTAssertEqual(search.matchCount, 3)
+        XCTAssertTrue(search.canStep)
         try capture(fixture.host, to: "/tmp/lad-conversation-search.png")
 
         // Shift-Return wraps back to the last match, at the end of a long
@@ -94,16 +140,37 @@ final class ConversationSearchTests: XCTestCase {
         try await waitForScroll(scroll, host: fixture.host, description: "the previous first match") { $0 < 300 }
         XCTAssertTrue(fixture.window.firstResponder === field.currentEditor(), "Stepping must keep the search field focused.")
 
+        // Find Next and Find Previous step without moving focus, wrapping
+        // at either end.
+        XCTAssertTrue(fixture.window.makeFirstResponder(composer))
+        search.step(forward: false)
+        try await waitForScroll(scroll, host: fixture.host, description: "the wrapped final match") { $0 > bottom - 200 }
+        search.step(forward: true)
+        try await waitForScroll(scroll, host: fixture.host, description: "the next wrapped first match") { $0 < 300 }
+        search.step(forward: true)
+        try await waitForScroll(scroll, host: fixture.host, description: "the next middle match") { $0 > 300 && $0 < bottom - 1_000 }
+        XCTAssertTrue(fixture.window.firstResponder === composer, "Find Next must not move focus.")
+        search.step(forward: false)
+        try await waitForScroll(scroll, host: fixture.host, description: "the first match again") { $0 < 300 }
+
+        // Find refocuses a visible field without losing its text.
+        search.show()
+        try await waitForFocus(on: field, in: fixture.window, host: fixture.host)
+        XCTAssertEqual(field.stringValue, "bracket")
+
         // A found match stays in place while the conversation continues.
         fixture.state.messages.append(ChatMessage(role: "assistant", content: "A new update arrives."))
         await settle(fixture.host, for: .milliseconds(600))
         XCTAssertLessThan(distanceFromTop(scroll), 300)
 
         try press(.escape, in: fixture.window)
-        let clearDeadline = ContinuousClock.now + .seconds(3)
-        while field.stringValue != "", ContinuousClock.now < clearDeadline { await settle(fixture.host) }
-        XCTAssertEqual(field.stringValue, "", "Escape clears the search.")
-        XCTAssertLessThan(distanceFromTop(scroll), 300, "Clearing the search keeps the reader's place.")
+        let hideDeadline = ContinuousClock.now + .seconds(3)
+        while existingSearchField(in: fixture.host) != nil, ContinuousClock.now < hideDeadline { await settle(fixture.host) }
+        XCTAssertNil(existingSearchField(in: fixture.host), "Escape hides the search bar.")
+        XCTAssertFalse(search.isVisible)
+        XCTAssertEqual(search.query, "", "Hiding ends the search.")
+        XCTAssertFalse(search.canStep)
+        XCTAssertLessThan(distanceFromTop(scroll), 300, "Hiding the search keeps the reader's place.")
         fixture.state.messages.append(ChatMessage(role: "assistant", content: "Another update arrives."))
         try await waitForScroll(scroll, host: fixture.host, description: "the latest message") { $0 > bottom - 50 }
         XCTAssertEqual(fixture.state.prompt, fixture.draft, "Searching must not change the composer draft.")
@@ -144,14 +211,29 @@ final class ConversationSearchTests: XCTestCase {
     }
 
     @MainActor
+    private func existingSearchField(in host: NSView) -> NSTextField? {
+        descendants(host).compactMap { $0 as? NSTextField }.first { $0.placeholderString == "Search conversation" }
+    }
+
+    @MainActor
     private func searchField(in host: NSView) async throws -> NSTextField {
         let deadline = ContinuousClock.now + .seconds(5)
         while ContinuousClock.now < deadline {
-            if let field = descendants(host).compactMap({ $0 as? NSTextField })
-                .first(where: { $0.placeholderString == "Search conversation" }) { return field }
+            if let field = existingSearchField(in: host) { return field }
             await settle(host)
         }
-        throw XCTSkip("The conversation search field is not exposed as a native text field.")
+        XCTFail("Showing the search must add its field.")
+        throw XCTSkip("No conversation search field.")
+    }
+
+    @MainActor
+    private func waitForFocus(on field: NSTextField, in window: NSWindow, host: NSView) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while field.currentEditor() == nil || window.firstResponder !== field.currentEditor(), ContinuousClock.now < deadline {
+            await settle(host)
+        }
+        XCTAssertTrue(field.currentEditor() != nil && window.firstResponder === field.currentEditor(),
+                      "Find must focus the search field.")
     }
 
     /// The conversation is the tall scroll area in the right-hand column.
@@ -214,7 +296,7 @@ final class ConversationSearchTests: XCTestCase {
         let previousPolicy: NSApplication.ActivationPolicy
         let draft = "An unsent draft stays put."
 
-        init() throws {
+        init(search: ConversationSearchController) throws {
             guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for the conversation UI.") }
             let application = NSApplication.shared
             previousPolicy = application.activationPolicy()
@@ -243,7 +325,7 @@ final class ConversationSearchTests: XCTestCase {
             try ProjectStore.write(project, to: source)
             state = AppState(autosaveStore: ProjectAutosaveStore(rootDirectory: directory))
             state.loadProject(project, from: source)
-            host = NSHostingView(rootView: WorkspaceView(state: state))
+            host = NSHostingView(rootView: WorkspaceView(state: state, conversationSearch: search))
             host.frame = NSRect(x: 0, y: 0, width: 1280, height: 800)
             host.appearance = NSAppearance(named: .darkAqua)
             window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 1280, height: 800),
