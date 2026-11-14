@@ -56,6 +56,28 @@ final class STEPIndividualExportTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["Case"])
     }
 
+    /// File providers such as iCloud Desktop hide dot-prefixed items and their
+    /// contents, so staging must never use a hidden sibling of the destination.
+    func testPublishedExportIsAnOrdinaryVisibleFolder() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = FileManager.default
+        let reference = root.appendingPathComponent("Reference")
+        try manager.createDirectory(at: reference, withIntermediateDirectories: false)
+        let destination = root.appendingPathComponent("Case")
+        let parts = [STEPIndividualExport.Part(name: "Base", solidIndices: [0]),
+                     STEPIndividualExport.Part(name: "Lid", solidIndices: [1])]
+        try STEPIndividualExport.write([Data("base".utf8), Data("lid".utf8)], parts: parts, to: destination)
+        XCTAssertEqual(Set(try manager.contentsOfDirectory(atPath: root.path)), ["Case", "Reference"])
+        XCTAssertEqual(try mode(of: destination), try mode(of: reference))
+        for url in [destination] + parts.map({ destination.appendingPathComponent($0.fileName) }) {
+            var information = stat()
+            XCTAssertEqual(lstat(url.path, &information), 0)
+            XCTAssertEqual(information.st_flags & UInt32(UF_HIDDEN), 0, url.lastPathComponent)
+            XCTAssertFalse(try url.resourceValues(forKeys: [.isHiddenKey]).isHidden ?? true, url.lastPathComponent)
+        }
+    }
+
     func testExistingFolderFileAndSymlinkRemainUntouched() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -81,7 +103,7 @@ final class STEPIndividualExportTests: XCTestCase {
         XCTAssertThrowsError(try STEPIndividualExport.write([Data()], parts: parts, to: link))
         XCTAssertEqual(try manager.destinationOfSymbolicLink(atPath: link.path), target.path)
         XCTAssertFalse(manager.fileExists(atPath: target.path))
-        XCTAssertFalse(try manager.contentsOfDirectory(atPath: root.path).contains { $0.hasPrefix(".lad-step-export-") })
+        XCTAssertEqual(Set(try manager.contentsOfDirectory(atPath: root.path)), ["Case", "File", "Link"])
     }
 
     func testApprovedReplacementPublishesCompleteFolderAndRemovesOldContents() throws {
@@ -129,10 +151,11 @@ final class STEPIndividualExportTests: XCTestCase {
         XCTAssertEqual(try manager.contentsOfDirectory(atPath: target.path), ["keep.txt"])
         XCTAssertEqual(try Data(contentsOf: target.appendingPathComponent("keep.txt")), original)
         XCTAssertFalse(manager.fileExists(atPath: root.appendingPathComponent("Missing target").path))
-        XCTAssertFalse(try manager.contentsOfDirectory(atPath: root.path).contains { $0.hasPrefix(".lad-step-export-") })
+        XCTAssertEqual(Set(try manager.contentsOfDirectory(atPath: root.path)),
+                       ["Existing file", "Original target", "Existing link", "Dangling link"])
     }
 
-    func testApprovedReplacementPreservesOldOutputWhenStagingFails() throws {
+    func testApprovedReplacementPreservesOldOutputWhenPublishingFails() throws {
         guard getuid() != 0 else { throw XCTSkip("Filesystem permission failures need an unprivileged test process.") }
         let root = try temporaryDirectory()
         let manager = FileManager.default
@@ -198,6 +221,10 @@ final class STEPIndividualExportTests: XCTestCase {
             XCTFail("A cancelled export must not publish a folder.")
         } catch is CancellationError {}
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+    }
+
+    private func mode(of url: URL) throws -> Int {
+        try XCTUnwrap(FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int)
     }
 
     private func temporaryDirectory() throws -> URL {

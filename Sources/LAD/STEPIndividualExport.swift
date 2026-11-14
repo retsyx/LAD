@@ -81,12 +81,16 @@ enum STEPIndividualExport {
             guard errno == ENOENT else { throw posixError(at: destination) }
         }
 
+        // Stage in a private same-volume replacement directory rather than
+        // beside the destination: file providers such as iCloud Desktop mark a
+        // dot-prefixed folder and its contents hidden, and the flag survives
+        // publication. The ordinary staged folder keeps its name and mode.
         let manager = FileManager.default
-        let staging = destination.deletingLastPathComponent()
-            .appendingPathComponent(".lad-step-export-\(UUID().uuidString)", isDirectory: true)
-        try manager.createDirectory(at: staging, withIntermediateDirectories: false,
-                                    attributes: [.posixPermissions: 0o700])
-        defer { try? manager.removeItem(at: staging) }
+        let container = try manager.url(for: .itemReplacementDirectory, in: .userDomainMask,
+                                        appropriateFor: destination.deletingLastPathComponent(), create: true)
+        defer { try? manager.removeItem(at: container) }
+        let staging = container.appendingPathComponent(destination.lastPathComponent, isDirectory: true)
+        try manager.createDirectory(at: staging, withIntermediateDirectories: false)
         for (part, bytes) in zip(parts, data) {
             try Task.checkCancellation()
             try bytes.write(to: staging.appendingPathComponent(part.fileName), options: .withoutOverwriting)
