@@ -376,35 +376,103 @@ private struct WorkspaceConversation: View {
 private struct WorkspaceMessageList: View {
     let state: AppState
     let onPreview: (SourceAttachment) -> Void
+    @State private var searchQuery = ""
+    @State private var searchIndex = 0
+    @State private var textWidth = ConversationTextWidth()
+
+    private static let textFontSize: CGFloat = 12
+    private static let textLineSpacing: CGFloat = 5
+    private static let userMessagePadding: CGFloat = 13
+
+    private var isSearching: Bool { ConversationSearch.isActive(searchQuery) }
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    HStack(spacing: 8) {
-                        Rectangle().fill(Palette.line).frame(height: 1)
-                        Text("DESIGN CONVERSATION").font(.system(size: 8, weight: .medium)).tracking(1.3).foregroundStyle(Palette.muted).fixedSize()
-                        Rectangle().fill(Palette.line).frame(height: 1)
-                    }.padding(.top, 6)
-                    ForEach(state.messages) { message in messageView(message).id(message.id) }
-                    if state.isWorking {
-                        HStack(spacing: 10) {
-                            ProgressView().controlSize(.small)
-                            Text(state.activityStatus).font(.system(size: 12)).foregroundStyle(Palette.muted)
-                        }.id("activity")
+        let matches = ConversationSearch.matches(in: state.messages, for: searchQuery)
+        let current = matches.isEmpty ? nil : min(searchIndex, matches.count - 1)
+        let highlights = Dictionary(grouping: matches, by: \.messageID)
+        return ScrollViewReader { proxy in
+            VStack(spacing: 0) {
+                ConversationSearchBar(query: $searchQuery, isActive: isSearching, matchCount: matches.count, current: current,
+                                      onStep: { forward in
+                                          revealMatch(ConversationSearch.step(from: current ?? -1, count: matches.count,
+                                                                              forward: forward), proxy: proxy)
+                                      })
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 24) {
+                        HStack(spacing: 8) {
+                            Rectangle().fill(Palette.line).frame(height: 1)
+                            Text("DESIGN CONVERSATION").font(.system(size: 8, weight: .medium)).tracking(1.3).foregroundStyle(Palette.muted).fixedSize()
+                            Rectangle().fill(Palette.line).frame(height: 1)
+                        }.padding(.top, 6)
+                        ForEach(state.messages) { message in
+                            messageView(message, highlights: highlights[message.id], current: current.map { matches[$0] })
+                                .id(message.id)
+                        }
+                        if state.isWorking {
+                            HStack(spacing: 10) {
+                                ProgressView().controlSize(.small)
+                                Text(state.activityStatus).font(.system(size: 12)).foregroundStyle(Palette.muted)
+                            }.id("activity")
+                        }
+                        Color.clear.frame(height: 1).id("bottom")
                     }
-                    Color.clear.frame(height: 1).id("bottom")
-                }.padding(20)
+                    // Read only when revealing a match; resizing must not
+                    // re-render the conversation.
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { textWidth.value = $0 }
+                    .padding(20)
+                }
             }
-            .onChange(of: state.messages.count) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            // Keep a found match in place while the conversation continues.
+            .onChange(of: state.messages.count) { _, _ in
+                if !isSearching { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            }
             .onChange(of: state.messages.last?.content) { _, _ in
-                if state.isWorking { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+                if state.isWorking, !isSearching { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
-            .onChange(of: state.isWorking) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            .onChange(of: state.isWorking) { _, _ in
+                if !isSearching { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            }
+            .onChange(of: searchQuery) { _, _ in revealMatch(0, proxy: proxy) }
+            .onChange(of: state.projectEditingID) { _, _ in
+                searchQuery = ""
+                searchIndex = 0
+            }
         }
     }
 
-    private func messageView(_ message: ChatMessage) -> some View {
+    /// Selects a match and scrolls its line into view.
+    private func revealMatch(_ index: Int, proxy: ScrollViewProxy) {
+        searchIndex = index
+        let matches = ConversationSearch.matches(in: state.messages, for: searchQuery)
+        guard matches.indices.contains(index),
+              let message = state.messages.first(where: { $0.id == matches[index].messageID }) else { return }
+        let width = textWidth.value - (message.role == "user" ? 2 * Self.userMessagePadding : 0)
+        let fraction = ConversationSearch.verticalFraction(of: matches[index].range, in: message.content, width: width,
+                                                           font: .systemFont(ofSize: Self.textFontSize),
+                                                           lineSpacing: Self.textLineSpacing)
+        // Aligning the same relative point of the text and the visible area
+        // keeps the match's line on screen even in messages taller than it.
+        proxy.scrollTo(ConversationSearchTextID(messageID: message.id), anchor: UnitPoint(x: 0, y: fraction))
+    }
+
+    private func messageText(_ message: ChatMessage, highlights: [ConversationSearchMatch]?,
+                             current: ConversationSearchMatch?) -> Text {
+        guard let highlights else { return Text(message.content) }
+        var text = AttributedString(message.content)
+        for match in highlights {
+            guard let range = Range(match.range, in: text) else { continue }
+            if match == current {
+                text[range].backgroundColor = Palette.accent
+                text[range].foregroundColor = Palette.background
+            } else {
+                text[range].backgroundColor = Palette.accent.opacity(0.3)
+            }
+        }
+        return Text(text)
+    }
+
+    private func messageView(_ message: ChatMessage, highlights: [ConversationSearchMatch]?,
+                             current: ConversationSearchMatch?) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 7) {
                 Image(systemName: message.role == "user" ? "person.crop.circle" : message.role == "system" ? "exclamationmark.circle" : "sparkle")
@@ -416,7 +484,10 @@ private struct WorkspaceMessageList: View {
                 Text(message.date, style: .time).font(.system(size: 9)).foregroundStyle(Palette.muted.opacity(0.6))
                 CopyButton(text: message.content, label: "Copy message")
             }
-            Text(message.content).font(.system(size: 12)).lineSpacing(5).foregroundStyle(Color.white.opacity(0.85)).textSelection(.enabled)
+            messageText(message, highlights: highlights, current: current)
+                .font(.system(size: Self.textFontSize)).lineSpacing(Self.textLineSpacing)
+                .foregroundStyle(Color.white.opacity(0.85)).textSelection(.enabled)
+                .id(ConversationSearchTextID(messageID: message.id))
             if let attachments = message.attachments, !attachments.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     let images = attachments.filter(\.isImage)
@@ -446,8 +517,60 @@ private struct WorkspaceMessageList: View {
                 }
             }
         }
-        .padding(message.role == "user" ? 13 : 0)
+        .padding(message.role == "user" ? Self.userMessagePadding : 0)
         .background(message.role == "user" ? Palette.raised.opacity(0.65) : .clear, in: RoundedRectangle(cornerRadius: 9))
+    }
+}
+
+private struct ConversationSearchTextID: Hashable {
+    let messageID: UUID
+}
+
+private final class ConversationTextWidth {
+    var value: CGFloat = 0
+}
+
+private struct ConversationSearchBar: View {
+    @Binding var query: String
+    let isActive: Bool
+    let matchCount: Int
+    let current: Int?
+    let onStep: (_ forward: Bool) -> Void
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(Palette.muted)
+            TextField("Search conversation", text: $query)
+                .textFieldStyle(.plain).font(.system(size: 12)).foregroundStyle(.primary)
+                .onSubmit {
+                    guard matchCount > 0 else { return }
+                    let event = NSApp.currentEvent
+                    onStep(!(event?.type == .keyDown && event?.modifierFlags.contains(.shift) == true))
+                }
+                .onExitCommand { query = "" }
+                .accessibilityLabel("Search conversation")
+                .accessibilityIdentifier("conversationSearchField")
+            if isActive {
+                Text(current.map { "\($0 + 1) of \(matchCount)" } ?? "No matches")
+                    .font(.system(size: 10)).monospacedDigit().foregroundStyle(Palette.muted).fixedSize()
+                    .accessibilityIdentifier("conversationSearchCount")
+                Button { onStep(false) } label: { Image(systemName: "chevron.up") }
+                    .help("Previous match (⇧Return)").accessibilityLabel("Previous match")
+                    .disabled(matchCount == 0)
+                Button { onStep(true) } label: { Image(systemName: "chevron.down") }
+                    .help("Next match (Return)").accessibilityLabel("Next match")
+                    .disabled(matchCount == 0)
+            }
+            if !query.isEmpty {
+                Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                    .help("Clear search").accessibilityLabel("Clear search")
+            }
+        }
+        .buttonStyle(.plain).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.muted)
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(Palette.background.opacity(0.75), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Palette.line, lineWidth: 1))
+        .padding(.horizontal, 16).padding(.top, 12)
     }
 }
 
