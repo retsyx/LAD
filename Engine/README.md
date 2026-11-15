@@ -265,6 +265,14 @@ as cavities. These are required recipe inputs, stored once in the design's share
 asset table. Arbitrary paths, links, open/invalid meshes and unsupported kinds
 are rejected. This does not allow generated replay programs to read user files.
 
+Before the program runs, each build writes `<input>.validated.brep`, a native
+copy of every input it imported and validated (`source` for `sourceAsset`,
+`input-000` and so on). The app keeps these for the session, keyed by the input's
+exact bytes, format and runtime, and stages a copy beside the unchanged original
+(`validatedBREP` per input, `sourceValidatedBREP`) so later builds neither
+translate nor validate that input again. An unreadable copy falls back to the
+original. Copies are never saved.
+
 ## Agent tool interface
 
 `agent_server.py --workspace <private-task-directory>` is LAD's stdlib-only
@@ -383,6 +391,12 @@ directly with `Poly_Triangulation.Triangle(i).Get()`. It avoids the slow Python
 sequence iterator over `Poly_Array1OfTriangle` and CadQuery Vector wrappers,
 while preserving the same vertices, face-local boundaries, oriented winding,
 quality tolerances, and per-solid ownership.
+
+A solid whose native mesh fails the display audit is cleaned and meshed again
+with the next setting, together with any solids sharing its native faces or edges
+(located instances and split solids); every other solid keeps its first mesh. The
+independent Delabella triangulator is tried at the original angle before a finer
+boundary angle, which multiplies the triangles of long curved trims.
 
 ## CAD programs
 
