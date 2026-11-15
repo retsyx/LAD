@@ -19,6 +19,10 @@ final class CADAgentTools {
         var partLayout: PartLayout? = nil
         var partColors: [String: PartColor] = [:]
         var colorChanges: [CADPartColorChange] = []
+        /// Built with `lad.print` true: the program's 3D printing version.
+        var print = false
+        /// Printing orientations found for this artifact's own native geometry.
+        var printOrientations: [Int: PrintOrientation] = [:]
     }
     private let workspace: CADAgentWorkspace
     private let python: String
@@ -162,8 +166,17 @@ final class CADAgentTools {
     }
 
     func validatedPreview(for model: ModelSpec) -> PreviewMesh? {
+        validatedPreview(for: model, print: false)
+    }
+
+    /// A matching 3D printing version built during this task, if any.
+    func validatedPrintPreview(for model: ModelSpec) -> PreviewMesh? {
+        validatedPreview(for: model, print: true)
+    }
+
+    private func validatedPreview(for model: ModelSpec, print: Bool) -> PreviewMesh? {
         for id in Array(artifactOrder.reversed()) + ["current"] {
-            guard let artifact = artifacts[id], constructionMatches(artifact.model, model),
+            guard let artifact = artifacts[id], artifact.print == print, constructionMatches(artifact.model, model),
                   let preview = artifact.preview,
                   preview.brepPath.map({ FileManager.default.fileExists(atPath: $0) }) == true else { continue }
             return preview
@@ -171,15 +184,30 @@ final class CADAgentTools {
         return nil
     }
 
+    /// A program that reads `lad.print` must also build a 3D printing version
+    /// with the design's parts. Reuses this task's matching printing build.
+    func validatedPrintVersion(for model: ModelSpec, design: PreviewMesh) async throws -> PreviewMesh? {
+        guard design.printVersion == true else { return nil }
+        let printing: PreviewMesh
+        if let cached = validatedPrintPreview(for: model) { printing = cached }
+        else { printing = try await engine.buildPreview(model, print: true, python: python, threads: threads) }
+        try checkCancellation()
+        try PrintLayout.validateParts(of: printing, matching: design)
+        return printing
+    }
+
     /// Rebuilds a committable candidate whose display cache was evicted, then
     /// applies the same checks as `validatedCandidate`.
     func committableCandidate(artifactID: String) async throws -> (model: ModelSpec, preview: PreviewMesh, colorChanges: [CADPartColorChange]) {
         try checkCancellation()
-        if let artifact = artifacts[artifactID], artifact.versionID == nil,
+        if let artifact = artifacts[artifactID], artifact.versionID == nil, !artifact.print,
            artifact.preview?.brepPath.map({ FileManager.default.fileExists(atPath: $0) }) != true {
             _ = try await build(artifact.model, id: artifactID)
         }
-        return try validatedCandidate(artifactID: artifactID)
+        let candidate = try validatedCandidate(artifactID: artifactID)
+        do { _ = try await validatedPrintVersion(for: candidate.model, design: candidate.preview) }
+        catch let failure as EngineBuildFailure { throw LADError.message(EngineFailureDiagnostic.repairText(for: failure)) }
+        return candidate
     }
 
     /// External agents commit a named candidate, never arbitrary source paired
@@ -193,6 +221,9 @@ final class CADAgentTools {
         }
         guard artifact.versionID == nil else {
             throw LADError.message("Historical builds use read-only saved input bindings. Register any required original reference files and build the final complete CAD program without versionID before committing it.")
+        }
+        guard !artifact.print else {
+            throw LADError.message("Commit the program's ordinary build, not its 3D printing version. LAD derives the printing version from the same program.")
         }
         var model = resolvingReconstructionInputs(in: artifact.model)
         model = try resolvingFinalDelivery(in: model)
@@ -371,7 +402,8 @@ final class CADAgentTools {
             }
             return try CADAgentToolResult(metadata: values, isError: values["status"] as? String == "error")
         case "lad_build":
-            try allowed(arguments, ["programPath", "title", "summary", "assetIDs", "versionID"])
+            try allowed(arguments, ["programPath", "title", "summary", "assetIDs", "versionID", "print"])
+            let printing = try bool("print", arguments) ?? false
             let version = try string("versionID", arguments).map { try versions.version(id: $0) }
             let origin = version?.model ?? current
             let path = try string("programPath", arguments, required: true)!
@@ -390,7 +422,7 @@ final class CADAgentTools {
                                   summary: try boundedText("summary", arguments, fallback: version?.model.summary ?? "CAD program built and validated by LAD.", maximum: 6_000),
                                   units: "mm", script: script, sourceSTEP: origin?.sourceSTEP,
                                   sourceName: origin?.sourceName, inputAssets: selected.isEmpty ? nil : selected)
-            let artifact = try await build(model, versionID: version?.id)
+            let artifact = try await build(model, versionID: version?.id, print: printing)
             return try result(summary(artifact))
         case "lad_import":
             try allowed(arguments, ["path", "name", "producerPaths"])
@@ -522,7 +554,8 @@ final class CADAgentTools {
         case "lad_render":
             try allowed(arguments, ["artifactID", "view", "projection", "display", "width", "height", "solidIndices",
                                     "yawDegrees", "elevationDegrees", "rollDegrees", "cameraPosition", "cameraTarget", "zoom",
-                                    "jointPositions", "drivingJoint"])
+                                    "jointPositions", "drivingJoint", "printLayout"])
+            let printLayout = try bool("printLayout", arguments) ?? false
             let view = try string("view", arguments) ?? "isometric"
             guard ["isometric", "front", "back", "top", "bottom", "left", "right"].contains(view),
                   let projection = ViewportProjectionMode(rawValue: try string("projection", arguments) ?? "isometric"),
@@ -539,9 +572,26 @@ final class CADAgentTools {
                     throw LADError.message("The assembly drivingJoint must name a joint supplied in jointPositions.")
                 }
             }
-            let artifact = try await artifact(arguments)
+            var artifact = try await artifact(arguments)
             var preview = artifact.preview!
-            if let jointPositions {
+            if printLayout {
+                guard jointPositions == nil else {
+                    throw LADError.message("Render printLayout without jointPositions; the printing layout replaces assembly poses.")
+                }
+                guard artifact.print || preview.printVersion != true else {
+                    throw LADError.message("This program reads lad.print. Build its 3D printing version with lad_build print=true and render that artifact with printLayout.")
+                }
+                let solids = Set(0..<preview.solids)
+                let missing = solids.subtracting(artifact.printOrientations.keys)
+                if !missing.isEmpty {
+                    let found = try await engine.printOrientations(preview, solids: missing, python: python, threads: threads)
+                    try checkCancellation()
+                    artifact.printOrientations.merge(found) { current, _ in current }
+                    if artifacts[artifact.id]?.preview?.brepPath == preview.brepPath { artifacts[artifact.id] = artifact }
+                }
+                preview.assemblyPose = AssemblyPose(positions: [:],
+                    solidTransforms: PrintLayout.transforms(for: solids, orientations: artifact.printOrientations))
+            } else if let jointPositions {
                 guard let motion = preview.assemblyMotion else {
                     throw LADError.message("The design has no assembly joints to position.")
                 }
@@ -568,7 +618,8 @@ final class CADAgentTools {
             metadata["cameraParameters"] = arguments.filter {
                 ["yawDegrees", "elevationDegrees", "rollDegrees", "cameraPosition", "cameraTarget", "zoom"].contains($0.key)
             }
-            if let pose = preview.assemblyPose { metadata["jointPositions"] = pose.positions }
+            if printLayout { metadata["printLayout"] = true }
+            else if let pose = preview.assemblyPose { metadata["jointPositions"] = pose.positions }
             return try imageResult(url, metadata: metadata)
         case "lad_check_motion":
             try allowed(arguments, ["artifactID", "joint", "from", "to", "steps", "pairs", "jointPositions"])
@@ -744,13 +795,22 @@ final class CADAgentTools {
         return try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
     }
 
-    private func build(_ model: ModelSpec, id: String? = nil, versionID: UUID? = nil, preparedPreview: PreviewMesh? = nil) async throws -> Artifact {
+    private func build(_ model: ModelSpec, id: String? = nil, versionID: UUID? = nil, preparedPreview: PreviewMesh? = nil,
+                       print: Bool = false) async throws -> Artifact {
         let id = id ?? UUID().uuidString
         var preview: PreviewMesh
         if let preparedPreview { preview = preparedPreview }
-        else if let cached = validatedPreview(for: model) { preview = cached }
-        else { preview = try await engine.buildPreview(model, python: python, threads: threads) }
+        else if let cached = validatedPreview(for: model, print: print) { preview = cached }
+        else { preview = try await engine.buildPreview(model, print: print, python: python, threads: threads) }
         try checkCancellation()
+        if print {
+            // The printing version must keep the ordinary build's parts.
+            let design: PreviewMesh
+            if let cached = validatedPreview(for: model) { design = cached }
+            else { design = try await build(model, versionID: versionID).preview! }
+            do { try PrintLayout.validateParts(of: preview, matching: design) }
+            catch let failure as EngineBuildFailure { throw LADError.message(EngineFailureDiagnostic.repairText(for: failure)) }
+        }
         runtime = preview.runtime
         let programURL = try workspace.write(Data(model.script.utf8), path: "artifacts/\(id)/program.py")
         let metadataURL = workspace.root.appendingPathComponent("artifacts/\(id)/metadata.json")
@@ -777,7 +837,7 @@ final class CADAgentTools {
         let artifact = Artifact(id: id, model: model, preview: preview, programURL: programURL, metadataURL: metadataURL,
             versionID: versionID, parts: nodes, partLayout: resolvedLayout,
             partColors: Self.completePartColors(in: nodes, colors: inherited),
-            colorChanges: patch.filter { physicalIDs.contains($0.partID) })
+            colorChanges: patch.filter { physicalIDs.contains($0.partID) }, print: print)
         _ = try workspace.write(JSONSerialization.data(withJSONObject: summary(artifact), options: [.sortedKeys, .prettyPrinted]), path: "artifacts/\(id)/metadata.json")
         artifacts[id] = artifact
         if !artifactOrder.contains(id) { artifactOrder.append(id) }
@@ -889,7 +949,8 @@ final class CADAgentTools {
     private func artifact(_ arguments: [String: Any]) async throws -> Artifact {
         let id = try string("artifactID", arguments) ?? "current"
         if let artifact = artifacts[id] {
-            return artifact.preview == nil ? try await build(artifact.model, id: id, versionID: artifact.versionID) : artifact
+            return artifact.preview == nil
+                ? try await build(artifact.model, id: id, versionID: artifact.versionID, print: artifact.print) : artifact
         }
         if id == "current", let current { return try await build(current, id: "current") }
         throw LADError.message(id == "current" ? "There is no current design. Build a CAD program first." : "The requested CAD artifact is unavailable in this task.")
@@ -916,6 +977,11 @@ final class CADAgentTools {
         }
         if let runtime = preview.runtime, let info = try? json(runtime) { result["runtime"] = info }
         if let versionID = artifact.versionID { result["versionID"] = versionID.uuidString }
+        if artifact.print { result["print"] = true }
+        else if preview.printVersion == true { result["definesPrintVersion"] = true }
+        if let pins = preview.printDown, !pins.isEmpty {
+            result["printDown"] = pins.map { ["solidIndex": $0.solid, "direction": $0.direction] as [String: Any] }
+        }
         return result
     }
 
@@ -963,6 +1029,13 @@ final class CADAgentTools {
             throw LADError.message("The LAD tool argument ‘\(key)’ must be nonempty text.")
         }
         return value
+    }
+    private func bool(_ key: String, _ values: [String: Any]) throws -> Bool? {
+        guard let value = values[key] else { return nil }
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            throw LADError.message("The LAD tool argument ‘\(key)’ must be true or false.")
+        }
+        return number.boolValue
     }
     private func strings(_ key: String, _ values: [String: Any]) throws -> [String]? {
         guard let value = values[key] else { return nil }

@@ -132,7 +132,6 @@ final class EngineService {
         var nativePath: String
         var selection: [Int]?
         var colors: [STEPExportColor]
-        var arrangeFor3DPrinting: Bool
         var parts: [[Int]]? = nil
         var transforms: [AssemblySolidTransform] = []
     }
@@ -158,11 +157,14 @@ final class EngineService {
 
     /// Validate new or changed inputs, or reuse a matching saved validation hash.
     /// Retain the original native solid without keeping generated STEP bytes.
-    func buildPreview(_ spec: ModelSpec, python: String, threads: Int, validatedHash: String? = nil) async throws -> PreviewMesh {
-        try await buildModel(spec, python: python, threads: threads, deferSTEP: true, validatedHash: validatedHash)
+    /// `print` builds the program's 3D printing version (`lad.print`).
+    func buildPreview(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int,
+                      validatedHash: String? = nil) async throws -> PreviewMesh {
+        try await buildModel(spec, print: print, python: python, threads: threads, deferSTEP: true, validatedHash: validatedHash)
     }
 
-    private func buildModel(_ spec: ModelSpec, python: String, threads: Int, deferSTEP: Bool, validatedHash: String? = nil) async throws -> PreviewMesh {
+    private func buildModel(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int, deferSTEP: Bool,
+                            validatedHash: String? = nil) async throws -> PreviewMesh {
         let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: deferSTEP, validatedHash: validatedHash) { folder in
             var sourceAsset: String?
             if let source = spec.sourceSTEP {
@@ -186,7 +188,7 @@ final class EngineService {
                 }
             }
             try EngineWorkerRequest.build(title: spec.title, summary: spec.summary, units: spec.units, script: spec.script,
-                                          sourceAsset: sourceAsset, inputAssets: staged).write(to: folder)
+                                          sourceAsset: sourceAsset, inputAssets: staged, print: print).write(to: folder)
         }
         return try await readPreview(output, deferSTEP: deferSTEP)
     }
@@ -263,9 +265,9 @@ final class EngineService {
     }
 
     /// Export an already built native solid, with no program replay or meshing.
-    /// Repeated exports reuse bytes only for the same geometry, subset, RGB and arrangement.
+    /// Repeated exports reuse bytes only for the same geometry, subset, RGB and placement.
     func exportSTEP(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, solidColors: [Int: PartColor] = [:],
-                    arrangeFor3DPrinting: Bool = false, solidTransforms: [Int: [Double]]? = nil,
+                    solidTransforms: [Int: [Double]]? = nil,
                     python: String, threads: Int) async throws -> Data {
         defer { withExtendedLifetime(preview.buildArtifacts) {} }
         try Task.checkCancellation()
@@ -282,8 +284,8 @@ final class EngineService {
         let selection: [Int]? = solidIndices.flatMap { $0.count == preview.solids ? nil : $0.sorted() }
         let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
         // Raw bytes retain their original coordinates and carry no requested display colors.
-        // Arrangement and current RGB must be written from native geometry.
-        if transforms.isEmpty, !arrangeFor3DPrinting, selection == nil, colors.isEmpty, let artifacts = preview.buildArtifacts, artifacts.containsSTEP,
+        // Placement and current RGB must be written from native geometry.
+        if transforms.isEmpty, selection == nil, colors.isEmpty, let artifacts = preview.buildArtifacts, artifacts.containsSTEP,
            preview.stepPath == artifacts.folder.appendingPathComponent("model.step").path {
             let source = URL(fileURLWithPath: preview.stepPath)
             return try await Task.detached(priority: .userInitiated) {
@@ -294,15 +296,13 @@ final class EngineService {
         }
         if let path = preview.brepPath, let artifacts = preview.buildArtifacts,
            path == artifacts.folder.appendingPathComponent("model.brep").path {
-            let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors,
-                                        arrangeFor3DPrinting: arrangeFor3DPrinting, transforms: transforms)
+            let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors, transforms: transforms)
             if let cached = cachedSTEP(for: cacheKey) { return cached[0] }
             let source = try nativeSource(preview)
             let output = try await runNative(python: python, threads: threads, action: "export this design") { folder in
                 try EngineWorkerRequest.export(Self.stageNative(source, into: folder), .init(
                     solidIndices: selection, solidTransforms: transforms,
-                    solidColors: colors.map { .init(solidIndex: $0.solidIndex, color: $0.color) },
-                    arrangeFor3DPrinting: arrangeFor3DPrinting)).write(to: folder)
+                    solidColors: colors.map { .init(solidIndex: $0.solidIndex, color: $0.color) })).write(to: folder)
             }
             let data = try await Task.detached(priority: .userInitiated) {
                 let data = try EngineArtifact.read(output.folder.appendingPathComponent("model.step"), in: output.folder,
@@ -318,10 +318,10 @@ final class EngineService {
     }
 
     /// Export all requested named parts in one worker, preserving their order.
-    /// Printing placement is shared across files, so importing them together
-    /// reconstructs the same bed layout as a combined export.
+    /// Placement is shared across files, so importing them together
+    /// reconstructs the same layout as a combined export.
     func exportSTEPParts(_ preview: PreviewMesh, parts: [[Int]], solidColors: [Int: PartColor] = [:],
-                         arrangeFor3DPrinting: Bool = false, solidTransforms: [Int: [Double]]? = nil,
+                         solidTransforms: [Int: [Double]]? = nil,
                          python: String, threads: Int) async throws -> [Data] {
         defer { withExtendedLifetime(preview.buildArtifacts) {} }
         try Task.checkCancellation()
@@ -343,15 +343,14 @@ final class EngineService {
               path == artifacts.folder.appendingPathComponent("model.brep").path else {
             throw EngineExportError.nativeArtifactUnavailable
         }
-        let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors,
-                                     arrangeFor3DPrinting: arrangeFor3DPrinting, parts: parts, transforms: transforms)
+        let cacheKey = STEPExportKey(nativePath: path, selection: selection, colors: colors, parts: parts, transforms: transforms)
         if let cached = cachedSTEP(for: cacheKey) { return cached }
         let source = try nativeSource(preview)
         let output = try await runNative(python: python, threads: threads, action: "export these design parts") { folder in
             try EngineWorkerRequest.export(Self.stageNative(source, into: folder), .init(
                 solidIndices: selection, solidTransforms: transforms,
                 solidColors: colors.map { .init(solidIndex: $0.solidIndex, color: $0.color) },
-                arrangeFor3DPrinting: arrangeFor3DPrinting, individualParts: parts)).write(to: folder)
+                individualParts: parts)).write(to: folder)
         }
         struct ExportedPart: Decodable { var path: String; var solidIndices: [Int] }
         struct ExportedParts: Decodable { var partFiles: [ExportedPart] }
@@ -377,6 +376,37 @@ final class EngineService {
         try Task.checkCancellation()
         cacheSTEP(data, for: cacheKey, owner: artifacts)
         return data
+    }
+
+    /// Printing orientations for the requested solids of an already built
+    /// native solid, honoring the program's pinned directions. No replay or
+    /// meshing; placement on the bed is `PrintLayout`'s.
+    func printOrientations(_ preview: PreviewMesh, solids: Set<Int>, python: String,
+                           threads: Int) async throws -> [Int: PrintOrientation] {
+        defer { withExtendedLifetime(preview.buildArtifacts) {} }
+        try Task.checkCancellation()
+        guard !solids.isEmpty else { return [:] }
+        guard solids.allSatisfy({ (0..<preview.solids).contains($0) }) else {
+            throw LADError.message("Choose available parts to orient for 3D printing.")
+        }
+        try PrintLayout.validatePins(preview)
+        let requested = solids.sorted()
+        let selection: [Int]? = requested.count == preview.solids ? nil : requested
+        let pins = preview.printDown ?? []
+        let source = try nativeSource(preview)
+        let output = try await runNative(python: python, threads: threads, action: "orient this design for 3D printing") { folder in
+            try EngineWorkerRequest.printOrientations(Self.stageNative(source, into: folder), solidIndices: selection,
+                                                      printDown: pins).write(to: folder)
+        }
+        struct Report: Decodable { var orientations: [PrintOrientation] }
+        let solidCount = preview.solids
+        let orientations = try await Task.detached(priority: .userInitiated) {
+            let data = try EngineArtifact.read(output.folder.appendingPathComponent("result.json"), in: output.folder, maximumBytes: 8_000_000)
+            return try PrintLayout.validatedOrientations(JSONDecoder().decode(Report.self, from: data).orientations,
+                                                         requested: requested, solidCount: solidCount)
+        }.value
+        try Task.checkCancellation()
+        return orientations
     }
 
     /// Draw one planar face of an already built native solid as a 2D DXF in
@@ -677,6 +707,7 @@ final class EngineService {
             }
             try ProjectStore.validatePreview(result)
             try CADMeasurements.validateTopology(result)
+            try PrintLayout.validatePins(result)
             if let motion = result.assemblyMotion {
                 result.assemblyPose = try motion.solve(parts: result.parts ?? [])
             }

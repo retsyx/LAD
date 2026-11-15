@@ -613,6 +613,7 @@ final class CADSceneView: NSView {
         }
         if reinstalling, !next.isEmpty {
             rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+            rebuildGrid()
             applyCamera()
         }
         return true
@@ -1238,6 +1239,8 @@ final class CADSceneView: NSView {
         case .fit:
             zoomAnchor = nil
             rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+            // Guides follow the placed parts, such as a 3D printing plate.
+            if hasModel { rebuildGrid() }
         case .isometric: rig.yaw = -.pi / 4; rig.elevation = 0.6154797087
         case .front: rig.yaw = -.pi / 2; rig.elevation = 0
         case .back: rig.yaw = .pi / 2; rig.elevation = 0

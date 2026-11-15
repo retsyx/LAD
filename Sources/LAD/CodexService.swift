@@ -51,16 +51,23 @@ final class CodexService {
     private var activeBridge: CADAgentBridge?
     private var validatedModel: ModelSpec?
     private var validatedMesh: PreviewMesh?
+    private var validatedPrintMesh: PreviewMesh?
     private(set) var partColorChanges: [CADPartColorChange] = []
 
     /// Hands the final request's validated geometry to its caller once. The
     /// service keeps no geometry after that handoff; callers take it as soon
     /// as `generate` returns, so it cannot outlive a canceled request.
     func validatedPreview(for model: ModelSpec) -> PreviewMesh? {
-        defer { validatedModel = nil; validatedMesh = nil }
+        validatedPreviews(for: model).design
+    }
+
+    /// The same single-use handoff, with any matching 3D printing version
+    /// the agent built during the request.
+    func validatedPreviews(for model: ModelSpec) -> (design: PreviewMesh?, print: PreviewMesh?) {
+        defer { validatedModel = nil; validatedMesh = nil; validatedPrintMesh = nil }
         guard let built = validatedModel, built.script == model.script, built.units == model.units,
-              built.sourceSTEP == model.sourceSTEP, built.inputAssets == model.inputAssets else { return nil }
-        return validatedMesh
+              built.sourceSTEP == model.sourceSTEP, built.inputAssets == model.inputAssets else { return (nil, nil) }
+        return (validatedMesh, validatedPrintMesh)
     }
 
     func generate(
@@ -228,6 +235,7 @@ final class CodexService {
             try ProjectStore.validateModel(specification)
             validatedModel = specification
             validatedMesh = bridge.tools.validatedPreview(for: specification)
+            validatedPrintMesh = bridge.tools.validatedPrintPreview(for: specification)
             partColorChanges = bridge.tools.partColorChanges(for: specification)
             return .ready(specification)
         } catch let error as CodexError {

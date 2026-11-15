@@ -252,11 +252,11 @@ private struct WorkspaceViewer: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            CADViewport(mesh: state.mesh, displayMode: state.displayMode, projectionMode: state.projectionMode, showGrid: state.showGrid,
+            CADViewport(mesh: state.displayedMesh, displayMode: state.displayMode, projectionMode: state.projectionMode, showGrid: state.showGrid,
                         command: state.viewportCommand,
                         selectedSolids: state.selectedSolids, hiddenSolids: state.hiddenSolids, solidColors: state.solidColors,
                         selectedFeatures: state.selectedFeatures,
-                        solidTransforms: state.assemblyPose?.solidTransforms ?? [:],
+                        solidTransforms: state.displayedSolidTransforms,
                         onSelectionChanged: { state.selectParts($0) },
                         onFeatureSelectionChanged: { state.selectFeatures($0) }, onDeselectAll: { state.clearSelections() },
                         onHideSelected: { state.hideSelectedParts() }, onShowAll: { state.showAllParts() },
@@ -277,23 +277,33 @@ private struct WorkspaceViewer: View {
                         onAssemblyGrabCancelled: { state.cancelAssemblyGrab(ownerID: viewportReference.assemblyGrabOwnerID) })
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
-                    HStack(spacing: 8) {
-                        Button { state.showGrid.toggle() } label: {
-                            Image(systemName: "grid").frame(width: 28, height: 28)
-                                .foregroundStyle(state.showGrid ? Palette.accent : Palette.muted)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            Button { state.showGrid.toggle() } label: {
+                                Image(systemName: "grid").frame(width: 28, height: 28)
+                                    .foregroundStyle(state.showGrid ? Palette.accent : Palette.muted)
+                            }
+                            .buttonStyle(.plain).padding(5)
+                            .background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
+                            .help("Toggle grid").accessibilityValue(state.showGrid ? "On" : "Off")
+                            if state.showGrid, let gridSpacing = viewportReference.gridSpacing {
+                                let spacing = gridSpacing.formatted(.number.precision(.fractionLength(0...2)))
+                                Text("\(spacing) mm")
+                                    .font(.system(size: 12)).monospacedDigit()
+                                    .foregroundStyle(Palette.muted).fixedSize()
+                                    .help("Grid square size")
+                                    .accessibilityLabel("Grid square size: \(spacing) millimetres")
+                                    .accessibilityIdentifier("gridSquareSize")
+                            }
+                        }
+                        Button { state.printView.toggle() } label: {
+                            Image(systemName: "square.3.layers.3d").frame(width: 28, height: 28)
+                                .foregroundStyle(state.printView ? Palette.accent : Palette.muted)
                         }
                         .buttonStyle(.plain).padding(5)
                         .background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
-                        .help("Toggle grid").accessibilityValue(state.showGrid ? "On" : "Off")
-                        if state.showGrid, let gridSpacing = viewportReference.gridSpacing {
-                            let spacing = gridSpacing.formatted(.number.precision(.fractionLength(0...2)))
-                            Text("\(spacing) mm")
-                                .font(.system(size: 12)).monospacedDigit()
-                                .foregroundStyle(Palette.muted).fixedSize()
-                                .help("Grid square size")
-                                .accessibilityLabel("Grid square size: \(spacing) millimetres")
-                                .accessibilityIdentifier("gridSquareSize")
-                        }
+                        .help("3D printing view").accessibilityLabel("3D Printing View")
+                        .accessibilityValue(state.printView ? "On" : "Off")
                     }
                     Spacer()
                     ViewportOrientationCubeControl(reference: viewportReference).frame(width: 108, height: 108)
@@ -315,12 +325,13 @@ private struct WorkspaceViewer: View {
                 .font(.system(size: 10)).foregroundStyle(Palette.muted)
                 .padding(.horizontal, 22).padding(.vertical, 12).background(Palette.panel.opacity(0.7))
             }
-            if state.mesh == nil {
+            if state.displayedMesh == nil {
+                let preparing = state.isWorking || state.isPreparingPrintView
                 VStack(spacing: 12) {
-                    if state.isWorking { ProgressView().controlSize(.large) }
+                    if preparing { ProgressView().controlSize(.large) }
                     else { Image(systemName: "cube.transparent").font(.system(size: 48, weight: .ultraLight)).foregroundStyle(Palette.muted) }
-                    Text(state.isWorking ? "Preparing your design" : "Your design starts here").font(.system(size: 17, weight: .medium))
-                    if !state.isWorking {
+                    Text(preparing ? "Preparing your design" : "Your design starts here").font(.system(size: 17, weight: .medium))
+                    if !preparing {
                         Text("Describe a part in the conversation to get started.").font(.system(size: 12)).foregroundStyle(Palette.muted)
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)

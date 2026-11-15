@@ -16,7 +16,7 @@ You must have your own Codex or Claude (or equivalent) subscription. LAD does no
 - Moving assemblies - drag parts to test design motion, or use precision inputs to select positions.
 - Attach reference images to the chat for the agent to use in modeling.
 - Reference external files (STL, STEP, KiCad, etc.) to guide the agent in modeling.
-- Export STEP files optionally oriented for 3D printing.
+- 3D printing view and STEP export: parts oriented and laid out for printing, with optional print-only features such as sacrificial bridges.
 
 
 ## Run

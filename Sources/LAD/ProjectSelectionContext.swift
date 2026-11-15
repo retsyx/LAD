@@ -49,13 +49,17 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
     var features: [ProjectSelectedFeature]
     /// Reproduce the selected mechanism pose when reconciling an older request.
     var jointPositions: [String: Double]? = nil
+    /// Captured in the 3D printing view: features and anchors belong to the
+    /// program's printing version in its built coordinates.
+    var printVersion: Bool? = nil
 
     static let maximumParts = 8_192
     static let maximumFeatures = 8_192
 
     static func capture(revisionID: UUID, preview: PreviewMesh?, nodes: [PartNode],
                         selectedSolids: Set<Int>, selectedNodeIDs: Set<String>,
-                        selectedFeatures: [CADFeatureID], assemblyPose: AssemblyPose? = nil) -> ProjectSelectionContext? {
+                        selectedFeatures: [CADFeatureID], assemblyPose: AssemblyPose? = nil,
+                        printVersion: Bool = false) -> ProjectSelectionContext? {
         struct Owner {
             var id: String
             var name: String
@@ -136,7 +140,8 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
         }
         guard !parts.isEmpty || !features.isEmpty else { return nil }
         return ProjectSelectionContext(revisionID: revisionID, parts: parts, features: features,
-                                       jointPositions: assemblyPose?.positions.isEmpty == false ? assemblyPose?.positions : nil)
+                                       jointPositions: assemblyPose?.positions.isEmpty == false ? assemblyPose?.positions : nil,
+                                       printVersion: printVersion ? true : nil)
     }
 
     func validate() throws {

@@ -22,7 +22,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
         try Data("previous STEP".utf8).write(to: folder.appendingPathComponent("First.step"))
         try Data("obsolete part".utf8).write(to: folder.appendingPathComponent("Obsolete.step"))
-        fixture.state.exportSTEP(to: folder, arrangeFor3DPrinting: true,
+        fixture.state.exportSTEP(to: folder, for3DPrinting: true,
                                  exportIndividualParts: true, replaceExisting: true)
         try await finish(fixture.state, expecting: folder)
         XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: folder.path)), ["First.step", "Second.step"])
@@ -38,7 +38,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
     }
 
     @MainActor
-    func testIndividualPartsUseCurrentNamesColorsAndPrintingArrangement() async throws {
+    func testIndividualPartsUseCurrentNamesColorsAndPrintingPlacement() async throws {
         try requireRuntime()
         let fixture = try await Fixture()
         defer { fixture.cleanUp() }
@@ -54,7 +54,7 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         let native = URL(fileURLWithPath: try XCTUnwrap(fixture.preview.brepPath))
         let nativeBefore = try Data(contentsOf: native)
         let folder = fixture.directory.appendingPathComponent("Individual parts", isDirectory: true)
-        fixture.state.exportSTEP(to: folder, arrangeFor3DPrinting: true, exportIndividualParts: true)
+        fixture.state.exportSTEP(to: folder, for3DPrinting: true, exportIndividualParts: true)
         try await finish(fixture.state, expecting: folder)
         XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: folder.path)), ["Base.step", "Lid.step"])
         let base = try await readParts(folder.appendingPathComponent("Base.step"))

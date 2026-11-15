@@ -3,9 +3,9 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class STEPExportOptionsView: NSView {
-    private static let arrangePreferenceKey = "stepExportArrangeFor3DPrinting"
+    private static let printingPreferenceKey = "stepExportFor3DPrinting"
     private static let individualPreferenceKey = "stepExportIndividualParts"
-    private let arrange = NSButton(checkboxWithTitle: "Arrange for 3D printing", target: nil, action: nil)
+    private let printing = NSButton(checkboxWithTitle: "For 3D printing", target: nil, action: nil)
     private let individual = NSButton(checkboxWithTitle: "Export individual parts", target: nil, action: nil)
     private let defaults: UserDefaults
     private weak var panel: NSSavePanel?
@@ -16,7 +16,7 @@ final class STEPExportOptionsView: NSView {
     private let nameLabel: String
     private var stepName: String
 
-    var arrangeFor3DPrinting: Bool { arrange.state == .on }
+    var for3DPrinting: Bool { printing.state == .on }
     var exportIndividualParts: Bool { individual.state == .on }
 
     init(panel: NSSavePanel, projectName: String, defaults: UserDefaults = .standard) {
@@ -29,13 +29,13 @@ final class STEPExportOptionsView: NSView {
         nameLabel = panel.nameFieldLabel
         stepName = panel.nameFieldStringValue
         super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 58))
-        arrange.state = defaults.bool(forKey: Self.arrangePreferenceKey) ? .on : .off
+        printing.state = defaults.bool(forKey: Self.printingPreferenceKey) ? .on : .off
         individual.state = defaults.bool(forKey: Self.individualPreferenceKey) ? .on : .off
-        arrange.target = self
-        arrange.action = #selector(arrangeChanged)
+        printing.target = self
+        printing.action = #selector(printingChanged)
         individual.target = self
         individual.action = #selector(individualChanged)
-        let stack = NSStackView(views: [arrange, individual])
+        let stack = NSStackView(views: [printing, individual])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
@@ -50,8 +50,8 @@ final class STEPExportOptionsView: NSView {
         if exportIndividualParts { updatePanelMode() }
     }
 
-    @objc private func arrangeChanged() {
-        defaults.set(arrangeFor3DPrinting, forKey: Self.arrangePreferenceKey)
+    @objc private func printingChanged() {
+        defaults.set(for3DPrinting, forKey: Self.printingPreferenceKey)
     }
 
     @objc private func individualChanged() {

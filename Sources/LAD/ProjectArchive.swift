@@ -46,7 +46,7 @@ enum ProjectArchive {
         let archive = Document(formatVersion: formatVersion, messages: messages,
                                revisions: revisions, selectedRevisionID: project.selectedRevisionID,
                                projectID: project.projectID, codexSettings: project.codexSettings,
-                               projectName: project.projectName, showGrid: project.showGrid,
+                               projectName: project.projectName, showGrid: project.showGrid, printView: project.printView,
                                projectionMode: project.projectionMode, displayMode: project.displayMode,
                                partsPaneFraction: project.partsPaneFraction,
                                recentPartColors: project.recentPartColors, taskAudits: taskAudits,
@@ -98,7 +98,7 @@ enum ProjectArchive {
         return LADProject(formatVersion: 1, messages: messages, revisions: revisions,
                           selectedRevisionID: archive.selectedRevisionID, projectID: archive.projectID,
                           codexSettings: archive.codexSettings, projectName: archive.projectName,
-                          showGrid: archive.showGrid, projectionMode: archive.projectionMode,
+                          showGrid: archive.showGrid, printView: archive.printView, projectionMode: archive.projectionMode,
                           displayMode: archive.displayMode, recentPartColors: archive.recentPartColors,
                           taskAudits: taskAudits, queuedRequests: queuedRequests,
                           draftPrompt: archive.draftPrompt, draftAttachments: draftAttachments,
@@ -114,6 +114,7 @@ enum ProjectArchive {
         var codexSettings: CodexProjectSettings?
         var projectName: String?
         var showGrid: Bool?
+        var printView: Bool?
         var projectionMode: ViewportProjectionMode?
         var displayMode: ViewportDisplayMode?
         var partsPaneFraction: Double?

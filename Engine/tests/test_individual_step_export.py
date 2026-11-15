@@ -34,6 +34,18 @@ class IndividualSTEPExportTests(unittest.TestCase):
         self.assertEqual(original, (folder / 'source.brep').read_bytes())
         return report
 
+    def plate(self, solids, selected):
+        """Printing placements as the app sends them: worker orientations,
+        then translations that ground and separate the footprints."""
+        import cadquery as cq
+        transforms, x = [], 0.0
+        for index, (matrix, box) in zip(selected, worker.print_orientations([solids[i] for i in selected], cq)):
+            matrix = list(matrix)
+            matrix[3] += x - box[0]; matrix[7] -= box[1]; matrix[11] -= box[2]
+            transforms.append({'solid': index, 'matrix': matrix})
+            x += box[3] - box[0] + 50
+        return transforms
+
     def assert_same_geometry(self, actual, expected, placed=False):
         self.assertEqual(len(actual.Faces()), len(expected.Faces()))
         self.assertAlmostEqual(actual.Volume(), expected.Volume(), places=6)
@@ -59,21 +71,21 @@ class IndividualSTEPExportTests(unittest.TestCase):
                     for shape, solid_index in zip(actual, expected_indices):
                         self.assert_same_geometry(shape, solids[solid_index])
 
-    def test_individual_printing_files_share_one_selected_arrangement(self):
+    def test_individual_printing_files_share_one_selected_placement(self):
         import cadquery as cq
         solids = self.fixture()
         selected = [0, 2]
+        plate = self.plate(solids, selected)
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
-            with mock.patch.object(worker, 'arrange_print_solids', wraps=worker.arrange_print_solids) as arrange:
+            with mock.patch.object(worker, 'print_orientations', side_effect=AssertionError('Placement is supplied')):
                 report = self.export(folder, solids, solidIndices=selected, individualParts=[[2], [0]],
-                                     arrangeFor3DPrinting=True)
-                self.assertEqual(arrange.call_count, 1, 'Packing and orientation must be shared across files')
+                                     solidTransforms=plate)
             exported = {record['solidIndices'][0]: cq.importers.importStep(str(folder / record['path'])).val()
                         for record in report['partFiles']}
             combined = folder / 'combined'
             combined.mkdir()
-            combined_report = self.export(combined, solids, solidIndices=selected, arrangeFor3DPrinting=True)
+            combined_report = self.export(combined, solids, solidIndices=selected, solidTransforms=plate)
             restored = cq.importers.importStep(combined_report['stepPath']).val().Solids()
             for index, expected in zip(selected, restored):
                 self.assert_same_geometry(exported[index], expected)
@@ -91,8 +103,9 @@ class IndividualSTEPExportTests(unittest.TestCase):
         for arrange in (False, True):
             with self.subTest(arrange=arrange), tempfile.TemporaryDirectory() as directory:
                 folder = Path(directory)
+                placement = {'solidTransforms': self.plate(solids, [0, 2])} if arrange else {}
                 report = self.export(folder, solids, solidIndices=[0, 2], individualParts=[[2], [0]],
-                                     solidColors=colors, arrangeFor3DPrinting=arrange)
+                                     solidColors=colors, **placement)
                 for record in report['partFiles']:
                     index = record['solidIndices'][0]
                     restored = read_xde_parts(folder / record['path'])

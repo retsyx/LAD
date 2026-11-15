@@ -124,6 +124,12 @@ struct PreviewMesh: Codable, Sendable {
     /// Derived rigid placements relative to the built native geometry.
     var assemblyPose: AssemblyPose? = nil
 
+    /// The program reads `lad.print`, so its 3D printing version is a
+    /// separate build. Otherwise this geometry also serves for printing.
+    var printVersion: Bool? = nil
+    /// Program-pinned outward directions that face the build plate, by solid.
+    var printDown: [PrintDownPin]? = nil
+
     /// Keeps private native files alive across copies and history navigation.
     /// Decoding derived worker JSON never grants ownership of arbitrary paths.
     var buildArtifacts: EngineBuildArtifacts? = nil
@@ -133,7 +139,7 @@ struct PreviewMesh: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case bounds, volume, area, solids, faces, buildSeconds, threads, stepPath
-        case parts, brepPath, runtime, topology, validatedHash, assemblyMotion
+        case parts, brepPath, runtime, topology, validatedHash, assemblyMotion, printVersion, printDown
     }
 
     var vertexCount: Int { positions.count / 3 }
@@ -247,6 +253,8 @@ struct LADProject: Codable, Sendable {
     var projectName: String? = nil
     /// Grid visibility belongs to the project; absent values use the default.
     var showGrid: Bool? = nil
+    /// The 3D printing view is local to this design; absent means off.
+    var printView: Bool? = nil
     /// Projection and surface rendering choices are local to this design.
     var projectionMode: ViewportProjectionMode? = nil
     var displayMode: ViewportDisplayMode? = nil
@@ -269,7 +277,7 @@ struct LADProject: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case formatVersion, messages, revisions, selectedRevisionID, projectID, codexSettings, projectName
-        case showGrid, projectionMode, displayMode, recentPartColors, taskAudits, queuedRequests
+        case showGrid, printView, projectionMode, displayMode, recentPartColors, taskAudits, queuedRequests
         case draftPrompt, draftAttachments, queuePaused, partsPaneFraction
     }
 }

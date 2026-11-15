@@ -19,6 +19,10 @@ final class EngineWorkerRequestTests: XCTestCase {
             "title": "Box", "summary": "A box.", "units": "mm", "script": "result = 1\n", "sourceAsset": "source.step",
             "inputAssets": [["id": "asset-1", "name": "part.stl", "format": "stl", "path": "input-000.stl"]]
         ])
+        let printing = EngineWorkerRequest.build(title: "Box", summary: "A box.", units: "mm", script: "result = 1\n",
+                                                 sourceAsset: nil, inputAssets: [], print: true)
+        XCTAssertEqual(try object(printing), ["title": "Box", "summary": "A box.", "units": "mm", "script": "result = 1\n",
+                                              "print": true])
         XCTAssertEqual(try object(.runtime), ["operation": "runtime"])
     }
 
@@ -32,11 +36,11 @@ final class EngineWorkerRequestTests: XCTestCase {
         XCTAssertEqual(try object(.export(source, .init(solidIndices: nil))), with(["operation": "export"]))
         let color = PartColor(red: 1, green: 0.5, blue: 0)
         let export = EngineWorkerRequest.Export(solidIndices: [0, 2], solidTransforms: [pose],
-            solidColors: [.init(solidIndex: 2, color: color)], arrangeFor3DPrinting: true, individualParts: [[0], [2]])
+            solidColors: [.init(solidIndex: 2, color: color)], individualParts: [[0], [2]])
         XCTAssertEqual(try object(.export(source, export)), with([
             "operation": "export", "solidIndices": [0, 2], "solidTransforms": [["solid": 1, "matrix": pose.matrix]],
             "solidColors": [["solidIndex": 2, "color": ["red": 1, "green": 0.5, "blue": 0]]],
-            "arrangeFor3DPrinting": true, "individualParts": [[0], [2]]
+            "individualParts": [[0], [2]]
         ]))
         let face = CADFeatureID(kind: .face, solidIndex: 1, localIndex: 4)
         XCTAssertEqual(try object(.faceDXF(source, face: face, solidTransforms: [])), with([
@@ -55,6 +59,11 @@ final class EngineWorkerRequestTests: XCTestCase {
         ]), "Posed measurements keep an explicit, possibly empty, transform list.")
         XCTAssertEqual(try object(.clearance(source, pairs: [[[0], [1, 2]]], poses: [[pose], []])), with([
             "operation": "clearance", "pairs": [[[0], [1, 2]]], "poses": [[["solid": 1, "matrix": pose.matrix]], []]
+        ]))
+        XCTAssertEqual(try object(.printOrientations(source, solidIndices: nil, printDown: [])), with(["operation": "print_orient"]))
+        XCTAssertEqual(try object(.printOrientations(source, solidIndices: [2],
+                                                     printDown: [.init(solid: 2, direction: [0, 0, 1])])), with([
+            "operation": "print_orient", "solidIndices": [2], "printDown": [["solid": 2, "direction": [0, 0, 1]]]
         ]))
     }
 

@@ -53,23 +53,40 @@ recently displayed revisions; older ones replay their program when shown again. 
 native solid to STEP without rerunning the model or tessellating it again.
 Repeated app exports reuse the exact STEP bytes in memory.
 
-The STEP save dialog can arrange physical solids for 3D printing. A bounded
-orientation search combines planar normals, rotational and inertia axes, the
-supplied pose and sphere directions. It ranks overhangs using trimmed planar
-areas and area-weighted native curved-surface normals, verifies bed contact
-against whole-solid analytic bounds, and packs separate solids on Z=0 with
-50 mm clearance. When a stable planar base exists, overhang minimization is
+A program may read `lad.print`, which is true only when the worker builds the
+design's 3D printing version (`"print": true` in the build request, which is part
+of the validation hash). The preview reports `printVersion` when the program read
+it; otherwise its ordinary geometry also serves for printing. Assembly metadata
+`lad_print_down` pins a part's outward bed-facing world direction, inherited by
+descendants and reported per solid as `printDown`. The app requires a printing
+version to keep the ordinary build's physical parts and solid ownership, and
+validates it before accepting an agent design.
+
+A `{"operation":"print_orient","brepAsset":"source.brep"}` request orients the
+requested native solids of a printing version, returning for each a rigid
+world-space delta from its built pose and its exact oriented bounds. A pinned
+direction replaces the search. Otherwise a bounded orientation search combines
+planar normals, rotational and inertia axes, the supplied pose and sphere
+directions. It ranks overhangs using trimmed planar areas and area-weighted
+native curved-surface normals, and verifies bed contact against whole-solid
+analytic bounds. When a stable planar base exists, overhang minimization is
 restricted to those poses: the volume centroid must project inside the support
 hull of actual contact boundaries. Parts without one retain the unrestricted
-search. The export applies rigid locations only, without tessellation
-or changing the live design. Matching translated instances share orientation
-work within that export; cached STEP variants include the arrangement option.
+search. An in-plane quarter turn keeps each footprint wider than deep. Matching
+translated instances share orientation work within a request. No tessellation
+occurs and the live design is unchanged.
+
+The app caches orientations per build for the session and packs them on Z=0
+with 50 mm clearance (`PrintLayout`). The 3D printing view packs every part
+once; hiding parts never repacks. Exports for 3D printing pack only the
+exported parts and send the resulting placements as `solidTransforms`, so the
+view and exports share orientations and the packing rule.
 Individual-part export batches the selected native solids in the same worker,
 then publishes one complete folder with filenames from the current parts tree.
 Approved replacement atomically swaps in that complete folder after staging,
 including removal of obsolete outputs.
-Printing placement is shared across those files, retaining the combined bed
-layout. Both export options are remembered as app-wide preferences.
+Placement is shared across those files, retaining the combined bed layout.
+Both export options are remembered as app-wide preferences.
 
 Preview extraction uses explicit indexed access to OpenCascade topology maps.
 This avoids the repeated native exception overhead of Python sequence iteration
@@ -183,7 +200,7 @@ Native export and measurement requests accept optional
 world-space delta from the built pose, acting on column vectors, with translation
 at indices 3, 7 and 11. Omitted solids retain their built pose. These requests
 preserve native subshape identities and do not replay programs or tessellate.
-Export applies poses before optional printing arrangement. A measurement request
+A measurement request
 with this field returns sparse `topology` for its selected features and parts,
 including exact transformed analytic bounds and world-space coordinates,
 centroids and directions. It accepts up to 8,192 features, retains pair metrics

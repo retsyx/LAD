@@ -101,7 +101,7 @@ final class EngineSTEPColorTests: XCTestCase {
     }
 
     @MainActor
-    func testPrintingArrangementBypassesOriginalSTEPAndHasSeparateColorAndSubsetCache() async throws {
+    func testPrintingPlacementBypassesOriginalSTEPAndHasSeparateColorAndSubsetCache() async throws {
         try requireRuntime()
         let service = EngineService()
         let preview = try await service.build(assembly(), python: EngineService.defaultPython, threads: 2)
@@ -109,7 +109,10 @@ final class EngineSTEPColorTests: XCTestCase {
         let native = URL(fileURLWithPath: try XCTUnwrap(preview.brepPath))
         let nativeBefore = try Data(contentsOf: native)
         let original = try await service.exportSTEP(preview, python: "/missing/python", threads: 1)
-        let arranged = try await service.exportSTEP(preview, arrangeFor3DPrinting: true,
+        let orientations = try await service.printOrientations(preview, solids: [0, 1], python: EngineService.defaultPython, threads: 2)
+        let plate = PrintLayout.transforms(for: [0, 1], orientations: orientations)
+        let subsetPlate = PrintLayout.transforms(for: [1], orientations: orientations)
+        let arranged = try await service.exportSTEP(preview, solidTransforms: plate,
                                                     python: EngineService.defaultPython, threads: 2)
         XCTAssertNotEqual(arranged, original, "Printing arrangement must bypass original-coordinate STEP bytes.")
         let imported = try await EngineService().previewSTEP(arranged, parts: nil, python: EngineService.defaultPython, threads: 2)
@@ -118,13 +121,13 @@ final class EngineSTEPColorTests: XCTestCase {
         XCTAssertEqual(imported.volume, preview.volume, accuracy: 1e-6)
         XCTAssertEqual(imported.bounds[2], 0, accuracy: 1e-6)
         let colors = [0: red, 1: blue]
-        let colored = try await service.exportSTEP(preview, solidColors: colors, arrangeFor3DPrinting: true,
+        let colored = try await service.exportSTEP(preview, solidColors: colors, solidTransforms: plate,
                                                    python: EngineService.defaultPython, threads: 2)
         let coloredPalette = try await palette(colored)
         assertContains(red, in: coloredPalette)
         assertContains(blue, in: coloredPalette)
         let subset = try await service.exportSTEP(preview, solidIndices: [1], solidColors: colors,
-                                                  arrangeFor3DPrinting: true, python: EngineService.defaultPython, threads: 2)
+                                                  solidTransforms: subsetPlate, python: EngineService.defaultPython, threads: 2)
         let subsetPalette = try await palette(subset)
         assertContains(blue, in: subsetPalette)
         XCTAssertFalse(contains(red, in: subsetPalette))
@@ -135,11 +138,11 @@ final class EngineSTEPColorTests: XCTestCase {
         XCTAssertEqual(importedSubset.bounds[2], 0, accuracy: 1e-6)
         XCTAssertEqual(try Data(contentsOf: native), nativeBefore, "Arranging export must leave the live native geometry unchanged.")
         try FileManager.default.removeItem(at: native)
-        let cached = try await service.exportSTEP(preview, solidColors: colors, arrangeFor3DPrinting: true,
+        let cached = try await service.exportSTEP(preview, solidColors: colors, solidTransforms: plate,
                                                   python: "/missing/python", threads: 1)
         XCTAssertEqual(cached, colored)
         let cachedSubset = try await service.exportSTEP(preview, solidIndices: [1], solidColors: colors,
-                                                        arrangeFor3DPrinting: true, python: "/missing/python", threads: 1)
+                                                        solidTransforms: subsetPlate, python: "/missing/python", threads: 1)
         XCTAssertEqual(cachedSubset, subset)
         do {
             _ = try await service.exportSTEP(preview, solidColors: colors, python: "/missing/python", threads: 1)
@@ -175,8 +178,10 @@ final class EngineSTEPColorTests: XCTestCase {
         let colors = [0: red, 1: blue]
         let ordinary = try await service.exportSTEPParts(preview, parts: [[1], [0]], solidColors: colors,
                                                          python: EngineService.defaultPython, threads: 2)
+        let orientations = try await service.printOrientations(preview, solids: [0, 1], python: EngineService.defaultPython, threads: 2)
+        let plate = PrintLayout.transforms(for: [0, 1], orientations: orientations)
         let arranged = try await service.exportSTEPParts(preview, parts: [[1], [0]], solidColors: colors,
-                                                         arrangeFor3DPrinting: true, python: EngineService.defaultPython, threads: 2)
+                                                         solidTransforms: plate, python: EngineService.defaultPython, threads: 2)
         XCTAssertEqual(ordinary.count, 2)
         XCTAssertEqual(arranged.count, 2)
         var printingBounds: [[Double]] = []
@@ -205,14 +210,14 @@ final class EngineSTEPColorTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: native), nativeBefore)
         try FileManager.default.removeItem(at: native)
         let cached = try await service.exportSTEPParts(preview, parts: [[1], [0]], solidColors: [1: blue, 0: red],
-            arrangeFor3DPrinting: true, python: "/missing/python", threads: 1)
+            solidTransforms: plate, python: "/missing/python", threads: 1)
         XCTAssertEqual(cached, arranged)
         let ordinaryCached = try await service.exportSTEPParts(preview, parts: [[1], [0]], solidColors: colors,
             python: "/missing/python", threads: 1)
         XCTAssertEqual(ordinaryCached, ordinary)
         do {
             _ = try await service.exportSTEPParts(preview, parts: [[0], [1]], solidColors: colors,
-                arrangeFor3DPrinting: true, python: "/missing/python", threads: 1)
+                solidTransforms: plate, python: "/missing/python", threads: 1)
             XCTFail("A differently ordered partition must not return mismatched cached files.")
         } catch EngineExportError.nativeArtifactUnavailable {}
     }

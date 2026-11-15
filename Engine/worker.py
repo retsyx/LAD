@@ -42,7 +42,7 @@ _validation_input = ContextVar("validation_input", default=None)
 _serving = False
 _native_shapes = {}
 NATIVE_CACHE_SIZE = 2
-NATIVE_OPERATIONS = {"runtime", "export", "dxf", "measure", "clearance"}
+NATIVE_OPERATIONS = {"runtime", "export", "dxf", "measure", "clearance", "print_orient"}
 # Fields every native operation accepts beside its own (see read_brep).
 NATIVE_SOURCE_FIELDS = {"brepAsset", "nativeIdentity", "validatedNative"}
 
@@ -136,8 +136,10 @@ def step_precision(direction):
 
 def validate_spec(spec):
     """Validate the complete request before importing or calling the CAD kernel."""
-    if not isinstance(spec, dict) or not ROOT_KEYS <= set(spec) or set(spec) - ROOT_KEYS - {"sourceAsset", "inputAssets"}:
+    if not isinstance(spec, dict) or not ROOT_KEYS <= set(spec) or set(spec) - ROOT_KEYS - {"sourceAsset", "inputAssets", "print"}:
         raise ModelError("Design must contain title, summary, units and a complete Python script.")
+    if "print" in spec and spec["print"] is not True:
+        raise ModelError("The 3D printing build option must be true when present.")
     for name, maximum in (("title", 160), ("summary", 6000)):
         if not isinstance(spec[name], str) or not 1 <= len(spec[name]) <= maximum:
             raise ModelError(f"{name} must be a nonempty string of at most {maximum} characters.")
@@ -577,13 +579,27 @@ def assembly_part_color(color):
     return validate_part_color({"red": red, "green": green, "blue": blue})
 
 
-def assembly_parts(assembly, shape):
+def print_down_direction(value):
+    """Validate a pinned 3D printing direction: the world-space outward
+    direction that faces the build plate."""
+    if (not isinstance(value, (list, tuple)) or len(value) != 3
+            or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item)
+                   for item in value)):
+        raise ModelError("Assembly metadata lad_print_down must be three finite numbers.")
+    length = math.sqrt(sum(float(item) * float(item) for item in value))
+    if length < 1e-9:
+        raise ModelError("Assembly metadata lad_print_down must be a nonzero direction.")
+    return [float(item) / length for item in value]
+
+
+def assembly_parts(assembly, shape, print_down=None):
     """Keep named assembly structure mapped to the exported solid ordering.
 
     Locations are composed in the same parent-before-child order as CadQuery's
     Assembly iterator. Shape identity includes the native location, so repeated
     instances of one shape map to their own bodies without comparing geometry
-    or changing the model's coordinates.
+    or changing the model's coordinates. Pinned printing directions are
+    inherited like colors and recorded per solid in `print_down`.
     """
     import cadquery as cq
     solids = _shape_entities(shape, "Solid")
@@ -621,9 +637,11 @@ def assembly_parts(assembly, shape):
         generated_ids.add(candidate)
         return candidate
 
-    def visit(node, parent_location, path, parent_color=None):
+    def visit(node, parent_location, path, parent_color=None, parent_down=None):
         location = parent_location * node.loc
         color = assembly_part_color(node.color) if node.color is not None else parent_color
+        down = (print_down_direction(node.metadata["lad_print_down"])
+                if node.metadata.get("lad_print_down") is not None else parent_down)
         name = supplied_name(node)
         if node.metadata.get("lad_id") is not None:
             identity = node.metadata["lad_id"]
@@ -645,6 +663,8 @@ def assembly_parts(assembly, shape):
                 if index not in claimed:
                     claimed.add(index)
                     indices.append(index)
+                    if down is not None and print_down is not None:
+                        print_down[index] = down
         children = []
         is_folder = identity.startswith(("user-folder:", "folder:"))
         if len(indices) > 1 or (indices and (node.children or is_folder)):
@@ -660,7 +680,7 @@ def assembly_parts(assembly, shape):
                 children.append(body)
             indices = []
         for index, child in enumerate(node.children):
-            part = visit(child, location, path + [supplied_name(child) or f"@{index}"], color)
+            part = visit(child, location, path + [supplied_name(child) or f"@{index}"], color, down)
             if part is not None:
                 children.append(part)
         if not indices and not children:
@@ -762,7 +782,26 @@ def compound_assembly_from_aliases(shape, namespace, cq):
     return root if found_alias else None
 
 
-def build_script(script, cq, source_asset=None, input_assets=None, preview_stats=None):
+class LADBuildMode:
+    """The program's `lad` value. `lad.print` is true only while building the
+    design's 3D printing version. A program that never reads it has no
+    distinct printing version, so its ordinary geometry serves both."""
+    __slots__ = ("_printing", "printing_read")
+
+    def __init__(self, printing):
+        self._printing = bool(printing)
+        self.printing_read = False
+
+    @property
+    def print(self):
+        self.printing_read = True
+        return self._printing
+
+    def __repr__(self):
+        return "lad"
+
+
+def build_script(script, cq, source_asset=None, input_assets=None, preview_stats=None, printing=False):
     """Run ordinary Python with the installed CadQuery/OpenCascade APIs.
 
     This is intentionally not a Python-language security boundary. The native
@@ -778,7 +817,8 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
         ceiling = min(ceiling, hard)
     resource.setrlimit(resource.RLIMIT_FSIZE, (ceiling, ceiling))
     import numpy as np
-    namespace = {"cq": cq, "math": math, "np": np, "__name__": "__lad_model__"}
+    build_mode = LADBuildMode(printing)
+    namespace = {"cq": cq, "math": math, "np": np, "lad": build_mode, "__name__": "__lad_model__"}
     namespace["imported_assets"] = {}
     for asset, path in input_assets or []:
         with validation_scope("input_asset", {"id": asset["id"], "name": asset["name"], "format": asset["format"]}):
@@ -829,8 +869,11 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
     if not _only_solids(result):
         raise ModelError("Python design result must contain only closed solids; remove construction wires, faces and tools from result.")
     validate_shape(result, preview_stats=preview_stats)
+    result._lad_print_version = build_mode.printing_read
     if assembly is not None:
-        result._lad_parts = assembly_parts(assembly, result)
+        print_down = {}
+        result._lad_parts = assembly_parts(assembly, result, print_down)
+        result._lad_print_down = print_down
         if "lad_motion" in assembly.metadata:
             result._lad_assembly_motion = validate_assembly_motion(assembly.metadata["lad_motion"], result._lad_parts)
     else:
@@ -859,7 +902,8 @@ def build_shape(spec, threads=1, asset_directory=None, preview_stats=None):
     if inputs and asset_directory is None:
         raise ModelError("The imported geometry asset directory is unavailable.")
     staged = [(asset, Path(asset_directory) / asset["path"]) for asset in inputs]
-    return build_script(spec["script"], cq, source_asset, staged, preview_stats=preview_stats)
+    return build_script(spec["script"], cq, source_asset, staged, preview_stats=preview_stats,
+                        printing=spec.get("print", False))
 
 
 def feature_id(kind, solid_index, local_index):
@@ -2097,6 +2141,11 @@ def make_preview(shape, preview_stats=None):
     motion = getattr(shape, "_lad_assembly_motion", None)
     if motion is not None:
         preview["assemblyMotion"] = motion
+    if getattr(shape, "_lad_print_version", False):
+        preview["printVersion"] = True
+    pins = getattr(shape, "_lad_print_down", None)
+    if pins:
+        preview["printDown"] = [{"solid": index, "direction": pins[index]} for index in sorted(pins)]
     return preview
 
 
@@ -2768,71 +2817,93 @@ def print_orientation(solid, cq):
                 best, best_cost, best_contact = index, cost, contact
         if best is not None:
             break
-    rotated = solid.moved(cq.Location(_print_rotation(directions[best])))
-    return rotated, support_bounds.get(best) or exact_bounds(rotated)
+    rotation = _print_rotation(directions[best])
+    return rotation, support_bounds.get(best) or exact_bounds(solid.moved(cq.Location(rotation)))
 
 
-def arrange_print_solids(solids, cq):
-    """Independently orient and shelf-pack exact solids on z=0 with 50 mm gaps.
+def _print_matrix(transform):
+    """Row-major 4x4 rigid matrix acting on column position vectors."""
+    return [transform.Value(row, column) for row in range(1, 4) for column in range(1, 5)] + [0.0, 0.0, 0.0, 1.0]
 
-    Rigid locations preserve analytic geometry, native solid order and colors;
-    no Boolean operation, tessellation or change to the live design is needed.
+
+def print_orientations(solids, cq, pins=None):
+    """Orient each exact solid for printing, independently of the others.
+
+    Returns one (matrix, bounds) pair per solid: a world-space rigid delta from
+    the built solid to its printing orientation, and the oriented solid's exact
+    bounds. A pinned outward bed direction replaces the overhang search for its
+    solid. Rigid locations preserve analytic geometry, native solid order and
+    colors; no Boolean operation, tessellation or change to the design is
+    needed. Placement on the bed is left to the caller.
     """
-    from OCP.gp import gp_Vec
-    arranged, sizes = [], []
+    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
+    results = []
     oriented_instances = {}
-    for solid in solids:
+    for position, solid in enumerate(solids):
+        pin = pins[position] if pins is not None else None
+        pin = tuple(pin) if pin is not None else None
         # Assembly instances often share native geometry and rotation. Remove
         # translation only, retaining the supplied build direction and sphere
-        # candidates. Reuse within this export, with an equality collision guard;
-        # never retain measurements on mutable shapes or across builds.
+        # candidates. Reuse within this request, with an equality collision
+        # guard; never retain measurements on mutable shapes or across builds.
         pose = solid.wrapped.Location().Transformation()
         canonical = solid.located(cq.Location())
         rotation = tuple(pose.Value(row, column) for row in range(1, 4) for column in range(1, 4))
-        key = (hash(canonical.wrapped), solid.wrapped.Orientation(), rotation)
+        key = (hash(canonical.wrapped), solid.wrapped.Orientation(), rotation, pin)
+        shift = gp_Trsf()
+        shift.SetTranslation(gp_Vec(*(-pose.Value(row, 4) for row in range(1, 4))))
         match = next((entry for entry in oriented_instances.get(key, ())
                       if entry[0].wrapped.IsPartner(solid.wrapped)), None)
         if match is None:
             pose.SetTranslationPart(gp_Vec())
             unshifted = solid.located(cq.Location(pose))
-            oriented, bounds = print_orientation(unshifted, cq)
-            oriented_instances.setdefault(key, []).append((solid, oriented, bounds))
+            if pin is None:
+                turn, bounds = print_orientation(unshifted, cq)
+            else:
+                turn = _print_rotation(tuple(-value for value in pin))
+                bounds = exact_bounds(unshifted.moved(cq.Location(turn)))
+            width, depth = bounds[3] - bounds[0], bounds[4] - bounds[1]
+            # In-plane quarter turns reduce long narrow rows without changing
+            # the printing direction or overhang score.
+            if depth > width:
+                quarter = gp_Trsf()
+                quarter.SetRotation(gp_Ax1(gp_Pnt(), gp_Dir(0, 0, 1)), math.pi / 2)
+                turn = quarter.Multiplied(turn)
+                bounds = [-bounds[4], bounds[0], bounds[2], -bounds[1], bounds[3], bounds[5]]
+            oriented_instances.setdefault(key, []).append((solid, turn, bounds))
         else:
-            _, oriented, bounds = match
-        width, depth = bounds[3] - bounds[0], bounds[4] - bounds[1]
-        # In-plane quarter turns reduce long narrow rows without changing the
-        # printing direction or overhang score.
-        if depth > width:
-            from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf
-            transform = gp_Trsf()
-            transform.SetRotation(gp_Ax1(gp_Pnt(), gp_Dir(0, 0, 1)), math.pi / 2)
-            oriented = oriented.moved(cq.Location(transform))
-            bounds = [-bounds[4], bounds[0], bounds[2], -bounds[1], bounds[3], bounds[5]]
-            width, depth = depth, width
-        arranged.append((oriented, bounds)); sizes.append((width, depth))
-    gap = 50.0
-    target = max(max(width for width, _ in sizes),
-                 math.sqrt(sum((width + gap) * (depth + gap) for width, depth in sizes)))
-    positions = [None] * len(solids)
-    x = y = row_depth = 0.0
-    for index in sorted(range(len(solids)), key=lambda index: (-sizes[index][1], -sizes[index][0], index)):
-        width, depth = sizes[index]
-        if x > 0 and x + width > target:
-            x = 0.0; y += row_depth + gap; row_depth = 0.0
-        oriented, bounds = arranged[index]
-        positions[index] = oriented.moved(cq.Location(cq.Vector(x - bounds[0], y - bounds[1], -bounds[2])))
-        x += width + gap
-        row_depth = max(row_depth, depth)
-    return positions
+            _, turn, bounds = match
+        results.append((_print_matrix(turn.Multiplied(shift)), [float(value) for value in bounds]))
+    return results
+
+
+def print_orient_brep(spec, asset_directory, cq, threads):
+    """Printing orientations of the requested native solids, without meshing."""
+    if set(spec) - NATIVE_SOURCE_FIELDS - {"operation", "solidIndices", "printDown"}:
+        raise ModelError("The printing orientation request contains unsupported fields.")
+    shape = read_brep(spec, asset_directory, cq, threads)
+    solids = _shape_entities(shape, "Solid")
+    indices = selected_solids(spec, solids)
+    records = spec.get("printDown", [])
+    if not isinstance(records, list) or len(records) > len(solids):
+        raise ModelError("Pinned printing directions must be a list of uniquely indexed solids.")
+    pins = {}
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"solid", "direction"}:
+            raise ModelError("Each pinned printing direction requires a solid index and a direction.")
+        index = record["solid"]
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(solids) or index in pins:
+            raise ModelError("Pinned printing directions contain invalid or duplicate solid indices.")
+        pins[index] = print_down_direction(record["direction"])
+    oriented = print_orientations([solids[index] for index in indices], cq, [pins.get(index) for index in indices])
+    return {"orientations": [{"solid": index, "matrix": matrix, "bounds": bounds}
+                             for index, (matrix, bounds) in zip(indices, oriented)]}
 
 
 def export_brep(spec, asset_directory, output, cq, threads):
     """Create whole or selected STEP without replaying or tessellating."""
-    if set(spec) - NATIVE_SOURCE_FIELDS - {"operation", "solidIndices", "solidColors", "arrangeFor3DPrinting", "individualParts", "solidTransforms"} or spec.get("brepAsset") != "source.brep":
+    if set(spec) - NATIVE_SOURCE_FIELDS - {"operation", "solidIndices", "solidColors", "individualParts", "solidTransforms"} or spec.get("brepAsset") != "source.brep":
         raise ModelError("STEP export requires the private source.brep asset.")
-    arrange = spec.get("arrangeFor3DPrinting", False)
-    if not isinstance(arrange, bool):
-        raise ModelError("The 3D printing arrangement option must be true or false.")
     shape = read_brep(spec, asset_directory, cq, threads)
     solids = posed_solids(shape.Solids(), spec.get("solidTransforms", []), cq)
     indices = selected_solids(spec, solids)
@@ -2858,11 +2929,6 @@ def export_brep(spec, asset_directory, output, cq, threads):
         shape = chosen[0] if len(chosen) == 1 else cq.Compound.makeCompound(chosen)
     else:
         indices = list(range(len(solids)))
-    if arrange:
-        arranged = arrange_print_solids([solids[index] for index in indices], cq)
-        solids = list(solids)
-        for index, solid in zip(indices, arranged):
-            solids[index] = solid
     report = {"solids": len(shape.Solids()), "faces": len(shape.Faces())}
     if parts is not None:
         files, total = [], 0
@@ -3153,6 +3219,9 @@ def validation_hash(spec, directory, cq):
                     "sourceAsset": bool(spec.get("sourceAsset")),
                     "inputAssets": [{"id": asset["id"], "format": asset["format"]}
                                     for asset in spec.get("inputAssets", [])]}
+    # The printing version is a different construction of the same program.
+    if spec.get("print"):
+        construction["print"] = True
     add(json.dumps(construction, sort_keys=True, separators=(",", ":")).encode())
     paths = ([directory / "source.step"] if spec.get("sourceAsset") else [])
     paths += [directory / asset["path"] for asset in spec.get("inputAssets", [])]
@@ -3191,7 +3260,7 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
     is_export = isinstance(spec, dict) and spec.get("operation") == "export"
     is_parts_export = is_export and "individualParts" in spec
     is_drawing = isinstance(spec, dict) and spec.get("operation") == "dxf"
-    is_measurement = isinstance(spec, dict) and spec.get("operation") in ("measure", "clearance")
+    is_measurement = isinstance(spec, dict) and spec.get("operation") in ("measure", "clearance", "print_orient")
     is_runtime = spec == {"operation": "runtime"}
     if not is_preview and not is_export and not is_drawing and not is_measurement and not is_runtime:
         if size > 2 * 1024 * 1024:
@@ -3207,6 +3276,8 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
         preview = {}
     elif is_measurement and spec["operation"] == "clearance":
         preview = clearance_brep(spec, request.parent.resolve(), cq, threads)
+    elif is_measurement and spec["operation"] == "print_orient":
+        preview = print_orient_brep(spec, request.parent.resolve(), cq, threads)
     elif is_measurement:
         preview = measure_brep(spec, request.parent.resolve(), cq, threads)
     elif is_export:

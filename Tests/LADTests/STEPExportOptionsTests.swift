@@ -11,16 +11,16 @@ final class STEPExportOptionsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         let firstPanel = panel(named: "Tentacle PCB Case.step")
         let first = STEPExportOptionsView(panel: firstPanel, projectName: "Tentacle PCB Case", defaults: defaults)
-        XCTAssertFalse(first.arrangeFor3DPrinting)
+        XCTAssertFalse(first.for3DPrinting)
         XCTAssertFalse(first.exportIndividualParts)
         try checkbox("Export individual parts", in: first).performClick(nil)
-        try checkbox("Arrange for 3D printing", in: first).performClick(nil)
+        try checkbox("For 3D printing", in: first).performClick(nil)
 
         // Reopening a dialog for another design uses the same app preferences,
         // while the destination remains specific to the current design.
         let secondPanel = panel(named: "Étagère selected parts.step")
         let second = STEPExportOptionsView(panel: secondPanel, projectName: "Étagère", defaults: defaults)
-        XCTAssertTrue(second.arrangeFor3DPrinting)
+        XCTAssertTrue(second.for3DPrinting)
         XCTAssertTrue(second.exportIndividualParts)
         XCTAssertEqual(secondPanel.nameFieldStringValue, "Étagère")
         XCTAssertTrue(secondPanel.allowedContentTypes.isEmpty)
@@ -29,7 +29,7 @@ final class STEPExportOptionsTests: XCTestCase {
     }
 
     @MainActor
-    func testReturningToSTEPOutputRestoresFilenameAndKeepsArrangementPreference() throws {
+    func testReturningToSTEPOutputRestoresFilenameAndKeepsPrintingPreference() throws {
         let suite = "LADSTEPExportOptionsTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -37,7 +37,7 @@ final class STEPExportOptionsTests: XCTestCase {
         let types = savePanel.allowedContentTypes
         let label = savePanel.nameFieldLabel
         let view = STEPExportOptionsView(panel: savePanel, projectName: "Tentacle PCB Case", defaults: defaults)
-        try checkbox("Arrange for 3D printing", in: view).performClick(nil)
+        try checkbox("For 3D printing", in: view).performClick(nil)
         let individual = try checkbox("Export individual parts", in: view)
         individual.performClick(nil)
         XCTAssertEqual(savePanel.nameFieldStringValue, "Tentacle PCB Case")
@@ -49,7 +49,7 @@ final class STEPExportOptionsTests: XCTestCase {
 
         let nextPanel = panel(named: "Another.step")
         let next = STEPExportOptionsView(panel: nextPanel, projectName: "Another", defaults: defaults)
-        XCTAssertTrue(next.arrangeFor3DPrinting)
+        XCTAssertTrue(next.for3DPrinting)
         XCTAssertFalse(next.exportIndividualParts)
         XCTAssertEqual(nextPanel.nameFieldStringValue, "Another.step")
         XCTAssertEqual(nextPanel.allowedContentTypes, types)

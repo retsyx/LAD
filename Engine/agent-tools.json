@@ -131,6 +131,11 @@
         "versionID": {
           "type": "string",
           "description": "Optional stable UUID returned by lad_version. Binds that saved version's exact original STEP and imported_assets inputs for this build only; does not change the current design or register historical inputs for the final replacement program."
+        },
+        "print": {
+          "type": "boolean",
+          "default": false,
+          "description": "Build the program's 3D printing version, with lad.print true, as its own artifact in built design coordinates. Requires the same physical parts as the ordinary build. Inspect, measure and render it like any artifact."
         }
       },
       "required": [
@@ -479,6 +484,11 @@
           "minLength": 1,
           "maxLength": 1024,
           "description": "Optional movable joint ID supplied in jointPositions whose requested value must remain fixed while passive joints satisfy closed-loop constraints."
+        },
+        "printLayout": {
+          "type": "boolean",
+          "default": false,
+          "description": "Render the 3D printing layout the user sees in the 3D printing view and exports for printing: every part of a 3D printing version artifact oriented for printing and packed on the build plate at z=0. Requires an artifact built with print=true, or one whose program never reads lad.print. Cannot combine with jointPositions."
         },
         "projection": {
           "type": "string",

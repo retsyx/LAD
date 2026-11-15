@@ -30,13 +30,14 @@ enum EngineWorkerRequest: Encodable, Sendable {
         var solidIndices: [Int]?
         var solidTransforms: [AssemblySolidTransform] = []
         var solidColors: [SolidColor] = []
-        var arrangeFor3DPrinting = false
         /// One STEP file per group of solids, in order.
         var individualParts: [[Int]]?
     }
 
     /// Replay a CAD program. Imported geometry is staged beside the request.
-    case build(title: String, summary: String, units: String, script: String, sourceAsset: String?, inputAssets: [InputAsset])
+    /// `print` builds the program's 3D printing version.
+    case build(title: String, summary: String, units: String, script: String, sourceAsset: String?, inputAssets: [InputAsset],
+               print: Bool = false)
     case runtime
     case export(NativeSource, Export)
     /// One planar face as a 2D DXF drawing, seen from outside its solid.
@@ -44,10 +45,12 @@ enum EngineWorkerRequest: Encodable, Sendable {
     case measure(NativeSource, features: [CADFeatureID], solidIndices: [Int], solidTransforms: [AssemblySolidTransform]?)
     /// Exact clearance of each pair of solid groups at each pose.
     case clearance(NativeSource, pairs: [[[Int]]], poses: [[AssemblySolidTransform]])
+    /// Printing orientations of the selected solids; nil selects every solid.
+    case printOrientations(NativeSource, solidIndices: [Int]?, printDown: [PrintDownPin])
 
     private enum Key: String, CodingKey {
-        case operation, title, summary, units, script, sourceAsset, inputAssets, brepAsset, nativeIdentity, validatedNative,
-             solidIndices, solidTransforms, solidColors, arrangeFor3DPrinting, individualParts, feature, features, pairs, poses
+        case operation, title, summary, units, script, sourceAsset, inputAssets, print, brepAsset, nativeIdentity, validatedNative,
+             solidIndices, solidTransforms, solidColors, individualParts, feature, features, pairs, poses, printDown
     }
 
     func encode(to encoder: Encoder) throws {
@@ -59,13 +62,14 @@ enum EngineWorkerRequest: Encodable, Sendable {
             try values.encode(source.validated, forKey: .validatedNative)
         }
         switch self {
-        case let .build(title, summary, units, script, sourceAsset, inputAssets):
+        case let .build(title, summary, units, script, sourceAsset, inputAssets, print):
             try values.encode(title, forKey: .title)
             try values.encode(summary, forKey: .summary)
             try values.encode(units, forKey: .units)
             try values.encode(script, forKey: .script)
             try values.encodeIfPresent(sourceAsset, forKey: .sourceAsset)
             if !inputAssets.isEmpty { try values.encode(inputAssets, forKey: .inputAssets) }
+            if print { try values.encode(true, forKey: .print) }
         case .runtime:
             try values.encode("runtime", forKey: .operation)
         case let .export(source, export):
@@ -73,7 +77,6 @@ enum EngineWorkerRequest: Encodable, Sendable {
             try values.encodeIfPresent(export.solidIndices, forKey: .solidIndices)
             if !export.solidTransforms.isEmpty { try values.encode(export.solidTransforms, forKey: .solidTransforms) }
             if !export.solidColors.isEmpty { try values.encode(export.solidColors, forKey: .solidColors) }
-            if export.arrangeFor3DPrinting { try values.encode(true, forKey: .arrangeFor3DPrinting) }
             try values.encodeIfPresent(export.individualParts, forKey: .individualParts)
         case let .faceDXF(source, face, solidTransforms):
             try encodeSource(source, operation: "dxf")
@@ -88,6 +91,10 @@ enum EngineWorkerRequest: Encodable, Sendable {
             try encodeSource(source, operation: "clearance")
             try values.encode(pairs, forKey: .pairs)
             try values.encode(poses, forKey: .poses)
+        case let .printOrientations(source, solidIndices, printDown):
+            try encodeSource(source, operation: "print_orient")
+            try values.encodeIfPresent(solidIndices, forKey: .solidIndices)
+            if !printDown.isEmpty { try values.encode(printDown, forKey: .printDown) }
         }
     }
 
