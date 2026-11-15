@@ -128,6 +128,31 @@ class PreviewMeshSafetyTests(unittest.TestCase):
         self.assertEqual(self.audit_curved_triangle(face, poly, points, normals), [[0, 1, 2]])
         self.assertEqual(self.triangle_state(poly, points, normals), before)
 
+    def test_shared_surface_projector_matches_fresh_global_projections(self):
+        from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+        face, _, _, _ = self.curved_triangle(.4, centroid_inward=True)
+        located = face.moved(cq.Location((7, -3, 2), (1, 2, 3), 29))
+        for candidate in (face, located):
+            projector = worker._SurfaceProjector(candidate)
+            surface = BRep_Tool.Surface_s(candidate.wrapped)
+            for point in ([.2, .1, .3], [.9, .35, -.4], [.5, .2, 2.], [-1., .1, .05], [.3, .38, .1]):
+                fresh = GeomAPI_ProjectPointOnSurf(gp_Pnt(*point), surface)
+                self.assertTrue(fresh.NbPoints())
+                self.assertAlmostEqual(projector.lower_distance(point), fresh.LowerDistance(), delta=1e-13,
+                                       msg='Reusing one initialised projector must find the same global minimum.')
+
+    def test_suspect_cells_of_one_face_share_one_projector(self):
+        import OCP.GeomAPI
+        face, poly, points, normals = self.curved_triangle(1e-6, centroid_inward=True)
+        real = OCP.GeomAPI.GeomAPI_ProjectPointOnSurf
+        distance = worker._SurfaceProjector.lower_distance
+        with mock.patch('OCP.GeomAPI.GeomAPI_ProjectPointOnSurf', side_effect=real) as constructed, \
+                mock.patch.object(worker._SurfaceProjector, 'lower_distance', autospec=True,
+                                  side_effect=distance) as projected:
+            self.assertEqual(self.audit_curved_triangle(face, poly, points, normals), [[0, 1, 2]])
+        self.assertGreater(projected.call_count, 1)
+        self.assertEqual(constructed.call_count, 1)
+
     def test_above_tolerance_curved_fold_remains_rejected(self):
         face, poly, points, normals = self.curved_triangle(1e-3, centroid_inward=True)
         plane = self.triangle_plane(points)

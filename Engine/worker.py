@@ -1239,27 +1239,52 @@ def _preview_patch_triangles(loop, points, normals, face, tolerance):
         plane = np.cross(np.asarray(points[b]) - points[a], np.asarray(points[c]) - points[a])
         if np.dot(plane, np.asarray([normals[a], normals[b], normals[c]]).sum(axis=0)) <= 0:
             raise _PreviewMeshError("a repaired surface patch contains an inward triangle")
-    from OCP.BRep import BRep_Tool
-    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
-    from OCP.gp import gp_Pnt
-    surface = BRep_Tool.Surface_s(face.wrapped)
+    projector = _SurfaceProjector(face)
     for triangle in result:
         corners = np.asarray([points[index] for index in triangle])
         samples = [corners.mean(axis=0)] + [(corners[index] + corners[(index + 1) % 3]) / 2 for index in range(3)]
         for sample in samples:
-            projection = GeomAPI_ProjectPointOnSurf(gp_Pnt(*sample), surface)
-            if not projection.NbPoints() or not projection.LowerDistance() <= tolerance:
+            distance = projector.lower_distance(sample)
+            if distance is None or not distance <= tolerance:
                 raise _PreviewMeshError("a repaired surface patch exceeds the display surface deflection")
     return result
 
 
-def _preview_triangle_matches_surface(face, corners, uv, tolerance, distance_limit):
-    """Check suspect cells against their own surface and parameter chart."""
-    from OCP.BRep import BRep_Tool
-    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
-    from OCP.gp import gp_Pnt
+class _SurfaceProjector:
+    """One face's exact surface with a projector initialised on first use.
+
+    Constructing GeomAPI_ProjectPointOnSurf for each point rebuilds its
+    extrema sampling of the whole surface, which costs tens of milliseconds
+    per point on a large B-spline. Init with the surface's natural bounds and
+    default tolerance is the constructor's own configuration, so each
+    projection finds the same global minimum, up to rounding.
+    """
+    __slots__ = ("surface", "_projector")
+
+    def __init__(self, face):
+        from OCP.BRep import BRep_Tool
+        self.surface, self._projector = BRep_Tool.Surface_s(face.wrapped), None
+
+    def lower_distance(self, point):
+        """The global minimum distance to the surface, or None without a projection."""
+        from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+        from OCP.gp import gp_Pnt
+        if self._projector is None:
+            projector = GeomAPI_ProjectPointOnSurf()
+            projector.Init(self.surface, *self.surface.Bounds())
+            self._projector = projector
+        self._projector.Perform(gp_Pnt(*(float(value) for value in point)))
+        return self._projector.LowerDistance() if self._projector.NbPoints() else None
+
+
+def _preview_triangle_matches_surface(face, corners, uv, tolerance, distance_limit, projector=None):
+    """Check suspect cells against their own surface and parameter chart.
+
+    Callers checking several cells of one face share its `projector`.
+    """
     try:
-        surface = BRep_Tool.Surface_s(face.wrapped)
+        projector = projector or _SurfaceProjector(face)
+        surface = projector.surface
         # Sample both the boundary and interior. The parameter check also
         # guards against a projection onto an unrelated nearby surface branch.
         for first in range(5):
@@ -1273,8 +1298,8 @@ def _preview_triangle_matches_surface(face, corners, uv, tolerance, distance_lim
                     return False
                 if distance_limit >= tolerance:
                     continue  # The corresponding surface point already proves this bound.
-                projection = GeomAPI_ProjectPointOnSurf(gp_Pnt(*point), surface)
-                if not projection.NbPoints() or not projection.LowerDistance() <= distance_limit:
+                distance = projector.lower_distance(point)
+                if distance is None or not distance <= distance_limit:
                     return False
     except Exception:
         return False
@@ -1390,6 +1415,7 @@ def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary
     if uv is not None and (uv.shape != (len(points), 2) or not np.all(np.isfinite(uv))):
         raise _PreviewMeshError("surface orientation requires finite native UV coordinates")
     surface = None
+    projector = None
     orientation_cache = {}
 
     def raw_audit(cells):
@@ -1401,7 +1427,7 @@ def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary
         return dots, lengths
 
     def audit(cells):
-        nonlocal uv, surface
+        nonlocal uv, surface, projector
         dots, lengths = raw_audit(cells)
         corners = xyz[cells]
         planes = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
@@ -1416,7 +1442,7 @@ def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary
             if uv is None:
                 uv = np.asarray([poly.UVNode(index).Coord() for index in range(1, poly.NbNodes() + 1)])
             if surface is None:
-                surface = BRepGProp_Face(face.wrapped)
+                surface, projector = BRepGProp_Face(face.wrapped), _SurfaceProjector(face)
             for index in suspects:
                 cell_uv = uv[cells[index]]
                 ab, ac = cell_uv[1] - cell_uv[0], cell_uv[2] - cell_uv[0]
@@ -1439,7 +1465,8 @@ def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary
                     center_dot = float(np.dot(unit[index], normal.Normalized().Coord()))
                     if math.isfinite(center_dot):
                         if (center_dot < threshold
-                                or _preview_triangle_matches_surface(face, corners[index], cell_uv, tolerance, tolerance)):
+                                or _preview_triangle_matches_surface(face, corners[index], cell_uv, tolerance, tolerance,
+                                                                     projector)):
                             dots[index] = center_dot
                 if dots[index] >= threshold:
                     if len(orientation_cache) < len(triangles) * 4:
@@ -1453,7 +1480,7 @@ def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary
                 # unresolved at that precision. Meaningful folds still fail.
                 if (lengths[index] / longest <= GEOMETRY_TOLERANCE_MM
                         and _preview_triangle_matches_surface(face, corners[index], cell_uv, tolerance,
-                                                              GEOMETRY_TOLERANCE_MM)):
+                                                              GEOMETRY_TOLERANCE_MM, projector)):
                     dots[index] = 0
                 if len(orientation_cache) < len(triangles) * 4:
                     orientation_cache[cache_key] = dots[index]
