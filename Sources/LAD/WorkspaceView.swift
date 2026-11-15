@@ -297,7 +297,7 @@ private struct WorkspaceViewer: View {
                             }
                         }
                         Button { state.printView.toggle() } label: {
-                            Image(systemName: "square.3.layers.3d").frame(width: 28, height: 28)
+                            PrinterIcon().frame(width: 19, height: 19).frame(width: 28, height: 28)
                                 .foregroundStyle(state.printView ? Palette.accent : Palette.muted)
                         }
                         .buttonStyle(.plain).padding(5)
