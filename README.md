@@ -306,26 +306,6 @@ The external agent writes a complete CadQuery/OCP program and uses LAD's native 
 
 Saved history, colors, native inspection, measurements, imports, exports, and mesh reconstruction use the same CAD operations as LAD's internal agent. Task IDs keep work and activity separate across clients and designs. Ordinary renders do not move the live viewport. Optional dependency permission requests still use LAD's existing per-operation policy and owning design window. LAD restricts operations performed through its tools; an external agent remains responsible for its independently executed commands and installations.
 
-## Verification
 
-```sh
-Scripts/test.sh
-```
 
-To include native app-worker and sandbox checks in a normal macOS Terminal:
 
-```sh
-LAD_RUN_ENGINE_TESTS=1 LAD_RUN_SANDBOX_TESTS=1 Scripts/test.sh
-```
-
-These checks require the installed CAD runtime and cannot launch a nested macOS sandbox from inside another restrictive sandbox.
-
-The suite includes camera projection invariants for cursor zoom and rotation about the design’s geometric center, Codex process/error/cancellation integration, reference-only context regressions, complete design and geometry roundtrips, and actual CAD builds with STEP reimport and volume checks.
-
-A live Codex request was also verified in the macOS app: a 30 mm OD / 12 mm ID / 8 mm tall spacer ring with 0.6 mm chamfers was generated, rendered, and saved as another design revision. Native UI checks covered selection, context menus, zoom, saved revision restoration, design saving, and STEP export.
-
-## Current scope
-
-This is a working development app with a bundled, managed Python/CAD runtime and an Apple Silicon release pipeline. Local builds are ad-hoc signed; distributable DMGs require the Developer ID/notarization workflow described above. Programs have access to the installed modeling APIs, subject to final solid/preview limits (4,096 solids, 1,000,000 vertices/triangles, and 200,000 UTF-8 bytes of source). There is no native FeatureScript/OpenSCAD interpreter, interactive sketch/constraint editor, or assembly mating UI. Assemblies are previewed as positioned solids with their part names and hierarchy. Current part colors are saved with the design and included in STEP exports; assembly mates are not exported.
-
-The native viewport uses SceneKit with Metal; design files use exact OpenCascade geometry. The bundled runtime omits optional native plugins that require separately installed solver products or MATLAB, and uses Numba’s workqueue backend in place of its optional OpenMP backend. Core CadQuery/OCP construction, sketch solving and the bundled IPOPT solver remain included; the runtime manifest records the exact exclusions. Dependencies retain their own licenses; inspect the installed distributions before redistributing a bundled runtime.
