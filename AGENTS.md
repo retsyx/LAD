@@ -11,6 +11,7 @@
 - Do not put internal protocol or build-profile terminology or descriptions into the UI or the top README.md.
 - When restarting LAD, do not save open designs. Files are autosaved already.
 - Do not byline commits with co-authorship claims.
+- When asked to make a change, make the change in a new temporary workspace, and commit the change to the current branch when done.
 
 ## Naming
 
