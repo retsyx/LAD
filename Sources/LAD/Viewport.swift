@@ -92,6 +92,8 @@ struct CADViewport: NSViewRepresentable {
     var solidColors: [Int: PartColor] = [:]
     var selectedFeatures: [CADFeatureID] = []
     var solidTransforms: [Int: [Double]] = [:]
+    /// Replacing the mesh under the same key keeps the camera.
+    var cameraKey: String? = nil
     var onSelectionChanged: ((Set<Int>) -> Void)? = nil
     var onFeatureSelectionChanged: (([CADFeatureID]) -> Void)? = nil
     var onDeselectAll: (() -> Void)? = nil
@@ -126,7 +128,8 @@ struct CADViewport: NSViewRepresentable {
         view.assemblyGrabbingEnabled = assemblyGrabbingEnabled
         view.update(mesh: mesh, mode: displayMode, grid: showGrid, command: command,
                     selectedSolids: selectedSolids, hiddenSolids: hiddenSolids, projection: projectionMode,
-                    solidColors: solidColors, selectedFeatures: selectedFeatures, solidTransforms: solidTransforms)
+                    solidColors: solidColors, selectedFeatures: selectedFeatures, solidTransforms: solidTransforms,
+                    cameraKey: cameraKey)
         onViewReady?(view)
     }
 }
@@ -201,6 +204,11 @@ final class CADSceneView: NSView {
     private var zoomAnchor: SIMD3<Double>?
     private var gridVisible = true
     private var hasModel = false
+    /// The camera key of the last installed model, retained while no model
+    /// is shown, and whether the model being installed shares it.
+    private var installedCameraKey: String?
+    private var installingCameraKey: String?
+    private var installKeepsCamera = false
     private var needsInitialFit = false
     private var selectedSolids = Set<Int>()
     private var selectedFeatures = [CADFeatureID]()
@@ -486,7 +494,7 @@ final class CADSceneView: NSView {
     func update(mesh: PreviewMesh?, mode: ViewportDisplayMode, grid: Bool, command: ViewportCommand?,
                 selectedSolids: Set<Int>, hiddenSolids: Set<Int>, projection: ViewportProjectionMode = .perspective,
                 solidColors: [Int: PartColor] = [:], selectedFeatures: [CADFeatureID] = [],
-                solidTransforms: [Int: [Double]] = [:]) {
+                solidTransforms: [Int: [Double]] = [:], cameraKey: String? = nil) {
         let orthographic = projection == .isometric
         let projectionChanged = rig.usesOrthographicProjection != orthographic
         let gridChanged = gridVisible != grid
@@ -526,6 +534,10 @@ final class CADSceneView: NSView {
             edgeNode.isHidden = true
             appliedStyle = nil
             if let mesh {
+                // Another display of the model last shown under the same camera
+                // key, even after an empty interim, keeps the user's camera.
+                installKeepsCamera = cameraKey != nil && cameraKey == installedCameraKey
+                installingCameraKey = cameraKey
                 // Copies of a preview share its converted buffers, so a version
                 // or image another view already prepared installs directly.
                 let shared = CADViewportPreparedMesh.shared(for: mesh)
@@ -612,7 +624,8 @@ final class CADSceneView: NSView {
             }
         }
         if reinstalling, !next.isEmpty {
-            rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+            if installKeepsCamera { rig.adoptBounds(meshBounds) }
+            else { rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height) }
             rebuildGrid()
             applyCamera()
         }
@@ -667,9 +680,14 @@ final class CADSceneView: NSView {
         meshBounds = mesh.bounds
         let first = !hasModel
         hasModel = true
-        needsInitialFit = bounds.width < 10 || bounds.height < 10
-        rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
-        if first { rig.yaw = -.pi / 4; rig.elevation = 0.6154797087 }
+        installedCameraKey = installingCameraKey
+        if installKeepsCamera {
+            rig.adoptBounds(meshBounds)
+        } else {
+            needsInitialFit = bounds.width < 10 || bounds.height < 10
+            rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+            if first { rig.yaw = -.pi / 4; rig.elevation = 0.6154797087 }
+        }
         rebuildGrid()
         applyCamera()
     }

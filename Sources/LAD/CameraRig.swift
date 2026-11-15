@@ -35,6 +35,16 @@ struct CameraRig {
         distance = radius / sin(angle) * 1.12
     }
 
+    /// Orbit about and limit zoom by new design bounds without moving the
+    /// camera, for another display of the same design.
+    mutating func adoptBounds(_ bounds: [Double]) {
+        guard bounds.count == 6, bounds.allSatisfy(\.isFinite) else { return }
+        let low = SIMD3(bounds[0], bounds[1], bounds[2])
+        let high = SIMD3(bounds[3], bounds[4], bounds[5])
+        orbitCenter = (low + high) / 2
+        radius = max(simd_length(high - low) / 2, 0.001)
+    }
+
     /// Intersect a screen ray at design-center depth while it is ahead of the
     /// camera. Surface zoom can move `target` far behind the design;
     /// using that target's depth after a missed hit can zoom past the design.

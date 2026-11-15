@@ -86,7 +86,7 @@ final class AppState {
     /// with its print-only features, in built coordinates.
     var printVersionView = false {
         didSet {
-            if printVersionView != oldValue { printViewChanged(geometryChanged: true); autosave() }
+            if printVersionView != oldValue { printViewChanged(layoutChanged: false); autosave() }
         }
     }
     /// The 3D printing layout view orients each displayed part and packs the
@@ -95,7 +95,7 @@ final class AppState {
     /// the plate is not packed again.
     var printLayoutView = false {
         didSet {
-            if printLayoutView != oldValue { printViewChanged(geometryChanged: false); autosave() }
+            if printLayoutView != oldValue { printViewChanged(layoutChanged: true); autosave() }
         }
     }
     /// Either 3D printing view replaces the posed design display.
@@ -122,6 +122,8 @@ final class AppState {
     @ObservationIgnored private var printPreviewTasks: [String: Task<PreviewMesh, Error>] = [:]
     @ObservationIgnored private var printViewTask: Task<Void, Never>?
     @ObservationIgnored private var printViewToken = UUID()
+    /// A layout toggle frames the next shown 3D printing display.
+    @ObservationIgnored private var fitsPrintViewWhenShown = false
     /// Printing versions build on their own engine, so they never cancel a
     /// design build or agent validation running on the main engine.
     private let printEngine = EngineService()
@@ -352,6 +354,10 @@ final class AppState {
         guard let mesh, let shown = printViewGeometry, shown.key == printViewKey(for: mesh) else { return nil }
         return shown.preview
     }
+
+    /// Displays of one build, the design and its printing version, share the
+    /// viewport camera.
+    var viewportCameraKey: String? { mesh.map(Self.printKey) }
 
     /// Rigid placements applied to `displayedMesh`.
     var displayedSolidTransforms: [Int: [Double]] {
@@ -1761,13 +1767,19 @@ final class AppState {
         return printing
     }
 
-    private func printViewChanged(geometryChanged: Bool) {
+    private func printViewChanged(layoutChanged: Bool) {
         cancelAssemblyGrab()
         // Feature IDs belong to one native topology; whole parts keep their
         // solids. The layout only places the same geometry.
-        if geometryChanged { selectedFeatures = [] }
+        if !layoutChanged { selectedFeatures = [] }
+        // Placing or unplacing the parts frames the view again. Switching
+        // between the design and its printing version keeps the camera.
+        if layoutChanged { fitsPrintViewWhenShown = true }
         preparePrintView()
-        if !showsPrintView, mesh != nil { viewportCommand = ViewportCommand(.fit) }
+        if !showsPrintView {
+            if fitsPrintViewWhenShown, mesh != nil { viewportCommand = ViewportCommand(.fit) }
+            fitsPrintViewWhenShown = false
+        }
         refreshMeasurements()
     }
 
@@ -1853,7 +1865,10 @@ final class AppState {
     private func showPrintView(_ geometry: PrintViewGeometry) {
         printViewGeometry = geometry
         isPreparingPrintView = false
-        viewportCommand = ViewportCommand(.fit)
+        if fitsPrintViewWhenShown {
+            fitsPrintViewWhenShown = false
+            viewportCommand = ViewportCommand(.fit)
+        }
     }
 
     /// The build's printing version. A program that never reads `lad.print`
@@ -1915,6 +1930,7 @@ final class AppState {
         printOrientationCache = [:]
         printViewGeometry = nil
         isPreparingPrintView = false
+        fitsPrintViewWhenShown = false
     }
 
     private func refreshMeasurements() {

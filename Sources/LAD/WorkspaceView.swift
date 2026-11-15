@@ -256,7 +256,7 @@ private struct WorkspaceViewer: View {
                         command: state.viewportCommand,
                         selectedSolids: state.selectedSolids, hiddenSolids: state.hiddenSolids, solidColors: state.solidColors,
                         selectedFeatures: state.selectedFeatures,
-                        solidTransforms: state.displayedSolidTransforms,
+                        solidTransforms: state.displayedSolidTransforms, cameraKey: state.viewportCameraKey,
                         onSelectionChanged: { state.selectParts($0) },
                         onFeatureSelectionChanged: { state.selectFeatures($0) }, onDeselectAll: { state.clearSelections() },
                         onHideSelected: { state.hideSelectedParts() }, onShowAll: { state.showAllParts() },

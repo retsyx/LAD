@@ -41,19 +41,25 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertEqual(state.selectedFeatures, [face])
 
         // The design itself, oriented and packed.
+        let cameraKey = state.viewportCameraKey
+        var command = state.viewportCommand
         state.printLayoutView = true
         XCTAssertEqual(state.selectedFeatures, [face], "The layout only places the same geometry")
         try await waitForPrintView(state)
+        XCTAssertNotEqual(state.viewportCommand, command, "Placing the parts frames them")
         XCTAssertEqual(state.displayedMesh?.brepPath, preview.brepPath)
         XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
         state.printLayoutView = false
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
 
-        // The printing version where the design was built.
+        // The printing version where the design was built, under the same camera.
+        command = state.viewportCommand
         state.printVersionView = true
         XCTAssertTrue(state.selectedFeatures.isEmpty, "Feature identities belong to one geometry")
         try await waitForPrintView(state)
+        XCTAssertEqual(state.viewportCommand, command, "Showing the printing version keeps the camera")
+        XCTAssertEqual(state.viewportCameraKey, cameraKey)
         let printing = try XCTUnwrap(state.displayedMesh)
         XCTAssertNotEqual(printing.brepPath, preview.brepPath)
         XCTAssertEqual(printing.volume - preview.volume, Double.pi * 1.6 * 1.6 * 0.2, accuracy: 1e-4)
@@ -95,15 +101,21 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertEqual(peg[5] - peg[2], 15, accuracy: 1e-3)
 
         // Prepared views return at once, without an empty interim display.
+        command = state.viewportCommand
         state.printVersionView = false
+        XCTAssertEqual(state.viewportCommand, command, "Leaving the printing version keeps the camera")
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertEqual(state.displayedMesh?.brepPath, preview.brepPath)
         XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
         state.printVersionView = true
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertEqual(state.displayedSolidTransforms, layout)
-        state.printVersionView = false
+        XCTAssertEqual(state.viewportCommand, command)
         state.printLayoutView = false
+        XCTAssertNotEqual(state.viewportCommand, command, "Returning the parts frames them")
+        command = state.viewportCommand
+        state.printVersionView = false
+        XCTAssertEqual(state.viewportCommand, command, "Leaving the printing version keeps the camera")
         XCTAssertEqual(state.displayedMesh?.brepPath, preview.brepPath)
         XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
     }

@@ -245,6 +245,69 @@ final class ViewportPreparationTests: XCTestCase {
     }
 
     @MainActor
+    func testAnotherDisplayUnderTheSameCameraKeyKeepsTheCamera() throws {
+        let view = try makeView()
+        func show(_ preview: PreviewMesh?, key: String, transforms: [Int: [Double]] = [:], command: ViewportCommand? = nil) {
+            view.update(mesh: preview, mode: .edges, grid: false, command: command, selectedSolids: [], hiddenSolids: [],
+                        solidTransforms: transforms, cameraKey: key)
+        }
+        show(mesh("design"), key: "build", command: ViewportCommand(.front))
+        let framed = camera(of: view)
+
+        // The printing version can differ in size, arrive after an empty
+        // interim, and be placed for printing; the camera stays put.
+        show(nil, key: "build")
+        show(scaled(mesh("printing"), by: 3), key: "build")
+        XCTAssertEqual(camera(of: view), framed)
+        let placed = [1: [1, 0, 0, 40, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1.0]]
+        show(scaled(mesh("printing plate"), by: 3), key: "build", transforms: placed)
+        XCTAssertEqual(camera(of: view), framed)
+        show(mesh("design again"), key: "build")
+        XCTAssertEqual(camera(of: view), framed)
+
+        // Another build frames its own geometry.
+        show(scaled(mesh("next build"), by: 3), key: "next build")
+        XCTAssertNotEqual(camera(of: view).distance, framed.distance)
+    }
+
+    @MainActor
+    func testMeshesWithoutACameraKeyAreFramed() throws {
+        let view = try makeView()
+        view.update(mesh: mesh("first"), mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
+        let framed = camera(of: view)
+        view.update(mesh: scaled(mesh("second"), by: 3), mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [])
+        XCTAssertNotEqual(camera(of: view).distance, framed.distance)
+    }
+
+    private struct CameraState: Equatable {
+        var position: [Double]
+        var target: [Double]
+        var distance: Double
+        var orthographicScale: Double
+        var right: SIMD3<Double>
+        var up: SIMD3<Double>
+    }
+
+    @MainActor
+    private func camera(of view: CADSceneView) -> CameraState {
+        let metadata = view.agentCaptureMetadata
+        return CameraState(position: metadata["cameraPosition"] as? [Double] ?? [],
+                           target: metadata["cameraTarget"] as? [Double] ?? [],
+                           distance: metadata["cameraDistance"] as? Double ?? 0,
+                           orthographicScale: metadata["orthographicScale"] as? Double ?? 0,
+                           right: view.cameraOrientation.right, up: view.cameraOrientation.up)
+    }
+
+    private func scaled(_ preview: PreviewMesh, by factor: Double) -> PreviewMesh {
+        var copy = preview
+        copy.positions = preview.positions.map { $0 * Float(factor) }
+        copy.edgePoints = preview.edgePoints.map { $0 * Float(factor) }
+        copy.bounds = preview.bounds.map { $0 * factor }
+        return copy
+    }
+
+    @MainActor
     private func waitForPreparation(_ view: CADSceneView) async throws {
         let deadline = Date().addingTimeInterval(5)
         while view.isPreparingResources, Date() < deadline {
