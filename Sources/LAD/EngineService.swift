@@ -177,6 +177,21 @@ final class EngineService {
     private var verifications: [String: Task<String, Error>] = [:]
     private var verificationOrder: [String] = []
 
+    /// A sandboxed build worker started before this engine's next build, with
+    /// the CAD runtime already loaded. It serves exactly one build.
+    private struct PreparedBuildWorker {
+        let python: String
+        let artifacts: EngineBuildArtifacts
+        let start: URL
+        let job: EngineProcessJob
+    }
+    private var preparedWorker: PreparedBuildWorker?
+    private var isPreparingWorker = false
+    private var preparedWorkerExpiry: Task<Void, Never>?
+    /// Builds served by a prepared worker, for regression tests.
+    private(set) var preparedBuilds = 0
+    var hasPreparedBuildWorker: Bool { preparedWorker != nil }
+
     init(temporaryDirectory: URL = FileManager.default.temporaryDirectory, inputCache: CADValidatedInputCache = .shared) {
         self.temporaryDirectory = temporaryDirectory
         self.inputCache = inputCache
@@ -184,7 +199,10 @@ final class EngineService {
         verifier = CADNativeWorker(temporaryDirectory: temporaryDirectory)
     }
 
-    deinit { job?.cancel() }
+    deinit {
+        job?.cancel()
+        preparedWorker?.job.discard()
+    }
 
     static var defaultPython: String {
         CADRuntimeManager.defaultPythonPath
@@ -745,53 +763,59 @@ final class EngineService {
         cancel()
         let token = UUID()
         generation = token
-        let artifacts = try EngineBuildArtifacts.create(in: temporaryDirectory, token: token, containsSTEP: !deferSTEP)
+        // Deferred-STEP builds of the same runtime use the prepared worker.
+        let prepared = scriptMode && deferSTEP ? takePreparedWorker(python: python) : nil
+        let artifacts: EngineBuildArtifacts
+        do { artifacts = try prepared?.artifacts ?? EngineBuildArtifacts.create(in: temporaryDirectory, token: token, containsSTEP: !deferSTEP) }
+        catch { prepared?.job.discard(); throw error }
         let folder = artifacts.folder
         defer { withExtendedLifetime(artifacts) {} }
         let request = folder.appendingPathComponent("request.json")
-        try await Task.detached(priority: .userInitiated) { try prepare(folder) }.value
-        guard token == generation, !Task.isCancelled else { throw CancellationError() }
-        let python = try await CADRuntimeManager.resolvePython(python)
-        guard token == generation, !Task.isCancelled else { throw CancellationError() }
-        let launch = try Self.workerLaunch(python: python)
-        let worker = launch.worker, runtime = launch.runtime, actualRuntime = launch.actualRuntime, interpreter = launch.interpreter
-        var arguments = [worker.path, "--request", request.path, "--output", folder.path, "--threads", String(max(1, min(256, threads)))] + (deferSTEP ? ["--defer-step"] : [])
-        if let validatedHash, validatedHash.utf8.count == 64,
-           validatedHash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) {
-            arguments.append("--validated-hash=\(validatedHash)")
+        do {
+            try await Task.detached(priority: .userInitiated) { try prepare(folder) }.value
+            guard token == generation, !Task.isCancelled else { throw CancellationError() }
+        } catch {
+            prepared?.job.discard()
+            throw error
         }
-        if deferSTEP, verifyLater { arguments.append("--verify-later") }
-        let executable: URL
-        let launchArguments: [String]
-        if scriptMode {
-            executable = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
-            let profile = worker.deletingLastPathComponent().appendingPathComponent("script.sb")
-            guard FileManager.default.isExecutableFile(atPath: executable.path), FileManager.default.fileExists(atPath: profile.path) else {
-                throw LADError.message("LAD could not start its CAD execution sandbox. Reinstall LAD and try again.")
+        let hash = validatedHash.flatMap { hash in
+            hash.utf8.count == 64 && hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) ? hash : nil
+        }
+        let workerThreads = max(1, min(256, threads))
+        var task: EngineProcessJob?
+        if let prepared {
+            var options: [String: Any] = ["threads": workerThreads, "deferStep": true, "verifyLater": verifyLater]
+            options["validatedHash"] = hash
+            let data = try JSONSerialization.data(withJSONObject: options)
+            do {
+                try await Task.detached(priority: .userInitiated) { try prepared.job.begin(options: data, at: prepared.start) }.value
+                task = prepared.job
+                preparedBuilds += 1
+            } catch {
+                // Its process ended while waiting; launch this build normally.
+                prepared.job.discard()
             }
-            let parameters = [
-                ("RUNTIME", runtime.deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath().path),
-                ("PYTHON_BASE", Self.pythonBaseDirectory(runtime: runtime, actualRuntime: actualRuntime).path),
-                ("WORKER", worker.deletingLastPathComponent().path),
-                ("OUTPUT", folder.path),
-                ("PYTHON", interpreter.path), ("ENTRY_PYTHON", runtime.path)
-            ]
-            launchArguments = parameters.flatMap { ["-D", "\($0.0)=\($0.1)"] } + ["-f", profile.path, interpreter.path] + arguments
-        } else {
-            executable = runtime
-            launchArguments = arguments
         }
-        let environment = try Self.workerEnvironment(folder: folder, launch: launch)
-        let task = try EngineProcessJob(executable: executable, arguments: launchArguments, artifacts: artifacts, environment: environment)
-        job = task
-        defer { if job === task { job = nil } }
+        if task == nil {
+            let python = try await CADRuntimeManager.resolvePython(python)
+            guard token == generation, !Task.isCancelled else { throw CancellationError() }
+            var arguments = ["--request", request.path, "--output", folder.path, "--threads", String(workerThreads)]
+                + (deferSTEP ? ["--defer-step"] : [])
+            if let hash { arguments.append("--validated-hash=\(hash)") }
+            if deferSTEP, verifyLater { arguments.append("--verify-later") }
+            task = try Self.workerJob(python: python, sandboxed: scriptMode, arguments: arguments, artifacts: artifacts)
+        }
+        let running = task!
+        job = running
+        defer { if job === running { job = nil } }
         let status = try await withTaskCancellationHandler {
-            try await task.run()
+            try await running.run()
         } onCancel: {
-            task.cancel()
+            running.cancel()
         }
         // A failed program can still have imported and validated its inputs.
         if let afterExit { await Task.detached(priority: .userInitiated) { afterExit(folder) }.value }
+        if scriptMode, deferSTEP { prepareBuildWorker(python: python) }
         guard token == generation, !Task.isCancelled else { throw CancellationError() }
         job = nil
         guard status == 0 else {
@@ -801,6 +825,77 @@ final class EngineService {
                                      diagnostic: EngineFailureDiagnostic.read(in: folder, stderr: log))
         }
         return RunResult(artifacts: artifacts, token: token)
+    }
+
+    /// A worker process for `arguments`, in the program sandbox when `sandboxed`.
+    private static func workerJob(python: String, sandboxed: Bool, arguments: [String],
+                                  artifacts: EngineBuildArtifacts) throws -> EngineProcessJob {
+        let folder = artifacts.folder
+        let launch = try workerLaunch(python: python)
+        let worker = launch.worker, runtime = launch.runtime, actualRuntime = launch.actualRuntime, interpreter = launch.interpreter
+        let executable: URL
+        let launchArguments: [String]
+        if sandboxed {
+            executable = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+            let profile = worker.deletingLastPathComponent().appendingPathComponent("script.sb")
+            guard FileManager.default.isExecutableFile(atPath: executable.path), FileManager.default.fileExists(atPath: profile.path) else {
+                throw LADError.message("LAD could not start its CAD execution sandbox. Reinstall LAD and try again.")
+            }
+            let parameters = [
+                ("RUNTIME", runtime.deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath().path),
+                ("PYTHON_BASE", pythonBaseDirectory(runtime: runtime, actualRuntime: actualRuntime).path),
+                ("WORKER", worker.deletingLastPathComponent().path),
+                ("OUTPUT", folder.path),
+                ("PYTHON", interpreter.path), ("ENTRY_PYTHON", runtime.path)
+            ]
+            launchArguments = parameters.flatMap { ["-D", "\($0.0)=\($0.1)"] } + ["-f", profile.path, interpreter.path, worker.path] + arguments
+        } else {
+            executable = runtime
+            launchArguments = [worker.path] + arguments
+        }
+        let environment = try workerEnvironment(folder: folder, launch: launch)
+        return try EngineProcessJob(executable: executable, arguments: launchArguments, artifacts: artifacts, environment: environment)
+    }
+
+    /// Start a sandboxed worker for this engine's next deferred-STEP build, so
+    /// Python and CadQuery are loaded before that build is requested. Each
+    /// worker still runs one program; an unused one stops after five minutes.
+    func prepareBuildWorker(python: String) {
+        guard preparedWorker == nil, !isPreparingWorker else { return }
+        isPreparingWorker = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { isPreparingWorker = false }
+            do {
+                let resolved = try await CADRuntimeManager.resolvePython(python)
+                let artifacts = try EngineBuildArtifacts.create(in: temporaryDirectory, token: UUID(), containsSTEP: false)
+                let start = artifacts.folder.appendingPathComponent("start")
+                guard mkfifo(start.path, 0o600) == 0 else { return }
+                let job = try Self.workerJob(python: resolved, sandboxed: true,
+                                             arguments: ["--await-build", start.path, "--output", artifacts.folder.path],
+                                             artifacts: artifacts)
+                try await Task.detached(priority: .utility) { try job.start() }.value
+                preparedWorker?.job.discard()
+                preparedWorker = PreparedBuildWorker(python: python, artifacts: artifacts, start: start, job: job)
+                preparedWorkerExpiry?.cancel()
+                preparedWorkerExpiry = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(300))
+                    guard !Task.isCancelled, let self else { return }
+                    preparedWorker?.job.discard()
+                    preparedWorker = nil
+                }
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func takePreparedWorker(python: String) -> PreparedBuildWorker? {
+        guard let worker = preparedWorker else { return nil }
+        preparedWorker = nil
+        preparedWorkerExpiry?.cancel(); preparedWorkerExpiry = nil
+        guard worker.python == python, worker.job.isRunning else { worker.job.discard(); return nil }
+        return worker
     }
 
     func readPreview(_ output: RunResult, deferSTEP: Bool) async throws -> PreviewMesh {
@@ -999,6 +1094,7 @@ private final class EngineProcessJob: @unchecked Sendable {
     private let directory: URL
     private let artifacts: EngineBuildArtifacts
     private let workerInput: FileHandle
+    private var stderr: FileHandle?
 
     init(executable: URL, arguments: [String], artifacts: EngineBuildArtifacts, environment: [String: String]) throws {
         self.artifacts = artifacts
@@ -1012,23 +1108,72 @@ private final class EngineProcessJob: @unchecked Sendable {
         process.standardOutput = FileHandle.nullDevice
     }
 
+    /// Launch the process; `run` launches it when this was not called first.
+    /// Foundation delivers a process's termination on its launching thread's
+    /// run loop, so one thread launches the process and reaps it, however
+    /// long a prepared worker waits for its build.
+    func start() throws {
+        let log = directory.appendingPathComponent("stderr.log")
+        FileManager.default.createFile(atPath: log.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: log)
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { finished = true; try? handle.close(); throw CancellationError() }
+        stderr = handle
+        process.standardError = handle
+        let started = DispatchSemaphore(value: 0)
+        var failure: Error?
+        let reaper = Thread { [process] in
+            do { try process.run() } catch { failure = error; started.signal(); return }
+            started.signal()
+            process.waitUntilExit()
+        }
+        reaper.name = "LAD CAD worker"
+        reaper.start()
+        started.wait()
+        if let failure { finished = true; try? handle.close(); throw failure }
+        launched = true
+    }
+
+    var isRunning: Bool { lock.withLock { launched && !finished && process.isRunning } }
+
+    /// Stop a launched worker that no build awaits. Its directory, which its
+    /// process keeps leased, stays owned until that process has exited.
+    func discard() {
+        cancel()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            while lock.withLock({ launched && process.isRunning }) { Thread.sleep(forTimeInterval: 0.03) }
+            lock.withLock { finished = true }
+            try? workerInput.close(); try? stderr?.close()
+        }
+    }
+
+    /// Deliver a prepared worker's build options through its private FIFO,
+    /// waiting while it finishes loading the CAD runtime.
+    func begin(options: Data, at start: URL) throws {
+        guard options.count <= Int(PIPE_BUF) else { throw LADError.message("The CAD build options are too large.") }
+        var descriptor: Int32 = -1
+        while descriptor < 0 {
+            descriptor = Darwin.open(start.path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+            // ENXIO: the worker has not opened its end yet.
+            if descriptor < 0 {
+                guard errno == ENXIO, isRunning, !lock.withLock({ cancelled }) else {
+                    throw LADError.message("The prepared CAD worker stopped before its build.")
+                }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+        }
+        defer { Darwin.close(descriptor) }
+        let written = options.withUnsafeBytes { Darwin.write(descriptor, $0.baseAddress, $0.count) }
+        guard written == options.count else { throw LADError.message("The prepared CAD worker did not accept its build.") }
+    }
+
     func run() async throws -> Int32 {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async { [self] in
-                defer { try? workerInput.close() }
-                let log = directory.appendingPathComponent("stderr.log")
-                FileManager.default.createFile(atPath: log.path, contents: nil)
+                defer { try? workerInput.close(); try? stderr?.close() }
                 do {
-                    let stderr = try FileHandle(forWritingTo: log)
-                    defer { try? stderr.close() }
-                    process.standardError = stderr
-                    lock.lock()
-                    if cancelled {
-                        finished = true; lock.unlock()
-                        continuation.resume(throwing: CancellationError()); return
-                    }
-                    do { try process.run(); launched = true; lock.unlock() }
-                    catch { finished = true; lock.unlock(); throw error }
+                    if !lock.withLock({ launched }) { try start() }
                     let deadline = Date().addingTimeInterval(600)
                     while process.isRunning {
                         if Date() >= deadline {
@@ -1037,7 +1182,6 @@ private final class EngineProcessJob: @unchecked Sendable {
                         }
                         Thread.sleep(forTimeInterval: 0.03)
                     }
-                    process.waitUntilExit()
                     lock.lock()
                     finished = true
                     let didCancel = cancelled, didTimeOut = timedOut

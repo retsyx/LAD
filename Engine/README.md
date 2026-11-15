@@ -224,6 +224,16 @@ generated programs, which always run in their own sandboxed process. The app
 stages each solid as an APFS clone, stops the server after two idle minutes, and
 stops it when a canceled request is still running two seconds later.
 
+Preview builds usually run in a sandboxed worker started before they are
+requested. `worker.py --await-build <fifo> --output <folder>` loads CadQuery,
+then reads one build's options (`threads`, `deferStep`, `verifyLater`,
+`validatedHash`) from the private FIFO the app created in that build folder,
+after the app has staged `request.json` there. Each process still runs exactly
+one program under the same sandbox profile, launched and reaped by its own
+thread. The app prepares the next worker when a build finishes or the agent
+calls `lad_runtime`, and stops an unused one after five minutes; the worker
+exits when LAD does.
+
 A preview build with `--defer-step --verify-later` skips the exact BRep/shell
 checks and STEP roundtrip, still checking closed solids, positive volumes and
 limits, and returns `pendingValidationHash` instead of `validatedHash`. A

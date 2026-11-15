@@ -106,6 +106,34 @@ final class EngineServiceTests: XCTestCase {
     }
 
     @MainActor
+    func testPreparedBuildWorkersServeLaterBuildsInsideTheSandbox() async throws {
+        try requireRuntime()
+        let canary = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-private-canary-\(UUID().uuidString).txt")
+        try Data("private canary".utf8).write(to: canary)
+        defer { try? FileManager.default.removeItem(at: canary) }
+        let probe = ModelSpec(title: "Isolated CAD program", summary: "Sandbox verification box.", units: "mm",
+                              script: try Self.sandboxProbe(canary))
+        let engine = EngineService()
+        func prepared() async throws {
+            let deadline = ContinuousClock.now + .seconds(60)
+            while !engine.hasPreparedBuildWorker, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+            XCTAssertTrue(engine.hasPreparedBuildWorker)
+        }
+        engine.prepareBuildWorker(python: EngineService.defaultPython)
+        try await prepared()
+        let first = try await engine.buildPreview(probe, python: EngineService.defaultPython, threads: 2)
+        XCTAssertEqual(engine.preparedBuilds, 1)
+        XCTAssertEqual(first.volume, 1_000, accuracy: 1e-6)
+        try await prepared()
+        let second = try await engine.buildPreview(probe, python: EngineService.defaultPython, threads: 2, verifyLater: true)
+        XCTAssertEqual(engine.preparedBuilds, 2, "Each finished build prepares the next build's worker.")
+        let verified = try await engine.verified(second, python: EngineService.defaultPython, threads: 2)
+        XCTAssertEqual(verified.validatedHash, first.validatedHash)
+        let folder = URL(fileURLWithPath: try XCTUnwrap(second.brepPath)).deletingLastPathComponent()
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: folder.path)), ["model.brep", ".lad-build-lease"])
+    }
+
+    @MainActor
     func testDecodedBuildRetainsOnlyNativeOutputs() async throws {
         try requireRuntime()
         let spec = ModelSpec(title: "Scratch cleanup", summary: "Imported inputs and requests are temporary.", units: "mm",
@@ -241,6 +269,45 @@ final class EngineServiceTests: XCTestCase {
         }
     }
 
+    /// A program that fails unless the sandbox denies an unrelated file, a
+    /// subprocess and the network; it then builds a 10 mm cube.
+    private static func sandboxProbe(_ canary: URL) throws -> String {
+        // JSON quoting is also valid for this generated Python string literal.
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
+        let literal = String(decoding: try encoder.encode(canary.path), as: UTF8.self)
+        return """
+        import os, socket, subprocess
+        try:
+            open(\(literal)).read()
+        except PermissionError:
+            pass
+        else:
+            raise RuntimeError('unrelated file was readable')
+        try:
+            subprocess.run(['/bin/echo', 'should not run'], check=True)
+        except (PermissionError, OSError):
+            pass
+        else:
+            raise RuntimeError('external process was executable')
+        sock = None
+        try:
+            sock = socket.socket()
+            sock.connect(('127.0.0.1', 9))
+        except PermissionError:
+            pass
+        except OSError as error:
+            if error.errno not in (1, 13):
+                raise RuntimeError('network was not sandbox denied: ' + str(error))
+        else:
+            raise RuntimeError('network was allowed')
+        finally:
+            if sock is not None:
+                sock.close()
+        assert not any(key in os.environ for key in ['OPENAI_API_KEY', 'CODEX_API_KEY', 'AWS_SECRET_ACCESS_KEY'])
+        result = cq.Workplane('XY').box(10, 10, 10)
+        """
+    }
+
     private func requireRuntime() throws {
         guard ProcessInfo.processInfo.environment["LAD_RUN_ENGINE_TESTS"] == "1" else {
             throw XCTSkip("Set LAD_RUN_ENGINE_TESTS=1 to verify the installed native CAD runtime and macOS sandbox.")
@@ -373,40 +440,7 @@ final class EngineServiceTests: XCTestCase {
         let canary = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-private-canary-\(UUID().uuidString).txt")
         try Data("private canary".utf8).write(to: canary)
         defer { try? FileManager.default.removeItem(at: canary) }
-        // JSON quoting is also valid for this generated Python string literal.
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
-        let literal = String(decoding: try encoder.encode(canary.path), as: UTF8.self)
-        let program = """
-        import os, socket, subprocess
-        try:
-            open(\(literal)).read()
-        except PermissionError:
-            pass
-        else:
-            raise RuntimeError('unrelated file was readable')
-        try:
-            subprocess.run(['/bin/echo', 'should not run'], check=True)
-        except (PermissionError, OSError):
-            pass
-        else:
-            raise RuntimeError('external process was executable')
-        sock = None
-        try:
-            sock = socket.socket()
-            sock.connect(('127.0.0.1', 9))
-        except PermissionError:
-            pass
-        except OSError as error:
-            if error.errno not in (1, 13):
-                raise RuntimeError('network was not sandbox denied: ' + str(error))
-        else:
-            raise RuntimeError('network was allowed')
-        finally:
-            if sock is not None:
-                sock.close()
-        assert not any(key in os.environ for key in ['OPENAI_API_KEY', 'CODEX_API_KEY', 'AWS_SECRET_ACCESS_KEY'])
-        result = cq.Workplane('XY').box(10, 10, 10)
-        """
+        let program = try Self.sandboxProbe(canary)
         let spec = ModelSpec(title: "Isolated CAD program", summary: "Sandbox verification box.", units: "mm", script: program)
         let mesh = try await EngineService().build(spec, python: EngineService.defaultPython, threads: 2)
         XCTAssertEqual(mesh.solids, 1)

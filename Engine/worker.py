@@ -3574,6 +3574,39 @@ def serve():
     return 0
 
 
+BUILD_OPTIONS = {"threads", "deferStep", "validatedHash", "verifyLater"}
+
+
+def await_build(start, output):
+    """Load the CAD runtime, then wait for one build's options on `start`.
+
+    The app starts a sandboxed worker before its next build is requested, so
+    Python, CadQuery and NumPy are already imported when it is. The app stages
+    the request in `output` and writes the options to this private FIFO; the
+    worker still runs exactly one program. It exits once LAD does.
+    """
+    import threading
+    parent = os.getppid()
+
+    def watch():
+        # An orphan is reparented to launchd, possibly before this started.
+        while os.getppid() == parent != 1:
+            time.sleep(1)
+        os._exit(1)
+
+    threading.Thread(target=watch, daemon=True).start()
+    import cadquery  # noqa: F401 -- the import this worker loads ahead of its build
+    import numpy  # noqa: F401
+    with open(start, "rb") as stream:
+        options = json.loads(stream.read(4_096))
+    if (not isinstance(options, dict) or set(options) - BUILD_OPTIONS
+            or isinstance(options.get("threads"), bool) or not isinstance(options.get("threads"), int)
+            or any(not isinstance(options.get(name, False), bool) for name in ("deferStep", "verifyLater"))
+            or not isinstance(options.get("validatedHash", ""), str)):
+        raise HostError("The CAD build options are invalid.")
+    return options
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serve", action="store_true", help="Answer native-geometry requests on stdin.")
@@ -3585,9 +3618,26 @@ def main():
     parser.add_argument("--validated-hash", help="Reuse successful validation of identical replay inputs.")
     parser.add_argument("--verify-later", action="store_true",
                         help="With --defer-step, leave exact checks and STEP verification to a separate verify request.")
+    parser.add_argument("--await-build", type=Path,
+                        help="Load the CAD runtime, then read one build's options from this FIFO; the request is in --output.")
     arguments = parser.parse_args()
     if arguments.serve:
         return serve()
+    if arguments.await_build is not None and arguments.output is not None:
+        try:
+            options = await_build(arguments.await_build, arguments.output)
+        except Exception as error:
+            try:
+                write_error_report(error, arguments.output)
+            except Exception:
+                pass
+            print(f"LAD CAD engine: {error}", file=sys.stderr)
+            return 1
+        arguments.request = arguments.output / "request.json"
+        arguments.threads = options["threads"]
+        arguments.defer_step = options.get("deferStep", False)
+        arguments.verify_later = options.get("verifyLater", False)
+        arguments.validated_hash = options.get("validatedHash")
     if arguments.request is None or arguments.output is None:
         parser.error("--request and --output are required")
     try:

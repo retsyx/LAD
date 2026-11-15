@@ -324,6 +324,9 @@ final class CADAgentTools {
         switch name {
         case "lad_runtime":
             try allowed(arguments, [])
+            // The agent calls this before constructing geometry; load the CAD
+            // runtime for its first build meanwhile.
+            engine.prepareBuildWorker(python: python)
             if runtime == nil { runtime = try await engine.runtimeInfo(python: python, threads: threads) }
             let meshHelp = try workspace.write(Data(contentsOf: ResourcePaths.root.appendingPathComponent("Engine/mesh-api.md")), path: "context/mesh-api.md")
             return try result(["pythonExecutable": python, "runtime": try json(runtime!), "threads": threads,
