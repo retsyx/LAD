@@ -1954,47 +1954,91 @@ def _preview_face_triangles(face, poly, location, points, normals, edges, tolera
     return triangles
 
 
+def _preview_solid_groups(solids):
+    """Partition solids that share native faces or edges, in solid order.
+
+    A face's triangulation and its edges' boundary polygons live on the shared
+    native subshapes, including every located instance of one solid. Cleaning
+    and remeshing one solid would discard the display data of each solid it
+    shares with, so those solids are meshed and retried together.
+    """
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCP.TopExp import TopExp
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    parents = list(range(len(solids)))
+
+    def root(index):
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    shared, owners, identity = TopTools_IndexedMapOfShape(), {}, TopLoc_Location()
+    for index, solid in enumerate(solids):
+        for kind in (TopAbs_FACE, TopAbs_EDGE):
+            local = TopTools_IndexedMapOfShape()
+            TopExp.MapShapes_s(solid.wrapped, kind, local)
+            for position in range(1, local.Extent() + 1):
+                owner = owners.setdefault(shared.Add(local.FindKey(position).Located(identity)), index)
+                if root(owner) != root(index):
+                    parents[root(index)] = root(owner)
+    groups = {}
+    for index in range(len(solids)):
+        groups.setdefault(root(index), []).append(index)
+    return list(groups.values())
+
+
 def _preview_mesh(shape, solids, tolerance):
-    from OCP.BRep import BRep_Tool
+    from OCP.BRep import BRep_Builder, BRep_Tool
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
     from OCP.BRepTools import BRepTools
     from OCP.IMeshTools import IMeshTools_Parameters, IMeshTools_MeshAlgoType
     from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS_Compound
+    watson = IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Watson
+    delabella = IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella
     faces = [[(face, _shape_entities(face, "Edge")) for face in _shape_entities(solid, "Face")] for solid in solids]
-    # Retain healthy native meshes; retry only a failed display candidate.
-    # Small connector blends can need finer boundary angles even when the
-    # assembly-wide linear deflection is already adequate.
-    attempts = [(IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Watson, angle, tolerance, False)
-                for angle in (0.15, 0.07)] + [
-        (IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella, angle, tolerance, False)
-        for angle in (0.16, 0.14, 0.18, 0.20)]
+    # Retain healthy native meshes; retry only the solids whose display
+    # candidate failed, never the whole assembly. Watson can report success
+    # with folded facets and large missing areas on trimmed analytic spheres,
+    # so try the independent native triangulator at the same angle before a
+    # finer one: small connector blends can need finer boundary angles even
+    # when the assembly-wide linear deflection is already adequate, but a finer
+    # angle multiplies the triangles of threads and other long curved trims.
+    attempts = [(watson, 0.15, tolerance, False), (delabella, 0.16, tolerance, False),
+                (watson, 0.07, tolerance, False)] + [
+        (delabella, angle, tolerance, False) for angle in (0.14, 0.18, 0.20)]
     # Pole-adjacent trims can still fold an analytic sphere's native mesh at
     # every ordinary angle. Refine its boundary and surface sampling together
     # before giving up; do not flip those facets or alter the exact geometry.
-    attempts += [(IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella, 0.20, tolerance * factor, False)
-                 for factor in (0.25, 0.125)]
-    refinement_queued = False
-    for attempt, (algorithm, angle, linear_deflection, refine_surface) in enumerate(attempts):
-        if attempt:
-            BRepTools.Clean_s(shape.wrapped)
+    attempts += [(delabella, 0.20, tolerance * factor, False) for factor in (0.25, 0.125)]
+    result = [None] * len(solids)
+    accepted = [0, 0]  # Nodes and triangles of solids whose meshes passed.
+
+    def mesh(target, attempt):
+        algorithm, angle, linear_deflection, refine_surface = attempt
         parameters = IMeshTools_Parameters()
         parameters.Deflection, parameters.Angle = linear_deflection, angle
         parameters.Relative, parameters.InParallel = False, True
         parameters.ControlSurfaceDeflection = not refine_surface
-        # Watson can report success with folded facets and large missing areas
-        # on trimmed analytic spheres. Try an independent native triangulator.
         parameters.MeshAlgo = algorithm
-        mesher = BRepMesh_IncrementalMesh(shape.wrapped, parameters)
-        failure_feature = None
+        return BRepMesh_IncrementalMesh(target, parameters)
+
+    def candidate(group, mesher):
+        """Try the group's next attempt on its current native meshes."""
+        attempt = group["attempts"].pop(0)
+        algorithm, angle, linear_deflection, refine_surface = attempt
+        group.update(attempt=attempt, status=mesher.GetStatusFlags(), feature=None)
         if not mesher.IsDone():
-            failure = "OpenCascade did not complete triangulation"
-            continue
-        result = []
-        total_nodes, total_triangles = 0, 0
+            group["failure"] = "OpenCascade did not complete triangulation"
+            return False
+        total_nodes, total_triangles = accepted
+        meshes = {}
         try:
-            for solid_index, solid_faces in enumerate(faces):
+            for solid_index in group["solids"]:
                 chunks = []
-                for local_index, (face, edges) in enumerate(solid_faces):
+                for local_index, (face, edges) in enumerate(faces[solid_index]):
                     location = TopLoc_Location()
                     poly = BRep_Tool.Triangulation_s(face.wrapped, location)
                     if poly is None or not poly.NbTriangles():
@@ -2011,27 +2055,60 @@ def _preview_mesh(shape, solids, tolerance):
                     if total_nodes > MAX_VERTICES or total_triangles > MAX_TRIANGLES:
                         raise ModelError("Preview exceeds the mesh size limit; simplify the design.")
                     chunks.append((face, edges, poly, location, points, normals, triangles))
-                result.append(chunks)
-            return result
+                meshes[solid_index] = chunks
         except _PreviewMeshError as error:
-            failure = f"part {solid_index + 1}, face {local_index + 1}: {error}"
-            failure_feature = feature_id("face", solid_index, local_index)
-            if error.refine_surface and not refinement_queued:
+            group["failure"] = f"part {solid_index + 1}, face {local_index + 1}: {error}"
+            group["feature"] = feature_id("face", solid_index, local_index)
+            if error.refine_surface and not group["refinement_queued"]:
                 # A highly sheared chart can make native surface refinement
                 # manufacture hundreds of thousands of folded cells. Try one
                 # coarse seed instead, with LAD's independent, bounded exact-
                 # surface refinement and complete trim audit on every face.
-                attempts.insert(attempt + 1, (algorithm, angle, linear_deflection, True))
-                refinement_queued = True
-    diagnostic = {"stage": "preview_meshing", "geometryScope": "native_candidate",
-                  "openCascadeMeshingStatus": mesher.GetStatusFlags(),
-                  "linearDeflectionMM": linear_deflection, "angularDeflectionRadians": angle,
-                  "independentSurfaceRefinement": refine_surface,
-                  "meshingAlgorithm": "Watson" if algorithm == attempts[0][0] else "Delabella"}
-    if failure_feature is not None:
-        diagnostic["feature"] = failure_feature
-    raise ModelError(f"OpenCascade could not produce a complete design preview ({failure}).",
-                     diagnostic=diagnostic)
+                group["attempts"].insert(0, (algorithm, angle, linear_deflection, True))
+                group["refinement_queued"] = True
+            return False
+        for solid_index, chunks in meshes.items():
+            result[solid_index] = chunks
+        accepted[:] = total_nodes, total_triangles
+        return True
+
+    def exhausted(group):
+        algorithm, angle, linear_deflection, refine_surface = group["attempt"]
+        diagnostic = {"stage": "preview_meshing", "geometryScope": "native_candidate",
+                      "openCascadeMeshingStatus": group["status"],
+                      "linearDeflectionMM": linear_deflection, "angularDeflectionRadians": angle,
+                      "independentSurfaceRefinement": refine_surface,
+                      "meshingAlgorithm": "Watson" if algorithm == watson else "Delabella"}
+        if group["feature"] is not None:
+            diagnostic["feature"] = group["feature"]
+        return ModelError(f"OpenCascade could not produce a complete design preview ({group['failure']}).",
+                          diagnostic=diagnostic)
+
+    groups = [{"solids": solids_in_group, "attempts": list(attempts), "refinement_queued": False}
+              for solids_in_group in _preview_solid_groups(solids)]
+    # One assembly-wide pass gives the native mesher every face at once.
+    mesher = mesh(shape.wrapped, attempts[0])
+    pending = [group for group in groups if not candidate(group, mesher)]
+    while pending:
+        for group in pending:
+            if not group["attempts"]:
+                raise exhausted(group)
+        # Remesh only failed groups; groups at the same attempt share a pass.
+        batches = {}
+        for group in pending:
+            batches.setdefault(group["attempts"][0], []).append(group)
+        pending = []
+        for attempt, members in batches.items():
+            compound, builder = TopoDS_Compound(), BRep_Builder()
+            builder.MakeCompound(compound)
+            for group in members:
+                for solid_index in group["solids"]:
+                    builder.Add(compound, solids[solid_index].wrapped)
+            BRepTools.Clean_s(compound)
+            mesher = mesh(compound, attempt)
+            pending += [group for group in members if not candidate(group, mesher)]
+        pending.sort(key=lambda group: group["solids"][0])
+    return result
 
 
 def make_preview(shape, preview_stats=None):
