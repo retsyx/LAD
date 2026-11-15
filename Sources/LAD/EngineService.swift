@@ -168,13 +168,20 @@ final class EngineService {
     /// Measurements, clearance checks, exports and runtime inspection share
     /// one long-lived worker; builds keep their own sandboxed process.
     let native: CADNativeWorker
+    /// Verifies previews that deferred their exact checks, so measurements
+    /// and exports never wait behind a verification.
+    let verifier: CADNativeWorker
     /// Validated copies of imported inputs, shared by every engine.
     let inputCache: CADValidatedInputCache
+    /// Each deferred verification by native solid path, retained for reuse.
+    private var verifications: [String: Task<String, Error>] = [:]
+    private var verificationOrder: [String] = []
 
     init(temporaryDirectory: URL = FileManager.default.temporaryDirectory, inputCache: CADValidatedInputCache = .shared) {
         self.temporaryDirectory = temporaryDirectory
         self.inputCache = inputCache
         native = CADNativeWorker(temporaryDirectory: temporaryDirectory)
+        verifier = CADNativeWorker(temporaryDirectory: temporaryDirectory)
     }
 
     deinit { job?.cancel() }
@@ -190,16 +197,70 @@ final class EngineService {
     /// Validate new or changed inputs, or reuse a matching saved validation hash.
     /// Retain the original native solid without keeping generated STEP bytes.
     /// `print` builds the program's 3D printing version (`lad.print`).
+    /// `verifyLater` returns a displayable preview before its exact checks and
+    /// STEP verification; accept it only through `verified`.
     func buildPreview(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int,
-                      validatedHash: String? = nil) async throws -> PreviewMesh {
-        try await buildModel(spec, print: print, python: python, threads: threads, deferSTEP: true, validatedHash: validatedHash)
+                      validatedHash: String? = nil, verifyLater: Bool = false) async throws -> PreviewMesh {
+        try await buildModel(spec, print: print, python: python, threads: threads, deferSTEP: true, validatedHash: validatedHash,
+                             verifyLater: verifyLater)
+    }
+
+    /// Start the checks a preview deferred, unless they already started.
+    @discardableResult
+    func startVerification(_ preview: PreviewMesh, python: String, threads: Int) -> Task<String, Error>? {
+        guard let receipt = preview.pendingValidationHash, let path = preview.brepPath else { return nil }
+        if let running = verifications[path] { return running }
+        let task: Task<String, Error>
+        do {
+            let source = try nativeSource(preview)
+            task = Task { @MainActor [self] in
+                _ = try await runNative(on: verifier, python: python, threads: threads, action: "verify this design",
+                                        designFailures: true) { folder in
+                    try EngineWorkerRequest.verify(Self.stageNative(source, into: folder)).write(to: folder)
+                }
+                return receipt
+            }
+        } catch {
+            task = Task { throw error }
+        }
+        verifications[path] = task
+        verificationOrder.append(path)
+        while verificationOrder.count > 64 { verifications[verificationOrder.removeFirst()] = nil }
+        return task
+    }
+
+    /// The preview with its validation receipt once the exact checks and STEP
+    /// verification it deferred pass. A canceled caller stops waiting at once.
+    func verified(_ preview: PreviewMesh, python: String, threads: Int) async throws -> PreviewMesh {
+        guard let task = startVerification(preview, python: python, threads: threads) else { return preview }
+        let handoff = ResultHandoff<String>()
+        let receipt: String
+        do {
+            receipt = try await withTaskCancellationHandler {
+                Task { handoff.resume(with: await task.result) }
+                return try await handoff.value()
+            } onCancel: {
+                handoff.resume(with: .failure(CancellationError()))
+            }
+        } catch let failure as EngineBuildFailure where failure.isRepairable {
+            throw failure
+        } catch {
+            // Only a rejected design is a lasting verdict; a later call retries
+            // a verification the engine could not complete.
+            if !(error is CancellationError), let path = preview.brepPath, verifications[path] == task { verifications[path] = nil }
+            throw error
+        }
+        var verified = preview
+        verified.validatedHash = receipt
+        verified.pendingValidationHash = nil
+        return verified
     }
 
     private func buildModel(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int, deferSTEP: Bool,
-                            validatedHash: String? = nil) async throws -> PreviewMesh {
+                            validatedHash: String? = nil, verifyLater: Bool = false) async throws -> PreviewMesh {
         let copies = ValidatedInputCopies(cache: inputCache, runtime: python)
         let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: deferSTEP, validatedHash: validatedHash,
-                                   afterExit: { copies.keep(from: $0) }) { folder in
+                                   verifyLater: verifyLater, afterExit: { copies.keep(from: $0) }) { folder in
             var sourceAsset: String?, sourceCopy: String?
             if let source = spec.sourceSTEP {
                 try Self.validateSTEP(source)
@@ -605,7 +666,10 @@ final class EngineService {
     private func nativeSource(_ preview: PreviewMesh) throws -> NativeSource {
         guard let path = preview.brepPath, let artifacts = preview.buildArtifacts,
               path == artifacts.folder.appendingPathComponent("model.brep").path else { throw EngineExportError.nativeArtifactUnavailable }
-        return NativeSource(url: URL(fileURLWithPath: path), validated: preview.validatedHash != nil, artifacts: artifacts)
+        // A build that deferred its exact checks still checked closed solids;
+        // its verification runs separately rather than in every native read.
+        return NativeSource(url: URL(fileURLWithPath: path),
+                            validated: preview.validatedHash != nil || preview.pendingValidationHash != nil, artifacts: artifacts)
     }
 
     /// Stage a build's solid into a request and return the request's reference
@@ -625,9 +689,11 @@ final class EngineService {
         return EngineWorkerRequest.NativeSource(identity: source.url.path, validated: source.validated)
     }
 
-    /// Native requests run on the long-lived worker. They never cancel a build
-    /// running on this engine, and a build never cancels them.
-    private func runNative(python: String, threads: Int, action: String,
+    /// Native requests run on a long-lived worker. They never cancel a build
+    /// running on this engine, and a build never cancels them. With
+    /// `designFailures`, a rejected design is a repairable build failure.
+    private func runNative(on worker: CADNativeWorker? = nil, python: String, threads: Int, action: String,
+                           designFailures: Bool = false,
                            prepare: @escaping @Sendable (URL) throws -> Void) async throws -> RunResult {
         try Task.checkCancellation()
         let artifacts = try EngineBuildArtifacts.create(in: temporaryDirectory, token: UUID(), containsSTEP: false)
@@ -636,11 +702,15 @@ final class EngineService {
         try Task.checkCancellation()
         let python = try await CADRuntimeManager.resolvePython(python)
         let reply: CADNativeWorker.Reply
-        do { reply = try await native.perform(folder: folder, threads: max(1, min(256, threads)), python: python) }
+        do { reply = try await (worker ?? native).perform(folder: folder, threads: max(1, min(256, threads)), python: python) }
         catch is CancellationError { throw CancellationError() }
         catch { throw LADError.message("The CAD engine could not \(action).\n\n\(error.localizedDescription)") }
         try Task.checkCancellation()
         guard reply.status == "complete" else {
+            if designFailures {
+                throw EngineBuildFailure(action: action, sandboxed: false,
+                                         diagnostic: EngineFailureDiagnostic.read(in: folder, stderr: reply.message ?? ""))
+            }
             let diagnostic = EngineFailureDiagnostic.message(in: folder, stderr: reply.message ?? "")
             if diagnostic.contains("No module named") {
                 throw LADError.message("LAD’s CAD runtime is incomplete. Reinstall LAD and try again.\n\n\(diagnostic.suffix(1_200))")
@@ -669,7 +739,7 @@ final class EngineService {
     }
 
     func run(python: String, threads: Int, scriptMode: Bool, deferSTEP: Bool = false, validatedHash: String? = nil,
-                     action: String = "build this design", afterExit: (@Sendable (URL) -> Void)? = nil,
+                     verifyLater: Bool = false, action: String = "build this design", afterExit: (@Sendable (URL) -> Void)? = nil,
                      prepare: @escaping @Sendable (URL) throws -> Void) async throws -> RunResult {
         try Task.checkCancellation()
         cancel()
@@ -690,6 +760,7 @@ final class EngineService {
            validatedHash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) {
             arguments.append("--validated-hash=\(validatedHash)")
         }
+        if deferSTEP, verifyLater { arguments.append("--verify-later") }
         let executable: URL
         let launchArguments: [String]
         if scriptMode {

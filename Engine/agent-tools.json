@@ -109,7 +109,7 @@
   },
   {
     "name": "lad_build",
-    "description": "Build a workspace Python CAD program with exact native geometry checks and temporary STEP roundtrip verification before acceptance. Returns an artifact ID and exact geometry metadata; does not commit the design or retain STEP.",
+    "description": "Build a workspace Python CAD program for review. Returns an artifact ID and exact geometry metadata once closed-solid checks pass; exact native topology validation and temporary STEP roundtrip verification then run in the background, and a later tool result reports a failure. Does not commit the design or retain STEP.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -380,7 +380,7 @@
   },
   {
     "name": "lad_validate",
-    "description": "Check that an artifact passed exact native topology, closed-solid, positive-volume, STEP roundtrip and preview validation before acceptance.",
+    "description": "Wait for and report an artifact's exact native topology, closed-solid, positive-volume, STEP roundtrip and preview validation. Required before acceptance.",
     "inputSchema": {
       "type": "object",
       "properties": {

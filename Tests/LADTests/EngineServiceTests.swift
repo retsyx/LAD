@@ -57,6 +57,55 @@ final class EngineServiceTests: XCTestCase {
     }
 
     @MainActor
+    func testDeferredVerificationDisplaysFirstThenEarnsTheFullBuildReceipt() async throws {
+        try requireRuntime()
+        let spec = ModelSpec(title: "Deferred", summary: "Displays before acceptance.", units: "mm",
+                             script: "result = cq.Solid.makeBox(2,3,4)")
+        let engine = EngineService()
+        let preview = try await engine.buildPreview(spec, python: EngineService.defaultPython, threads: 2, verifyLater: true)
+        XCTAssertNil(preview.validatedHash, "An unverified preview carries no validation receipt.")
+        let pending = try XCTUnwrap(preview.pendingValidationHash)
+        let face = try XCTUnwrap(preview.topology?.faces.first?.id)
+        let report = try await engine.measure(preview, features: [face], solids: [], python: EngineService.defaultPython, threads: 2)
+        XCTAssertFalse(report.metrics.isEmpty, "A displayed candidate can be measured while it verifies.")
+        let verified = try await engine.verified(preview, python: EngineService.defaultPython, threads: 2)
+        XCTAssertEqual(verified.validatedHash, pending)
+        XCTAssertNil(verified.pendingValidationHash)
+        XCTAssertEqual(verified.brepPath, preview.brepPath)
+        let full = try await EngineService().buildPreview(spec, python: EngineService.defaultPython, threads: 2)
+        XCTAssertEqual(full.validatedHash, pending, "Verification earns the receipt of a fully checked build.")
+    }
+
+    @MainActor
+    func testDeferredVerificationRejectsADisplayedDefectAsARepairableDesignFailure() async throws {
+        try requireRuntime()
+        let spec = ModelSpec(title: "Invalid edge curve", summary: "A 0.001 mm curve defect exceeds the numerical tolerance.",
+                             units: "mm", script: """
+        from OCP.BRep import BRep_Builder, BRep_Tool
+        from OCP.gp import gp_Vec2d
+        result = cq.Solid.makeBox(2,3,4)
+        face = result.Faces()[0]
+        edge = face.Edges()[0]
+        curve = BRep_Tool.CurveOnSurface_s(edge.wrapped, face.wrapped, 0., 0.)
+        BRep_Builder().UpdateEdge(edge.wrapped, curve.Translated(gp_Vec2d(0.001,0)), face.wrapped, 1e-7)
+        """)
+        let engine = EngineService()
+        let preview = try await engine.buildPreview(spec, python: EngineService.defaultPython, threads: 2, verifyLater: true)
+        XCTAssertEqual(preview.solids, 1, "The defect does not prevent reviewing the design.")
+        for _ in 0..<2 {
+            do {
+                _ = try await engine.verified(preview, python: EngineService.defaultPython, threads: 2)
+                XCTFail("A design that fails its exact checks must never earn a receipt.")
+            } catch let failure as EngineBuildFailure {
+                XCTAssertTrue(failure.isRepairable)
+                let report = EngineFailureDiagnostic.repairText(for: failure)
+                XCTAssertTrue(report.contains("BRepCheck_InvalidCurveOnSurface"), report)
+                XCTAssertTrue(report.contains("Geometry scope: native_candidate"), report)
+            }
+        }
+    }
+
+    @MainActor
     func testDecodedBuildRetainsOnlyNativeOutputs() async throws {
         try requireRuntime()
         let spec = ModelSpec(title: "Scratch cleanup", summary: "Imported inputs and requests are temporary.", units: "mm",

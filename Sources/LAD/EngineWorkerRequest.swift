@@ -49,6 +49,8 @@ enum EngineWorkerRequest: Encodable, Sendable {
     case clearance(NativeSource, pairs: [[[Int]]], poses: [[AssemblySolidTransform]])
     /// Printing orientations of the selected solids; nil selects every solid.
     case printOrientations(NativeSource, solidIndices: [Int]?, printDown: [PrintDownPin])
+    /// The exact checks and STEP verification a preview build deferred.
+    case verify(NativeSource)
 
     private enum Key: String, CodingKey {
         case operation, title, summary, units, script, sourceAsset, sourceValidatedBREP, inputAssets, print, brepAsset,
@@ -99,6 +101,8 @@ enum EngineWorkerRequest: Encodable, Sendable {
             try encodeSource(source, operation: "print_orient")
             try values.encodeIfPresent(solidIndices, forKey: .solidIndices)
             if !printDown.isEmpty { try values.encode(printDown, forKey: .printDown) }
+        case let .verify(source):
+            try encodeSource(source, operation: "verify")
         }
     }
 

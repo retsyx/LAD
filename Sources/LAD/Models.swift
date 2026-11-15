@@ -118,6 +118,9 @@ struct PreviewMesh: Codable, Sendable {
 
     /// Successful worker validation receipt, bound to complete replay inputs.
     var validatedHash: String? = nil
+    /// The receipt a build that deferred its exact checks and STEP
+    /// verification earns once `EngineService.verified` passes.
+    var pendingValidationHash: String? = nil
 
     /// Reconstructed from the complete CAD program; never a replacement for it.
     var assemblyMotion: AssemblyMotion? = nil
@@ -139,7 +142,7 @@ struct PreviewMesh: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case bounds, volume, area, solids, faces, buildSeconds, threads, stepPath
-        case parts, brepPath, runtime, topology, validatedHash, assemblyMotion, printVersion, printDown
+        case parts, brepPath, runtime, topology, validatedHash, pendingValidationHash, assemblyMotion, printVersion, printDown
     }
 
     var vertexCount: Int { positions.count / 3 }

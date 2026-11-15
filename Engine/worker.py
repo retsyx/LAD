@@ -42,7 +42,7 @@ _validation_input = ContextVar("validation_input", default=None)
 _serving = False
 _native_shapes = {}
 NATIVE_CACHE_SIZE = 2
-NATIVE_OPERATIONS = {"runtime", "export", "dxf", "measure", "clearance", "print_orient"}
+NATIVE_OPERATIONS = {"runtime", "export", "dxf", "measure", "clearance", "print_orient", "verify"}
 # Fields every native operation accepts beside its own (see read_brep).
 NATIVE_SOURCE_FIELDS = {"brepAsset", "nativeIdentity", "validatedNative"}
 
@@ -415,8 +415,12 @@ def write_error_report(error, output):
             path.unlink(missing_ok=True)
 
 
-def validate_shape(shape, preview_stats=None):
-    """Validate exact, closed geometry before meshing or accepting a build."""
+def validate_shape(shape, preview_stats=None, exact=True):
+    """Validate exact, closed geometry before meshing or accepting a build.
+
+    `exact` False leaves the exact topology and shell checks to a separate
+    verification of the same native solid; the remaining checks still run.
+    """
     from OCP.BRepCheck import BRepCheck_Analyzer, BRepCheck_Shell, BRepCheck_NoError
     if preview_stats is not None:
         preview_stats.clear()
@@ -431,7 +435,7 @@ def validate_shape(shape, preview_stats=None):
         raise ModelError("geometry exceeds the 4,096 solid limit; simplify the design")
     apply_geometry_tolerance(shape)
     face_count = len(_shape_entities(shape, "Face"))
-    if not _validated_replay.get():
+    if exact and not _validated_replay.get():
         # CadQuery's isValid() uses finitely sampled curve/surface checks. Exact
         # checking catches parameterization defects that those samples can miss.
         analyzer = BRepCheck_Analyzer(shape.wrapped, True, False, True)
@@ -809,13 +813,14 @@ class LADBuildMode:
 
 
 def build_script(script, cq, source_asset=None, input_assets=None, preview_stats=None, printing=False,
-                 validated_inputs=None):
+                 validated_inputs=None, exact=True):
     """Run ordinary Python with the installed CadQuery/OpenCascade APIs.
 
     This is intentionally not a Python-language security boundary. The native
     app applies a macOS process sandbox restricting files, subprocesses and
     networking. CLI callers must apply equivalent isolation for untrusted code.
-    `validated_inputs` reads and keeps validated copies of imported inputs.
+    `validated_inputs` reads and keeps validated copies of imported inputs;
+    `exact` False defers the result's exact checks (see validate_shape).
     """
     import resource
     # Bound individual files (including stderr) before generated Python runs.
@@ -879,7 +884,7 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
         raise ModelError("Python design result must be a CadQuery Shape, Workplane or Assembly.")
     if not _only_solids(result):
         raise ModelError("Python design result must contain only closed solids; remove construction wires, faces and tools from result.")
-    validate_shape(result, preview_stats=preview_stats)
+    validate_shape(result, preview_stats=preview_stats, exact=exact)
     result._lad_print_version = build_mode.printing_read
     if assembly is not None:
         print_down = {}
@@ -900,7 +905,7 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
     return result
 
 
-def build_shape(spec, threads=1, asset_directory=None, preview_stats=None, validated_copies=None):
+def build_shape(spec, threads=1, asset_directory=None, preview_stats=None, validated_copies=None, exact=True):
     """`validated_copies` is the directory receiving copies of newly imported inputs."""
     validate_spec(spec)
     import cadquery as cq
@@ -918,7 +923,8 @@ def build_shape(spec, threads=1, asset_directory=None, preview_stats=None, valid
               for name in [spec.get("sourceValidatedBREP")] + [asset.get("validatedBREP") for asset in inputs] if name}
     return build_script(spec["script"], cq, source_asset, staged, preview_stats=preview_stats,
                         printing=spec.get("print", False),
-                        validated_inputs=ValidatedInputs(copies, None if validated_copies is None else Path(validated_copies)))
+                        validated_inputs=ValidatedInputs(copies, None if validated_copies is None else Path(validated_copies)),
+                        exact=exact)
 
 
 VALIDATED_COPY_SUFFIX = ".validated.brep"
@@ -3351,6 +3357,28 @@ def clearance_brep(spec, asset_directory, cq, threads):
     return {"samples": samples}
 
 
+def verify_brep(spec, asset_directory, output, cq, threads):
+    """Run the checks a preview build deferred, on that build's own native solid.
+
+    Exact topology and shell validation and STEP roundtrip verification are
+    what acceptance requires, not what a display needs. A build may defer them
+    so its design displays first; this performs exactly those checks, and a
+    design is accepted only after they pass.
+    """
+    if set(spec) - {"operation"} - NATIVE_SOURCE_FIELDS:
+        raise ModelError("Verification accepts only a build's native solid.")
+    import tempfile
+    # The build already checked closed solids; the exact checks follow here.
+    shape = read_brep({**spec, "validatedNative": True}, asset_directory, cq, threads)
+    stats = {}
+    validate_shape(shape, preview_stats=stats)
+    with tempfile.TemporaryDirectory(prefix=".step-validation-", dir=output) as directory:
+        step = Path(directory) / "candidate.step"
+        write_step(stats["solids"], step, cq)
+        validate_step_roundtrip(shape, cq, step, preview_stats=stats)
+    return {"verified": True}
+
+
 def runtime_info(cq):
     import platform
     from importlib.metadata import PackageNotFoundError, version
@@ -3404,7 +3432,7 @@ def validation_hash(spec, directory, cq):
     return digest.hexdigest()
 
 
-def run(request, output, threads, defer_step=False, validated_hash=None, native_only=False):
+def run(request, output, threads, defer_step=False, validated_hash=None, native_only=False, verify_later=False):
     if not 1 <= threads <= 256:
         raise HostError("Thread count must be between 1 and 256.")
     size = request.stat().st_size
@@ -3431,7 +3459,7 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
     is_export = isinstance(spec, dict) and spec.get("operation") == "export"
     is_parts_export = is_export and "individualParts" in spec
     is_drawing = isinstance(spec, dict) and spec.get("operation") == "dxf"
-    is_measurement = isinstance(spec, dict) and spec.get("operation") in ("measure", "clearance", "print_orient")
+    is_measurement = isinstance(spec, dict) and spec.get("operation") in ("measure", "clearance", "print_orient", "verify")
     is_runtime = spec == {"operation": "runtime"}
     if not is_preview and not is_export and not is_drawing and not is_measurement and not is_runtime:
         if size > 2 * 1024 * 1024:
@@ -3449,6 +3477,8 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
         preview = clearance_brep(spec, request.parent.resolve(), cq, threads)
     elif is_measurement and spec["operation"] == "print_orient":
         preview = print_orient_brep(spec, request.parent.resolve(), cq, threads)
+    elif is_measurement and spec["operation"] == "verify":
+        preview = verify_brep(spec, request.parent.resolve(), output, cq, threads)
     elif is_measurement:
         preview = measure_brep(spec, request.parent.resolve(), cq, threads)
     elif is_export:
@@ -3460,19 +3490,24 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
     else:
         fingerprint = validation_hash(spec, request.parent.resolve(), cq)
         reuse_validation = validated_hash == fingerprint
+        # A preview can display before its exact checks and STEP roundtrip;
+        # a separate `verify` of its native solid must pass before acceptance.
+        deferred = verify_later and defer_step and not reuse_validation
         preview_stats = {}
         token = _validated_replay.set(reuse_validation)
         try:
             shape = build_shape(spec, threads, request.parent.resolve(), preview_stats=preview_stats,
-                                validated_copies=output)
+                                validated_copies=output, exact=not deferred)
             # A successful native build is not sufficient: STEP translation can
             # turn closed native geometry into open shells. Verify it before the
-            # candidate can be rendered, reused by lad_validate or committed.
+            # candidate can be accepted, here or in its deferred verification.
             # Export the same unique physical solids as the app's colored exporter.
             solids = preview_stats["solids"]
             if reuse_validation:
                 if not defer_step:
                     write_step(solids, step, cq)
+            elif deferred:
+                pass
             elif defer_step:
                 import tempfile
                 with tempfile.TemporaryDirectory(prefix=".step-validation-", dir=output) as directory:
@@ -3482,10 +3517,17 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
             else:
                 write_step(solids, step, cq)
                 validate_step_roundtrip(shape, cq, step, preview_stats=preview_stats)
-            preview = make_preview(shape, preview_stats=preview_stats)
+            try:
+                preview = make_preview(shape, preview_stats=preview_stats)
+            except ModelError:
+                if deferred:
+                    # Report the deferred exact check's failure, which names the
+                    # defective topology, rather than its display consequence.
+                    validate_shape(shape)
+                raise
         finally:
             _validated_replay.reset(token)
-        preview["validatedHash"] = fingerprint
+        preview["pendingValidationHash" if deferred else "validatedHash"] = fingerprint
     if not is_export and not is_drawing and not is_measurement and not is_preview and not is_runtime:
         # Both STEP imports and generated previews retain the identical native
         # topology so later measurements cannot be remapped by a STEP roundtrip.
@@ -3541,13 +3583,16 @@ def main():
     parser.add_argument("--defer-step", action="store_true",
                         help="Verify a temporary STEP, then retain only the preview and private native solid.")
     parser.add_argument("--validated-hash", help="Reuse successful validation of identical replay inputs.")
+    parser.add_argument("--verify-later", action="store_true",
+                        help="With --defer-step, leave exact checks and STEP verification to a separate verify request.")
     arguments = parser.parse_args()
     if arguments.serve:
         return serve()
     if arguments.request is None or arguments.output is None:
         parser.error("--request and --output are required")
     try:
-        result = run(arguments.request, arguments.output, arguments.threads, arguments.defer_step, arguments.validated_hash)
+        result = run(arguments.request, arguments.output, arguments.threads, arguments.defer_step, arguments.validated_hash,
+                     verify_later=arguments.verify_later)
         print(json.dumps({"status": "complete", "solids": result.get("solids"), "faces": result.get("faces")}))
     except Exception as error:
         try:

@@ -56,6 +56,8 @@ final class CADAgentTools {
     /// own their own network and leave this unset.
     var onPermissionAllowed: (@MainActor (_ operation: String) -> Void)?
     private var cancelled = false
+    /// Background verification failures not yet reported to the agent.
+    private var verificationFailures: [[String: Any]] = []
     private lazy var meshSession = CADMeshSession(workspace: workspace)
     private var reconstructionPrograms = Set<String>()
     private var reconstructionArtifacts = Set<String>()
@@ -165,6 +167,8 @@ final class CADAgentTools {
         return assets
     }
 
+    /// A matching candidate built during this task. Its exact checks and STEP
+    /// verification may still be running; accept it through `EngineService.verified`.
     func validatedPreview(for model: ModelSpec) -> PreviewMesh? {
         validatedPreview(for: model, print: false)
     }
@@ -189,7 +193,7 @@ final class CADAgentTools {
     func validatedPrintVersion(for model: ModelSpec, design: PreviewMesh) async throws -> PreviewMesh? {
         guard design.printVersion == true else { return nil }
         let printing: PreviewMesh
-        if let cached = validatedPrintPreview(for: model) { printing = cached }
+        if let cached = validatedPrintPreview(for: model) { printing = try await engine.verified(cached, python: python, threads: threads) }
         else { printing = try await engine.buildPreview(model, print: true, python: python, threads: threads) }
         try checkCancellation()
         try PrintLayout.validateParts(of: printing, matching: design)
@@ -204,8 +208,12 @@ final class CADAgentTools {
            artifact.preview?.brepPath.map({ FileManager.default.fileExists(atPath: $0) }) != true {
             _ = try await build(artifact.model, id: artifactID)
         }
-        let candidate = try validatedCandidate(artifactID: artifactID)
-        do { _ = try await validatedPrintVersion(for: candidate.model, design: candidate.preview) }
+        var candidate = try validatedCandidate(artifactID: artifactID)
+        do {
+            candidate.preview = try await engine.verified(candidate.preview, python: python, threads: threads)
+            try checkCancellation()
+            _ = try await validatedPrintVersion(for: candidate.model, design: candidate.preview)
+        }
         catch let failure as EngineBuildFailure { throw LADError.message(EngineFailureDiagnostic.repairText(for: failure)) }
         return candidate
     }
@@ -300,6 +308,17 @@ final class CADAgentTools {
     }
 
     func handle(name: String, arguments: [String: Any]) async throws -> CADAgentToolResult {
+        let result = try await perform(name: name, arguments: arguments)
+        guard !verificationFailures.isEmpty else { return result }
+        // A candidate that failed its background verification is reported with
+        // the next result, so the agent can repair it before building on it.
+        var metadata = result.metadata
+        metadata["verificationFailures"] = verificationFailures
+        verificationFailures = []
+        return try CADAgentToolResult(metadata: metadata, image: result.image, isError: result.isError)
+    }
+
+    private func perform(name: String, arguments: [String: Any]) async throws -> CADAgentToolResult {
         try checkCancellation()
         guard let tool = try AgentToolCatalog.native()[name] else { throw LADError.message("Unknown LAD tool ‘\(name)’.") }
         switch name {
@@ -423,7 +442,7 @@ final class CADAgentTools {
                                   units: "mm", script: script, sourceSTEP: origin?.sourceSTEP,
                                   sourceName: origin?.sourceName, inputAssets: selected.isEmpty ? nil : selected)
             let artifact = try await build(model, versionID: version?.id, print: printing)
-            return try result(summary(artifact))
+            return try result(verificationStatus(summary(artifact), artifact))
         case "lad_import":
             try allowed(arguments, ["path", "name", "producerPaths"])
             let path = try string("path", arguments, required: true)!
@@ -441,7 +460,7 @@ final class CADAgentTools {
                                   inputAssets: [asset])
             let artifact = try await build(model)
             inputs[id] = asset
-            var info = summary(artifact)
+            var info = verificationStatus(summary(artifact), artifact)
             info["assetID"] = id
             info["name"] = asset.name
             info["format"] = format
@@ -547,6 +566,11 @@ final class CADAgentTools {
         case "lad_validate":
             try allowed(arguments, ["artifactID"])
             let artifact = try await artifact(arguments)
+            do { _ = try await engine.verified(artifact.preview!, python: python, threads: threads) }
+            catch let failure as EngineBuildFailure {
+                verificationFailures.removeAll { $0["artifactID"] as? String == artifact.id }
+                throw LADError.message(EngineFailureDiagnostic.repairText(for: failure))
+            }
             var info = summary(artifact)
             info["valid"] = true
             info["checks"] = ["Exact OpenCascade geometry and topology validity", "closed oriented final solids", "positive finite part volumes and surface area", "STEP roundtrip preserves closed solids and per-part geometry", "finite dimensions", "native topology ownership", "preview integrity"]
@@ -801,7 +825,7 @@ final class CADAgentTools {
         var preview: PreviewMesh
         if let preparedPreview { preview = preparedPreview }
         else if let cached = validatedPreview(for: model, print: print) { preview = cached }
-        else { preview = try await engine.buildPreview(model, print: print, python: python, threads: threads) }
+        else { preview = try await engine.buildPreview(model, print: print, python: python, threads: threads, verifyLater: true) }
         try checkCancellation()
         if print {
             // The printing version must keep the ordinary build's parts.
@@ -841,6 +865,7 @@ final class CADAgentTools {
         _ = try workspace.write(JSONSerialization.data(withJSONObject: summary(artifact), options: [.sortedKeys, .prettyPrinted]), path: "artifacts/\(id)/metadata.json")
         artifacts[id] = artifact
         if !artifactOrder.contains(id) { artifactOrder.append(id) }
+        startVerification(of: artifact)
         // Retain recipes for replay while bounding heavyweight display caches.
         // An evicted candidate rebuilds when inspected or committed, and then
         // counts as the most recently built one.
@@ -849,6 +874,25 @@ final class CADAgentTools {
         for old in previewOrder.dropLast(Self.retainedCandidatePreviews) where old != "current" { artifacts[old]?.preview = nil }
         previewOrder = previewOrder.filter { artifacts[$0]?.preview != nil }
         return artifact
+    }
+
+    /// Exact checks and STEP verification run while the agent reviews the
+    /// candidate; a failure is reported with the next tool result.
+    private func startVerification(of artifact: Artifact) {
+        guard let preview = artifact.preview,
+              let task = engine.startVerification(preview, python: python, threads: threads) else { return }
+        let id = artifact.id
+        Task { [weak self] in
+            guard case .failure(let error) = await task.result, error is EngineBuildFailure, let self, !cancelled else { return }
+            verificationFailures.append(["artifactID": id, "error": EngineFailureDiagnostic.repairText(for: error)])
+        }
+    }
+
+    private func verificationStatus(_ summary: [String: Any], _ artifact: Artifact) -> [String: Any] {
+        guard artifact.preview?.pendingValidationHash != nil else { return summary }
+        var result = summary
+        result["verification"] = "running; lad_validate reports the outcome"
+        return result
     }
 
     private static func parts(in preview: PreviewMesh?) -> [PartNode] {

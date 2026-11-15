@@ -197,6 +197,50 @@ final class CADAgentToolsTests: XCTestCase {
         XCTAssertEqual(preview.volume, 4, accuracy: 1e-7)
     }
 
+    @MainActor
+    func testAgentReviewsCandidatesWhileTheyVerifyAndLearnsOfFailures() async throws {
+        guard ProcessInfo.processInfo.environment["LAD_RUN_ENGINE_TESTS"] == "1" else {
+            throw XCTSkip("Set LAD_RUN_ENGINE_TESTS=1 to exercise background candidate verification.")
+        }
+        let root = temporary()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defective = """
+        from OCP.BRep import BRep_Builder, BRep_Tool
+        from OCP.gp import gp_Vec2d
+        result = cq.Solid.makeBox(2,3,4)
+        face = result.Faces()[0]
+        edge = face.Edges()[0]
+        curve = BRep_Tool.CurveOnSurface_s(edge.wrapped, face.wrapped, 0., 0.)
+        BRep_Builder().UpdateEdge(edge.wrapped, curve.Translated(gp_Vec2d(0.001,0)), face.wrapped, 1e-7)
+        """
+        try Data(defective.utf8).write(to: root.appendingPathComponent("defective.py"))
+        try Data("result = cq.Solid.makeBox(2,3,4)".utf8).write(to: root.appendingPathComponent("valid.py"))
+        let engine = EngineService()
+        let tools = try CADAgentTools(directory: root, python: EngineService.defaultPython, threads: 2,
+                                      current: nil, currentPreview: nil, engine: engine)
+        let built = try await tools.handle(name: "lad_build", arguments: ["programPath": "defective.py", "title": "Defective"])
+        let id = try XCTUnwrap(built.metadata["artifactID"] as? String)
+        XCTAssertNotNil(built.metadata["verification"], "The candidate is reviewable while its exact checks run.")
+        let candidate = try XCTUnwrap(tools.validatedPreview(for: ModelSpec(title: "Defective", summary: "Defective", units: "mm",
+                                                                          script: defective)))
+        _ = await engine.startVerification(candidate, python: EngineService.defaultPython, threads: 2)?.result
+        try await Task.sleep(for: .milliseconds(200))
+        let next = try await tools.handle(name: "lad_build", arguments: ["programPath": "valid.py", "title": "Valid"])
+        let failures = try XCTUnwrap(next.metadata["verificationFailures"] as? [[String: Any]])
+        XCTAssertEqual(failures.map { $0["artifactID"] as? String }, [id])
+        XCTAssertTrue((failures[0]["error"] as? String)?.contains("BRepCheck_InvalidCurveOnSurface") == true)
+        let valid = try XCTUnwrap(next.metadata["artifactID"] as? String)
+        let passed = try await tools.handle(name: "lad_validate", arguments: ["artifactID": valid])
+        XCTAssertEqual(passed.metadata["valid"] as? Bool, true)
+        XCTAssertNil(passed.metadata["verificationFailures"], "Each failure is reported once.")
+        do { _ = try await tools.handle(name: "lad_validate", arguments: ["artifactID": id]); XCTFail("A failed candidate is not valid") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("BRepCheck_InvalidCurveOnSurface"), error.localizedDescription) }
+        do { _ = try await tools.committableCandidate(artifactID: id); XCTFail("A failed candidate cannot be committed") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("BRepCheck_InvalidCurveOnSurface"), error.localizedDescription) }
+        let committed = try await tools.committableCandidate(artifactID: valid)
+        XCTAssertNotNil(committed.preview.validatedHash, "A committed candidate carries its validation receipt.")
+    }
+
     private func content(_ result: CADAgentToolResult) throws -> [String: Any] {
         result.metadata
     }

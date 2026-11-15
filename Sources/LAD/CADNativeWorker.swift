@@ -55,7 +55,7 @@ actor CADNativeWorker {
         let id = nextID
         runningID = id
         let request = folder.appendingPathComponent("request.json")
-        let handoff = ReplyHandoff()
+        let handoff = ResultHandoff<Reply>()
         // The request runs in its own task so a canceled caller can return
         // while the worker finishes or is stopped; the next request waits.
         Task { [weak self] in
@@ -129,12 +129,14 @@ actor CADNativeWorker {
 
 /// Resumes a waiting caller exactly once, with whichever of the reply or the
 /// caller's cancellation comes first.
-private final class ReplyHandoff: @unchecked Sendable {
+/// Delivers one result to one waiter; the first result wins, so a canceled
+/// waiter can return before the work it waited for finishes.
+final class ResultHandoff<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<CADNativeWorker.Reply, Error>?
-    private var result: Result<CADNativeWorker.Reply, Error>?
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var result: Result<Value, Error>?
 
-    func value() async throws -> CADNativeWorker.Reply {
+    func value() async throws -> Value {
         try await withCheckedThrowingContinuation { continuation in
             lock.lock()
             if let result { lock.unlock(); continuation.resume(with: result); return }
@@ -143,7 +145,7 @@ private final class ReplyHandoff: @unchecked Sendable {
         }
     }
 
-    func resume(with result: Result<CADNativeWorker.Reply, Error>) {
+    func resume(with result: Result<Value, Error>) {
         lock.lock()
         guard self.result == nil else { lock.unlock(); return }
         self.result = result

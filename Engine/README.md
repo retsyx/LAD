@@ -39,10 +39,12 @@ lock and deletes afterward; the next installation finishes an interrupted one.
 .build/cad-runtime/arm64/expanded/python/bin/python3 -m unittest discover -s Engine/tests -v
 ```
 
-Every build passes exact native curve-on-surface and closed-solid checks,
-then a temporary STEP export/reimport must preserve the closed solids and each
-part's volume, surface area, analytic bounds and centroid before a preview is
-accepted. The imported verification geometry never replaces the native build.
+Every accepted design passes exact native curve-on-surface and closed-solid
+checks, then a temporary STEP export/reimport must preserve the closed solids and
+each part's volume, surface area, analytic bounds and centroid. A build runs these
+checks before returning its preview or, with `--verify-later`, leaves them to a
+`verify` request (see below). The imported verification geometry never replaces
+the native build.
 With `--defer-step`, builds remove the verification STEP and write `result.json`
 and a private session `model.brep`, with no retained STEP file. The native BREP excludes triangulations and
 normals; it is temporary worker IPC, never a project asset. Once the app has
@@ -221,6 +223,17 @@ is checked only for closed solids when read again. The serving process refuses
 generated programs, which always run in their own sandboxed process. The app
 stages each solid as an APFS clone, stops the server after two idle minutes, and
 stops it when a canceled request is still running two seconds later.
+
+A preview build with `--defer-step --verify-later` skips the exact BRep/shell
+checks and STEP roundtrip, still checking closed solids, positive volumes and
+limits, and returns `pendingValidationHash` instead of `validatedHash`. A
+`{"operation":"verify"}` request then performs exactly those checks on the
+build's `model.brep` in a second serving worker, so measurements never wait
+behind it; passing earns the pending receipt. Agent candidates and replays whose
+saved receipt no longer matches display first, while committing a design,
+`lad_validate` and `lad_commit` wait for verification. A failure is a repairable
+design failure, reported with the agent's next tool result; a replayed design
+stays displayed with the reported error.
 
 A `clearance` request contains `pairs` (1–8 pairs of two disjoint, nonempty
 solid-index groups) and `poses` (1–361 sparse `solidTransforms` lists). For each
@@ -485,7 +498,8 @@ which is bumped only when validation or the geometry it validates changes, so
 unrelated worker edits keep saved receipts. Titles, summaries and input
 display names are excluded, matching validated candidate reuse at final commit. A matching receipt skips exact BRep/shell checks
 and STEP roundtrip validation during replay. Missing or changed hashes require
-full validation; only successful builds return a new receipt. This is an
+full validation, which a preview may complete after display; only a successful
+build or verification returns a new receipt. This is an
 accidental-change detector, not an authenticity mechanism or proof that Python
 is deterministic. Replay keeps its process sandbox, solid-only and size limits,
 finite analytic measurements, and app-side preview/topology checks. Native

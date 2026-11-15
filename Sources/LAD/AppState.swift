@@ -244,6 +244,9 @@ final class AppState {
     static let retainedRevisionPreviews = 4
     private var recentPreviewRevisionIDs: [UUID] = []
     private var projectSessionID = UUID()
+    /// Receipts earned after display by replays whose saved receipt no longer
+    /// matched, by native solid path. The displayed preview keeps its value.
+    private var verifiedReplayReceipts: [String: String] = [:]
     private var projectID = UUID()
     private var autosavedProjectURL: URL?
     private var projectFileOrigin: ProjectFileOrigin?
@@ -1213,7 +1216,11 @@ final class AppState {
                 var printPreview: PreviewMesh?
                 do {
                     if let validated = validatedPreview {
-                        preview = validated
+                        if validated.pendingValidationHash != nil {
+                            recordTaskEvent(ProjectActivityEvent(id: "final:validation", category: "validation",
+                                title: "Validate final CAD program", status: "running"))
+                        }
+                        preview = try await engine.verified(validated, python: runtime, threads: cores)
                         recordTaskEvent(ProjectActivityEvent(id: "final:validation", category: "validation",
                             title: "Final design matches validated CAD geometry", status: "completed",
                             output: "Reused the geometry built through LAD tools; no additional program replay was needed."))
@@ -1279,7 +1286,7 @@ final class AppState {
                         return
                     }
                     activity = "Validating the repaired geometry…"
-                    if let validated = validatedPreview { preview = validated }
+                    if let validated = validatedPreview { preview = try await engine.verified(validated, python: runtime, threads: cores) }
                     else { preview = try await engine.buildPreview(spec, python: runtime, threads: cores) }
                     guard operationID == token else { return }
                     try Task.checkCancellation()
@@ -1741,18 +1748,20 @@ final class AppState {
         guard design.printVersion == true else { return nil }
         let event = "final:print-validation"
         let printing: PreviewMesh
-        if let reused {
-            printing = reused
-        } else {
-            recordTaskEvent(ProjectActivityEvent(id: event, category: "validation",
-                title: "Validate 3D printing version", status: "running"))
-            do { printing = try await engine.buildPreview(spec, print: true, python: python, threads: threads) }
-            catch let failure as EngineBuildFailure {
+        do {
+            if let reused, reused.pendingValidationHash == nil {
+                printing = reused
+            } else {
                 recordTaskEvent(ProjectActivityEvent(id: event, category: "validation",
-                    title: "3D printing version validation failed", status: "failed", output: failure.message))
-                throw EngineBuildFailure(kind: failure.kind, message: "The 3D printing version of this design failed. \(failure.message)",
-                    report: "The lad.print = True build failed: " + EngineFailureDiagnostic.repairText(for: failure))
+                    title: "Validate 3D printing version", status: "running"))
+                if let reused { printing = try await engine.verified(reused, python: python, threads: threads) }
+                else { printing = try await engine.buildPreview(spec, print: true, python: python, threads: threads) }
             }
+        } catch let failure as EngineBuildFailure {
+            recordTaskEvent(ProjectActivityEvent(id: event, category: "validation",
+                title: "3D printing version validation failed", status: "failed", output: failure.message))
+            throw EngineBuildFailure(kind: failure.kind, message: "The 3D printing version of this design failed. \(failure.message)",
+                report: "The lad.print = True build failed: " + EngineFailureDiagnostic.repairText(for: failure))
         }
         do { try PrintLayout.validateParts(of: printing, matching: design) }
         catch {
@@ -2193,7 +2202,8 @@ final class AppState {
         isWorking = true; activity = "Building solid geometry…"; error = nil
         operation = Task {
             do {
-                let preview = try await engine.buildPreview(spec, python: runtime, threads: cores, validatedHash: validatedHash)
+                let preview = try await engine.buildPreview(spec, python: runtime, threads: cores, validatedHash: validatedHash,
+                                                            verifyLater: true)
                 guard operationID == token, !Task.isCancelled else { return }
                 if let index = revisions.firstIndex(where: { $0.id == revisionID }) {
                     let defaults = Self.defaultParts(for: preview)
@@ -2206,7 +2216,7 @@ final class AppState {
                         !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: oldHidden)
                     }.map(\.id))
                     revisions[index].preview = preview
-                    revisions[index].validatedHash = preview.validatedHash
+                    revisions[index].validatedHash = preview.validatedHash ?? revisions[index].validatedHash
                     if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
                     revisions[index].parts = defaults
                     revisions[index].partLayout = layout
@@ -2219,6 +2229,7 @@ final class AppState {
                 viewportCommand = ViewportCommand(.fit)
                 isWorking = false; activity = "Ready"; operation = nil
                 autosave()
+                if let revisionID { verifyReplay(preview, revisionID: revisionID) }
             } catch is CancellationError {
                 if operationID == token { isWorking = false; operation = nil }
             } catch {
@@ -2757,22 +2768,25 @@ final class AppState {
             return true
         }
 
-        // Generated geometry is reconstructed from the exact saved program.
-        // Native and temporary STEP validation finish before preview acceptance.
+        // Generated geometry is reconstructed from the exact saved program. A
+        // saved receipt that no longer matches is earned again after display.
         let token = UUID(); operationID = token
         let runtime = python, cores = threads
         isWorking = true; activity = "Preparing preview…"; error = nil
         operation = Task {
             do {
-                let preview = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash)
+                let preview = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash,
+                                                            verifyLater: true)
                 guard operationID == token, selectedRevisionID == revision.id, !Task.isCancelled,
                       let index = revisions.firstIndex(where: { $0.id == revision.id }) else { return }
                 // Only transient geometry changes here. User edits made while
                 // the worker was busy remain authoritative.
+                let receipt = revisions[index].validatedHash
                 try cacheReplayedPreview(preview, at: index)
-                if revision.validatedHash != preview.validatedHash { autosave() }
+                if revisions[index].validatedHash != receipt { autosave() }
                 viewportCommand = ViewportCommand(.fit)
                 activity = "Ready"; isWorking = false; operation = nil
+                verifyReplay(preview, revisionID: revision.id)
             } catch is CancellationError {
                 if operationID == token { isWorking = false; activity = "Ready"; operation = nil }
             } catch {
@@ -2782,6 +2796,35 @@ final class AppState {
             }
         }
         return true
+    }
+
+    /// A displayed replay whose saved receipt no longer matched finishes its
+    /// exact checks and STEP verification here, then records its receipt. A
+    /// failure is reported without removing the displayed design.
+    private func verifyReplay(_ preview: PreviewMesh, revisionID: UUID) {
+        guard preview.pendingValidationHash != nil, let path = preview.brepPath else { return }
+        let runtime = python, cores = threads, session = projectSessionID
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let verified = try await engine.verified(preview, python: runtime, threads: cores)
+                guard projectSessionID == session, let receipt = verified.validatedHash,
+                      let index = revisions.firstIndex(where: { $0.id == revisionID }),
+                      revisions[index].preview?.brepPath == path else { return }
+                verifiedReplayReceipts[path] = receipt
+                var revision = revisions[index]
+                revision.preview?.validatedHash = receipt
+                revision.preview?.pendingValidationHash = nil
+                revision.validatedHash = receipt
+                revisions[index] = revision
+                autosave()
+            } catch is CancellationError {
+            } catch {
+                guard projectSessionID == session, revisions.contains(where: { $0.id == revisionID && $0.preview?.brepPath == path })
+                else { return }
+                self.error = error.localizedDescription
+            }
+        }
     }
 
     private func retainRecentRevisionPreviews(including id: UUID) {
@@ -2810,7 +2853,8 @@ final class AppState {
         revisions[index].partLayout = restored.layout
         revisions[index].hiddenSolids = restored.hidden.sorted()
         revisions[index].preview = preview
-        revisions[index].validatedHash = preview.validatedHash
+        // A replay still verifying keeps the saved receipt until it earns one.
+        revisions[index].validatedHash = preview.validatedHash ?? revisions[index].validatedHash
         if revisions[index].runtime == nil { revisions[index].runtime = preview.runtime }
         mesh = preview; builtRevisionID = revisions[index].id
         hiddenSolids = restored.hidden; selectedSolids = restored.selected
@@ -2945,12 +2989,13 @@ final class AppState {
     private func currentProjectThumbnailInput() -> ProjectThumbnail.Input? {
         guard let mesh, let selectedRevisionID, builtRevisionID == selectedRevisionID,
               Self.sameProjectThumbnailRecipe(current, projectThumbnailMeshModel),
-              let presentation = currentProjectThumbnailPresentation(),
-              presentation.validationHash == mesh.validatedHash else { return nil }
+              let presentation = currentProjectThumbnailPresentation() else { return nil }
+        let receipt = mesh.validatedHash ?? mesh.brepPath.flatMap { verifiedReplayReceipts[$0] }
+        guard presentation.validationHash == receipt else { return nil }
         let key = ProjectThumbnailInputKey(presentation: presentation, geometryPath: mesh.stepPath, nativePath: mesh.brepPath)
         if key == projectThumbnailInputKey { return projectThumbnailCachedInput }
         let input = ProjectThumbnail.Input(revisionID: selectedRevisionID, geometryPath: mesh.stepPath,
-            nativePath: mesh.brepPath, validationHash: mesh.validatedHash,
+            nativePath: mesh.brepPath, validationHash: receipt,
             projection: projectionMode, display: displayMode, hiddenSolids: hiddenSolids, solidColors: solidColors)
         projectThumbnailInputKey = key; projectThumbnailCachedInput = input
         projectThumbnailWork.inputResolutions += 1

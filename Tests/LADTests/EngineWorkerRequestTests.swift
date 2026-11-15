@@ -61,6 +61,7 @@ final class EngineWorkerRequestTests: XCTestCase {
             "operation": "dxf", "feature": ["kind": "face", "solidIndex": 1, "localIndex": 4],
             "solidTransforms": [["solid": 1, "matrix": pose.matrix]]
         ]))
+        XCTAssertEqual(try object(.verify(source)), with(["operation": "verify"]))
         let feature = CADFeatureID(kind: .edge, solidIndex: 0, localIndex: 3)
         XCTAssertEqual(try object(.measure(source, features: [feature], solidIndices: [], solidTransforms: nil)), with([
             "operation": "measure", "features": [["kind": "edge", "solidIndex": 0, "localIndex": 3]], "solidIndices": []
