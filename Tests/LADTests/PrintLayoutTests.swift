@@ -109,29 +109,36 @@ final class PrintLayoutTests: XCTestCase {
         let store = ProjectAutosaveStore(rootDirectory: root.appendingPathComponent("LAD", isDirectory: true))
         let revision = ProjectRevision(model: .bracket)
         var printing = LADProject(messages: [ChatMessage(role: "user", content: "Create a design")], revisions: [revision],
-                                  selectedRevisionID: revision.id, projectID: UUID(), printView: true)
+                                  selectedRevisionID: revision.id, projectID: UUID(), printVersionView: true)
         printing.projectName = "Printing design"
         var ordinary = printing
-        ordinary.projectID = UUID(); ordinary.projectName = "Ordinary design"; ordinary.printView = nil
+        ordinary.projectID = UUID(); ordinary.projectName = "Ordinary design"; ordinary.printVersionView = nil
+        ordinary.printLayoutView = true
         let printingURL = try await store.write(project: printing, projectID: try XCTUnwrap(printing.projectID), title: "P", sequence: 1)
         let ordinaryURL = try await store.write(project: ordinary, projectID: try XCTUnwrap(ordinary.projectID), title: "O", sequence: 1)
-        XCTAssertEqual(try ProjectStore.read(from: printingURL).printView, true)
-        XCTAssertNil(try ProjectStore.read(from: ordinaryURL).printView)
+        XCTAssertEqual(try ProjectStore.read(from: printingURL).printVersionView, true)
+        XCTAssertNil(try ProjectStore.read(from: printingURL).printLayoutView)
+        XCTAssertNil(try ProjectStore.read(from: ordinaryURL).printVersionView)
+        XCTAssertEqual(try ProjectStore.read(from: ordinaryURL).printLayoutView, true)
         let copy = root.appendingPathComponent("Copy.lad")
         try await store.writeCopy(printing, to: copy)
-        XCTAssertEqual(try ProjectStore.read(from: copy).printView, true)
-        XCTAssertEqual(try SaveNewProject.snapshot(from: printing).printView, true)
-        XCTAssertEqual(try ProjectStore.decode(ProjectStore.encode(printing)).printView, true)
+        XCTAssertEqual(try ProjectStore.read(from: copy).printVersionView, true)
+        XCTAssertEqual(try SaveNewProject.snapshot(from: printing).printVersionView, true)
+        XCTAssertEqual(try SaveNewProject.snapshot(from: ordinary).printLayoutView, true)
+        XCTAssertEqual(try ProjectStore.decode(ProjectStore.encode(printing)).printVersionView, true)
+        XCTAssertEqual(try ProjectStore.decode(ProjectStore.encode(ordinary)).printLayoutView, true)
     }
 
     @MainActor
     func testNewDesignsStartInTheOrdinaryViewAndTogglesStayLocal() {
         let first = AppState(), second = AppState()
-        XCTAssertFalse(first.printView)
-        first.printView = true
-        XCTAssertTrue(first.printView)
-        XCTAssertFalse(second.printView)
-        XCTAssertNil(first.displayedMesh, "Nothing is shown until a build's printing layout is ready")
+        XCTAssertFalse(first.printVersionView)
+        XCTAssertFalse(first.printLayoutView)
+        first.printVersionView = true
+        first.printLayoutView = true
+        XCTAssertTrue(first.printVersionView && first.printLayoutView)
+        XCTAssertFalse(second.printVersionView || second.printLayoutView)
+        XCTAssertNil(first.displayedMesh, "Nothing is shown until a build's printing view is ready")
         XCTAssertFalse(first.isPreparingPrintView, "Without a build there is nothing to prepare")
         XCTAssertNil(first.projectURL)
     }

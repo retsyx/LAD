@@ -40,8 +40,9 @@ struct AssemblyMotionControls: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        // The 3D printing view places parts for printing, not by joint pose.
-        .disabled(state.isWorking || state.printView)
+        // The 3D printing views show parts as built or placed for printing,
+        // not by joint pose.
+        .disabled(state.isWorking || state.showsPrintView)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Assembly motion")
     }

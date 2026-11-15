@@ -296,14 +296,12 @@ private struct WorkspaceViewer: View {
                                     .accessibilityIdentifier("gridSquareSize")
                             }
                         }
-                        Button { state.printView.toggle() } label: {
-                            PrinterIcon().frame(width: 19, height: 19).frame(width: 28, height: 28)
-                                .foregroundStyle(state.printView ? Palette.accent : Palette.muted)
+                        HStack(spacing: 8) {
+                            printViewToggle($state.printVersionView, label: "3D Printing Version",
+                                            help: "3D printing version", icon: PrinterIcon())
+                            printViewToggle($state.printLayoutView, label: "3D Printing Layout",
+                                            help: "3D printing orientation and layout", icon: PrintLayoutIcon())
                         }
-                        .buttonStyle(.plain).padding(5)
-                        .background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
-                        .help("3D printing view").accessibilityLabel("3D Printing View")
-                        .accessibilityValue(state.printView ? "On" : "Off")
                     }
                     Spacer()
                     ViewportOrientationCubeControl(reference: viewportReference).frame(width: 108, height: 108)
@@ -337,6 +335,17 @@ private struct WorkspaceViewer: View {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
             }
         }.background(Palette.background)
+    }
+
+    private func printViewToggle<Icon: View>(_ isOn: Binding<Bool>, label: String, help: String, icon: Icon) -> some View {
+        Button { isOn.wrappedValue.toggle() } label: {
+            icon.frame(width: 19, height: 19).frame(width: 28, height: 28)
+                .foregroundStyle(isOn.wrappedValue ? Palette.accent : Palette.muted)
+        }
+        .buttonStyle(.plain).padding(5)
+        .background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
+        .help(help).accessibilityLabel(label)
+        .accessibilityValue(isOn.wrappedValue ? "On" : "Off")
     }
 }
 

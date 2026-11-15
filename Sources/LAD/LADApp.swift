@@ -200,7 +200,11 @@ private struct ProjectCommands: Commands {
             Divider()
             Toggle("Show Grid", isOn: Binding(get: { state?.showGrid ?? true }, set: { state?.showGrid = $0 }))
                 .disabled(state == nil)
-            Toggle("3D Printing View", isOn: Binding(get: { state?.printView ?? false }, set: { state?.printView = $0 }))
+            Toggle("3D Printing Version", isOn: Binding(get: { state?.printVersionView ?? false },
+                                                        set: { state?.printVersionView = $0 }))
+                .disabled(state == nil)
+            Toggle("3D Printing Layout", isOn: Binding(get: { state?.printLayoutView ?? false },
+                                                       set: { state?.printLayoutView = $0 }))
                 .disabled(state == nil)
             Button("Rebuild Design") { state?.rebuild() }.disabled(state?.isWorking != false)
         }

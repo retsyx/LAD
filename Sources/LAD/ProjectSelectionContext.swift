@@ -49,7 +49,7 @@ struct ProjectSelectionContext: Codable, Sendable, Equatable {
     var features: [ProjectSelectedFeature]
     /// Reproduce the selected mechanism pose when reconciling an older request.
     var jointPositions: [String: Double]? = nil
-    /// Captured in the 3D printing view: features and anchors belong to the
+    /// Captured in the 3D printing version view: features and anchors belong to the
     /// program's printing version in its built coordinates.
     var printVersion: Bool? = nil
 

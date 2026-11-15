@@ -76,11 +76,14 @@ search. An in-plane quarter turn keeps each footprint wider than deep. Matching
 translated instances share orientation work within a request. No tessellation
 occurs and the live design is unchanged.
 
-The app caches orientations per build for the session and packs them on Z=0
-with 50 mm clearance (`PrintLayout`). The 3D printing view packs every part
-once; hiding parts never repacks. Exports for 3D printing pack only the
-exported parts and send the resulting placements as `solidTransforms`, so the
-view and exports share orientations and the packing rule.
+The app caches orientations per oriented geometry for the session and packs
+them on Z=0 with 50 mm clearance (`PrintLayout`). The 3D printing version view
+shows the printing version in built coordinates; the 3D printing layout view
+orients and packs every part of the displayed geometry (the design or its
+printing version) once, and hiding parts never repacks. Exports for 3D
+printing always use the printing version, pack only the exported parts and
+send the resulting placements as `solidTransforms`, so with both views on the
+display and exports share geometry, orientations and the packing rule.
 Individual-part export batches the selected native solids in the same worker,
 then publishes one complete folder with filenames from the current parts tree.
 Approved replacement atomically swaps in that complete folder after staging,

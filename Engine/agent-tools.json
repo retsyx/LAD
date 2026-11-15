@@ -488,7 +488,7 @@
         "printLayout": {
           "type": "boolean",
           "default": false,
-          "description": "Render the 3D printing layout the user sees in the 3D printing view and exports for printing: every part of a 3D printing version artifact oriented for printing and packed on the build plate at z=0. Requires an artifact built with print=true, or one whose program never reads lad.print. Cannot combine with jointPositions."
+          "description": "Render the 3D printing layout the user sees with both 3D printing views on and exports for printing: every part of a 3D printing version artifact oriented for printing and packed on the build plate at z=0. Requires an artifact built with print=true, or one whose program never reads lad.print. Cannot combine with jointPositions."
         },
         "projection": {
           "type": "string",

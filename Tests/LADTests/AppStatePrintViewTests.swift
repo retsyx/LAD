@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 @testable import LAD
 
-/// The 3D printing view and printing exports share one geometry pipeline.
+/// The 3D printing views and printing exports share one geometry pipeline.
 final class AppStatePrintViewTests: XCTestCase {
     private static let program = """
     plate = cq.Workplane("XY").box(40, 20, 6).val()
@@ -17,9 +17,9 @@ final class AppStatePrintViewTests: XCTestCase {
     """
 
     @MainActor
-    func testViewShowsPackedPrintingVersionAndExportsUseItsOrientations() async throws {
+    func testViewsShowPrintingVersionAndPackedLayoutAndExportsUseBoth() async throws {
         guard ProcessInfo.processInfo.environment["LAD_RUN_ENGINE_TESTS"] == "1" else {
-            throw XCTSkip("Set LAD_RUN_ENGINE_TESTS=1 for the 3D printing view and export pipeline test.")
+            throw XCTSkip("Set LAD_RUN_ENGINE_TESTS=1 for the 3D printing views and export pipeline test.")
         }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-print-view-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -40,12 +40,29 @@ final class AppStatePrintViewTests: XCTestCase {
         state.selectFeatures([face])
         XCTAssertEqual(state.selectedFeatures, [face])
 
-        state.printView = true
+        // The design itself, oriented and packed.
+        state.printLayoutView = true
+        XCTAssertEqual(state.selectedFeatures, [face], "The layout only places the same geometry")
+        try await waitForPrintView(state)
+        XCTAssertEqual(state.displayedMesh?.brepPath, preview.brepPath)
+        XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
+        state.printLayoutView = false
+        XCTAssertFalse(state.isPreparingPrintView)
+        XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
+
+        // The printing version where the design was built.
+        state.printVersionView = true
         XCTAssertTrue(state.selectedFeatures.isEmpty, "Feature identities belong to one geometry")
         try await waitForPrintView(state)
         let printing = try XCTUnwrap(state.displayedMesh)
         XCTAssertNotEqual(printing.brepPath, preview.brepPath)
         XCTAssertEqual(printing.volume - preview.volume, Double.pi * 1.6 * 1.6 * 0.2, accuracy: 1e-4)
+        XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
+
+        // Both: the printing version oriented and packed, as exported.
+        state.printLayoutView = true
+        try await waitForPrintView(state)
+        XCTAssertEqual(state.displayedMesh?.brepPath, printing.brepPath)
         let layout = state.displayedSolidTransforms
         XCTAssertEqual(Set(layout.keys), [0, 1])
         let viewBounds = try (0..<2).map { solid -> [Double] in
@@ -77,7 +94,16 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertEqual(Array(peg[0..<3]), [0, 0, 0].map(Double.init), accuracy: 1e-3)
         XCTAssertEqual(peg[5] - peg[2], 15, accuracy: 1e-3)
 
-        state.printView = false
+        // Prepared views return at once, without an empty interim display.
+        state.printVersionView = false
+        XCTAssertFalse(state.isPreparingPrintView)
+        XCTAssertEqual(state.displayedMesh?.brepPath, preview.brepPath)
+        XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
+        state.printVersionView = true
+        XCTAssertFalse(state.isPreparingPrintView)
+        XCTAssertEqual(state.displayedSolidTransforms, layout)
+        state.printVersionView = false
+        state.printLayoutView = false
         XCTAssertEqual(state.displayedMesh?.brepPath, preview.brepPath)
         XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
     }

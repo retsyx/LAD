@@ -82,30 +82,43 @@ final class AppState {
             if showGrid != oldValue { autosave() }
         }
     }
-    /// The 3D printing view shows the program's printing version with each
-    /// part oriented and packed on the build plate, exactly as exported for
-    /// printing. Hidden parts are only hidden; the plate is not packed again.
-    var printView = false {
+    /// The 3D printing version view shows the program's printing version,
+    /// with its print-only features, in built coordinates.
+    var printVersionView = false {
         didSet {
-            if printView != oldValue { printViewChanged(); autosave() }
+            if printVersionView != oldValue { printViewChanged(geometryChanged: true); autosave() }
         }
     }
+    /// The 3D printing layout view orients each displayed part and packs the
+    /// parts on the build plate. Together with the printing version, it shows
+    /// exactly what is exported for printing. Hidden parts are only hidden;
+    /// the plate is not packed again.
+    var printLayoutView = false {
+        didSet {
+            if printLayoutView != oldValue { printViewChanged(geometryChanged: false); autosave() }
+        }
+    }
+    /// Either 3D printing view replaces the posed design display.
+    var showsPrintView: Bool { printVersionView || printLayoutView }
     private(set) var isPreparingPrintView = false
-    /// The displayed printing geometry and plate layout of the current build.
+    private struct PrintViewKey: Equatable {
+        var build: String
+        var version: Bool
+        var layout: Bool
+    }
+    /// The displayed geometry and plate layout of the current build's 3D printing views.
     private struct PrintViewGeometry {
-        var key: String
+        var key: PrintViewKey
         var preview: PreviewMesh
         var transforms: [Int: [Double]]
     }
     private var printViewGeometry: PrintViewGeometry?
     /// Session-only printing versions of recently displayed builds, keyed by
-    /// the ordinary build's native path, with the orientations found so far.
-    /// The view and STEP export share them; neither is ever saved.
-    private struct PrintGeometry {
-        var preview: PreviewMesh
-        var orientations: [Int: PrintOrientation] = [:]
-    }
-    @ObservationIgnored private var printGeometries: [String: PrintGeometry] = [:]
+    /// the ordinary build's native path, and the print orientations found so
+    /// far, keyed by the native path of the geometry they orient. The views
+    /// and STEP export share them; neither is ever saved.
+    @ObservationIgnored private var printVersions: [String: PreviewMesh] = [:]
+    @ObservationIgnored private var printOrientationCache: [String: [Int: PrintOrientation]] = [:]
     @ObservationIgnored private var printPreviewTasks: [String: Task<PreviewMesh, Error>] = [:]
     @ObservationIgnored private var printViewTask: Task<Void, Never>?
     @ObservationIgnored private var printViewToken = UUID()
@@ -332,16 +345,18 @@ final class AppState {
     }
 
     /// The geometry the viewport shows: the printing version in the 3D
-    /// printing view (nil while it is being prepared), otherwise the build.
+    /// printing version view, otherwise the build. It is nil while a 3D
+    /// printing view is being prepared.
     var displayedMesh: PreviewMesh? {
-        guard printView else { return mesh }
-        guard let mesh, let layout = printViewGeometry, layout.key == Self.printKey(mesh) else { return nil }
-        return layout.preview
+        guard showsPrintView else { return mesh }
+        guard let mesh, let shown = printViewGeometry, shown.key == printViewKey(for: mesh) else { return nil }
+        return shown.preview
     }
 
     /// Rigid placements applied to `displayedMesh`.
     var displayedSolidTransforms: [Int: [Double]] {
-        printView ? (displayedMesh == nil ? [:] : printViewGeometry?.transforms ?? [:]) : (assemblyPose?.solidTransforms ?? [:])
+        guard showsPrintView else { return assemblyPose?.solidTransforms ?? [:] }
+        return displayedMesh == nil ? [:] : printViewGeometry?.transforms ?? [:]
     }
 
     var current: ModelSpec? { revisions.first(where: { $0.id == selectedRevisionID })?.model }
@@ -375,7 +390,7 @@ final class AppState {
     }
     var canExport: Bool { mesh != nil && builtRevisionID == selectedRevisionID && !isWorking && !isSolvingAssembly }
     var canManipulateAssembly: Bool {
-        !isWorking && !printView && builtRevisionID == selectedRevisionID && mesh?.assemblyMotion != nil
+        !isWorking && !showsPrintView && builtRevisionID == selectedRevisionID && mesh?.assemblyMotion != nil
     }
 
     func setPartsPaneFraction(_ fraction: Double) {
@@ -673,7 +688,8 @@ final class AppState {
         recentPartColors = []
         partsPaneFraction = 0.75
         showGrid = true
-        printView = false
+        printVersionView = false
+        printLayoutView = false
         resetPrintGeometry()
         projectionMode = .perspective
         displayMode = .edges
@@ -729,12 +745,12 @@ final class AppState {
 
     private func capturedRequestSelection() -> ProjectSelectionContext? {
         guard let revisionID = selectedRevisionID else { return nil }
-        // Printing-view selections refer to the printing version in its
+        // 3D printing view selections refer to the displayed geometry in its
         // built coordinates, never to the plate layout.
-        if printView {
+        if showsPrintView {
             return ProjectSelectionContext.capture(revisionID: revisionID, preview: displayedMesh, nodes: partTree,
                 selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedFeatures: selectedFeatures,
-                printVersion: true)
+                printVersion: printVersionView)
         }
         return ProjectSelectionContext.capture(revisionID: revisionID, preview: mesh, nodes: partTree,
             selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedFeatures: selectedFeatures,
@@ -1282,8 +1298,8 @@ final class AppState {
                 let hiddenIDs = sourceRevision?.hiddenSolids == nil ? previouslyHidden : Set(liveLayout.nodes.flatMap(\.flattened).filter {
                     !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: liveHidden)
                 }.map(\.id))
-                // The printing view and export reuse the validated printing version.
-                if let printPreview { printGeometries[Self.printKey(preview)] = PrintGeometry(preview: printPreview) }
+                // The printing views and export reuse the validated printing version.
+                if let printPreview { printVersions[Self.printKey(preview)] = printPreview }
                 try commit(spec, preview: preview, previousLayout: liveLayout, previouslyHidden: hiddenIDs, userMessageID: userMessage.id,
                            previousColors: Self.completePartColors(in: liveLayout.nodes, stored: sourceRevision?.partColors ?? [:]),
                            colorChanges: codex.partColorChanges,
@@ -1745,109 +1761,158 @@ final class AppState {
         return printing
     }
 
-    private func printViewChanged() {
+    private func printViewChanged(geometryChanged: Bool) {
         cancelAssemblyGrab()
-        // Feature IDs belong to one native topology; whole parts keep their solids.
-        selectedFeatures = []
+        // Feature IDs belong to one native topology; whole parts keep their
+        // solids. The layout only places the same geometry.
+        if geometryChanged { selectedFeatures = [] }
         preparePrintView()
-        if !printView, mesh != nil { viewportCommand = ViewportCommand(.fit) }
+        if !showsPrintView, mesh != nil { viewportCommand = ViewportCommand(.fit) }
         refreshMeasurements()
     }
 
-    /// Show the current build's printing version, oriented and packed once
-    /// for all parts. Changing visibility never repacks the plate.
+    private func printViewKey(for mesh: PreviewMesh) -> PrintViewKey {
+        PrintViewKey(build: Self.printKey(mesh), version: printVersionView, layout: printLayoutView)
+    }
+
+    /// Show the current build's printing version and/or its displayed
+    /// geometry oriented and packed once for all parts. Changing visibility
+    /// never repacks the plate.
     private func preparePrintView() {
-        let build = mesh.flatMap { mesh -> (key: String, preview: PreviewMesh, model: ModelSpec)? in
-            let key = Self.printKey(mesh)
+        let build = mesh.flatMap { mesh -> (key: PrintViewKey, preview: PreviewMesh, model: ModelSpec)? in
+            let key = printViewKey(for: mesh)
             guard let revision = revisions.first(where: { $0.id == selectedRevisionID }),
-                  revision.preview.map(Self.printKey) == key else { return nil }
+                  revision.preview.map(Self.printKey) == key.build else { return nil }
             return (key, mesh, revision.model)
         }
-        for (key, task) in printPreviewTasks where key != build?.key {
+        for (key, task) in printPreviewTasks where key != build?.key.build {
             task.cancel(); printPreviewTasks[key] = nil
         }
-        guard printView, let build else {
+        guard showsPrintView, let build else {
             printViewTask?.cancel(); printViewTask = nil; printViewToken = UUID()
             if printViewGeometry != nil { printViewGeometry = nil }
             isPreparingPrintView = false
             return
         }
-        if printViewGeometry?.key == build.key { return }
-        printViewTask?.cancel()
+        let key = build.key
+        if printViewGeometry?.key == key { return }
+        printViewTask?.cancel(); printViewTask = nil
         let token = UUID(); printViewToken = token
+        let solids = Set(0..<build.preview.solids)
+        // Geometry and orientations found earlier this session show at once.
+        if let cached = cachedPrintView(key, build: build.preview, solids: solids) {
+            showPrintView(cached)
+            return
+        }
         printViewGeometry = nil
         isPreparingPrintView = true
-        let solids = Set(0..<build.preview.solids)
         printViewTask = Task { [weak self] in
+            var preparingVersion = key.version
             do {
                 guard let self else { return }
-                let geometry = try await self.printGeometry(for: build.preview, model: build.model, solids: solids)
+                var preview = build.preview
+                if key.version { preview = try await self.printVersion(of: build.preview, model: build.model) }
+                preparingVersion = false
+                var transforms: [Int: [Double]] = [:]
+                if key.layout {
+                    transforms = try await PrintLayout.transforms(for: solids,
+                        orientations: self.printOrientations(of: preview, solids: solids))
+                }
                 guard self.printViewToken == token, !Task.isCancelled else { return }
-                self.printViewGeometry = PrintViewGeometry(key: build.key, preview: geometry.preview,
-                    transforms: PrintLayout.transforms(for: solids, orientations: geometry.orientations))
-                self.isPreparingPrintView = false; self.printViewTask = nil
-                self.viewportCommand = ViewportCommand(.fit)
+                self.printViewTask = nil
+                self.showPrintView(PrintViewGeometry(key: key, preview: preview, transforms: transforms))
                 self.refreshMeasurements()
             } catch is CancellationError {
             } catch {
                 guard let self, self.printViewToken == token else { return }
                 self.isPreparingPrintView = false; self.printViewTask = nil
-                self.error = "The 3D printing view could not be prepared. \(error.localizedDescription)"
-                self.printView = false
+                if preparingVersion {
+                    self.error = "The 3D printing version could not be prepared. \(error.localizedDescription)"
+                    self.printVersionView = false
+                } else {
+                    self.error = "The 3D printing layout could not be prepared. \(error.localizedDescription)"
+                    self.printLayoutView = false
+                }
             }
         }
     }
 
-    /// The build's printing version with orientations for at least `solids`.
-    /// A program that never reads `lad.print` prints its ordinary geometry.
-    private func printGeometry(for preview: PreviewMesh, model: ModelSpec, solids: Set<Int>) async throws -> PrintGeometry {
-        let key = Self.printKey(preview)
-        var geometry: PrintGeometry
-        if let cached = printGeometries[key] {
-            geometry = cached
-        } else {
-            let built: PreviewMesh
-            if preview.printVersion == true {
-                let task: Task<PreviewMesh, Error>
-                if let pending = printPreviewTasks[key] { task = pending }
-                else {
-                    let engine = printEngine, runtime = python, cores = threads
-                    task = Task { @MainActor in
-                        let result = try await engine.buildPreview(model, print: true, python: runtime, threads: cores)
-                        try PrintLayout.validateParts(of: result, matching: preview)
-                        return result
-                    }
-                    printPreviewTasks[key] = task
-                }
-                defer { if printPreviewTasks[key] == task { printPreviewTasks[key] = nil } }
-                built = try await task.value
-            } else { built = preview }
-            try Task.checkCancellation()
-            geometry = printGeometries[key] ?? PrintGeometry(preview: built)
+    private func cachedPrintView(_ key: PrintViewKey, build: PreviewMesh, solids: Set<Int>) -> PrintViewGeometry? {
+        var preview = build
+        if key.version, build.printVersion == true {
+            guard let printing = printVersions[key.build] else { return nil }
+            preview = printing
         }
-        let missing = solids.subtracting(geometry.orientations.keys)
-        if !missing.isEmpty {
-            let found = try await engine.printOrientations(geometry.preview, solids: missing, python: python, threads: threads)
-            try Task.checkCancellation()
-            if let latest = printGeometries[key] { geometry.orientations.merge(latest.orientations) { current, _ in current } }
-            geometry.orientations.merge(found) { current, _ in current }
-        }
-        printGeometries[key] = geometry
-        prunePrintGeometries()
-        return geometry
+        guard key.layout else { return PrintViewGeometry(key: key, preview: preview, transforms: [:]) }
+        guard let orientations = printOrientationCache[Self.printKey(preview)],
+              solids.isSubset(of: orientations.keys) else { return nil }
+        return PrintViewGeometry(key: key, preview: preview,
+                                 transforms: PrintLayout.transforms(for: solids, orientations: orientations))
     }
 
-    /// Keep printing versions only for builds retained by the session history.
+    private func showPrintView(_ geometry: PrintViewGeometry) {
+        printViewGeometry = geometry
+        isPreparingPrintView = false
+        viewportCommand = ViewportCommand(.fit)
+    }
+
+    /// The build's printing version. A program that never reads `lad.print`
+    /// prints its ordinary geometry.
+    private func printVersion(of preview: PreviewMesh, model: ModelSpec) async throws -> PreviewMesh {
+        guard preview.printVersion == true else { return preview }
+        let key = Self.printKey(preview)
+        if let cached = printVersions[key] { return cached }
+        let task: Task<PreviewMesh, Error>
+        if let pending = printPreviewTasks[key] { task = pending }
+        else {
+            let engine = printEngine, runtime = python, cores = threads
+            task = Task { @MainActor in
+                let result = try await engine.buildPreview(model, print: true, python: runtime, threads: cores)
+                try PrintLayout.validateParts(of: result, matching: preview)
+                return result
+            }
+            printPreviewTasks[key] = task
+        }
+        defer { if printPreviewTasks[key] == task { printPreviewTasks[key] = nil } }
+        let built = try await task.value
+        try Task.checkCancellation()
+        if let cached = printVersions[key] { return cached }
+        printVersions[key] = built
+        prunePrintGeometries()
+        return built
+    }
+
+    /// Print orientations for at least `solids` of `geometry`, found once
+    /// per geometry and part.
+    private func printOrientations(of geometry: PreviewMesh, solids: Set<Int>) async throws -> [Int: PrintOrientation] {
+        let key = Self.printKey(geometry)
+        let known = printOrientationCache[key] ?? [:]
+        let missing = solids.subtracting(known.keys)
+        guard !missing.isEmpty else { return known }
+        let found = try await engine.printOrientations(geometry, solids: missing, python: python, threads: threads)
+        try Task.checkCancellation()
+        var orientations = printOrientationCache[key] ?? [:]
+        orientations.merge(found) { current, _ in current }
+        printOrientationCache[key] = orientations
+        prunePrintGeometries()
+        return orientations
+    }
+
+    /// Keep printing versions and orientations only for builds retained by
+    /// the session history.
     private func prunePrintGeometries() {
-        let retained = Set(revisions.compactMap { $0.preview.map(Self.printKey) })
-        printGeometries = printGeometries.filter { retained.contains($0.key) }
+        let builds = Set(revisions.compactMap { $0.preview.map(Self.printKey) })
+        printVersions = printVersions.filter { builds.contains($0.key) }
+        let geometries = builds.union(printVersions.values.map(Self.printKey))
+        printOrientationCache = printOrientationCache.filter { geometries.contains($0.key) }
     }
 
     private func resetPrintGeometry() {
         printViewTask?.cancel(); printViewTask = nil; printViewToken = UUID()
         printPreviewTasks.values.forEach { $0.cancel() }
         printPreviewTasks = [:]
-        printGeometries = [:]
+        printVersions = [:]
+        printOrientationCache = [:]
         printViewGeometry = nil
         isPreparingPrintView = false
     }
@@ -2368,11 +2433,13 @@ final class AppState {
                                   python: String, threads: Int) async throws -> (files: [Data], parts: [STEPIndividualExport.Part]) {
         var source = preview
         var transforms: [Int: [Double]]?
+        // Exports for 3D printing always use both the printing version and its
+        // plate layout, as the two 3D printing views together show them.
         if for3DPrinting {
             let exported = solidIndices ?? Set(0..<preview.solids)
-            let geometry = try await printGeometry(for: preview, model: model, solids: exported)
-            source = geometry.preview
-            transforms = PrintLayout.transforms(for: exported, orientations: geometry.orientations)
+            source = try await printVersion(of: preview, model: model)
+            transforms = try await PrintLayout.transforms(for: exported,
+                orientations: printOrientations(of: source, solids: exported))
         }
         if individualParts {
             let parts = STEPIndividualExport.parts(in: nodes, selected: solidIndices, solidCount: source.solids)
@@ -2517,7 +2584,8 @@ final class AppState {
         mesh = nil; builtRevisionID = nil
         // Set after the previous design's geometry is gone, so it never
         // starts printing work for that design.
-        printView = project.printView ?? false
+        printVersionView = project.printVersionView ?? false
+        printLayoutView = project.printLayoutView ?? false
         queuedRequests = project.queuedRequests ?? []
         // Reopening a file restores intent, never starts agent work by itself.
         queuePaused = !queuedRequests.isEmpty
@@ -2789,7 +2857,8 @@ final class AppState {
         let draftAttachments = draft?.attachments ?? pendingAttachments
         return LADProject(messages: messages, revisions: revisions, selectedRevisionID: selectedRevisionID,
                    projectID: projectID, codexSettings: draft?.codexSettings ?? codexSettings, projectName: projectName,
-                   showGrid: showGrid, printView: printView ? true : nil,
+                   showGrid: showGrid,
+                   printVersionView: printVersionView ? true : nil, printLayoutView: printLayoutView ? true : nil,
                    projectionMode: projectionMode, displayMode: displayMode,
                    recentPartColors: recentPartColors.isEmpty ? nil : recentPartColors,
                    taskAudits: taskAudits.isEmpty ? nil : taskAudits,

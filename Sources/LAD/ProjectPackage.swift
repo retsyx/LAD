@@ -110,7 +110,8 @@ enum ProjectPackage {
         var codexSettings: CodexProjectSettings?
         var projectName: String?
         var showGrid: Bool?
-        var printView: Bool?
+        var printVersionView: Bool?
+        var printLayoutView: Bool?
         var projectionMode: ViewportProjectionMode?
         var displayMode: ViewportDisplayMode?
         var partsPaneFraction: Double?
@@ -467,7 +468,8 @@ enum ProjectPackage {
 
         var manifest = Manifest(formatVersion: formatVersion, projectID: portable.projectID,
                                 selectedRevisionID: portable.selectedRevisionID, codexSettings: portable.codexSettings,
-                                projectName: portable.projectName, showGrid: portable.showGrid, printView: portable.printView,
+                                projectName: portable.projectName, showGrid: portable.showGrid,
+                                printVersionView: portable.printVersionView, printLayoutView: portable.printLayoutView,
                                 projectionMode: portable.projectionMode, displayMode: portable.displayMode,
                                 partsPaneFraction: portable.partsPaneFraction, recentPartColors: portable.recentPartColors,
                                 queuedRequests: queue, draftPrompt: portable.draftPrompt, draftAttachments: draftAttachments,
@@ -966,7 +968,8 @@ enum ProjectPackage {
         let document = ProjectArchive.Document(
             formatVersion: ProjectArchive.formatVersion, messages: messages.records, revisions: revisions,
             selectedRevisionID: manifest.selectedRevisionID, projectID: manifest.projectID, codexSettings: manifest.codexSettings,
-            projectName: manifest.projectName, showGrid: manifest.showGrid, printView: manifest.printView,
+            projectName: manifest.projectName, showGrid: manifest.showGrid,
+            printVersionView: manifest.printVersionView, printLayoutView: manifest.printLayoutView,
             projectionMode: manifest.projectionMode,
             displayMode: manifest.displayMode, partsPaneFraction: manifest.partsPaneFraction,
             recentPartColors: manifest.recentPartColors, taskAudits: tasks.isEmpty ? nil : tasks,

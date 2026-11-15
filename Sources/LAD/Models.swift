@@ -253,8 +253,9 @@ struct LADProject: Codable, Sendable {
     var projectName: String? = nil
     /// Grid visibility belongs to the project; absent values use the default.
     var showGrid: Bool? = nil
-    /// The 3D printing view is local to this design; absent means off.
-    var printView: Bool? = nil
+    /// The 3D printing views are local to this design; absent means off.
+    var printVersionView: Bool? = nil
+    var printLayoutView: Bool? = nil
     /// Projection and surface rendering choices are local to this design.
     var projectionMode: ViewportProjectionMode? = nil
     var displayMode: ViewportDisplayMode? = nil
@@ -277,7 +278,7 @@ struct LADProject: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case formatVersion, messages, revisions, selectedRevisionID, projectID, codexSettings, projectName
-        case showGrid, printView, projectionMode, displayMode, recentPartColors, taskAudits, queuedRequests
+        case showGrid, printVersionView, printLayoutView, projectionMode, displayMode, recentPartColors, taskAudits, queuedRequests
         case draftPrompt, draftAttachments, queuePaused, partsPaneFraction
     }
 }

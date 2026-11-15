@@ -30,7 +30,8 @@ enum SaveNewProject {
         revision.preview = nil
         return LADProject(messages: [], revisions: [revision], selectedRevisionID: revision.id,
                           projectID: UUID(), codexSettings: original.codexSettings,
-                          projectName: original.projectName, showGrid: original.showGrid, printView: original.printView,
+                          projectName: original.projectName, showGrid: original.showGrid,
+                          printVersionView: original.printVersionView, printLayoutView: original.printLayoutView,
                           projectionMode: original.projectionMode, displayMode: original.displayMode,
                           recentPartColors: original.recentPartColors,
                           partsPaneFraction: original.partsPaneFraction,
