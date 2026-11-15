@@ -117,6 +117,35 @@ enum EngineFailureDiagnostic {
     }
 }
 
+/// One build's inputs staged without a validated copy, whose new copies it keeps.
+private final class ValidatedInputCopies: @unchecked Sendable {
+    private let lock = NSLock()
+    private let cache: CADValidatedInputCache
+    private let runtime: String
+    private var pending: [(key: CADValidatedInputCache.Key, name: String)] = []
+
+    init(cache: CADValidatedInputCache, runtime: String) {
+        self.cache = cache
+        self.runtime = runtime
+    }
+
+    /// Stage the input's copy as `<stem>.validated.brep`; nil when none is kept yet.
+    func stage(_ data: Data, format: String, stem: String, in folder: URL) -> String? {
+        let key = CADValidatedInputCache.Key(data: data, format: format, runtime: runtime)
+        let name = stem + CADValidatedInputCache.suffix
+        if cache.stage(key, to: folder.appendingPathComponent(name)) { return name }
+        lock.withLock { pending.append((key, name)) }
+        return nil
+    }
+
+    func keep(from folder: URL) {
+        for (key, name) in lock.withLock({ pending }) {
+            let produced = folder.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: produced.path) { cache.store(key, from: produced, in: folder) }
+        }
+    }
+}
+
 /// A separate process keeps the UI responsive and contains native-kernel failures.
 /// Generated CAD programs run under a restricted macOS sandbox.
 @MainActor
@@ -139,9 +168,12 @@ final class EngineService {
     /// Measurements, clearance checks, exports and runtime inspection share
     /// one long-lived worker; builds keep their own sandboxed process.
     let native: CADNativeWorker
+    /// Validated copies of imported inputs, shared by every engine.
+    let inputCache: CADValidatedInputCache
 
-    init(temporaryDirectory: URL = FileManager.default.temporaryDirectory) {
+    init(temporaryDirectory: URL = FileManager.default.temporaryDirectory, inputCache: CADValidatedInputCache = .shared) {
         self.temporaryDirectory = temporaryDirectory
+        self.inputCache = inputCache
         native = CADNativeWorker(temporaryDirectory: temporaryDirectory)
     }
 
@@ -165,12 +197,15 @@ final class EngineService {
 
     private func buildModel(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int, deferSTEP: Bool,
                             validatedHash: String? = nil) async throws -> PreviewMesh {
-        let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: deferSTEP, validatedHash: validatedHash) { folder in
-            var sourceAsset: String?
+        let copies = ValidatedInputCopies(cache: inputCache, runtime: python)
+        let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: deferSTEP, validatedHash: validatedHash,
+                                   afterExit: { copies.keep(from: $0) }) { folder in
+            var sourceAsset: String?, sourceCopy: String?
             if let source = spec.sourceSTEP {
                 try Self.validateSTEP(source)
                 try source.write(to: folder.appendingPathComponent("source.step"), options: .atomic)
                 sourceAsset = "source.step"
+                sourceCopy = copies.stage(source, format: "step", stem: "source", in: folder)
             }
             var staged: [EngineWorkerRequest.InputAsset] = []
             if let assets = spec.inputAssets, !assets.isEmpty {
@@ -182,13 +217,16 @@ final class EngineService {
                           asset.data.count <= ProjectStore.maximumSTEPBytes else {
                         throw LADError.message("An imported geometry input is invalid or exceeds 512 MB.")
                     }
-                    let name = String(format: "input-%03d.%@", index, asset.format)
+                    let stem = String(format: "input-%03d", index)
+                    let name = "\(stem).\(asset.format)"
                     try asset.data.write(to: folder.appendingPathComponent(name), options: .atomic)
-                    staged.append(.init(id: asset.id, name: asset.name, format: asset.format, path: name))
+                    staged.append(.init(id: asset.id, name: asset.name, format: asset.format, path: name,
+                                        validatedBREP: copies.stage(asset.data, format: asset.format, stem: stem, in: folder)))
                 }
             }
             try EngineWorkerRequest.build(title: spec.title, summary: spec.summary, units: spec.units, script: spec.script,
-                                          sourceAsset: sourceAsset, inputAssets: staged, print: print).write(to: folder)
+                                          sourceAsset: sourceAsset, inputAssets: staged, print: print,
+                                          sourceValidatedBREP: sourceCopy).write(to: folder)
         }
         return try await readPreview(output, deferSTEP: deferSTEP)
     }
@@ -631,7 +669,7 @@ final class EngineService {
     }
 
     func run(python: String, threads: Int, scriptMode: Bool, deferSTEP: Bool = false, validatedHash: String? = nil,
-                     action: String = "build this design",
+                     action: String = "build this design", afterExit: (@Sendable (URL) -> Void)? = nil,
                      prepare: @escaping @Sendable (URL) throws -> Void) async throws -> RunResult {
         try Task.checkCancellation()
         cancel()
@@ -681,6 +719,8 @@ final class EngineService {
         } onCancel: {
             task.cancel()
         }
+        // A failed program can still have imported and validated its inputs.
+        if let afterExit { await Task.detached(priority: .userInitiated) { afterExit(folder) }.value }
         guard token == generation, !Task.isCancelled else { throw CancellationError() }
         job = nil
         guard status == 0 else {

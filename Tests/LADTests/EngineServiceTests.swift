@@ -28,6 +28,35 @@ final class EngineServiceTests: XCTestCase {
     }
 
     @MainActor
+    func testLaterBuildsReuseValidatedCopiesOfUnchangedInputs() async throws {
+        try requireRuntime()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-input-cache-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = CADValidatedInputCache(root: root)
+        let reference = try await EngineService().build(.bracket, python: EngineService.defaultPython, threads: 2)
+        let step = try Data(contentsOf: URL(fileURLWithPath: reference.stepPath))
+        let engine = EngineService(inputCache: cache)
+        func build(_ offset: Int) async throws -> PreviewMesh {
+            try await engine.buildPreview(ModelSpec(title: "Inputs", summary: "Imported inputs.", units: "mm",
+                script: "result = cq.Compound.makeCompound([imported_model, imported_assets['part'].translate((\(offset), 0, 0))])",
+                sourceSTEP: step, sourceName: "source.step",
+                inputAssets: [CADInputAsset(id: "part", name: "part.step", format: "step", data: step)]),
+                python: EngineService.defaultPython, threads: 2)
+        }
+        let first = try await build(200)
+        XCTAssertEqual(cache.stagedCopies, 0)
+        let second = try await build(300)
+        XCTAssertEqual(cache.stagedCopies, 2, "Both unchanged inputs reuse their validated copies.")
+        XCTAssertEqual(second.solids, first.solids)
+        XCTAssertEqual(second.faces, first.faces)
+        XCTAssertEqual(second.volume, first.volume, accuracy: 1e-6)
+        XCTAssertEqual(second.bounds[3], first.bounds[3] + 100, accuracy: 1e-6)
+        let folder = URL(fileURLWithPath: try XCTUnwrap(second.brepPath)).deletingLastPathComponent()
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: folder.path)), ["model.brep", ".lad-build-lease"])
+    }
+
+    @MainActor
     func testDecodedBuildRetainsOnlyNativeOutputs() async throws {
         try requireRuntime()
         let spec = ModelSpec(title: "Scratch cleanup", summary: "Imported inputs and requests are temporary.", units: "mm",

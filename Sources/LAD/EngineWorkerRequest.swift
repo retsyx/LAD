@@ -4,12 +4,14 @@ import Foundation
 /// Engine/worker.py accepts and encodes exactly the fields it allows.
 /// Reconstruction requests are built by `CADMeshSession`.
 enum EngineWorkerRequest: Encodable, Sendable {
-    /// An imported input staged beside the request as `path`.
+    /// An imported input staged beside the request as `path`, with the
+    /// worker's validated copy from an earlier build when one is staged.
     struct InputAsset: Encodable, Sendable {
         var id: String
         var name: String
         var format: String
         var path: String
+        var validatedBREP: String? = nil
     }
 
     /// A build's native solid staged beside the request as `source.brep`. The
@@ -37,7 +39,7 @@ enum EngineWorkerRequest: Encodable, Sendable {
     /// Replay a CAD program. Imported geometry is staged beside the request.
     /// `print` builds the program's 3D printing version.
     case build(title: String, summary: String, units: String, script: String, sourceAsset: String?, inputAssets: [InputAsset],
-               print: Bool = false)
+               print: Bool = false, sourceValidatedBREP: String? = nil)
     case runtime
     case export(NativeSource, Export)
     /// One planar face as a 2D DXF drawing, seen from outside its solid.
@@ -49,7 +51,8 @@ enum EngineWorkerRequest: Encodable, Sendable {
     case printOrientations(NativeSource, solidIndices: [Int]?, printDown: [PrintDownPin])
 
     private enum Key: String, CodingKey {
-        case operation, title, summary, units, script, sourceAsset, inputAssets, print, brepAsset, nativeIdentity, validatedNative,
+        case operation, title, summary, units, script, sourceAsset, sourceValidatedBREP, inputAssets, print, brepAsset,
+             nativeIdentity, validatedNative,
              solidIndices, solidTransforms, solidColors, individualParts, feature, features, pairs, poses, printDown
     }
 
@@ -62,12 +65,13 @@ enum EngineWorkerRequest: Encodable, Sendable {
             try values.encode(source.validated, forKey: .validatedNative)
         }
         switch self {
-        case let .build(title, summary, units, script, sourceAsset, inputAssets, print):
+        case let .build(title, summary, units, script, sourceAsset, inputAssets, print, sourceValidatedBREP):
             try values.encode(title, forKey: .title)
             try values.encode(summary, forKey: .summary)
             try values.encode(units, forKey: .units)
             try values.encode(script, forKey: .script)
             try values.encodeIfPresent(sourceAsset, forKey: .sourceAsset)
+            try values.encodeIfPresent(sourceValidatedBREP, forKey: .sourceValidatedBREP)
             if !inputAssets.isEmpty { try values.encode(inputAssets, forKey: .inputAssets) }
             if print { try values.encode(true, forKey: .print) }
         case .runtime:

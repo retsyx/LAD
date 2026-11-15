@@ -136,7 +136,8 @@ def step_precision(direction):
 
 def validate_spec(spec):
     """Validate the complete request before importing or calling the CAD kernel."""
-    if not isinstance(spec, dict) or not ROOT_KEYS <= set(spec) or set(spec) - ROOT_KEYS - {"sourceAsset", "inputAssets", "print"}:
+    if (not isinstance(spec, dict) or not ROOT_KEYS <= set(spec)
+            or set(spec) - ROOT_KEYS - {"sourceAsset", "sourceValidatedBREP", "inputAssets", "print"}):
         raise ModelError("Design must contain title, summary, units and a complete Python script.")
     if "print" in spec and spec["print"] is not True:
         raise ModelError("The 3D printing build option must be true when present.")
@@ -150,17 +151,23 @@ def validate_spec(spec):
         raise ModelError(f"Python script must be nonempty text of at most {MAX_SCRIPT_BYTES:,} UTF-8 bytes.")
     if "sourceAsset" in spec and spec["sourceAsset"] != "source.step":
         raise ModelError("Imported geometry requires the private source.step asset.")
+    if "sourceValidatedBREP" in spec and ("sourceAsset" not in spec
+                                          or spec["sourceValidatedBREP"] != "source" + VALIDATED_COPY_SUFFIX):
+        raise ModelError("A validated copy of the imported STEP requires the private source.validated.brep asset.")
     assets = spec.get("inputAssets", [])
     if not isinstance(assets, list) or len(assets) > 256:
         raise ModelError("Imported geometry contains too many input assets.")
     seen = set()
     for index, asset in enumerate(assets):
-        if (not isinstance(asset, dict) or set(asset) != {"id", "name", "format", "path"}
+        if (not isinstance(asset, dict) or not {"id", "name", "format", "path"} <= set(asset)
+                or set(asset) - {"id", "name", "format", "path", "validatedBREP"}
                 or not isinstance(asset["id"], str) or not 1 <= len(asset["id"]) <= 1024
                 or any(ord(char) < 32 for char in asset["id"]) or asset["id"] in seen
                 or not isinstance(asset["name"], str) or not 1 <= len(asset["name"]) <= 255
                 or not isinstance(asset["format"], str) or asset["format"] not in {"step", "stp", "brep", "stl", "obj"}
-                or asset["path"] != f"input-{index:03d}.{asset['format']}"):
+                or asset["path"] != f"input-{index:03d}.{asset['format']}"
+                or asset.get("validatedBREP", f"input-{index:03d}{VALIDATED_COPY_SUFFIX}")
+                != f"input-{index:03d}{VALIDATED_COPY_SUFFIX}"):
             raise ModelError("Imported geometry requires uniquely identified private input assets.")
         seen.add(asset["id"])
     return spec
@@ -801,12 +808,14 @@ class LADBuildMode:
         return "lad"
 
 
-def build_script(script, cq, source_asset=None, input_assets=None, preview_stats=None, printing=False):
+def build_script(script, cq, source_asset=None, input_assets=None, preview_stats=None, printing=False,
+                 validated_inputs=None):
     """Run ordinary Python with the installed CadQuery/OpenCascade APIs.
 
     This is intentionally not a Python-language security boundary. The native
     app applies a macOS process sandbox restricting files, subprocesses and
     networking. CLI callers must apply equivalent isolation for untrusted code.
+    `validated_inputs` reads and keeps validated copies of imported inputs.
     """
     import resource
     # Bound individual files (including stderr) before generated Python runs.
@@ -820,9 +829,11 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
     build_mode = LADBuildMode(printing)
     namespace = {"cq": cq, "math": math, "np": np, "lad": build_mode, "__name__": "__lad_model__"}
     namespace["imported_assets"] = {}
+    validated_inputs = validated_inputs or ValidatedInputs()
     for asset, path in input_assets or []:
         with validation_scope("input_asset", {"id": asset["id"], "name": asset["name"], "format": asset["format"]}):
-            namespace["imported_assets"][asset["id"]] = import_input_asset(path, asset["format"], cq)
+            namespace["imported_assets"][asset["id"]] = validated_inputs.load(
+                path.stem, cq, lambda path=path, asset=asset: import_input_asset(path, asset["format"], cq))
     if source_asset is not None:
         import stat
         try:
@@ -830,7 +841,7 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
                 raise ModelError("The imported STEP asset must be a regular private file of at most 512 MB.")
             with validation_scope("source_step", {"name": source_asset.name, "format": "step"}):
-                imported = import_step(source_asset, cq)
+                imported = validated_inputs.load("source", cq, lambda: import_step(source_asset, cq))
             namespace["imported_model"] = imported
         except ModelError:
             raise
@@ -889,7 +900,8 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
     return result
 
 
-def build_shape(spec, threads=1, asset_directory=None, preview_stats=None):
+def build_shape(spec, threads=1, asset_directory=None, preview_stats=None, validated_copies=None):
+    """`validated_copies` is the directory receiving copies of newly imported inputs."""
     validate_spec(spec)
     import cadquery as cq
     configure_threads(threads)
@@ -902,8 +914,59 @@ def build_shape(spec, threads=1, asset_directory=None, preview_stats=None):
     if inputs and asset_directory is None:
         raise ModelError("The imported geometry asset directory is unavailable.")
     staged = [(asset, Path(asset_directory) / asset["path"]) for asset in inputs]
+    copies = {Path(name).name.removesuffix(VALIDATED_COPY_SUFFIX): Path(asset_directory) / name
+              for name in [spec.get("sourceValidatedBREP")] + [asset.get("validatedBREP") for asset in inputs] if name}
     return build_script(spec["script"], cq, source_asset, staged, preview_stats=preview_stats,
-                        printing=spec.get("print", False))
+                        printing=spec.get("print", False),
+                        validated_inputs=ValidatedInputs(copies, None if validated_copies is None else Path(validated_copies)))
+
+
+VALIDATED_COPY_SUFFIX = ".validated.brep"
+
+
+class ValidatedInputs:
+    """Session copies of imported inputs, as this worker imported and validated them.
+
+    Translating and exactly validating an unchanged STEP or mesh input again in
+    every build of a task repeats the same work. The app stages a native copy
+    of each input that an earlier build of this worker and runtime validated,
+    beside its unchanged original bytes, and keeps each new copy written here.
+    Copies are written before the program runs, so they hold the shapes a
+    program receives rather than anything it changes afterwards. A copy that
+    cannot be read falls back to importing the original.
+    """
+
+    def __init__(self, staged=None, directory=None):
+        self.staged, self.directory = staged or {}, directory
+
+    def load(self, name, cq, read):
+        copy = self.staged.get(name)
+        if copy is not None:
+            try:
+                return read_validated_copy(copy, cq)
+            except Exception:
+                pass
+        shape = read()
+        if copy is None and self.directory is not None:
+            path = self.directory / f"{name}{VALIDATED_COPY_SUFFIX}"
+            try:
+                write_brep(shape, path)
+            except Exception:
+                # A copy only saves later work; never fail this build for it.
+                path.unlink(missing_ok=True)
+        return shape
+
+
+def read_validated_copy(path, cq):
+    """Read an app-staged copy of an input this worker version already validated."""
+    import stat
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
+        raise ModelError("A validated input copy must be a regular private file of at most 512 MB.")
+    shape = _read_brep_file(path, cq, "validated input copy")
+    if shape.isNull() or not _only_solids(shape) or not 0 < len(_shape_entities(shape, "Solid")) <= 4_096:
+        raise ModelError("The validated input copy does not contain closed solids.")
+    return shape
 
 
 def feature_id(kind, solid_index, local_index):
@@ -2370,19 +2433,23 @@ def _read_input_asset(path, format, cq):
     if format in {"step", "stp"}:
         return import_step(path, cq)
     if format == "brep":
-        from OCP.BRep import BRep_Builder
-        from OCP.BRepTools import BRepTools
-        from OCP.TopoDS import TopoDS_Shape
-        with path.open("rb") as stream:
-            if not stream.read(128).startswith(b"DBRep_DrawableShape\n"):
-                raise ModelError("The imported BREP asset is invalid.")
-        wrapped = TopoDS_Shape()
-        if not BRepTools.Read_s(wrapped, str(path), BRep_Builder()) or wrapped.IsNull():
-            raise ModelError("The imported BREP asset could not be read.")
-        return validate_shape(cq.Shape.cast(wrapped))
+        return validate_shape(_read_brep_file(path, cq, "imported BREP asset"))
     if format in {"stl", "obj"}:
         return mesh_to_solid(read_mesh(path, format), cq)
     raise ModelError("Unsupported imported geometry format.")
+
+
+def _read_brep_file(path, cq, label):
+    from OCP.BRep import BRep_Builder
+    from OCP.BRepTools import BRepTools
+    from OCP.TopoDS import TopoDS_Shape
+    with path.open("rb") as stream:
+        if not stream.read(128).startswith(b"DBRep_DrawableShape\n"):
+            raise ModelError(f"The {label} is invalid.")
+    wrapped = TopoDS_Shape()
+    if not BRepTools.Read_s(wrapped, str(path), BRep_Builder()) or wrapped.IsNull():
+        raise ModelError(f"The {label} could not be read.")
+    return cq.Shape.cast(wrapped)
 
 
 def read_mesh(path, format):
@@ -3396,7 +3463,8 @@ def run(request, output, threads, defer_step=False, validated_hash=None, native_
         preview_stats = {}
         token = _validated_replay.set(reuse_validation)
         try:
-            shape = build_shape(spec, threads, request.parent.resolve(), preview_stats=preview_stats)
+            shape = build_shape(spec, threads, request.parent.resolve(), preview_stats=preview_stats,
+                                validated_copies=output)
             # A successful native build is not sufficient: STEP translation can
             # turn closed native geometry into open shells. Verify it before the
             # candidate can be rendered, reused by lad_validate or committed.

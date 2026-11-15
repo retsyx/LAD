@@ -19,6 +19,17 @@ final class EngineWorkerRequestTests: XCTestCase {
             "title": "Box", "summary": "A box.", "units": "mm", "script": "result = 1\n", "sourceAsset": "source.step",
             "inputAssets": [["id": "asset-1", "name": "part.stl", "format": "stl", "path": "input-000.stl"]]
         ])
+        let copied = EngineWorkerRequest.build(title: "Box", summary: "A box.", units: "mm", script: "result = 1\n",
+            sourceAsset: "source.step",
+            inputAssets: [.init(id: "asset-1", name: "part.stl", format: "stl", path: "input-000.stl",
+                                validatedBREP: "input-000.validated.brep")],
+            sourceValidatedBREP: "source.validated.brep")
+        XCTAssertEqual(try object(copied), [
+            "title": "Box", "summary": "A box.", "units": "mm", "script": "result = 1\n", "sourceAsset": "source.step",
+            "sourceValidatedBREP": "source.validated.brep",
+            "inputAssets": [["id": "asset-1", "name": "part.stl", "format": "stl", "path": "input-000.stl",
+                             "validatedBREP": "input-000.validated.brep"]]
+        ])
         let printing = EngineWorkerRequest.build(title: "Box", summary: "A box.", units: "mm", script: "result = 1\n",
                                                  sourceAsset: nil, inputAssets: [], print: true)
         XCTAssertEqual(try object(printing), ["title": "Box", "summary": "A box.", "units": "mm", "script": "result = 1\n",
