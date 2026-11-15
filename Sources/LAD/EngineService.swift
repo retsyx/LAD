@@ -231,10 +231,17 @@ final class EngineService {
         let task: Task<String, Error>
         do {
             let source = try nativeSource(preview)
+            // The worker compares STEP with the parts the build measured.
+            guard let parts = preview.topology?.parts.sorted(by: { $0.solidIndex < $1.solidIndex }),
+                  parts.map(\.solidIndex) == Array(0..<preview.solids) else {
+                throw LADError.message("The design preview is missing its part measurements.")
+            }
+            let expected = parts.map { EngineWorkerRequest.ExpectedPart(volume: $0.volume, area: $0.area, bounds: $0.bounds,
+                                                                        centroid: $0.centroid) }
             task = Task { @MainActor [self] in
                 _ = try await runNative(on: verifier, python: python, threads: threads, action: "verify this design",
                                         designFailures: true) { folder in
-                    try EngineWorkerRequest.verify(Self.stageNative(source, into: folder)).write(to: folder)
+                    try EngineWorkerRequest.verify(Self.stageNative(source, into: folder), expectedParts: expected).write(to: folder)
                 }
                 return receipt
             }

@@ -3365,18 +3365,37 @@ def verify_brep(spec, asset_directory, output, cq, threads):
     so its design displays first; this performs exactly those checks, and a
     design is accepted only after they pass.
     """
-    if set(spec) - {"operation"} - NATIVE_SOURCE_FIELDS:
-        raise ModelError("Verification accepts only a build's native solid.")
+    if set(spec) - {"operation", "expectedParts"} - NATIVE_SOURCE_FIELDS:
+        raise ModelError("Verification accepts only a build's native solid and its part measurements.")
     import tempfile
     # The build already checked closed solids; the exact checks follow here.
     shape = read_brep({**spec, "validatedNative": True}, asset_directory, cq, threads)
     stats = {}
     validate_shape(shape, preview_stats=stats)
+    # Compare the STEP readback with the parts the build measured on the shape
+    # it produced, as a build that runs these checks does. The optimal bounds
+    # of some trimmed periodic faces change once the solid is written as BREP
+    # and read again, although its geometry does not.
+    expected = _expected_parts(spec.get("expectedParts"), len(stats["solids"]))
     with tempfile.TemporaryDirectory(prefix=".step-validation-", dir=output) as directory:
         step = Path(directory) / "candidate.step"
         write_step(stats["solids"], step, cq)
-        validate_step_roundtrip(shape, cq, step, preview_stats=stats)
+        validate_step_roundtrip(shape, cq, step, preview_stats={**stats, "solidProperties": expected})
     return {"verified": True}
+
+
+def _expected_parts(records, count):
+    """A verification's per-part measurements from its build, one per solid."""
+    def numbers(value, length):
+        return (isinstance(value, list) and len(value) == length
+                and all(isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(item)
+                        for item in value))
+    if (not isinstance(records, list) or len(records) != count
+            or any(not isinstance(record, dict) or set(record) != {"volume", "area", "bounds", "centroid"}
+                   or not numbers([record["volume"], record["area"]], 2)
+                   or not numbers(record["bounds"], 6) or not numbers(record["centroid"], 3) for record in records)):
+        raise ModelError("Verification requires the build's measurements for each of its solids.")
+    return [{key: record[key] for key in ("volume", "area", "bounds", "centroid")} for record in records]
 
 
 def runtime_info(cq):

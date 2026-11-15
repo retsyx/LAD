@@ -49,13 +49,23 @@ enum EngineWorkerRequest: Encodable, Sendable {
     case clearance(NativeSource, pairs: [[[Int]]], poses: [[AssemblySolidTransform]])
     /// Printing orientations of the selected solids; nil selects every solid.
     case printOrientations(NativeSource, solidIndices: [Int]?, printDown: [PrintDownPin])
-    /// The exact checks and STEP verification a preview build deferred.
-    case verify(NativeSource)
+    /// The exact checks and STEP verification a preview build deferred,
+    /// compared with the build's own part measurements.
+    case verify(NativeSource, expectedParts: [ExpectedPart])
+
+    /// A part as its build measured it, before the solid was written as BREP.
+    struct ExpectedPart: Encodable, Sendable {
+        var volume: Double
+        var area: Double
+        var bounds: [Double]
+        var centroid: [Double]
+    }
 
     private enum Key: String, CodingKey {
         case operation, title, summary, units, script, sourceAsset, sourceValidatedBREP, inputAssets, print, brepAsset,
              nativeIdentity, validatedNative,
-             solidIndices, solidTransforms, solidColors, individualParts, feature, features, pairs, poses, printDown
+             solidIndices, solidTransforms, solidColors, individualParts, feature, features, pairs, poses, printDown,
+             expectedParts
     }
 
     func encode(to encoder: Encoder) throws {
@@ -101,8 +111,9 @@ enum EngineWorkerRequest: Encodable, Sendable {
             try encodeSource(source, operation: "print_orient")
             try values.encodeIfPresent(solidIndices, forKey: .solidIndices)
             if !printDown.isEmpty { try values.encode(printDown, forKey: .printDown) }
-        case let .verify(source):
+        case let .verify(source, expectedParts):
             try encodeSource(source, operation: "verify")
+            try values.encode(expectedParts, forKey: .expectedParts)
         }
     }
 

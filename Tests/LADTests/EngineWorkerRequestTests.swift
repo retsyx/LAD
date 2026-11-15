@@ -61,7 +61,10 @@ final class EngineWorkerRequestTests: XCTestCase {
             "operation": "dxf", "feature": ["kind": "face", "solidIndex": 1, "localIndex": 4],
             "solidTransforms": [["solid": 1, "matrix": pose.matrix]]
         ]))
-        XCTAssertEqual(try object(.verify(source)), with(["operation": "verify"]))
+        let part = EngineWorkerRequest.ExpectedPart(volume: 24, area: 52, bounds: [0, 0, 0, 2, 3, 4], centroid: [1, 1.5, 2])
+        XCTAssertEqual(try object(.verify(source, expectedParts: [part])), with([
+            "operation": "verify", "expectedParts": [["volume": 24, "area": 52, "bounds": [0, 0, 0, 2, 3, 4], "centroid": [1, 1.5, 2]]]
+        ]))
         let feature = CADFeatureID(kind: .edge, solidIndex: 0, localIndex: 3)
         XCTAssertEqual(try object(.measure(source, features: [feature], solidIndices: [], solidTransforms: nil)), with([
             "operation": "measure", "features": [["kind": "edge", "solidIndex": 0, "localIndex": 3]], "solidIndices": []
