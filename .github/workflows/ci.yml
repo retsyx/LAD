@@ -61,8 +61,14 @@ jobs:
 
       - name: Run Swift and engine tests
         id: tests
-        run: Scripts/test.sh 2>&1 | tee "$RUNNER_TEMP/test.log"
+        run: |
+          .github/scripts/sample_memory.sh > "$RUNNER_TEMP/memory.log" &
+          sampler=$!
+          trap 'kill "$sampler"' EXIT
+          Scripts/test.sh 2>&1 | tee "$RUNNER_TEMP/test.log"
 
-      - name: Summarize test failures
-        if: failure() && steps.tests.outcome == 'failure'
-        run: python3 -I .github/scripts/summarize_test_failures.py "$RUNNER_TEMP/test.log"
+      - name: Report test results
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        run: >-
+          python3 -I .github/scripts/report_test_run.py "${{ steps.tests.outcome }}"
+          "$RUNNER_TEMP/test.log" "$RUNNER_TEMP/memory.log"
