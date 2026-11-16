@@ -4,9 +4,10 @@ usage: report_test_run.py OUTCOME TEST_LOG MEMORY_LOG
 
 A successful run gets one notice with its peak memory use. A failed run gets
 one error listing failed XCTest cases and Python tests, the XCTest case that
-was running if the test process died, the macOS crash reports and kernel
-memory kills recorded during the run, memory samples and the end of the
-output.
+was running if the test process died, the crash reports, new diagnostic
+reports and relevant system log lines from around its end, memory samples
+and the end of the output. The complete system log window goes to the job
+log.
 """
 import glob
 import json
@@ -23,7 +24,14 @@ SAMPLE_FIELD = re.compile(r"(\w+)=(-?\d+)")
 CRASH_REPORTS = os.path.expanduser("~/Library/Logs/DiagnosticReports")
 CRASH_FRAMES = 30
 MEMORY_LINES = 12
-KERNEL_LINES = 30
+SYSTEM_LOG_BEFORE = 60
+SYSTEM_LOG_AFTER = 5
+SYSTEM_LOG_LINES = 40
+SYSTEM_LOG_PREDICATE = ('process == "kernel" OR process == "launchd" OR process == "runningboardd" '
+                        'OR process == "WindowServer" OR eventMessage CONTAINS "xctest" '
+                        'OR (process == "xctest" AND (messageType == error OR messageType == fault))')
+SYSTEM_LOG_KEYWORDS = re.compile(r"\b(kill|terminat|signal|sigkill|sigterm|jetsam|memorystatus|gpu|hang|timeout"
+                                 r"|abort|crash|exit|resource)", re.IGNORECASE)
 TAIL_LINES = 40
 LINE_LIMIT = 300
 
@@ -95,18 +103,36 @@ def describe_crash(path):
     return lines
 
 
-def kernel_memory_events(since):
-    # A process killed for memory gets SIGKILL, which leaves no crash report.
-    start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
-    predicate = ('process == "kernel" AND (eventMessage CONTAINS "memorystatus" '
-                 'OR eventMessage CONTAINS[c] "swap" OR eventMessage CONTAINS "xctest")')
+def system_events(ended):
+    # A SIGKILLed process leaves no crash report and SwiftPM prints no signal,
+    # so look for whatever ended it in the system log. The complete window
+    # goes to the job log; the annotation keeps the lines that look relevant.
+    def local(timestamp):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
     try:
-        result = subprocess.run(["/usr/bin/log", "show", "--start", start, "--style", "compact",
-                                 "--predicate", predicate], capture_output=True, text=True, timeout=120)
+        result = subprocess.run(["/usr/bin/log", "show", "--start", local(ended - SYSTEM_LOG_BEFORE),
+                                 "--end", local(ended + SYSTEM_LOG_AFTER), "--style", "compact",
+                                 "--predicate", SYSTEM_LOG_PREDICATE], capture_output=True, text=True, timeout=180)
         events = [line for line in result.stdout.splitlines()[1:] if line.strip()]
     except (OSError, subprocess.SubprocessError) as error:
         return [f"  Unavailable: {error}"]
-    return [f"  {line}" for line in events[-KERNEL_LINES:]] or ["  None"]
+    print("::group::System log around the end of the test process")
+    print("\n".join(events))
+    print("::endgroup::")
+    def relevant(line):
+        # Compact lines are: date time type process[pid:tid] message.
+        fields = line.split(None, 4)
+        mentions_xctest = len(fields) == 5 and not fields[3].startswith("xctest[") and "xctest" in fields[4]
+        return mentions_xctest or SYSTEM_LOG_KEYWORDS.search(line)
+    selected = [f"  {line}" for line in events if relevant(line)]
+    return selected[-SYSTEM_LOG_LINES:] or [f"  Nothing relevant in {len(events)} lines"]
+
+
+def new_diagnostic_reports(since):
+    paths = glob.glob(f"{CRASH_REPORTS}/**/*", recursive=True)
+    paths += glob.glob("/Library/Logs/DiagnosticReports/**/*", recursive=True)
+    names = sorted(os.path.basename(path) for path in paths if os.path.isfile(path) and os.path.getmtime(path) >= since)
+    return [f"  {name}" for name in names] or ["  None"]
 
 
 outcome, log_path, memory_path = sys.argv[1:4]
@@ -133,7 +159,8 @@ if running:
     report.append(f"Test process ended while running: {running}")
     for path in crash_reports(since):
         report += describe_crash(path)
-    report += ["Kernel memory events:"] + kernel_memory_events(since)
+    report += ["New diagnostic reports:"] + new_diagnostic_reports(since)
+    report += ["System log around the end:"] + system_events(os.stat(log_path).st_mtime)
 report += ["Memory: " + memory_peaks(samples)] + [f"  {line}" for line in samples[-MEMORY_LINES:]]
 report += ["Last output:"] + lines[-TAIL_LINES:]
 annotate("error", "Test failures", "\n".join(line[:LINE_LIMIT] for line in report))
