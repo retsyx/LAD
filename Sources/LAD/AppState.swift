@@ -27,10 +27,11 @@ final class AppState {
     var mesh: PreviewMesh? {
         didSet {
             projectThumbnailMeshModel = mesh == nil ? nil : current
-            loadAssemblyPose()
-            preparePrintView()
             // Feature IDs belong to one native topology. Even a replacement
             // at the same artifact path must not keep old feature selections.
+            featureSelectionOrigin = nil; selectedFeaturesGeometry = nil
+            loadAssemblyPose()
+            preparePrintView()
             selectedFeatures = []
             refreshMeasurements()
             scheduleProjectThumbnail()
@@ -153,6 +154,22 @@ final class AppState {
     /// Solids owning the selected features. Kept with the selection so each
     /// parts-tree row does not rebuild it.
     private(set) var featureSelectedSolids: Set<Int> = []
+    /// A build's design or printing version, whose native topology indexes features.
+    private struct FeatureSelectionGeometry {
+        var preview: PreviewMesh
+        var printVersion: Bool
+    }
+    /// The user's feature selection on the geometry where it was made. The
+    /// design and its printing version each show the corresponding features,
+    /// so switching between them and back restores the selection.
+    private struct FeatureSelectionOrigin {
+        var geometry: FeatureSelectionGeometry
+        var features: [CADFeatureID]
+    }
+    @ObservationIgnored private var featureSelectionOrigin: FeatureSelectionOrigin?
+    /// The geometry `selectedFeatures` index. While a 3D printing view is
+    /// being prepared, it remains the previously displayed geometry.
+    @ObservationIgnored private var selectedFeaturesGeometry: FeatureSelectionGeometry?
     private(set) var measurementReport: CADMeasurementReport?
     private(set) var assemblyPose: AssemblyPose?
     private(set) var isSolvingAssembly = false
@@ -755,11 +772,13 @@ final class AppState {
     private func capturedRequestSelection() -> ProjectSelectionContext? {
         guard let revisionID = selectedRevisionID else { return nil }
         // 3D printing view selections refer to the displayed geometry in its
-        // built coordinates, never to the plate layout.
+        // built coordinates, never to the plate layout. While a view is being
+        // prepared, selected features still index their previous geometry.
         if showsPrintView {
-            return ProjectSelectionContext.capture(revisionID: revisionID, preview: displayedMesh, nodes: partTree,
+            let geometry = displayedMesh.map(displayedFeatureGeometry) ?? selectedFeaturesGeometry
+            return ProjectSelectionContext.capture(revisionID: revisionID, preview: geometry?.preview, nodes: partTree,
                 selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedFeatures: selectedFeatures,
-                printVersion: printVersionView)
+                printVersion: geometry?.printVersion ?? printVersionView)
         }
         return ProjectSelectionContext.capture(revisionID: revisionID, preview: mesh, nodes: partTree,
             selectedSolids: selectedSolids, selectedNodeIDs: selectedPartNodeIDs, selectedFeatures: selectedFeatures,
@@ -1551,19 +1570,46 @@ final class AppState {
     }
 
     func selectFeatures(_ features: [CADFeatureID]) {
-        guard let topology = displayedMesh?.topology else { return }
+        guard let preview = displayedMesh, let topology = preview.topology else { return }
         var seen = Set<CADFeatureID>()
         let valid = features.filter {
             seen.insert($0).inserted && topology.contains($0) && !hiddenSolids.contains($0.solidIndex)
         }
+        let geometry = displayedFeatureGeometry(preview)
+        selectedFeaturesGeometry = geometry
+        featureSelectionOrigin = valid.isEmpty ? nil : FeatureSelectionOrigin(geometry: geometry, features: valid)
         selectedFeatures = valid
     }
 
     func clearSelections() {
         selectedSolids = []
         selectedPartNodeIDs = []
+        featureSelectionOrigin = nil
         selectedFeatures = []
         refreshMeasurements()
+    }
+
+    private func displayedFeatureGeometry(_ preview: PreviewMesh) -> FeatureSelectionGeometry {
+        FeatureSelectionGeometry(preview: preview, printVersion: showsPrintView && printVersionView)
+    }
+
+    /// Select the displayed geometry's counterparts of the user's features
+    /// when the design and its printing version replace each other. Solid
+    /// indices identify the same parts in both.
+    private func showFeatureSelection() {
+        guard let preview = displayedMesh else { return }
+        let shown = displayedFeatureGeometry(preview)
+        let changed = selectedFeaturesGeometry.map { Self.printKey($0.preview) } != Self.printKey(preview)
+        selectedFeaturesGeometry = shown
+        guard changed else { return }
+        guard let origin = featureSelectionOrigin else { selectedFeatures = []; return }
+        var features: [CADFeatureID] = []
+        if Self.printKey(origin.geometry.preview) == Self.printKey(preview) {
+            features = origin.features
+        } else if let source = origin.geometry.preview.topology, let target = preview.topology {
+            features = CADFeatureCorrespondence.features(origin.features, from: source, to: target)
+        }
+        selectedFeatures = features.filter { !hiddenSolids.contains($0.solidIndex) }
     }
 
     private func cancelMeasurement() {
@@ -1778,9 +1824,6 @@ final class AppState {
 
     private func printViewChanged(layoutChanged: Bool) {
         cancelAssemblyGrab()
-        // Feature IDs belong to one native topology; whole parts keep their
-        // solids. The layout only places the same geometry.
-        if !layoutChanged { selectedFeatures = [] }
         // Placing or unplacing the parts frames the view again. Switching
         // between the design and its printing version keeps the camera.
         if layoutChanged { fitsPrintViewWhenShown = true }
@@ -1813,6 +1856,7 @@ final class AppState {
             printViewTask?.cancel(); printViewTask = nil; printViewToken = UUID()
             if printViewGeometry != nil { printViewGeometry = nil }
             isPreparingPrintView = false
+            showFeatureSelection()
             return
         }
         let key = build.key
@@ -1874,6 +1918,7 @@ final class AppState {
     private func showPrintView(_ geometry: PrintViewGeometry) {
         printViewGeometry = geometry
         isPreparingPrintView = false
+        showFeatureSelection()
         if fitsPrintViewWhenShown {
             fitsPrintViewWhenShown = false
             viewportCommand = ViewportCommand(.fit)
@@ -2085,6 +2130,7 @@ final class AppState {
         if hiddenSolids.isDisjoint(with: valid) { hiddenSolids.formUnion(valid) }
         else { hiddenSolids.subtract(valid) }
         selectedSolids.subtract(hiddenSolids)
+        featureSelectionOrigin?.features.removeAll { hiddenSolids.contains($0.solidIndex) }
         selectedFeatures.removeAll { hiddenSolids.contains($0.solidIndex) }
         selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: selectedPartNodeIDs, in: partTree)
         persistPartVisibility()

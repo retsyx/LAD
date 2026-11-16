@@ -86,6 +86,10 @@ printing version) once, and hiding parts never repacks. Exports for 3D
 printing always use the printing version, pack only the exported parts and
 send the resulting placements as `solidTransforms`, so with both views on the
 display and exports share geometry, orientations and the packing rule.
+Switching between the design and its printing version keeps feature
+selections: unchanged features correspond by exact native geometry, a changed
+feature by its unique nearby replacement (`CADFeatureCorrespondence`), and
+switching back restores the original selection.
 Individual-part export batches the selected native solids in the same worker,
 then publishes one complete folder with filenames from the current parts tree.
 Approved replacement atomically swaps in that complete folder after staging,

@@ -36,15 +36,27 @@ final class AppStatePrintViewTests: XCTestCase {
         state.revisions = [revision]
         state.selectedRevisionID = revision.id
         XCTAssertTrue(state.loadStoredRevision())
-        let face = try XCTUnwrap(preview.topology?.faces.first?.id)
-        state.selectFeatures([face])
-        XCTAssertEqual(state.selectedFeatures, [face])
+        // Unchanged features of both parts, and the counterbore floor and
+        // shaft bore that the printing version's bridge changes.
+        let design = try XCTUnwrap(preview.topology)
+        let floor = try XCTUnwrap(design.faces.first { plateFace($0, "PLANE", z: 0) }?.id)
+        let top = try XCTUnwrap(design.faces.first { plateFace($0, "PLANE", z: 3) }?.id)
+        let bore = try XCTUnwrap(design.faces.first { plateFace($0, "CYLINDER", radius: 1.6) }?.id)
+        let corner = try XCTUnwrap(design.vertices.first { $0.id.solidIndex == 0 && $0.position == [20, 10, 3] }?.id)
+        let rim = try XCTUnwrap(design.edges.first {
+            $0.id.solidIndex == 0 && $0.type == "LINE" && $0.startPoint?[2] == 3 && $0.endPoint?[2] == 3
+        }?.id)
+        let pegFace = try XCTUnwrap(design.faces.first { $0.id.solidIndex == 1 }?.id)
+        var selection = [floor, top, bore, corner, rim, pegFace]
+        state.selectFeatures(selection)
+        state.selectParts([1])
+        XCTAssertEqual(state.selectedFeatures, selection)
 
         // The design itself, oriented and packed.
         let cameraKey = state.viewportCameraKey
         var command = state.viewportCommand
         state.printLayoutView = true
-        XCTAssertEqual(state.selectedFeatures, [face], "The layout only places the same geometry")
+        XCTAssertEqual(state.selectedFeatures, selection, "The layout only places the same geometry")
         try await waitForPrintView(state)
         XCTAssertNotEqual(state.viewportCommand, command, "Placing the parts frames them")
         XCTAssertEqual(state.displayedMesh?.brepPath, preview.brepPath)
@@ -56,7 +68,7 @@ final class AppStatePrintViewTests: XCTestCase {
         // The printing version where the design was built, under the same camera.
         command = state.viewportCommand
         state.printVersionView = true
-        XCTAssertTrue(state.selectedFeatures.isEmpty, "Feature identities belong to one geometry")
+        XCTAssertEqual(state.selectedFeatures, selection, "Selections stay while the printing version is prepared")
         try await waitForPrintView(state)
         XCTAssertEqual(state.viewportCommand, command, "Showing the printing version keeps the camera")
         XCTAssertEqual(state.viewportCameraKey, cameraKey)
@@ -64,6 +76,27 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertNotEqual(printing.brepPath, preview.brepPath)
         XCTAssertEqual(printing.volume - preview.volume, Double.pi * 1.6 * 1.6 * 0.2, accuracy: 1e-4)
         XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
+
+        // The same selection on the printing version, measured there: the
+        // bridge closes the counterbore floor and shortens the bore.
+        let printed = try XCTUnwrap(printing.topology)
+        var printedSelection = state.selectedFeatures
+        XCTAssertEqual(printedSelection.count, selection.count)
+        XCTAssertEqual(state.selectedSolids, [1])
+        let closedFloor = try XCTUnwrap(printed.face(for: printedSelection[0]))
+        XCTAssertTrue(plateFace(closedFloor, "PLANE", z: 0))
+        XCTAssertEqual(closedFloor.area, .pi * 9, accuracy: 1e-6)
+        XCTAssertEqual(try XCTUnwrap(printed.face(for: printedSelection[2])).area, 2 * .pi * 1.6 * 2.8, accuracy: 1e-6)
+        for (index, original) in [(1, top), (5, pegFace)] {
+            let face = try XCTUnwrap(printed.face(for: printedSelection[index])), unchanged = try XCTUnwrap(design.face(for: original))
+            XCTAssertEqual(face.area, unchanged.area, accuracy: 1e-9); XCTAssertEqual(face.center, unchanged.center, accuracy: 1e-9)
+        }
+        XCTAssertEqual(printed.vertex(for: printedSelection[3])?.position, [20, 10, 3])
+        let printedRim = try XCTUnwrap(printed.edge(for: printedSelection[4])), designRim = try XCTUnwrap(design.edge(for: rim))
+        XCTAssertEqual(Set([printedRim.startPoint, printedRim.endPoint]), Set([designRim.startPoint, designRim.endPoint]))
+        XCTAssertEqual(state.measurementReport?.features, printedSelection)
+        XCTAssertEqual(state.measurementReport?.solidIndices, [1])
+        XCTAssertEqual(try area(state, printedSelection[0]), .pi * 9, accuracy: 1e-6)
 
         // Both: the printing version oriented and packed, as exported.
         state.printLayoutView = true
@@ -80,9 +113,12 @@ final class AppStatePrintViewTests: XCTestCase {
                                         viewBounds[1][1] - viewBounds[0][4], viewBounds[0][1] - viewBounds[1][4]), 50 - 1e-6)
         XCTAssertEqual(layout[0]?[10] ?? 0, -1, accuracy: 1e-9, "The pinned top face of the plate faces the bed")
 
+        XCTAssertEqual(state.selectedFeatures, printedSelection, "The layout only places the same geometry")
         state.togglePartVisibility([1])
         XCTAssertEqual(state.displayedSolidTransforms, layout, "Hiding a part never repacks the plate")
         state.togglePartVisibility([1])
+        selection.removeLast(); printedSelection.removeLast()
+        XCTAssertEqual(state.selectedFeatures, printedSelection, "Hiding a part deselects its features")
 
         let full = directory.appendingPathComponent("printing.step")
         state.exportSTEP(to: full, for3DPrinting: true)
@@ -100,24 +136,47 @@ final class AppStatePrintViewTests: XCTestCase {
         XCTAssertEqual(Array(peg[0..<3]), [0, 0, 0].map(Double.init), accuracy: 1e-3)
         XCTAssertEqual(peg[5] - peg[2], 15, accuracy: 1e-3)
 
-        // Prepared views return at once, without an empty interim display.
+        // Prepared views return at once, without an empty interim display,
+        // and switching back restores the design's own selection.
         command = state.viewportCommand
         state.printVersionView = false
         XCTAssertEqual(state.viewportCommand, command, "Leaving the printing version keeps the camera")
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertEqual(state.displayedMesh?.brepPath, preview.brepPath)
         XCTAssertEqual(Set(state.displayedSolidTransforms.keys), [0, 1])
+        XCTAssertEqual(state.selectedFeatures, selection)
+        try await waitForMeasurement(state)
+        XCTAssertEqual(state.measurementReport?.features, selection, "Placed parts are measured natively")
         state.printVersionView = true
         XCTAssertFalse(state.isPreparingPrintView)
         XCTAssertEqual(state.displayedSolidTransforms, layout)
         XCTAssertEqual(state.viewportCommand, command)
+        XCTAssertEqual(state.selectedFeatures, printedSelection)
         state.printLayoutView = false
         XCTAssertNotEqual(state.viewportCommand, command, "Returning the parts frames them")
+
+        // A selection made on the printing version maps back to the design,
+        // without the printing-only bridge underside.
+        let underside = try XCTUnwrap(printed.faces.first { plateFace($0, "PLANE", z: -0.2) }?.id)
+        state.selectFeatures([underside, printedSelection[0]])
         command = state.viewportCommand
         state.printVersionView = false
         XCTAssertEqual(state.viewportCommand, command, "Leaving the printing version keeps the camera")
         XCTAssertEqual(state.displayedMesh?.brepPath, preview.brepPath)
         XCTAssertTrue(state.displayedSolidTransforms.isEmpty)
+        XCTAssertEqual(state.selectedFeatures, [floor])
+        XCTAssertEqual(try area(state, floor), .pi * (9 - 1.6 * 1.6), accuracy: 1e-6)
+    }
+
+    private func plateFace(_ face: CADFace, _ type: String, z: Double? = nil, radius: Double? = nil) -> Bool {
+        face.id.solidIndex == 0 && face.type == type &&
+            z.map { abs(face.center[2] - $0) < 1e-6 && abs(abs(face.normal?[2] ?? 0) - 1) < 1e-9 } ?? true &&
+            radius.map { abs((face.radius ?? 0) - $0) < 1e-6 } ?? true
+    }
+
+    @MainActor
+    private func area(_ state: AppState, _ face: CADFeatureID) throws -> Double {
+        try XCTUnwrap(state.measurementReport?.metrics.first { $0.id == face.id + ":area" }?.values.first)
     }
 
     @MainActor
@@ -126,6 +185,14 @@ final class AppStatePrintViewTests: XCTestCase {
         while state.isPreparingPrintView, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
         XCTAssertNil(state.error)
         XCTAssertFalse(state.isPreparingPrintView)
+    }
+
+    @MainActor
+    private func waitForMeasurement(_ state: AppState) async throws {
+        let deadline = ContinuousClock.now + .seconds(60)
+        while state.isMeasuring, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertNil(state.measurementError)
+        XCTAssertFalse(state.isMeasuring)
     }
 
     @MainActor
