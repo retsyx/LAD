@@ -1,0 +1,63 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Build and test (arm64)
+    runs-on: xcode-27
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report compiler errors and test failures as annotations
+        run: echo "::add-matcher::.github/problem-matchers/tests.json"
+
+      - name: Show the selected toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Restore the CAD runtime payload
+        id: runtime-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .build/cad-runtime
+          key: cad-runtime-arm64-${{ hashFiles('Engine/runtime-source.json', 'Engine/requirements-lock.txt', 'Engine/runtime-wheels-arm64.json', 'Scripts/prepare-runtime.sh', 'Scripts/prepare_runtime.py', 'Scripts/audit_runtime.py', 'Scripts/check_runtime.py') }}
+
+      - name: Prepare the CAD runtime payload
+        run: Scripts/prepare-runtime.sh
+
+      # Save right after preparation so a failing build or test run still
+      # reuses the payload next time.
+      - name: Save the CAD runtime payload
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .build/cad-runtime
+          key: ${{ steps.runtime-cache.outputs.cache-primary-key }}
+
+      - name: Build the app
+        run: Scripts/build-app.sh
+
+      - name: Run Swift and engine tests
+        run: Scripts/test.sh

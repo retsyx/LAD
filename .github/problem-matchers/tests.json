@@ -1,0 +1,47 @@
+{
+  "problemMatcher": [
+    {
+      "owner": "lad-swift-error",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^(/.+?\\.swift):(\\d+):(?:(\\d+):)? (?:\\x1b\\[[0-9;]*m)*error: (?:\\x1b\\[[0-9;]*m)*(.*?)(?:\\x1b\\[[0-9;]*m)*$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "message": 4
+        }
+      ]
+    },
+    {
+      "owner": "lad-swift-unlocated-test-failure",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^<unknown>:0: error: (.*)$",
+          "message": 1
+        }
+      ]
+    },
+    {
+      "owner": "lad-swift-trap",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^(\\S+\\.swift:\\d+: Fatal error: .*)$",
+          "message": 1
+        }
+      ]
+    },
+    {
+      "owner": "lad-python-test-failure",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^((?:FAIL|ERROR): test\\w* \\(.+\\))$",
+          "message": 1
+        }
+      ]
+    }
+  ]
+}
