@@ -289,9 +289,17 @@ final class CADSceneView: NSView {
     private(set) var renderedFrameCount = 0
     /// The design camera's world transform in the newest completed frame.
     private(set) var renderedCameraTransform: simd_float4x4?
-    private var publishedCameraTransforms: [(generation: UInt64, transform: simd_float4x4)] = []
+    /// Whether the newest completed frame drew the model.
+    private(set) var renderedShowsModel = false
+    private var publishedCameraTransforms: [(generation: UInt64, transform: simd_float4x4, showsModel: Bool)] = []
+    /// A model replaced by another display ready to install, such as the
+    /// design and its 3D printing version, stays on screen in the last
+    /// presented frame until the replacement and its highlights are prepared.
+    /// Publishing meanwhile would present an empty interim frame.
+    private var holdsFramesForReplacement = false
+    private var hasHeldFrame = false
     /// True until the GPU has completed a frame showing the latest change.
-    var hasPendingFrames: Bool { framePublicationScheduled || renderedGeneration < publishedGeneration }
+    var hasPendingFrames: Bool { framePublicationScheduled || hasHeldFrame || renderedGeneration < publishedGeneration }
     var onFrameRendered: (() -> Void)?
     private(set) var isPreparingResources = false {
         didSet { resumeCaptureWaitersIfReady() }
@@ -527,6 +535,8 @@ final class CADSceneView: NSView {
         if gridChanged { gridNode.isHidden = !grid }
         var installedModel = false
         if meshChanged {
+            let replacing = hasModel
+            holdsFramesForReplacement = false
             loadedPath = mesh?.stepPath
             loadedNativePath = mesh?.brepPath
             invalidateResourcePreparation()
@@ -546,6 +556,7 @@ final class CADSceneView: NSView {
                 } else if let prepared = try? shared ?? CADViewportPreparedMesh.prepareShared(mesh) {
                     install(prepared)
                     installedModel = hasModel
+                    holdsFramesForReplacement = replacing && installedModel
                 } else { clearModel() }
             } else {
                 clearModel()
@@ -1458,6 +1469,10 @@ final class CADSceneView: NSView {
 
     private func publishFrame() {
         framePublicationScheduled = false
+        // Preparation completion requests the held frame.
+        hasHeldFrame = holdsFramesForReplacement && isPreparingCaptureResources
+        guard !hasHeldFrame else { return }
+        holdsFramesForReplacement = false
         // Changes made while the window cannot draw are published when it is
         // revealed or deminiaturized.
         guard canDrawViewport, let loop = renderLoop ?? startRenderLoop() else { return }
@@ -1468,7 +1483,7 @@ final class CADSceneView: NSView {
         // reads the scene, so the frame shows all of them together.
         SCNTransaction.flush()
         publishedGeneration &+= 1
-        publishedCameraTransforms.append((publishedGeneration, cameraNode.simdWorldTransform))
+        publishedCameraTransforms.append((publishedGeneration, cameraNode.simdWorldTransform, !modelNode.isHidden))
         if publishedCameraTransforms.count > 16 { publishedCameraTransforms.removeFirst() }
         loop.submit(.init(frame: makeFrame(width: width, height: height), source: sceneSource,
                           generation: publishedGeneration))
@@ -1487,6 +1502,7 @@ final class CADSceneView: NSView {
         renderedGeneration = max(renderedGeneration, generation)
         if let published = publishedCameraTransforms.last(where: { $0.generation == generation }) {
             renderedCameraTransform = published.transform
+            renderedShowsModel = published.showsModel
         }
         publishedCameraTransforms.removeAll { $0.generation <= generation }
         onFrameRendered?()

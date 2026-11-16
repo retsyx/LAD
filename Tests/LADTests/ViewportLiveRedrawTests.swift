@@ -84,6 +84,65 @@ final class ViewportLiveRedrawTests: XCTestCase {
     }
 
     @MainActor
+    func testSwitchingBetweenReadyDisplaysKeepsPresentingTheModel() async throws {
+        guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for live viewport drawing.") }
+        _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let application = NSApplication.shared
+        let previousPolicy = application.activationPolicy()
+        XCTAssertTrue(application.setActivationPolicy(.regular))
+        defer { _ = application.setActivationPolicy(previousPolicy) }
+        application.finishLaunching()
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        let frames = ViewportRenderCounter(view)
+        let window = NSWindow(contentRect: NSRect(x: 50, y: 50, width: 480, height: 360),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.title = "LAD viewport display switch test"
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        defer {
+            window.orderOut(nil)
+            window.contentView = nil
+            window.close()
+        }
+        // A design and its printing version, both already converted for
+        // display, with a selected face highlighted on each.
+        let design = box(path: "/tmp/live-viewport-design", top: 1)
+        let printing = box(path: "/tmp/live-viewport-printing", top: 1.2)
+        let top = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 1)
+        func show(_ mesh: PreviewMesh) {
+            view.update(mesh: mesh, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [],
+                        selectedFeatures: [top], cameraKey: "build")
+        }
+        func settle(after previous: Int) async throws -> Bool {
+            let deadline = ContinuousClock.now + .seconds(10)
+            while view.isPreparingCaptureResources || view.hasPendingFrames || frames.count <= previous,
+                  ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertFalse(view.isPreparingCaptureResources)
+            return try await waitForFrame(frames, after: previous, reason: "Each display must draw.")
+        }
+        show(design)
+        application.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        view.layout()
+        guard try await settle(after: 0) else { return }
+        show(printing)
+        guard try await settle(after: frames.count), try await waitForIdle(frames) else { return }
+
+        for mesh in [design, printing, design] {
+            let before = frames.count
+            show(mesh)
+            XCTAssertTrue(view.isPreparingCaptureResources, "Each display prepares its own scene resources")
+            XCTAssertTrue(view.hasPendingFrames)
+            guard try await settle(after: before) else { return }
+            XCTAssertEqual(frames.modelVisibility(after: before).filter { !$0 }.count, 0,
+                           "Switching displays must never present an empty frame")
+            guard try await waitForIdle(frames) else { return }
+        }
+    }
+
+    @MainActor
     func testIdleNativeViewportRendersDisplayAndCameraChangesIntoItsWindow() async throws {
         guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for live viewport drawing.") }
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
@@ -280,14 +339,28 @@ final class ViewportLiveRedrawTests: XCTestCase {
         return false
     }
 
-    private func box() -> PreviewMesh {
-        PreviewMesh(vertices: [[-3,-2,-1],[3,-2,-1],[3,2,-1],[-3,2,-1],[-3,-2,1],[3,-2,1],[3,2,1],[-3,2,1]],
+    /// A box whose six faces carry native topology, each from two triangles.
+    private func box(path: String, top: Double) -> PreviewMesh {
+        var mesh = box(top: top, path: path)
+        let normals: [[Double]] = [[0, 0, -1], [0, 0, 1], [0, -1, 0], [1, 0, 0], [0, 1, 0], [-1, 0, 0]]
+        let faces = normals.enumerated().map { index, normal in
+            CADFace(id: CADFeatureID(kind: .face, solidIndex: 0, localIndex: index), type: "PLANE", area: 1,
+                    center: normal.map { $0 * 0.5 }, normal: normal)
+        }
+        mesh.topology = CADTopology(vertices: [], edges: [], faces: faces, parts: [
+            CADPart(solidIndex: 0, area: 1, volume: 1, bounds: mesh.bounds, centroid: [0, 0, 0])])
+        mesh.triangleFaces = (0..<12).map { $0 / 2 }
+        return mesh
+    }
+
+    private func box(top z: Double = 1, path: String = "/tmp/live-viewport-redraw-test") -> PreviewMesh {
+        PreviewMesh(vertices: [[-3,-2,-1],[3,-2,-1],[3,2,-1],[-3,2,-1],[-3,-2,z],[3,-2,z],[3,2,z],[-3,2,z]],
             triangles: [[0,2,1],[0,3,2],[4,5,6],[4,6,7],[0,1,5],[0,5,4],
                         [1,2,6],[1,6,5],[2,3,7],[2,7,6],[3,0,4],[3,4,7]],
             edges: [[-3,-2,-1,3,-2,-1],[3,-2,-1,3,2,-1],[3,2,-1,-3,2,-1],[-3,2,-1,-3,-2,-1],
-                    [-3,-2,1,3,-2,1],[3,-2,1,3,2,1],[3,2,1,-3,2,1],[-3,2,1,-3,-2,1]],
-            bounds: [-3,-2,-1,3,2,1], volume: 48, area: 88, solids: 1, faces: 6,
-            buildSeconds: 0, threads: 1, stepPath: "/tmp/live-viewport-redraw-test",
+                    [-3,-2,z,3,-2,z],[3,-2,z,3,2,z],[3,2,z,-3,2,z],[-3,2,z,-3,-2,z]],
+            bounds: [-3,-2,-1,3,2,z], volume: 48, area: 88, solids: 1, faces: 6,
+            buildSeconds: 0, threads: 1, stepPath: path,
             triangleSolids: Array(repeating: 0, count: 12), edgeSolids: Array(repeating: 0, count: 8))
     }
 }

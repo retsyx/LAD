@@ -7,13 +7,13 @@ import XCTest
 @MainActor
 final class ViewportRenderCounter {
     private weak var view: CADSceneView?
-    private var renderedPoses = [(frame: Int, pose: simd_float4x4)]()
+    private var renderedPoses = [(frame: Int, pose: simd_float4x4, showsModel: Bool)]()
 
     init(_ view: CADSceneView) {
         self.view = view
         view.onFrameRendered = { [weak self, weak view] in
             guard let self, let view, let pose = view.renderedCameraTransform else { return }
-            renderedPoses.append((view.renderedFrameCount, pose))
+            renderedPoses.append((view.renderedFrameCount, pose, view.renderedShowsModel))
             if renderedPoses.count > 512 { renderedPoses.removeFirst(renderedPoses.count - 512) }
         }
     }
@@ -22,5 +22,10 @@ final class ViewportRenderCounter {
 
     func poses(after frame: Int) -> [simd_float4x4] {
         renderedPoses.filter { $0.frame > frame }.map(\.pose)
+    }
+
+    /// Whether each frame completed after `frame` drew the model.
+    func modelVisibility(after frame: Int) -> [Bool] {
+        renderedPoses.filter { $0.frame > frame }.map(\.showsModel)
     }
 }
