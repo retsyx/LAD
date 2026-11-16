@@ -24,6 +24,16 @@
       ]
     },
     {
+      "owner": "lad-swift-test-process-exit",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^error: Process '\\S*/xctest .*' (exited with .*)$",
+          "message": 1
+        }
+      ]
+    },
+    {
       "owner": "lad-swift-trap",
       "severity": "error",
       "pattern": [
@@ -38,7 +48,7 @@
       "severity": "error",
       "pattern": [
         {
-          "regexp": "^((?:FAIL|ERROR): test\\w* \\(.+\\))$",
+          "regexp": "^((?:FAIL|ERROR): \\w+ \\(.+\\))$",
           "message": 1
         }
       ]

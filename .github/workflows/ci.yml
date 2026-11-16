@@ -60,4 +60,9 @@ jobs:
         run: Scripts/build-app.sh
 
       - name: Run Swift and engine tests
-        run: Scripts/test.sh
+        id: tests
+        run: Scripts/test.sh 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      - name: Summarize test failures
+        if: failure() && steps.tests.outcome == 'failure'
+        run: python3 -I .github/scripts/summarize_test_failures.py "$RUNNER_TEMP/test.log"
