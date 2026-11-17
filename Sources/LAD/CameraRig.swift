@@ -17,7 +17,10 @@ struct CameraRig {
         SIMD3(cos(elevation) * cos(yaw), cos(elevation) * sin(yaw), sin(elevation))
     }
     var right: SIMD3<Double> { SIMD3(-sin(yaw), cos(yaw), 0) }
+    /// Remains well defined at and beyond the poles, where world up points
+    /// down on screen.
     var up: SIMD3<Double> { simd_cross(backward, right) }
+    var isUpsideDown: Bool { cos(elevation) < 0 }
     var position: SIMD3<Double> { target + backward * distance }
     var tangent: Double { tan(fieldOfView * .pi / 360) }
     /// Half the visible vertical extent, matching perspective at the target.
@@ -76,14 +79,20 @@ struct CameraRig {
 
     /// Rotate the entire camera pose about the center of the model's bounds, even
     /// after panning or cursor zoom has moved the view target away from it.
-    mutating func orbitAroundCenter(dx: Double, dy: Double) {
-        let yawDelta = -dx * 0.008
-        let nextElevation = min(max(elevation + dy * 0.008, -.pi / 2 + 0.005), .pi / 2 - 0.005)
-        let elevationDelta = nextElevation - elevation
+    /// Elevation continues over the poles without limit. A gesture that began
+    /// upside down reverses yaw so the near surface still follows the cursor.
+    mutating func orbitAroundCenter(dx: Double, dy: Double, reversesYaw: Bool = false) {
+        let yawDelta = (reversesYaw ? dx : -dx) * 0.008
+        let elevationDelta = dy * 0.008
         target = orbitCenter + simd_quatd(angle: yawDelta, axis: SIMD3<Double>(0, 0, 1)).act(target - orbitCenter)
-        yaw += yawDelta
+        yaw = Self.wrappedAngle(yaw + yawDelta)
         target = orbitCenter + simd_quatd(angle: -elevationDelta, axis: right).act(target - orbitCenter)
-        elevation = nextElevation
+        elevation = Self.wrappedAngle(elevation + elevationDelta)
+    }
+
+    /// The equivalent angle in [-π, π], keeping repeated turns bounded.
+    static func wrappedAngle(_ angle: Double) -> Double {
+        angle.remainder(dividingBy: 2 * .pi)
     }
 
     /// Pixel coordinates with a bottom-left origin, used to verify anchored zoom.

@@ -233,6 +233,8 @@ final class CADSceneView: NSView {
     private var modifierMonitor: Any?
     var isGrabbingAssembly: Bool { assemblyGrab != nil }
     private var rightDragging = false
+    /// Fixed for each drag, so crossing a pole mid-gesture never flips it.
+    private var orbitReversesYaw = false
     private var topology: CADTopology?
     private var solidTransforms: [Int: [Double]] = [:]
     private var solidMatrices: [Int: simd_double4x4] = [:]
@@ -1808,6 +1810,7 @@ final class CADSceneView: NSView {
         if !rightDragging {
             guard hypot(point.x - start.x, point.y - start.y) >= 3 else { return }
             rightDragging = true
+            orbitReversesYaw = rig.isUpsideDown
             NSCursor.closedHand.set()
         }
         rightDragPoint = point
@@ -1820,7 +1823,7 @@ final class CADSceneView: NSView {
         if event.modifierFlags.contains(.shift) {
             rig.pan(dx: dx, dy: dy, height: bounds.height)
         } else {
-            rig.orbitAroundCenter(dx: dx, dy: dy)
+            rig.orbitAroundCenter(dx: dx, dy: dy, reversesYaw: orbitReversesYaw)
         }
         applyCamera()
     }

@@ -129,6 +129,35 @@ final class ViewportNavigationTests: XCTestCase {
     }
 
     @MainActor
+    func testRightDragOrbitsPastThePoleAndFixesHorizontalDirectionPerGesture() async throws {
+        let view = try await readyView()
+        let camera = try XCTUnwrap(view.pointOfView)
+        // Counterclockwise turn of the view direction about world Z.
+        func horizontalTurn(_ from: simd_float4x4, _ to: simd_float4x4) -> Float {
+            from.columns.2.x * to.columns.2.y - from.columns.2.y * to.columns.2.x
+        }
+
+        view.rightMouseDown(with: try event(.rightMouseDown, x: 300, y: 400))
+        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 300, y: 200))
+        XCTAssertLessThan(camera.simdTransform.columns.1.z, -0.5, "Orbit must continue beyond the pole.")
+        var before = camera.simdTransform
+        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 340, y: 200))
+        XCTAssertLessThan(horizontalTurn(before, camera.simdTransform), -0.01,
+                          "Crossing a pole must not reverse the current gesture.")
+        view.rightMouseUp(with: try event(.rightMouseUp, x: 340, y: 200))
+
+        view.rightMouseDown(with: try event(.rightMouseDown, x: 300, y: 200))
+        before = camera.simdTransform
+        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 340, y: 200))
+        XCTAssertGreaterThan(horizontalTurn(before, camera.simdTransform), 0.01,
+                             "A gesture that begins upside down keeps the near side following the pointer.")
+        let origin = try projectedOrigin(in: view)
+        XCTAssertEqual(origin.x, 320, accuracy: 0.01)
+        XCTAssertEqual(origin.y, 240, accuracy: 0.01)
+        view.rightMouseUp(with: try event(.rightMouseUp, x: 340, y: 200))
+    }
+
+    @MainActor
     private func readyView() async throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))

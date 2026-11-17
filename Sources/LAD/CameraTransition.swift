@@ -11,8 +11,14 @@ struct CameraTransition {
         guard progress < 1 else { return to }
         let amount = progress * progress * (3 - 2 * progress)
         var rig = to
-        rig.yaw = from.yaw + atan2(sin(to.yaw - from.yaw), cos(to.yaw - from.yaw)) * amount
-        rig.elevation = from.elevation + (to.elevation - from.elevation) * amount
+        // Both angles take their shorter turn. Endpoints within the upright
+        // range keep the camera upright; an upside-down start swings back
+        // over the nearer pole or underside.
+        func turn(_ from: Double, _ to: Double) -> Double {
+            CameraRig.wrappedAngle(from + CameraRig.wrappedAngle(to - from) * amount)
+        }
+        rig.yaw = turn(from.yaw, to.yaw)
+        rig.elevation = turn(from.elevation, to.elevation)
         rig.distance = exp(log(from.distance) * (1 - amount) + log(to.distance) * amount)
         rig.orbitCenter = from.orbitCenter * (1 - amount) + to.orbitCenter * amount
         rig.radius = from.radius * (1 - amount) + to.radius * amount

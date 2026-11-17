@@ -231,7 +231,7 @@ final class CameraRigTests: XCTestCase {
         XCTAssertEqual(centerScreen.y, after.y, accuracy: 1e-9)
     }
 
-    func testOrbitAtElevationLimitKeepsModelCenterFixed() {
+    func testLargeOrbitsKeepModelCenterFixedAndAnglesBounded() {
         var rig = CameraRig()
         let center = SIMD3<Double>(146, -91, 1)
         rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
@@ -242,6 +242,69 @@ final class CameraRigTests: XCTestCase {
             let after = rig.project(center, width: 1200, height: 800)
             XCTAssertEqual(before.x, after.x, accuracy: 1e-7)
             XCTAssertEqual(before.y, after.y, accuracy: 1e-7)
+        }
+        for _ in 0..<10_000 {
+            rig.orbitAroundCenter(dx: 97, dy: 13)
+            XCTAssertLessThanOrEqual(abs(rig.yaw), .pi)
+            XCTAssertLessThanOrEqual(abs(rig.elevation), .pi)
+        }
+        let after = rig.project(center, width: 1200, height: 800)
+        XCTAssertEqual(before.x, after.x, accuracy: 1e-7)
+        XCTAssertEqual(before.y, after.y, accuracy: 1e-7)
+    }
+
+    func testOrbitContinuesOverBothPolesWithoutStopping() {
+        var rig = CameraRig()
+        rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
+        rig.pan(dx: 32, dy: 20, height: 800)
+        let start = rig
+        let center = rig.project(rig.orbitCenter, width: 1200, height: 800)
+        let steps = 100
+        let step = 2 * Double.pi / Double(steps)
+        // Two complete vertical turns each way, crossing both poles.
+        for direction in [1.0, -1.0] {
+            var reachedUpsideDown = false
+            for _ in 0..<(2 * steps) {
+                let previous = rig
+                rig.orbitAroundCenter(dx: 0, dy: direction * step / 0.008)
+                reachedUpsideDown = reachedUpsideDown || rig.isUpsideDown
+                XCTAssertLessThanOrEqual(abs(rig.elevation), .pi)
+                XCTAssertEqual(acos(min(simd_dot(previous.backward, rig.backward), 1)), step, accuracy: 1e-9)
+                XCTAssertEqual(acos(min(simd_dot(previous.up, rig.up), 1)), step, accuracy: 1e-9)
+                XCTAssertEqual(simd_dot(rig.up, rig.backward), 0, accuracy: 1e-12)
+                let projected = rig.project(rig.orbitCenter, width: 1200, height: 800)
+                XCTAssertEqual(projected.x, center.x, accuracy: 1e-7)
+                XCTAssertEqual(projected.y, center.y, accuracy: 1e-7)
+            }
+            XCTAssertTrue(reachedUpsideDown)
+            XCTAssertEqual(simd_distance(rig.backward, start.backward), 0, accuracy: 1e-9)
+            XCTAssertEqual(simd_distance(rig.up, start.up), 0, accuracy: 1e-9)
+            XCTAssertEqual(simd_distance(rig.target, start.target), 0, accuracy: 1e-7)
+        }
+    }
+
+    func testReversedYawKeepsNearSideFollowingCursorWhenUpsideDown() {
+        for upsideDown in [false, true] {
+            var rig = CameraRig()
+            rig.fit(bounds: [-50, -20, 0, 50, 20, 35], width: 1200, height: 800)
+            rig.yaw = -.pi / 2
+            rig.elevation = upsideDown ? .pi - 0.4 : 0.4
+            XCTAssertEqual(rig.isUpsideDown, upsideDown)
+            // A point on the camera's side of the design center, at its height.
+            let toward = simd_normalize(SIMD3(rig.backward.x, rig.backward.y, 0))
+            let near = rig.orbitCenter + toward * (rig.radius * 0.5)
+            let before = rig.project(near, width: 1200, height: 800).x
+            var reversed = rig
+            rig.orbitAroundCenter(dx: 10, dy: 0)
+            reversed.orbitAroundCenter(dx: 10, dy: 0, reversesYaw: true)
+            let plain = rig.project(near, width: 1200, height: 800).x - before
+            let corrected = reversed.project(near, width: 1200, height: 800).x - before
+            if upsideDown {
+                XCTAssertLessThan(plain, 0)
+                XCTAssertGreaterThan(corrected, 0)
+            } else {
+                XCTAssertGreaterThan(plain, 0)
+            }
         }
     }
 }

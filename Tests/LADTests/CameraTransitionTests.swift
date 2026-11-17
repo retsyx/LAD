@@ -34,9 +34,31 @@ final class CameraTransitionTests: XCTestCase {
         to.yaw = -179 * .pi / 180
         let transition = CameraTransition(from: from, to: to)
         let middle = transition.rig(at: 0.5)
-        XCTAssertEqual(middle.yaw - from.yaw, .pi / 180, accuracy: 1e-11)
+        XCTAssertEqual(CameraRig.wrappedAngle(middle.yaw - from.yaw), .pi / 180, accuracy: 1e-11)
+        XCTAssertLessThanOrEqual(abs(middle.yaw), .pi)
         XCTAssertLessThan(middle.backward.x, 0)
         XCTAssertEqual(middle.backward.y, 0, accuracy: 1e-11)
+    }
+
+    func testUpsideDownStartTakesShortElevationRoute() {
+        var from = CameraRig()
+        from.yaw = -.pi / 2
+        from.elevation = 3
+        var to = from
+        to.elevation = -.pi / 2 + 0.00001
+        let transition = CameraTransition(from: from, to: to)
+        var previous = from
+        for step in 1...100 {
+            let rig = transition.rig(at: Double(step) / 100)
+            XCTAssertLessThanOrEqual(abs(rig.elevation), .pi)
+            XCTAssertEqual(simd_length(rig.up), 1, accuracy: 1e-12)
+            XCTAssertEqual(simd_dot(rig.up, rig.backward), 0, accuracy: 1e-12)
+            // The 98° route passes beneath the design, not 262° over the top.
+            XCTAssertLessThanOrEqual(rig.backward.z, sin(3) + 1e-12)
+            XCTAssertGreaterThan(simd_dot(previous.backward, rig.backward), cos(0.05))
+            previous = rig
+        }
+        assertEqual(transition.rig(at: 1), to)
     }
 
     func testMoveEasesAtBothEndsAndScalesDistanceProportionally() {
