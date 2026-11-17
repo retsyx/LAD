@@ -201,18 +201,20 @@ final class ProjectWindowCoordinator: ObservableObject {
         register(ProjectWindowSession(state: state), id: id, sourceURL: sourceURL)
     }
 
-    func openProject(at url: URL, createWindow: @escaping (ProjectWindowRequest) -> Void) {
-        guard !isQuitting else { return }
+    /// Returns the window that shows, or will show, the design.
+    @discardableResult
+    func openProject(at url: URL, createWindow: @escaping (ProjectWindowRequest) -> Void) -> UUID? {
+        guard !isQuitting else { return nil }
         let canonical = Self.canonicalURL(url)
         // During a drop, the receiving window owns the pending destination.
         if let pending = pendingURLs[canonical] {
             focus(pending.windowID)
-            return
+            return pending.windowID
         }
         if let existing = entryID(matching: canonical) {
             entries[existing]?.state.noteProjectOpened(fallbackURL: entries[existing]?.sourceURL)
             focus(existing)
-            return
+            return existing
         }
         let request = ProjectWindowRequest(fileURL: canonical)
         reserve(canonical, for: request.id, token: request.id)
@@ -242,9 +244,10 @@ final class ProjectWindowCoordinator: ObservableObject {
                 if closing.state.hasUnsavedChanges { reopeningStates[request.id] = closing.state }
                 createWindow(ProjectWindowRequest(id: request.id, fileURL: destination))
             }
-            return
+            return request.id
         }
         createWindow(request)
+        return request.id
     }
 
     /// SwiftUI may create an implicit window to deliver a Finder open event.
@@ -259,8 +262,9 @@ final class ProjectWindowCoordinator: ObservableObject {
         initialRestoreClaimed = true
         guard reusingInitialWindow, session.canReceiveInitialProject,
               !unusedInitialWindows.contains(id), initialExternalURLs[id] == nil else {
-            openProject(at: url, createWindow: createWindow)
+            let target = openProject(at: url, createWindow: createWindow)
             discardRegisteredInitialWindows()
+            if let target, target != id { focusAfterExternalEvent(target) }
             return nil
         }
         implicitInitialWindows.remove(id)
@@ -277,6 +281,15 @@ final class ProjectWindowCoordinator: ObservableObject {
         }
         discardRegisteredInitialWindows()
         return request
+    }
+
+    /// After an open event's handler returns, SwiftUI brings the window that
+    /// received the event to the front. Front the design's own window after that.
+    private func focusAfterExternalEvent(_ id: UUID) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !isQuitting, windows[id]?.window != nil else { return }
+            focus(id)
+        }
     }
 
     private func discardRegisteredInitialWindows() {
