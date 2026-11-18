@@ -158,28 +158,23 @@ final class ViewportNavigationTests: XCTestCase {
     }
 
     @MainActor
-    func testOrbitKeepsTheMouseDownUpAxisOverThePoleAndReanchorsOnTheNextDrag() async throws {
+    func testRightDragFollowsCurrentViewportAxesWhenChangingDirectionPastThePole() async throws {
         let view = try await readyView()
-        let camera = try XCTUnwrap(view.pointOfView)
-        let startUp = SIMD3<Float>(view.cameraOrientation.up)
         view.rightMouseDown(with: try event(.rightMouseDown, x: 300, y: 400))
         view.rightMouseDragged(with: try event(.rightMouseDragged, x: 300, y: 150))
-        XCTAssertLessThan(view.cameraOrientation.up.z, -0.5, "Orbit must continue beyond the pole.")
-        let beforeHorizontal = camera.simdOrientation
-        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 340, y: 150))
-        let rotation = camera.simdOrientation * beforeHorizontal.inverse
-        XCTAssertGreaterThan(simd_length(rotation.imag), 0.05)
-        XCTAssertEqual(simd_distance(rotation.act(startUp), startUp), 0, accuracy: 1e-5,
-                       "Horizontal movement must still turn around the up axis from mouse-down.")
-        view.rightMouseUp(with: try event(.rightMouseUp, x: 340, y: 150))
+        let pastPole = view.cameraOrientation
+        XCTAssertLessThan(pastPole.up.z, -0.5, "Orbit must continue beyond the pole.")
 
-        let nextStart = view.cameraOrientation
-        view.rightMouseDown(with: try event(.rightMouseDown, x: 300, y: 150))
         view.rightMouseDragged(with: try event(.rightMouseDragged, x: 340, y: 150))
-        let next = view.cameraOrientation
-        XCTAssertEqual(simd_distance(next.up, nextStart.up), 0, accuracy: 1e-5)
-        XCTAssertLessThan(simd_dot(next.backward, nextStart.right), -0.1)
-        view.rightMouseUp(with: try event(.rightMouseUp, x: 340, y: 150))
+        let afterHorizontal = view.cameraOrientation
+        XCTAssertEqual(simd_distance(afterHorizontal.up, pastPole.up), 0, accuracy: 1e-5)
+        XCTAssertLessThan(simd_dot(afterHorizontal.backward, pastPole.right), -0.1)
+
+        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 340, y: 190))
+        let afterVertical = view.cameraOrientation
+        XCTAssertEqual(simd_distance(afterVertical.right, afterHorizontal.right), 0, accuracy: 1e-5)
+        XCTAssertLessThan(simd_dot(afterVertical.backward, afterHorizontal.up), -0.1)
+        view.rightMouseUp(with: try event(.rightMouseUp, x: 340, y: 190))
     }
 
     @MainActor

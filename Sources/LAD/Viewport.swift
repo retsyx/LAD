@@ -219,7 +219,6 @@ final class CADSceneView: NSView {
     private var hasOwnedEdges = false
     private struct RightMouseGesture {
         let start: NSPoint
-        let orbitAxes: CameraRig.OrbitAxes
         var previous: NSPoint
         var isDragging = false
     }
@@ -1799,7 +1798,7 @@ final class CADSceneView: NSView {
         window?.makeFirstResponder(self)
         setHoveredFeature(nil)
         let point = convert(event.locationInWindow, from: nil)
-        rightGesture = RightMouseGesture(start: point, orbitAxes: rig.orbitAxes, previous: point)
+        rightGesture = RightMouseGesture(start: point, previous: point)
     }
     override func rightMouseUp(with event: NSEvent) {
         guard let gesture = rightGesture else { return }
@@ -1829,7 +1828,7 @@ final class CADSceneView: NSView {
         if event.modifierFlags.contains(.shift) {
             rig.pan(dx: dx, dy: dy, height: bounds.height)
         } else {
-            rig.orbitAroundCenter(dx: dx, dy: dy, axes: gesture.orbitAxes)
+            rig.orbitAroundCenter(dx: dx, dy: dy)
         }
         applyCamera()
     }

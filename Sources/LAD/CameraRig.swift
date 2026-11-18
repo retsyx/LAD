@@ -18,19 +18,14 @@ struct CameraRig {
     var backward: SIMD3<Double> {
         SIMD3(cos(elevation) * cos(yaw), cos(elevation) * sin(yaw), sin(elevation))
     }
-    struct OrbitAxes {
-        let right: SIMD3<Double>
-        let up: SIMD3<Double>
-    }
-
-    var orbitAxes: OrbitAxes {
+    private var viewAxes: (right: SIMD3<Double>, up: SIMD3<Double>) {
         let levelRight = SIMD3(-sin(yaw), cos(yaw), 0)
         let levelUp = simd_cross(backward, levelRight)
-        return OrbitAxes(right: levelRight * cos(roll) - levelUp * sin(roll),
-                         up: levelRight * sin(roll) + levelUp * cos(roll))
+        return (right: levelRight * cos(roll) - levelUp * sin(roll),
+                up: levelRight * sin(roll) + levelUp * cos(roll))
     }
-    var right: SIMD3<Double> { orbitAxes.right }
-    var up: SIMD3<Double> { orbitAxes.up }
+    var right: SIMD3<Double> { viewAxes.right }
+    var up: SIMD3<Double> { viewAxes.up }
     var position: SIMD3<Double> { target + backward * distance }
     var tangent: Double { tan(fieldOfView * .pi / 360) }
     /// Half the visible vertical extent, matching perspective at the target.
@@ -87,13 +82,14 @@ struct CameraRig {
         target += right * (-dx * units) + up * (dy * units)
     }
 
-    /// Rotate the entire pose about the design center using the screen axes at mouse-down.
-    mutating func orbitAroundCenter(dx: Double, dy: Double, axes: OrbitAxes) {
+    /// Each drag increment orbits the design center about the current viewport's up and right axes.
+    mutating func orbitAroundCenter(dx: Double, dy: Double) {
         let travel = hypot(dx, dy)
         guard travel > 0, travel.isFinite else { return }
+        let axes = viewAxes
         let axis = axes.up * (dx / travel) + axes.right * (dy / travel)
         let rotation = simd_quatd(angle: -0.008 * travel, axis: axis)
-        let rotatedRight = rotation.act(right)
+        let rotatedRight = rotation.act(axes.right)
         let rotatedBack = rotation.act(backward)
         target = orbitCenter + rotation.act(target - orbitCenter)
 

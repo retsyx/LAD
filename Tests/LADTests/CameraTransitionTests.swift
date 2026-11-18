@@ -88,7 +88,7 @@ final class CameraTransitionTests: XCTestCase {
             from.pan(dx: 45, dy: -23, height: 800)
             let surface = from.orbitCenter + from.backward * (from.radius * 0.6) + from.right * (from.radius * 0.2)
             from.zoom(factor: 1e10, anchor: surface)
-            from.orbitAroundCenter(dx: 430, dy: 35, axes: from.orbitAxes)
+            from.orbitAroundCenter(dx: 430, dy: 35)
             var to = from
             to.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
             to.yaw = -.pi / 2
