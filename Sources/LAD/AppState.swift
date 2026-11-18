@@ -2474,7 +2474,7 @@ final class AppState {
                                                         individualParts: exportIndividualParts, python: runtime, threads: cores)
                 }
                 guard operationID == token, projectSessionID == sessionID, selectedRevisionID == revisionID,
-                      !Task.isCancelled, let index = revisions.firstIndex(where: { $0.id == revisionID }) else { return }
+                      !Task.isCancelled, revisions.contains(where: { $0.id == revisionID }) else { return }
                 let writing = Task.detached(priority: .userInitiated) {
                     try Task.checkCancellation()
                     if exportIndividualParts {
