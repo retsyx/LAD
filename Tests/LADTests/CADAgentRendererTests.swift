@@ -43,6 +43,50 @@ final class CADAgentRendererTests: XCTestCase {
     }
 
     @MainActor
+    func testReleasingCaptureDisconnectsItsProbeAndPreservesTheLiveProbe() throws {
+        let view = try makeView()
+        let name = CADViewportSceneSource.probeName
+        let liveNode = try XCTUnwrap(view.scene.rootNode.childNode(withName: name, recursively: true))
+        let liveProbe = try XCTUnwrap(liveNode.rendererDelegate)
+        let copy = try autoreleasepool {
+            let capture = try CADViewportCapture(view: view, width: 80, height: 60)
+            let scene = capture.source.scene
+            let node = try XCTUnwrap(scene.rootNode.childNode(withName: name, recursively: true))
+            XCTAssertFalse(node === liveNode)
+            XCTAssertFalse(capture.source.probe === liveProbe)
+            XCTAssertTrue(node.rendererDelegate === capture.source.probe)
+            return (scene: scene, node: node, probe: capture.source.probe)
+        }
+        // Keep the graph and the assign delegate alive to inspect teardown safely.
+        withExtendedLifetime((view, copy)) {
+            XCTAssertNil(copy.node.rendererDelegate)
+            XCTAssertTrue(liveNode.rendererDelegate === liveProbe)
+            copy.node.rendererDelegate = nil
+        }
+    }
+
+    @MainActor
+    func testReleasingSceneSourcePreservesItsReplacementProbeUntilThatOwnerIsReleased() throws {
+        let scene = SCNScene()
+        let camera = SCNNode()
+        camera.camera = SCNCamera()
+        scene.rootNode.addChildNode(camera)
+        var original: CADViewportSceneSource? = CADViewportSceneSource.install(in: scene, camera: camera)
+        let node = try XCTUnwrap(scene.rootNode.childNode(withName: CADViewportSceneSource.probeName, recursively: true))
+        XCTAssertTrue(node.rendererDelegate === original?.probe)
+        let replacementProbe = try autoreleasepool {
+            let replacement = try XCTUnwrap(CADViewportSceneSource.adopt(scene: scene, camera: camera))
+            original = nil
+            XCTAssertTrue(node.rendererDelegate === replacement.probe)
+            return replacement.probe
+        }
+        withExtendedLifetime((replacementProbe, scene)) {
+            XCTAssertNil(node.rendererDelegate)
+            node.rendererDelegate = nil
+        }
+    }
+
+    @MainActor
     func testCapturePreservesLiveCameraMaterialsAndHiddenState() async throws {
         let view = try makeView()
         let preview = box()

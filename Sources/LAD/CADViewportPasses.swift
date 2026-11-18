@@ -187,16 +187,26 @@ final class CADViewportSceneSource: @unchecked Sendable {
     let decorationsCamera: SCNNode
     let accumulationCamera: SCNNode
     let revealageCamera: SCNNode
-    let probe: CADViewportFrameProbe
+    private let probeNode: SCNNode
+    let probe = CADViewportFrameProbe()
 
-    init(scene: SCNScene, camera: SCNNode, decorationsCamera: SCNNode, accumulationCamera: SCNNode,
-         revealageCamera: SCNNode, probe: CADViewportFrameProbe) {
+    private init(scene: SCNScene, camera: SCNNode, decorationsCamera: SCNNode, accumulationCamera: SCNNode,
+                 revealageCamera: SCNNode, probeNode: SCNNode) {
         self.scene = scene
         self.camera = camera
         self.decorationsCamera = decorationsCamera
         self.accumulationCamera = accumulationCamera
         self.revealageCamera = revealageCamera
-        self.probe = probe
+        self.probeNode = probeNode
+        probeNode.rendererDelegate = probe
+    }
+
+    deinit {
+        // SceneKit updates scene culling when unregistering a delegate. Do this
+        // while the scene is intact and only for this source's registration.
+        if probeNode.rendererDelegate === probe {
+            probeNode.rendererDelegate = nil
+        }
     }
 
     /// Adds the translucent pass cameras under `camera` and the matrix probe
@@ -211,18 +221,18 @@ final class CADViewportSceneSource: @unchecked Sendable {
             camera.addChildNode(node)
             return node
         }
-        let source = CADViewportSceneSource(
-            scene: scene, camera: camera,
-            decorationsCamera: passCamera(decorationsCameraName, mask: CADViewportCategory.translucentDecorations),
-            accumulationCamera: passCamera(accumulationCameraName, mask: CADViewportCategory.translucentAccumulation),
-            revealageCamera: passCamera(revealageCameraName, mask: CADViewportCategory.translucentRevealage),
-            probe: CADViewportFrameProbe())
         // No geometry or bounds: the probe must never change automatic clipping.
         let probeNode = SCNNode()
         probeNode.name = probeName
         probeNode.categoryBitMask = CADViewportCategory.probe
         probeNode.renderingOrder = 1_000_000
-        probeNode.rendererDelegate = source.probe
+        let source = CADViewportSceneSource(
+            scene: scene, camera: camera,
+            decorationsCamera: passCamera(decorationsCameraName, mask: CADViewportCategory.translucentDecorations),
+            accumulationCamera: passCamera(accumulationCameraName, mask: CADViewportCategory.translucentAccumulation),
+            revealageCamera: passCamera(revealageCameraName, mask: CADViewportCategory.translucentRevealage),
+            probeNode: probeNode)
+        // Attach the geometry-free node with its delegate already registered so SceneKit draws it.
         scene.rootNode.addChildNode(probeNode)
         source.synchronizeCameras()
         return source
@@ -235,10 +245,8 @@ final class CADViewportSceneSource: @unchecked Sendable {
               let accumulation = camera.childNode(withName: accumulationCameraName, recursively: false),
               let revealage = camera.childNode(withName: revealageCameraName, recursively: false),
               let probeNode = scene.rootNode.childNode(withName: probeName, recursively: true) else { return nil }
-        let probe = CADViewportFrameProbe()
-        probeNode.rendererDelegate = probe
         return CADViewportSceneSource(scene: scene, camera: camera, decorationsCamera: decorations,
-                                      accumulationCamera: accumulation, revealageCamera: revealage, probe: probe)
+                                      accumulationCamera: accumulation, revealageCamera: revealage, probeNode: probeNode)
     }
 
     /// Copies the design camera's projection into each pass camera.

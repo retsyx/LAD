@@ -190,7 +190,7 @@ final class ViewportTranslucencyTests: XCTestCase {
         guard let path = ProcessInfo.processInfo.environment["LAD_TRANSLUCENCY_PREVIEW"] else {
             throw XCTSkip("Set LAD_TRANSLUCENCY_PREVIEW to inspect a representative preview with production materials.")
         }
-        let preview = try JSONDecoder().decode(PreviewMesh.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        let preview = try PreviewMesh.loadResult(at: URL(fileURLWithPath: path))
         for mode in [ViewportDisplayMode.edges, .translucent] {
             let png = try await CADAgentRenderer.renderPNG(preview: preview, display: mode, width: 1_024, height: 768)
             let prefix = ProcessInfo.processInfo.environment["LAD_TRANSLUCENCY_ARTIFACT_PREFIX"] ?? "/tmp/lad-translucency-representative"

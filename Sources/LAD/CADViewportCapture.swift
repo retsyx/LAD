@@ -114,6 +114,8 @@ final class CADViewportCapture: @unchecked Sendable {
         isolate(source.rootNode, root)
         scene.rootNode.addChildNode(root)
         guard let camera = copiedCamera, let copied = CADViewportSceneSource.adopt(scene: scene, camera: camera) else {
+            // A failed copy still carries the live probe's unretained delegate.
+            root.childNode(withName: CADViewportSceneSource.probeName, recursively: true)?.rendererDelegate = nil
             throw LADError.message("The design camera is unavailable for capture.")
         }
         return copied
