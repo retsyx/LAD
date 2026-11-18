@@ -96,11 +96,7 @@ struct CADAgentCamera: Sendable {
         rig.distance = orthographic ? baseDistance : baseDistance / zoom
         let orthographicScale = baseDistance * rig.tangent / zoom
         let position = rig.target + backward * rig.distance
-        let unrolledRight = SIMD3<Double>(-sin(rig.yaw), cos(rig.yaw), 0)
-        let unrolledUp = simd_cross(backward, unrolledRight)
-        let roll = radians(rollDegrees)
-        let right = unrolledRight * cos(roll) - unrolledUp * sin(roll)
-        let up = unrolledUp * cos(roll) + unrolledRight * sin(roll)
+        rig.roll = radians(rollDegrees)
         let floatPosition = SIMD3<Float>(position)
         let floatTarget = SIMD3<Float>(rig.target)
         guard rig.distance.isFinite, rig.distance > 0,
@@ -110,7 +106,7 @@ struct CADAgentCamera: Sendable {
               floatPosition != floatTarget else {
             throw LADError.message("The requested camera is too close or too far for rendering precision. Reduce the zoom or choose another camera position.")
         }
-        return CADAgentCameraPose(rig: rig, right: right, up: up, backward: backward,
+        return CADAgentCameraPose(rig: rig, backward: backward,
                                   position: position, automaticDistance: automaticDistance, baseDistance: baseDistance,
                                   orthographicScale: orthographicScale)
     }
@@ -124,8 +120,6 @@ struct CADAgentCamera: Sendable {
 
 struct CADAgentCameraPose: Sendable {
     var rig: CameraRig
-    var right: SIMD3<Double>
-    var up: SIMD3<Double>
     var backward: SIMD3<Double>
     var position: SIMD3<Double>
     var automaticDistance: Double
@@ -134,4 +128,6 @@ struct CADAgentCameraPose: Sendable {
 
     var target: SIMD3<Double> { rig.target }
     var distance: Double { rig.distance }
+    var right: SIMD3<Double> { rig.right }
+    var up: SIMD3<Double> { rig.up }
 }

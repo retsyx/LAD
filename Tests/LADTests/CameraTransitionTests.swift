@@ -8,15 +8,18 @@ final class CameraTransitionTests: XCTestCase {
         from.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
         from.pan(dx: 45, dy: -23, height: 800)
         from.zoom(factor: 8, anchor: SIMD3(165, -80, 7))
+        from.roll = .pi / 3
         var to = from
         to.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
         to.yaw = .pi
         to.elevation = 0
+        to.roll = 0
         let transition = CameraTransition(from: from, to: to)
         assertEqual(transition.rig(at: 0), from)
         assertEqual(transition.rig(at: -1), from)
         assertEqual(transition.rig(at: 1), to)
         assertEqual(transition.rig(at: 2), to)
+        XCTAssertEqual(transition.rig(at: 0.5).roll, .pi / 6, accuracy: 1e-12)
 
         let current = transition.rig(at: 0.4)
         var replacement = to
@@ -85,7 +88,7 @@ final class CameraTransitionTests: XCTestCase {
             from.pan(dx: 45, dy: -23, height: 800)
             let surface = from.orbitCenter + from.backward * (from.radius * 0.6) + from.right * (from.radius * 0.2)
             from.zoom(factor: 1e10, anchor: surface)
-            from.orbitAroundCenter(dx: 430, dy: 35)
+            from.orbitAroundCenter(dx: 430, dy: 35, axes: from.orbitAxes)
             var to = from
             to.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
             to.yaw = -.pi / 2
@@ -142,6 +145,7 @@ final class CameraTransitionTests: XCTestCase {
         XCTAssertEqual(actual.radius, expected.radius, file: file, line: line)
         XCTAssertEqual(actual.yaw, expected.yaw, file: file, line: line)
         XCTAssertEqual(actual.elevation, expected.elevation, file: file, line: line)
+        XCTAssertEqual(actual.roll, expected.roll, file: file, line: line)
         XCTAssertEqual(actual.usesOrthographicProjection, expected.usesOrthographicProjection, file: file, line: line)
     }
 }

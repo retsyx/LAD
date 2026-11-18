@@ -57,17 +57,17 @@ final class ViewportNavigationTests: XCTestCase {
         let stepped = try await readyView()
         let single = try await readyView()
         stepped.rightMouseDown(with: try event(.rightMouseDown, x: 200, y: 200))
-        stepped.rightMouseDragged(with: try event(.rightMouseDragged, x: 220, y: 200))
-        stepped.rightMouseDragged(with: try event(.rightMouseDragged, x: 240, y: 200))
+        stepped.rightMouseDragged(with: try event(.rightMouseDragged, x: 220, y: 210))
+        stepped.rightMouseDragged(with: try event(.rightMouseDragged, x: 240, y: 220))
         single.rightMouseDown(with: try event(.rightMouseDown, x: 200, y: 200))
-        single.rightMouseDragged(with: try event(.rightMouseDragged, x: 240, y: 200))
+        single.rightMouseDragged(with: try event(.rightMouseDragged, x: 240, y: 220))
         assertMatrixEqual(try XCTUnwrap(stepped.pointOfView).simdTransform,
                           try XCTUnwrap(single.pointOfView).simdTransform)
         let beforeRepeatedEvent = try XCTUnwrap(stepped.pointOfView).simdTransform
-        stepped.rightMouseDragged(with: try event(.rightMouseDragged, x: 240, y: 200))
+        stepped.rightMouseDragged(with: try event(.rightMouseDragged, x: 240, y: 220))
         assertMatrixEqual(try XCTUnwrap(stepped.pointOfView).simdTransform, beforeRepeatedEvent)
-        stepped.rightMouseUp(with: try event(.rightMouseUp, x: 240, y: 200))
-        single.rightMouseUp(with: try event(.rightMouseUp, x: 240, y: 200))
+        stepped.rightMouseUp(with: try event(.rightMouseUp, x: 240, y: 220))
+        single.rightMouseUp(with: try event(.rightMouseUp, x: 240, y: 220))
     }
 
     @MainActor
@@ -129,36 +129,61 @@ final class ViewportNavigationTests: XCTestCase {
     }
 
     @MainActor
-    func testRightDragOrbitsPastThePoleAndFixesHorizontalDirectionPerGesture() async throws {
-        let view = try await readyView()
-        let camera = try XCTUnwrap(view.pointOfView)
-        // Counterclockwise turn of the view direction about world Z.
-        func horizontalTurn(_ from: simd_float4x4, _ to: simd_float4x4) -> Float {
-            from.columns.2.x * to.columns.2.y - from.columns.2.y * to.columns.2.x
+    func testHorizontalDragFromTopAndBottomTurnsTheDesignSidewaysAroundItsPannedCenter() async throws {
+        for projection in ViewportProjectionMode.allCases {
+            let view = try await readyView(projection: projection)
+            for face in [ViewportCubeFace.bottom, .top] {
+                view.selectOrientationCubeFace(face)
+                view.otherMouseDown(with: try event(.otherMouseDown, x: 250, y: 200))
+                view.otherMouseDragged(with: try event(.otherMouseDragged, x: 280, y: 215))
+                view.otherMouseUp(with: try event(.otherMouseUp, x: 280, y: 215))
+                let pivot = try projectedOrigin(in: view)
+                let start = view.cameraOrientation
+                XCTAssertEqual(start.backward.z, face.normal.z, accuracy: 1e-5)
+                view.rightMouseDown(with: try event(.rightMouseDown, x: 200, y: 200))
+                for offset: CGFloat in [40, -40] {
+                    view.rightMouseDragged(with: try event(.rightMouseDragged, x: 200 + offset, y: 200))
+                    let turned = view.cameraOrientation
+                    XCTAssertEqual(simd_distance(turned.up, start.up), 0, accuracy: 1e-5)
+                    let sideways = simd_dot(turned.backward, start.right)
+                    XCTAssertLessThan(sideways * (offset > 0 ? 1 : -1), -0.1,
+                                      "Dragging must bring a side into view from either pole.")
+                    let projected = try projectedOrigin(in: view)
+                    XCTAssertEqual(projected.x, pivot.x, accuracy: 0.01)
+                    XCTAssertEqual(projected.y, pivot.y, accuracy: 0.01)
+                }
+                view.rightMouseUp(with: try event(.rightMouseUp, x: 160, y: 200))
+            }
         }
-
-        view.rightMouseDown(with: try event(.rightMouseDown, x: 300, y: 400))
-        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 300, y: 200))
-        XCTAssertLessThan(camera.simdTransform.columns.1.z, -0.5, "Orbit must continue beyond the pole.")
-        var before = camera.simdTransform
-        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 340, y: 200))
-        XCTAssertLessThan(horizontalTurn(before, camera.simdTransform), -0.01,
-                          "Crossing a pole must not reverse the current gesture.")
-        view.rightMouseUp(with: try event(.rightMouseUp, x: 340, y: 200))
-
-        view.rightMouseDown(with: try event(.rightMouseDown, x: 300, y: 200))
-        before = camera.simdTransform
-        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 340, y: 200))
-        XCTAssertGreaterThan(horizontalTurn(before, camera.simdTransform), 0.01,
-                             "A gesture that begins upside down keeps the near side following the pointer.")
-        let origin = try projectedOrigin(in: view)
-        XCTAssertEqual(origin.x, 320, accuracy: 0.01)
-        XCTAssertEqual(origin.y, 240, accuracy: 0.01)
-        view.rightMouseUp(with: try event(.rightMouseUp, x: 340, y: 200))
     }
 
     @MainActor
-    private func readyView() async throws -> CADSceneView {
+    func testOrbitKeepsTheMouseDownUpAxisOverThePoleAndReanchorsOnTheNextDrag() async throws {
+        let view = try await readyView()
+        let camera = try XCTUnwrap(view.pointOfView)
+        let startUp = SIMD3<Float>(view.cameraOrientation.up)
+        view.rightMouseDown(with: try event(.rightMouseDown, x: 300, y: 400))
+        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 300, y: 150))
+        XCTAssertLessThan(view.cameraOrientation.up.z, -0.5, "Orbit must continue beyond the pole.")
+        let beforeHorizontal = camera.simdOrientation
+        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 340, y: 150))
+        let rotation = camera.simdOrientation * beforeHorizontal.inverse
+        XCTAssertGreaterThan(simd_length(rotation.imag), 0.05)
+        XCTAssertEqual(simd_distance(rotation.act(startUp), startUp), 0, accuracy: 1e-5,
+                       "Horizontal movement must still turn around the up axis from mouse-down.")
+        view.rightMouseUp(with: try event(.rightMouseUp, x: 340, y: 150))
+
+        let nextStart = view.cameraOrientation
+        view.rightMouseDown(with: try event(.rightMouseDown, x: 300, y: 150))
+        view.rightMouseDragged(with: try event(.rightMouseDragged, x: 340, y: 150))
+        let next = view.cameraOrientation
+        XCTAssertEqual(simd_distance(next.up, nextStart.up), 0, accuracy: 1e-5)
+        XCTAssertLessThan(simd_dot(next.backward, nextStart.right), -0.1)
+        view.rightMouseUp(with: try event(.rightMouseUp, x: 340, y: 150))
+    }
+
+    @MainActor
+    private func readyView(projection: ViewportProjectionMode = .perspective) async throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
         let preview = PreviewMesh(vertices: [[-10, -10, 0], [10, -10, 0], [10, 10, 0], [-10, 10, 0]],
@@ -166,7 +191,8 @@ final class ViewportNavigationTests: XCTestCase {
             bounds: [-10, -10, 0, 10, 10, 0], volume: 1, area: 400, solids: 1, faces: 1,
             buildSeconds: 0, threads: 1, stepPath: "/tmp/viewport-navigation-test",
             triangleSolids: [0, 0], edgeSolids: [0])
-        view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [],
+                    projection: projection)
         view.layout()
         let deadline = ContinuousClock.now + .seconds(10)
         while view.isPreparingResources, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }

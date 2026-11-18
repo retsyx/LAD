@@ -217,8 +217,13 @@ final class CADSceneView: NSView {
     private var solidColors: [Int: PartColor] = [:]
     private var ownedEdgeSolids = Set<Int>()
     private var hasOwnedEdges = false
-    private var rightDownPoint: NSPoint?
-    private var rightDragPoint: NSPoint?
+    private struct RightMouseGesture {
+        let start: NSPoint
+        let orbitAxes: CameraRig.OrbitAxes
+        var previous: NSPoint
+        var isDragging = false
+    }
+    private var rightGesture: RightMouseGesture?
     private var otherDragPoint: NSPoint?
     private struct AssemblyGrabGesture {
         var solid: Int
@@ -232,9 +237,6 @@ final class CADSceneView: NSView {
     private var commandCursorSet = false
     private var modifierMonitor: Any?
     var isGrabbingAssembly: Bool { assemblyGrab != nil }
-    private var rightDragging = false
-    /// Fixed for each drag, so crossing a pole mid-gesture never flips it.
-    private var orbitReversesYaw = false
     private var topology: CADTopology?
     private var solidTransforms: [Int: [Double]] = [:]
     private var solidMatrices: [Int: simd_double4x4] = [:]
@@ -699,7 +701,11 @@ final class CADSceneView: NSView {
         } else {
             needsInitialFit = bounds.width < 10 || bounds.height < 10
             rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
-            if first { rig.yaw = -.pi / 4; rig.elevation = 0.6154797087 }
+            if first {
+                rig.yaw = -.pi / 4
+                rig.elevation = 0.6154797087
+                rig.roll = 0
+            }
         }
         rebuildGrid()
         applyCamera()
@@ -1266,6 +1272,7 @@ final class CADSceneView: NSView {
     private func perform(_ action: ViewportCommand.Action) {
         if pendingMesh != nil { pendingCamera = .command(action); return }
         cancelCameraTransition()
+        if action != .fit { rig.roll = 0 }
         switch action {
         case .fit:
             zoomAnchor = nil
@@ -1315,6 +1322,7 @@ final class CADSceneView: NSView {
         }
         zoomAnchor = nil
         var destination = destination
+        destination.roll = 0
         destination.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
         // Activation and occlusion notifications can lag the click that
         // brings a design window forward. Do not let those bits skip motion.
@@ -1684,7 +1692,7 @@ final class CADSceneView: NSView {
     }
 
     private func updatePointerCursor() {
-        if rightDragging || otherDragPoint != nil {
+        if rightGesture?.isDragging == true || otherDragPoint != nil {
             NSCursor.closedHand.set()
         } else if pointerPoint != nil && assemblyGrabbingEnabled && commandPressed {
             NSCursor.closedHand.set()
@@ -1700,7 +1708,7 @@ final class CADSceneView: NSView {
     private func clearPointerFeedback() {
         pointerPoint = nil
         commandPressed = false
-        if (commandCursorSet || rightDragging || otherDragPoint != nil), NSCursor.current === NSCursor.closedHand {
+        if (commandCursorSet || rightGesture?.isDragging == true || otherDragPoint != nil), NSCursor.current === NSCursor.closedHand {
             NSCursor.arrow.set()
         }
         commandCursorSet = false
@@ -1710,7 +1718,7 @@ final class CADSceneView: NSView {
     private func refreshPointerFeedback() {
         updatePointerCursor()
         guard let point = pointerPoint, !(assemblyGrabbingEnabled && commandPressed),
-              !commandGrabGesture, !isAnimatingCamera, rightDownPoint == nil,
+              !commandGrabGesture, !isAnimatingCamera, rightGesture == nil,
               NSEvent.pressedMouseButtons == 0 else {
             setHoveredFeature(nil)
             return
@@ -1790,40 +1798,38 @@ final class CADSceneView: NSView {
         cancelCameraTransition()
         window?.makeFirstResponder(self)
         setHoveredFeature(nil)
-        rightDownPoint = convert(event.locationInWindow, from: nil)
-        rightDragPoint = rightDownPoint
-        rightDragging = false
+        let point = convert(event.locationInWindow, from: nil)
+        rightGesture = RightMouseGesture(start: point, orbitAxes: rig.orbitAxes, previous: point)
     }
     override func rightMouseUp(with event: NSEvent) {
-        guard rightDownPoint != nil else { return }
+        guard let gesture = rightGesture else { return }
         trackPointer(with: event)
-        let wasDragging = rightDragging
         resetNavigationGesture()
-        if !wasDragging {
+        if !gesture.isDragging {
             showContextMenu(event)
         }
     }
     override func rightMouseDragged(with event: NSEvent) {
-        guard let start = rightDownPoint, let previous = rightDragPoint else { return }
+        guard var gesture = rightGesture else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard point.x.isFinite, point.y.isFinite else { return }
-        if !rightDragging {
-            guard hypot(point.x - start.x, point.y - start.y) >= 3 else { return }
-            rightDragging = true
-            orbitReversesYaw = rig.isUpsideDown
+        if !gesture.isDragging {
+            guard hypot(point.x - gesture.start.x, point.y - gesture.start.y) >= 3 else { return }
+            gesture.isDragging = true
             NSCursor.closedHand.set()
         }
-        rightDragPoint = point
         // Some mouse/remote input paths report zero NSEvent deltas even as
         // their locations move. Track actual cursor travel in view points.
         // AppKit view Y points up; CameraRig's existing mouse Y points down.
-        let dx = Double(point.x - previous.x)
-        let dy = Double(previous.y - point.y)
+        let dx = Double(point.x - gesture.previous.x)
+        let dy = Double(gesture.previous.y - point.y)
+        gesture.previous = point
+        rightGesture = gesture
         guard dx != 0 || dy != 0 else { return }
         if event.modifierFlags.contains(.shift) {
             rig.pan(dx: dx, dy: dy, height: bounds.height)
         } else {
-            rig.orbitAroundCenter(dx: dx, dy: dy, reversesYaw: orbitReversesYaw)
+            rig.orbitAroundCenter(dx: dx, dy: dy, axes: gesture.orbitAxes)
         }
         applyCamera()
     }
@@ -1896,10 +1902,8 @@ final class CADSceneView: NSView {
     }
 
     private func resetNavigationGesture() {
-        rightDownPoint = nil
-        rightDragPoint = nil
+        rightGesture = nil
         otherDragPoint = nil
-        rightDragging = false
         updatePointerCursor()
     }
 

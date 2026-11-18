@@ -90,6 +90,28 @@ final class ViewportOrientationCubeIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testFitKeepsRolledOrientationAndNamedViewsRestoreTheirScreenUp() async throws {
+        let (view, preview) = try await readyView()
+        for useCube in [false, true] {
+            try view.configureAgentView(named: "front", camera: CADAgentCamera(rollDegrees: 45))
+            let rolled = view.cameraOrientation
+            XCTAssertLessThan(rolled.right.z, -0.7)
+            view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.fit),
+                        selectedSolids: [], hiddenSolids: [])
+            assertVectorEqual(view.cameraOrientation.right, rolled.right)
+            assertVectorEqual(view.cameraOrientation.up, rolled.up)
+            if useCube {
+                view.selectOrientationCubeFace(.right)
+            } else {
+                view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.right),
+                            selectedSolids: [], hiddenSolids: [])
+            }
+            assertVectorEqual(view.cameraOrientation.backward, SIMD3(1, 0, 0))
+            assertVectorEqual(view.cameraOrientation.up, SIMD3(0, 0, 1))
+        }
+    }
+
+    @MainActor
     func testCubeDraggingLeavesCameraSelectionAndDrawingResourcesUnchanged() async throws {
         for projection in ViewportProjectionMode.allCases {
             let (view, _) = try await readyView(projection: projection)

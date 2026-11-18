@@ -70,7 +70,7 @@ final class CameraRigTests: XCTestCase {
         rig.pan(dx: 45, dy: -23, height: 800)
         rig.zoom(factor: 0.6, anchor: SIMD3(165, -80, 7))
         let before = rig.project(center, width: 1200, height: 800)
-        rig.orbitAroundCenter(dx: 80, dy: 25)
+        rig.orbitAroundCenter(dx: 80, dy: 25, axes: rig.orbitAxes)
         let after = rig.project(center, width: 1200, height: 800)
         XCTAssertEqual(before.x, after.x, accuracy: 1e-9)
         XCTAssertEqual(before.y, after.y, accuracy: 1e-9)
@@ -108,7 +108,7 @@ final class CameraRigTests: XCTestCase {
             rig.usesOrthographicProjection = orthographic
             rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
             rig.pan(dx: 35, dy: -20, height: 800)
-            rig.orbitAroundCenter(dx: 40, dy: 15)
+            rig.orbitAroundCenter(dx: 40, dy: 15, axes: rig.orbitAxes)
             let surface = rig.orbitCenter + rig.backward * (rig.radius * 0.6)
             rig.zoom(factor: 1e10, anchor: surface)
             XCTAssertGreaterThan(abs(simd_dot(rig.target - rig.orbitCenter, rig.backward)), rig.radius * 1000,
@@ -127,7 +127,7 @@ final class CameraRigTests: XCTestCase {
             rig.usesOrthographicProjection = orthographic
             rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
             rig.pan(dx: 35, dy: -20, height: 800)
-            rig.orbitAroundCenter(dx: 40, dy: 15)
+            rig.orbitAroundCenter(dx: 40, dy: 15, axes: rig.orbitAxes)
             let initialDistance = rig.distance
             let surface = rig.orbitCenter + rig.backward * (rig.radius * 0.6)
             let cursor = rig.project(surface, width: 1200, height: 800)
@@ -201,7 +201,7 @@ final class CameraRigTests: XCTestCase {
         let cameraRadius = simd_length(rig.position - center)
         let targetRadius = simd_length(rig.target - center)
         let before = rig.project(center, width: 1200, height: 800)
-        rig.orbitAroundCenter(dx: 42, dy: 17)
+        rig.orbitAroundCenter(dx: 42, dy: 17, axes: rig.orbitAxes)
         let after = rig.project(center, width: 1200, height: 800)
         XCTAssertEqual(simd_length(rig.position - center), cameraRadius, accuracy: 1e-9)
         XCTAssertEqual(simd_length(rig.target - center), targetRadius, accuracy: 1e-9)
@@ -215,7 +215,7 @@ final class CameraRigTests: XCTestCase {
         rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
         XCTAssertEqual(rig.orbitCenter, SIMD3(146, -91, 1))
         XCTAssertEqual(rig.target, SIMD3(146, -91, 1))
-        rig.orbitAroundCenter(dx: 100, dy: -35)
+        rig.orbitAroundCenter(dx: 100, dy: -35, axes: rig.orbitAxes)
         XCTAssertEqual(rig.target, rig.orbitCenter)
     }
 
@@ -224,7 +224,7 @@ final class CameraRigTests: XCTestCase {
         rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
         XCTAssertEqual(rig.orbitCenter, SIMD3(146, -91, 1))
         let centerScreen = rig.project(rig.orbitCenter, width: 1200, height: 800)
-        rig.orbitAroundCenter(dx: 80, dy: 25)
+        rig.orbitAroundCenter(dx: 80, dy: 25, axes: rig.orbitAxes)
         XCTAssertEqual(rig.target, rig.orbitCenter)
         let after = rig.project(rig.orbitCenter, width: 1200, height: 800)
         XCTAssertEqual(centerScreen.x, after.x, accuracy: 1e-9)
@@ -238,13 +238,13 @@ final class CameraRigTests: XCTestCase {
         rig.pan(dx: 32, dy: 20, height: 800)
         let before = rig.project(center, width: 1200, height: 800)
         for dy in [10_000.0, 30, -10_000, -30] {
-            rig.orbitAroundCenter(dx: 50, dy: dy)
+            rig.orbitAroundCenter(dx: 50, dy: dy, axes: rig.orbitAxes)
             let after = rig.project(center, width: 1200, height: 800)
             XCTAssertEqual(before.x, after.x, accuracy: 1e-7)
             XCTAssertEqual(before.y, after.y, accuracy: 1e-7)
         }
         for _ in 0..<10_000 {
-            rig.orbitAroundCenter(dx: 97, dy: 13)
+            rig.orbitAroundCenter(dx: 97, dy: 13, axes: rig.orbitAxes)
             XCTAssertLessThanOrEqual(abs(rig.yaw), .pi)
             XCTAssertLessThanOrEqual(abs(rig.elevation), .pi)
         }
@@ -258,6 +258,7 @@ final class CameraRigTests: XCTestCase {
         rig.fit(bounds: [115, -107, -6, 177, -75, 8], width: 1200, height: 800)
         rig.pan(dx: 32, dy: 20, height: 800)
         let start = rig
+        let axes = start.orbitAxes
         let center = rig.project(rig.orbitCenter, width: 1200, height: 800)
         let steps = 100
         let step = 2 * Double.pi / Double(steps)
@@ -266,8 +267,8 @@ final class CameraRigTests: XCTestCase {
             var reachedUpsideDown = false
             for _ in 0..<(2 * steps) {
                 let previous = rig
-                rig.orbitAroundCenter(dx: 0, dy: direction * step / 0.008)
-                reachedUpsideDown = reachedUpsideDown || rig.isUpsideDown
+                rig.orbitAroundCenter(dx: 0, dy: direction * step / 0.008, axes: axes)
+                reachedUpsideDown = reachedUpsideDown || rig.up.z < 0
                 XCTAssertLessThanOrEqual(abs(rig.elevation), .pi)
                 XCTAssertEqual(acos(min(simd_dot(previous.backward, rig.backward), 1)), step, accuracy: 1e-9)
                 XCTAssertEqual(acos(min(simd_dot(previous.up, rig.up), 1)), step, accuracy: 1e-9)
@@ -283,28 +284,23 @@ final class CameraRigTests: XCTestCase {
         }
     }
 
-    func testReversedYawKeepsNearSideFollowingCursorWhenUpsideDown() {
-        for upsideDown in [false, true] {
+    func testHorizontalOrbitMovesNearSurfaceWithCursorAtAnyInclinationAndRoll() {
+        for elevation in [0.4, .pi - 0.4, .pi / 2, -.pi / 2] {
             var rig = CameraRig()
             rig.fit(bounds: [-50, -20, 0, 50, 20, 35], width: 1200, height: 800)
-            rig.yaw = -.pi / 2
-            rig.elevation = upsideDown ? .pi - 0.4 : 0.4
-            XCTAssertEqual(rig.isUpsideDown, upsideDown)
-            // A point on the camera's side of the design center, at its height.
-            let toward = simd_normalize(SIMD3(rig.backward.x, rig.backward.y, 0))
-            let near = rig.orbitCenter + toward * (rig.radius * 0.5)
-            let before = rig.project(near, width: 1200, height: 800).x
-            var reversed = rig
-            rig.orbitAroundCenter(dx: 10, dy: 0)
-            reversed.orbitAroundCenter(dx: 10, dy: 0, reversesYaw: true)
-            let plain = rig.project(near, width: 1200, height: 800).x - before
-            let corrected = reversed.project(near, width: 1200, height: 800).x - before
-            if upsideDown {
-                XCTAssertLessThan(plain, 0)
-                XCTAssertGreaterThan(corrected, 0)
-            } else {
-                XCTAssertGreaterThan(plain, 0)
-            }
+            rig.elevation = elevation
+            rig.roll = .pi / 3
+            let axes = rig.orbitAxes
+            let near = rig.orbitCenter + rig.backward * (rig.radius * 0.5)
+            let before = rig.project(near, width: 1200, height: 800)
+            rig.orbitAroundCenter(dx: 10, dy: 0, axes: axes)
+            let after = rig.project(near, width: 1200, height: 800)
+            XCTAssertGreaterThan(after.x, before.x)
+            XCTAssertEqual(after.y, before.y, accuracy: 1e-9)
+            XCTAssertEqual(simd_distance(rig.up, axes.up), 0, accuracy: 1e-12)
+            rig.orbitAroundCenter(dx: -10, dy: 0, axes: axes)
+            XCTAssertEqual(simd_distance(rig.right, axes.right), 0, accuracy: 1e-12)
+            XCTAssertEqual(simd_distance(rig.up, axes.up), 0, accuracy: 1e-12)
         }
     }
 }

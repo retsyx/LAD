@@ -1,7 +1,7 @@
 import Foundation
 import simd
 
-/// Z-up orbit camera. All CAD-space arithmetic stays in Double precision.
+/// Orbit camera in the Z-up CAD coordinate system. All arithmetic stays in Double precision.
 struct CameraRig {
     var target = SIMD3<Double>(0, 0, 0)
     /// Fixed model-space pivot, independent of cursor zoom and view panning.
@@ -10,17 +10,27 @@ struct CameraRig {
     var radius: Double = 50
     var yaw: Double = -.pi / 4
     var elevation: Double = 0.6154797087
+    /// Positive roll turns the image counterclockwise.
+    var roll: Double = 0
     var usesOrthographicProjection = false
     let fieldOfView: Double = 38
 
     var backward: SIMD3<Double> {
         SIMD3(cos(elevation) * cos(yaw), cos(elevation) * sin(yaw), sin(elevation))
     }
-    var right: SIMD3<Double> { SIMD3(-sin(yaw), cos(yaw), 0) }
-    /// Remains well defined at and beyond the poles, where world up points
-    /// down on screen.
-    var up: SIMD3<Double> { simd_cross(backward, right) }
-    var isUpsideDown: Bool { cos(elevation) < 0 }
+    struct OrbitAxes {
+        let right: SIMD3<Double>
+        let up: SIMD3<Double>
+    }
+
+    var orbitAxes: OrbitAxes {
+        let levelRight = SIMD3(-sin(yaw), cos(yaw), 0)
+        let levelUp = simd_cross(backward, levelRight)
+        return OrbitAxes(right: levelRight * cos(roll) - levelUp * sin(roll),
+                         up: levelRight * sin(roll) + levelUp * cos(roll))
+    }
+    var right: SIMD3<Double> { orbitAxes.right }
+    var up: SIMD3<Double> { orbitAxes.up }
     var position: SIMD3<Double> { target + backward * distance }
     var tangent: Double { tan(fieldOfView * .pi / 360) }
     /// Half the visible vertical extent, matching perspective at the target.
@@ -77,17 +87,33 @@ struct CameraRig {
         target += right * (-dx * units) + up * (dy * units)
     }
 
-    /// Rotate the entire camera pose about the center of the model's bounds, even
-    /// after panning or cursor zoom has moved the view target away from it.
-    /// Elevation continues over the poles without limit. A gesture that began
-    /// upside down reverses yaw so the near surface still follows the cursor.
-    mutating func orbitAroundCenter(dx: Double, dy: Double, reversesYaw: Bool = false) {
-        let yawDelta = (reversesYaw ? dx : -dx) * 0.008
-        let elevationDelta = dy * 0.008
-        target = orbitCenter + simd_quatd(angle: yawDelta, axis: SIMD3<Double>(0, 0, 1)).act(target - orbitCenter)
-        yaw = Self.wrappedAngle(yaw + yawDelta)
-        target = orbitCenter + simd_quatd(angle: -elevationDelta, axis: right).act(target - orbitCenter)
-        elevation = Self.wrappedAngle(elevation + elevationDelta)
+    /// Rotate the entire pose about the design center using the screen axes at mouse-down.
+    mutating func orbitAroundCenter(dx: Double, dy: Double, axes: OrbitAxes) {
+        let travel = hypot(dx, dy)
+        guard travel > 0, travel.isFinite else { return }
+        let axis = axes.up * (dx / travel) + axes.right * (dy / travel)
+        let rotation = simd_quatd(angle: -0.008 * travel, axis: axis)
+        let rotatedRight = rotation.act(right)
+        let rotatedBack = rotation.act(backward)
+        target = orbitCenter + rotation.act(target - orbitCenter)
+
+        let horizontal = hypot(rotatedBack.x, rotatedBack.y)
+        guard horizontal > 1e-12 else {
+            // At a pole the right vector alone determines the heading.
+            yaw = atan2(-rotatedRight.x, rotatedRight.y)
+            elevation = copysign(.pi / 2, rotatedBack.z)
+            roll = 0
+            return
+        }
+        // Either heading represents the same sightline. Use the one closer to
+        // screen right so crossing a pole continues into an inverted elevation.
+        var levelRight = SIMD3(-rotatedBack.y, rotatedBack.x, 0) / horizontal
+        let inverted = simd_dot(rotatedRight, levelRight) < 0
+        if inverted { levelRight = -levelRight }
+        yaw = atan2(-levelRight.x, levelRight.y)
+        elevation = atan2(rotatedBack.z, inverted ? -horizontal : horizontal)
+        let levelUp = simd_cross(rotatedBack, levelRight)
+        roll = atan2(-simd_dot(rotatedRight, levelUp), simd_dot(rotatedRight, levelRight))
     }
 
     /// The equivalent angle in [-π, π], keeping repeated turns bounded.
