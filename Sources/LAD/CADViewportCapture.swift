@@ -20,9 +20,6 @@ final class CADViewportCapture: @unchecked Sendable {
         frame = view.makeFrame(width: width, height: height)
     }
 
-    var width: Int { frame.width }
-    var height: Int { frame.height }
-
     /// Renders on the calling thread and waits for the GPU. Cancellation of
     /// the calling task stops preparation before any frame is encoded.
     func image() throws -> CGImage {

@@ -1,7 +1,6 @@
 """Reversible program snapshots: staged validity is separate from completion."""
 import ast
 import copy
-import hashlib
 import math
 from pathlib import Path
 import sys

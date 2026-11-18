@@ -212,7 +212,7 @@ def _base_comparison(directory,spec,context,revision):
     return base
 
 
-def _target(context,revision,directory,spec):
+def _target(revision,directory,spec):
     import cadquery as cq
     target=copy.deepcopy(revision)
     target["shape"]=None
@@ -296,7 +296,7 @@ def execute(spec,directory,output,threads=1,*,worker):
         revision=read_json(directory,spec["revisionAsset"]) if spec.get("revisionAsset") else {}
         if revision and (revision.get("context_ref")!=context["id"] or revision.get("source_hash")!=context["source_hash"]):
             raise ValueError("Revision belongs to another reference context")
-        target=_target(context,revision,directory,spec) if revision else None
+        target=_target(revision,directory,spec) if revision else None
         if operation=="mesh_inspect":
             evidence=read_json(directory,spec["evidenceAsset"]) if spec.get("evidenceAsset") else []
             records={item.get("id",item.get("evidence_id")):item for item in evidence}

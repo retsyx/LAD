@@ -415,11 +415,6 @@ final class CodexService {
         activeWorkspace = nil
     }
 
-    /// Model lookup and requests use the same automatically discovered choice.
-    nonisolated static var configuredExecutable: String {
-        CodexExecutable.configuredPath(override: UserDefaults.standard.string(forKey: CodexExecutable.preferenceKey))
-    }
-
     nonisolated static func findExecutable() -> String? {
         CodexExecutable.find()
     }

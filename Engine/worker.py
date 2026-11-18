@@ -3596,13 +3596,13 @@ def serve():
 BUILD_OPTIONS = {"threads", "deferStep", "validatedHash", "verifyLater"}
 
 
-def await_build(start, output):
+def await_build(start):
     """Load the CAD runtime, then wait for one build's options on `start`.
 
     The app starts a sandboxed worker before its next build is requested, so
     Python, CadQuery and NumPy are already imported when it is. The app stages
-    the request in `output` and writes the options to this private FIFO; the
-    worker still runs exactly one program. It exits once LAD does.
+    the request in the output directory and writes the options to this private
+    FIFO. The worker runs exactly one program and exits once LAD does.
     """
     import threading
     parent = os.getppid()
@@ -3644,7 +3644,7 @@ def main():
         return serve()
     if arguments.await_build is not None and arguments.output is not None:
         try:
-            options = await_build(arguments.await_build, arguments.output)
+            options = await_build(arguments.await_build)
         except Exception as error:
             try:
                 write_error_report(error, arguments.output)

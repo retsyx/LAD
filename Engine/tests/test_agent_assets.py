@@ -1,6 +1,5 @@
 """Native external-backend import and MCP transport regression checks."""
 import base64
-import importlib.util
 import json
 import math
 import os
@@ -16,7 +15,7 @@ import unittest
 ENGINE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ENGINE))
 from worker import ModelError, build_shape, import_input_asset, read_mesh, run, validate_spec, write_brep
-from agent_server import NativeBridge, read_regular, transport_result
+from agent_server import read_regular, transport_result
 
 
 def cube_obj(low=0, high=1, offset=0):

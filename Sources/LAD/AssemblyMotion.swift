@@ -337,7 +337,7 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
         let evaluated = graph.evaluate(joints: joints, positions: values)
         let world = evaluated.poses[coordinates.part]! * SIMD4(builtPoint, 1)
         guard projection.screen(SIMD3(world.x, world.y, world.z)) != nil else { return nil }
-        return AssemblyGrabContext(solidIndex: solidIndex, point: point, projection: projection,
+        return AssemblyGrabContext(point: point, projection: projection,
             motion: self, graph: graph, part: coordinates.part, coordinates: coordinates.indices,
             initialPositions: pose.positions)
     }
@@ -777,7 +777,6 @@ struct AssemblyMotion: Codable, Sendable, Equatable {
 
 /// Immutable per-gesture setup can safely cross to a detached solve task.
 struct AssemblyGrabContext: Sendable {
-    let solidIndex: Int
     let point: [Double]
     let projection: AssemblyGrabProjection
     fileprivate let motion: AssemblyMotion

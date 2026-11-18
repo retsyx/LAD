@@ -1,6 +1,5 @@
 """Comparison keeps edit feedback separate from whole reconstruction approval."""
 from pathlib import Path
-import copy
 import hashlib
 import math
 import sys

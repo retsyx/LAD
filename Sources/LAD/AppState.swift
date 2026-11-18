@@ -785,17 +785,6 @@ final class AppState {
             assemblyPose: assemblyPose)
     }
 
-    func editQueuedRequest(id: UUID, text: String) {
-        guard text.utf8.count <= 1_000_000 else {
-            error = "The request exceeds the design file's 1 MB message limit."; return
-        }
-        guard id != isSendingQueuedRequestID, let index = queuedRequests.firstIndex(where: { $0.id == id }),
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(queuedRequests[index].attachments ?? []).isEmpty else { return }
-        queuedRequests[index].content = text
-        prepareQueuedSources(for: id)
-        autosave()
-    }
-
     var canBeginEditingQueuedRequests: Bool { !isReadingDraftAttachments }
 
     var canCommitQueuedRequest: Bool {
@@ -876,11 +865,6 @@ final class AppState {
         refreshSteeringAvailability()
         autosave()
         drainQueueIfPossible()
-    }
-
-    func endEditingQueuedRequest(id: UUID) {
-        guard editingQueuedRequestID == id else { return }
-        cancelEditingQueuedRequest()
     }
 
     private func restoreQueuedRequestComposerDraft() {
@@ -2414,8 +2398,8 @@ final class AppState {
                    exportIndividualParts: options.exportIndividualParts, replaceExisting: true)
     }
 
-    func exportSelectedPartsSTEP(_ solidIndices: Set<Int>? = nil) {
-        let solids = (solidIndices ?? selectedPartSolids).intersection(Set(0..<currentSolidCount))
+    func exportSelectedPartsSTEP() {
+        let solids = selectedPartSolids.intersection(Set(0..<currentSolidCount))
         guard canExport, !solids.isEmpty else { return }
         let revisionID = selectedRevisionID, sessionID = projectSessionID
         let panel = NSSavePanel()

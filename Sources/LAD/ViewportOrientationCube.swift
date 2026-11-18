@@ -296,7 +296,6 @@ final class ViewportOrientationCube: NSView {
     var projectedFaces: [ViewportCubeProjection.Face] { currentProjection.faces }
     var projectedTargetCenters: [ViewportCubeTarget: NSPoint] { currentProjection.projectedTargetCenters }
 
-    func face(at point: NSPoint) -> ViewportCubeFace? { currentProjection.face(at: point) }
     func hitTarget(at point: NSPoint) -> ViewportCubeTarget? { currentProjection.hitTarget(at: point) }
 
     private var currentProjection: ViewportCubeProjection {

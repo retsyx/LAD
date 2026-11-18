@@ -7,7 +7,7 @@ import sys
 import unittest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from mesh_inspect import inspect,_analysis
+from mesh_inspect import inspect
 
 
 def context(vertices,triangles):

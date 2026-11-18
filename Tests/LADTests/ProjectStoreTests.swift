@@ -125,6 +125,8 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertTrue(try file.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true)
         XCTAssertEqual(try JSONSerialization.jsonObject(with: ProjectStore.readArchive(from: file)) as? [String: Any] != nil, true)
         let restored = try ProjectStore.read(from: file)
+        XCTAssertEqual(restored.revisions.map(\.id), original.revisions.map(\.id))
+        XCTAssertTrue(restored.revisions.allSatisfy { $0.preview == nil })
         var withoutGeometry = original
         withoutGeometry.revisions[0].preview = nil
         withoutGeometry.revisions[1].preview?.triangleSolids = nil

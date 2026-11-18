@@ -1,7 +1,6 @@
 import AppKit
 import ImageIO
 import Metal
-import SceneKit
 import UniformTypeIdentifiers
 
 /// Agent images use the same prepared geometry, camera convention, materials
@@ -67,11 +66,6 @@ enum CADAgentRenderer {
         surface.layout()
         try await waitForPreparation(surface)
         return try await snapshotWithMetadata(of: surface, width: width, height: height)
-    }
-
-    static func capture(view: CADSceneView, to url: URL) async throws -> URL {
-        let data = try await capturePNG(view: view)
-        return try await write(data, to: url)
     }
 
     static func capturePNG(view: CADSceneView) async throws -> Data {

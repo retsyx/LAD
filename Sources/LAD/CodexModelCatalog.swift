@@ -55,9 +55,6 @@ final class CodexModelCatalog: ObservableObject {
     @Published private(set) var configuredModelID: String?
     @Published private(set) var configuredReasoningEffort: String?
 
-    var configuredModel: String? { configuredModelID }
-    var executablePath: String? { loadedExecutable }
-
     func matches(executable: String) -> Bool {
         loadedExecutable == executable.trimmingCharacters(in: .whitespacesAndNewlines)
     }

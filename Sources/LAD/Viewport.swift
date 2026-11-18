@@ -3,22 +3,12 @@ import SceneKit
 import SwiftUI
 import simd
 
-enum ViewportProjectionMode: String, Codable, Sendable, CaseIterable, Identifiable {
+enum ViewportProjectionMode: String, Codable, Sendable, CaseIterable {
     case perspective, isometric
-    var id: String { rawValue }
 }
 
-enum ViewportDisplayMode: String, Codable, Sendable, CaseIterable, Identifiable {
+enum ViewportDisplayMode: String, Codable, Sendable, CaseIterable {
     case shaded, edges, translucent, wireframe
-    var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .shaded: return "Shaded"
-        case .edges: return "Shaded + edges"
-        case .translucent: return "Translucent"
-        case .wireframe: return "Wireframe"
-        }
-    }
 }
 
 struct ViewportCommand: Equatable {

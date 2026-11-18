@@ -50,7 +50,7 @@ def _circle(points):
     return origin, radius, float(np.abs(np.linalg.norm(points-origin, axis=1)-radius).max())
 
 
-def _axes(points, normals, areas, edges=None):
+def _axes(points, normals, areas):
     candidates = []
     # Cap/large planar normals are stronger evidence than density-biased PCA.
     bins = {}
@@ -62,25 +62,6 @@ def _axes(points, normals, areas, edges=None):
         old = bins.get(key, (0, direction))
         bins[key] = (old[0] + area, direction)
     candidates.extend(direction for _, direction in sorted(bins.values(), key=lambda item: -item[0])[:9])
-    if edges:
-        curved_bins = {}
-        for uses in edges.values():
-            if len(uses) != 2:
-                continue
-            first,second = uses[0][0],uses[1][0]
-            product = float(normals[first]@normals[second])
-            if not .85 < product < 1-1e-9:
-                continue
-            cross = np.cross(normals[first],normals[second])
-            length = np.linalg.norm(cross)
-            if length < 1e-8:
-                continue
-            direction = _canonical_direction(cross)
-            key = tuple(np.round(direction,3))
-            weight = min(float(areas[first]),float(areas[second]))
-            previous = curved_bins.get(key,(0,direction))
-            curved_bins[key] = (previous[0]+weight,direction)
-        candidates.extend(direction for _,direction in sorted(curved_bins.values(),key=lambda item:-item[0])[:6])
     if len(points) > 3:
         sample = points[::max(1, len(points) // 4000)]
         _, vectors = np.linalg.eigh(np.cov((sample - sample.mean(axis=0)).T))
@@ -698,7 +679,7 @@ def rounded_extrusion_evidence(points,triangles,regions,scale):
                     if np.any(center_world<local.min(axis=0)-scale*.01) or np.any(center_world>local.max(axis=0)+scale*.01):continue
                     fit=_rounded_rectangle(loop,scale)
                     if fit is not None:found.append((level,fit))
-            for index,(level,fit) in enumerate(found):
+            for level,fit in found:
                 matches=[(z,other) for z,other in found if abs(z-level)>scale*1e-4 and np.linalg.norm(np.asarray(other["center"])-fit["center"])<scale*5e-5
                          and np.max(np.abs(np.asarray([other["width"],other["height"],other["corner_radius"]])-[fit["width"],fit["height"],fit["corner_radius"]]))<scale*5e-5]
                 if not matches:continue

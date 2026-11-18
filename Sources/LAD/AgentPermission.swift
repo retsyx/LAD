@@ -103,7 +103,7 @@ final class AgentPermissionController: ObservableObject {
         let result = try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<AgentPermissionDecision, Error>) in
-                let request = Request(id: id, operation: operation, reason: reason, consequence: consequence, window: window,
+                let request = Request(operation: operation, reason: reason, consequence: consequence, window: window,
                                       continuation: continuation, cancellation: cancellation)
                 pending[id] = request
                 queue.append(id)
@@ -206,7 +206,6 @@ final class AgentPermissionController: ObservableObject {
 
     @MainActor
     private final class Request {
-        let id: UUID
         let prompt: AgentPermissionPrompt
         let hadOwner: Bool
         let ownerID: ObjectIdentifier?
@@ -214,9 +213,8 @@ final class AgentPermissionController: ObservableObject {
         let cancellation: AgentPermissionCancellation
         var closeObserver: NSObjectProtocol?
 
-        init(id: UUID, operation: String, reason: String, consequence: String?, window: NSWindow?,
+        init(operation: String, reason: String, consequence: String?, window: NSWindow?,
              continuation: CheckedContinuation<AgentPermissionDecision, Error>, cancellation: AgentPermissionCancellation) {
-            self.id = id
             prompt = AgentPermissionPrompt(operation: operation, reason: reason, consequence: consequence, window: window)
             hadOwner = window != nil
             ownerID = window.map(ObjectIdentifier.init)

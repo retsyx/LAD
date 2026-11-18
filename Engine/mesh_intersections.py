@@ -14,7 +14,6 @@ size alone never makes a geometrically well-behaved mesh unauditable.
 from __future__ import annotations
 
 from fractions import Fraction
-import math
 
 import numpy as np
 

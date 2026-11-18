@@ -11,7 +11,6 @@ import XCTest
 struct ViewportPassShot {
     let image: NSBitmapImageRep
     let renderer: SCNRenderer
-    let frame: CADViewportFrame
 
     /// Pixel color at a world point projected by the renderer that drew it.
     func color(at point: SCNVector3) throws -> NSColor {
@@ -73,11 +72,6 @@ enum ViewportPassTestRenderer {
         if frame.hasHighlights { frame.highlightBounds = .full }
         let renderer = SCNRenderer(device: device, options: nil)
         let image = try CADViewportCapture.image(of: frame, source: source, renderer: renderer, passes: passes)
-        return ViewportPassShot(image: NSBitmapImageRep(cgImage: image), renderer: renderer, frame: frame)
-    }
-
-    /// The current state of a viewport, rendered offscreen at an output size.
-    static func capture(_ view: CADSceneView, width: Int, height: Int) throws -> NSBitmapImageRep {
-        NSBitmapImageRep(cgImage: try CADViewportCapture(view: view, width: width, height: height).image())
+        return ViewportPassShot(image: NSBitmapImageRep(cgImage: image), renderer: renderer)
     }
 }

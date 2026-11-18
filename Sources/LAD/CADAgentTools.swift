@@ -506,7 +506,7 @@ final class CADAgentTools {
             let kind = try string("kind", arguments) ?? "summary"
             if kind == "summary" { return try result(summary(artifact)) }
             guard let topology = preview.topology else { throw LADError.message("The design has no native topology metadata.") }
-            let solids = try indices(arguments, preview: preview, optional: true)
+            let solids = try indices(arguments, preview: preview)
             let offset = try integer("offset", arguments, fallback: 0, range: 0...1_000_000)
             let limit = try integer("limit", arguments, fallback: 100, range: 1...500)
             var pageTopology = CADTopology(vertices: [], edges: [], faces: [], parts: [])
@@ -563,7 +563,7 @@ final class CADAgentTools {
             let raw = arguments["features"] ?? []
             let features = try JSONDecoder().decode([CADFeatureID].self, from: JSONSerialization.data(withJSONObject: raw))
             guard features.count <= 256 else { throw LADError.message("Measure at most 256 features at once.") }
-            let report = try await engine.measure(preview, features: features, solids: try indices(arguments, preview: preview, optional: true, allowEmpty: true) ?? [],
+            let report = try await engine.measure(preview, features: features, solids: try indices(arguments, preview: preview, allowEmpty: true) ?? [],
                                                   python: python, threads: threads)
             return try result(json(report))
         case "lad_validate":
@@ -631,7 +631,7 @@ final class CADAgentTools {
                 preview.assemblyPose = try await withTaskCancellationHandler(operation: { try await solving.value }, onCancel: { solving.cancel() })
                 try checkCancellation()
             }
-            let selected = try indices(arguments, preview: preview, optional: true)
+            let selected = try indices(arguments, preview: preview)
             let hidden = selected.map { Set(0..<preview.solids).subtracting($0) } ?? []
             let captured = try await CADAgentRenderer.renderWithMetadata(preview: preview, view: view, projection: projection,
                 display: display, hiddenSolids: hidden, solidColors: renderColors(for: artifact), width: width, height: height, camera: camera)
@@ -774,7 +774,7 @@ final class CADAgentTools {
             let previous = artifacts[requestedID]
             let artifact = try await artifact(arguments)
             let preview = artifact.preview!
-            var indices = try indices(arguments, preview: preview, optional: true)
+            var indices = try indices(arguments, preview: preview)
             if let requested = indices, let previous, previous.preview == nil, !previous.parts.isEmpty {
                 indices = try Self.remappedExportIndices(requested, from: previous.parts, to: artifact.parts)
             }
@@ -1167,8 +1167,8 @@ final class CADAgentTools {
         }
         return result
     }
-    private func indices(_ values: [String: Any], preview: PreviewMesh, optional: Bool, allowEmpty: Bool = false) throws -> Set<Int>? {
-        guard let raw = values["solidIndices"] else { return optional ? nil : [] }
+    private func indices(_ values: [String: Any], preview: PreviewMesh, allowEmpty: Bool = false) throws -> Set<Int>? {
+        guard let raw = values["solidIndices"] else { return nil }
         guard let numbers = raw as? [NSNumber], (allowEmpty || !numbers.isEmpty), numbers.count <= preview.solids else {
             throw LADError.message("Choose at least one available solid index.")
         }

@@ -126,7 +126,7 @@ def _source_samples(source,ids,budget):
             tid=max(candidates,key=lambda t:source.areas[t]);rows.append({"triangle_id":tid,"barycentric":[1/3]*3,"position":source.centroids[tid].tolist(),"stratum":"component_guard","area_weight":0.})
     for tid in ids[source.areas[ids]==0][:budget//8]:
         for bary in ([1,0,0],[0,1,0],[0,0,1]):rows.append({"triangle_id":int(tid),"barycentric":bary,"position":(np.asarray(bary)@source.faces[tid]).tolist(),"stratum":"lower_dimensional","area_weight":0.})
-    for index,row in enumerate(rows):row["id"]="mesh-sample-"+canonical_digest([source.digest,row["triangle_id"],row["barycentric"],row["stratum"]])[:20]
+    for row in rows:row["id"]="mesh-sample-"+canonical_digest([source.digest,row["triangle_id"],row["barycentric"],row["stratum"]])[:20]
     return rows
 
 
@@ -515,7 +515,7 @@ def _protected_checks(source,shape,context):
         "method":"source endpoints, oriented incident normals and one-to-one sharp-chain correspondence"}
 
 
-def _representation(context,target,shape):
+def _representation(context,target):
     record=target.get("representation",{})
     if record.get("status") in {"faceted","triangle_wrapping","rejected"}:return {"kind":"reconstructed_representation","status":"fail","reason":"Faceted source wrapping is not a reconstructed CAD deliverable"}
     if record.get("source_hash") not in (None,context["source_hash"]):return {"kind":"reconstructed_representation","status":"inconclusive","reason":"Representation provenance belongs to a different source"}
@@ -552,7 +552,7 @@ def _requirements(context,target,key):
     return result
 
 
-def _circular_strip_check(context,source,shape):
+def _circular_strip_check(source,shape):
     """Do not approve replayed circular tessellation strips as compact CAD.
 
     Co-circular source contours do not prove original intent. A polygonal result
@@ -606,8 +606,8 @@ def _circular_strip_check(context,source,shape):
     return {"kind":"circular_tessellation_replay","status":"inconclusive" if supports else "pass","suspect_supports":supports,"reason":"Co-circular source rims are replayed as many planar axial strips; independent polygonal-feature intent is required" if supports else None,"method":"source rim incidence/circle evidence plus actual exposed planar strip geometry; face count alone is not used"}
 
 
-def _representation_strict(context,target,shape):
-    result=_representation(context,target,shape)
+def _representation_strict(context,target):
+    result=_representation(context,target)
     if target.get("representation",{}).get("method")=="authored_program" and result["status"]=="pass":
         import ast
         tree=ast.parse(target.get("script",""))
@@ -679,7 +679,7 @@ def compare(context,target,scope="all",quality="preview"):
                 "triangle_ids":sorted({r["triangle_id"] for r in rows}),
                 "minimum_distance":min(r["distance"] for r in rows),
                 "maximum_distance":max(r["distance"] for r in rows),"complete":False,"guarantee":"sampled"})
-    validity=_native_checks(shape,False);representation=_representation_strict(context,target,shape) if faces else {"kind":"reconstructed_representation","status":"not_evaluated","reason":"No current CAD boundary"}
+    validity=_native_checks(shape,False);representation=_representation_strict(context,target) if faces else {"kind":"reconstructed_representation","status":"not_evaluated","reason":"No current CAD boundary"}
     completion=check_requirements(context,target,_requirements(context,target,"completion_obligations"));invariants=check_requirements(context,target,_requirements(context,target,"active_invariants"));constraints=check_requirements(context,target,_requirements(context,target,"constraints"))
     feature_checks={"completion_obligations":completion,"active_invariants":invariants,"constraints":constraints,"observed_features":{"status":"not_evaluated","reason":"Protected source topology is a final-only computation"}}
     material={"available":False,"assumptions":policy.get("reference_interpretation",{"material":"unknown"}),"estimates_or_bounds":None,"ambiguous_regions":[],"reason":"Unsigned surface distances are supplied; signed material differences are not computed"}
@@ -711,13 +711,13 @@ def compare(context,target,scope="all",quality="preview"):
             "algorithm_versions":{"compare":"iterative-compare-1","bounds":"adaptive-outward-native-surfaces-1"},
             "reference_samples":source_coverage["sampling_fingerprint"]}}
     if quality=="final" and whole:
-        _final(context,target,shape,source,report)
+        _final(context,shape,source,report)
     elif quality=="final":report["limitations"].append("A local comparison cannot approve whole-reconstruction acceptance")
     report["comparison_id"]="comparison-"+canonical_digest({k:v for k,v in report.items() if k!="comparison_id"})[:24]
     return report
 
 
-def _final(context,target,shape,source,report):
+def _final(context,shape,source,report):
     policy=context.get("policy",{});checks=[]
     settings=_settings(context)
     body=audit_body(shape,face_budget=int(settings.get("native_si_face_budget",2048)))
@@ -739,7 +739,7 @@ def _final(context,target,shape,source,report):
         checks.append({"kind":"interpreted_source_topology","status":"pass" if expected==observed and count==audit["component_count"] else "fail","source_euler_characteristics":expected,"cad_euler_characteristics":observed,"expected_body_count":audit["component_count"],"actual_body_count":count})
         report["feature_checks"]["observed_features"]=_protected_checks(feature_source,shape,context);checks.append(report["feature_checks"]["observed_features"])
     report["validity_checks"].extend(checks)
-    circular=_circular_strip_check(context,feature_source,shape);report["representation_checks"].append(circular)
+    circular=_circular_strip_check(feature_source,shape);report["representation_checks"].append(circular)
     all_checks=list(report["validity_checks"])+report["representation_checks"]
     for key in ("completion_obligations","active_invariants","constraints"):all_checks.extend(c for c in report["feature_checks"][key] if c.get("mandatory",True))
     if any(c["status"]=="fail" for c in all_checks):report["acceptance"]="fail";return

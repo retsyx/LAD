@@ -22,7 +22,6 @@ records this scope, including closure of UV endpoint roundoff-sized gaps.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
 import heapq
 import math

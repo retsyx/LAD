@@ -344,7 +344,9 @@ final class AppStateRequestQueueTests: XCTestCase {
         let replacement = fixture.directory.appendingPathComponent("replacement.py")
         let content = "result = cq.Workplane('XY').box(2, 3, 4)\n"
         try Data(content.utf8).write(to: replacement)
-        state.editQueuedRequest(id: id, text: "Use \"\(replacement.path)\" instead")
+        state.beginEditingQueuedRequest(id: id)
+        state.prompt = "Use \"\(replacement.path)\" instead"
+        XCTAssertTrue(state.commitEditingQueuedRequest())
         try await waitForSources(state)
         XCTAssertEqual(state.queuedRequests.first?.id, id)
         XCTAssertEqual(state.queuedRequests.first?.attachments?.first?.content, content)

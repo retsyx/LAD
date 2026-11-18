@@ -359,12 +359,6 @@ final class PromptImageAttachmentTests: XCTestCase {
     }
 
     @MainActor
-    private func snapshot(_ view: NSView, to path: String) throws {
-        let bitmap = try bitmap(view)
-        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: URL(fileURLWithPath: path))
-    }
-
-    @MainActor
     private func bitmap(_ view: NSView) throws -> NSBitmapImageRep {
         view.layoutSubtreeIfNeeded()
         view.displayIfNeeded()

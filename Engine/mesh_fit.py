@@ -360,7 +360,7 @@ def _generated_candidate(family,evidence,tolerance,context=None,data=None):
     return None
 
 
-def _binding(constraint,members,evidence_ids):
+def _binding(constraint,members):
     ref=constraint.get("member",constraint.get("target",constraint.get("evidence_ref")))
     if ref is None and len(members)==1:return members[0]["id"]
     matches=[member["id"] for member in members if ref in (member["id"],member.get("role"),member.get("evidence_id"))]
@@ -368,13 +368,13 @@ def _binding(constraint,members,evidence_ids):
     return matches[0]
 
 
-def _compile_constraints(constraints,members,resolve_reference):
+def _compile_constraints(constraints,members):
     result=[];byid={m["id"]:m for m in members}
     for raw in constraints:
         if not isinstance(raw,dict) or raw.get("strength","hard") not in ("hard","soft"):raise EvidenceError("INVALID_CONSTRAINT","Constraint records require hard or soft strength")
         item=copy.deepcopy(raw);kind=item.get("kind")
         if kind=="fixed":
-            identity=_binding(item,members,[]);parameter=item.get("parameter");geometry=byid[identity]["geometry"]
+            identity=_binding(item,members);parameter=item.get("parameter");geometry=byid[identity]["geometry"]
             if parameter not in geometry or parameter=="kind":raise EvidenceError("INVALID_CONSTRAINT","Fixed parameter is not available on the selected family")
             value=item.get("value");array=np.asarray(value,float)
             if not np.isfinite(array).all() or array.shape!=np.asarray(geometry[parameter]).shape:raise EvidenceError("INVALID_CONSTRAINT","Fixed value has invalid dimensions or nonfinite coordinates")
@@ -387,7 +387,7 @@ def _compile_constraints(constraints,members,resolve_reference):
         elif kind in ("coaxial","parallel","perpendicular","equal_radius","concentric"):
             refs=item.get("members",item.get("evidence_refs",item.get("entities")))
             if not isinstance(refs,list) or len(refs)!=2:raise EvidenceError("INVALID_CONSTRAINT","A shared relationship requires two explicit member/evidence references")
-            item["members"]=[_binding({"target":ref},members,[]) for ref in refs]
+            item["members"]=[_binding({"target":ref},members) for ref in refs]
             if len(set(item["members"]))!=2:raise EvidenceError("INVALID_CONSTRAINT","A relationship needs distinct members")
             a,b=[byid[identity]["geometry"] for identity in item["members"]]
             if kind=="coaxial" and not all("axis" in g and "origin" in g for g in (a,b)):raise EvidenceError("INCOMPATIBLE_FAMILY","Coaxiality requires two axis-bearing surface members")
@@ -527,7 +527,7 @@ def _recognized_candidates(context,records,requested,constraints,limit,tolerance
             # Do not move a specialized fit under a constraint without a new
             # source-residual implementation. Exact existing fixed values are
             # useful and can be checked independently without changing it.
-            compiled=_compile_constraints(constraints,members,None)
+            compiled=_compile_constraints(constraints,members)
             if any(c["kind"]!="fixed" for c in compiled):
                 diagnostics.append(diagnostic("UNSUPPORTED_RECOGNITION_CONSTRAINT","Regional recognition alternatives currently support checking existing fixed values only; use a targeted primitive fit for relational refinement"));continue
             hard,soft=_constraint_reports(members,compiled,_analysis(context)["scale"])
@@ -552,7 +552,7 @@ def _recognized_candidates(context,records,requested,constraints,limit,tolerance
     return {"status":"partial" if diagnostics or any(c["unresolved_evidence"] for c in candidates) else "ok","payload":candidates[:limit],"diagnostics":diagnostics,"provenance":provenance}
 
 
-def fit(context,evidence_records,families="auto",constraints=(),resolve_reference=None):
+def fit(context,evidence_records,families="auto",constraints=()):
     provenance={"context_ref":context.get("id") if isinstance(context,dict) else None,"source_hash":context.get("source_hash") if isinstance(context,dict) else None,
                 "dependency_revisions":[],"parameters":{"families":families,"constraints":constraints},"algorithm_versions":{"fit":VERSION},"seed":context.get("seed",0) if isinstance(context,dict) else 0}
     try:
@@ -624,7 +624,7 @@ def fit(context,evidence_records,families="auto",constraints=(),resolve_referenc
         if combination_count>64:diagnostics.append(diagnostic("BUDGET_EXHAUSTED",f"Joint search evaluates 64 of {combination_count} family combinations; unattempted alternatives remain unknown"))
         for chosen in itertools.islice(itertools.product(*options),64):
             members=copy.deepcopy(list(chosen))
-            try:compiled=_compile_constraints(constraints,members,resolve_reference)
+            try:compiled=_compile_constraints(constraints,members)
             except EvidenceError as error:
                 if error.code=="INCOMPATIBLE_FAMILY":continue
                 raise

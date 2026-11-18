@@ -7,11 +7,8 @@ enum CADSilhouetteBatching {
     struct Bounds: Sendable {
         var low = SIMD3<Double>(repeating: .infinity)
         var high = SIMD3<Double>(repeating: -.infinity)
-        mutating func include(_ point: [Double]) {
-            include(SIMD3(point[0], point[1], point[2]))
-        }
-        mutating func include(_ point: SIMD3<Float>) { include(SIMD3<Double>(point)) }
-        mutating func include(_ value: SIMD3<Double>) {
+        mutating func include(_ point: SIMD3<Float>) {
+            let value = SIMD3<Double>(point)
             low = simd_min(low, value); high = simd_max(high, value)
         }
         var values: [Double] { [low.x, low.y, low.z, high.x, high.y, high.z] }
@@ -21,7 +18,6 @@ enum CADSilhouetteBatching {
         var high: SIMD2<Double>
 
         static let full = Rect(low: SIMD2(repeating: -1), high: SIMD2(repeating: 1))
-        var vector: SIMD4<Float> { SIMD4(Float(low.x), Float(low.y), Float(high.x), Float(high.y)) }
         func overlaps(_ other: Rect) -> Bool {
             low.x <= other.high.x && high.x >= other.low.x && low.y <= other.high.y && high.y >= other.low.y
         }

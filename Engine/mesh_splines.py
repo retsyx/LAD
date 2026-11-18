@@ -22,10 +22,6 @@ def _union(values):
                  for i in range(len(values[0])))
 
 
-def _zero(dimension):
-    return tuple(_I(0) for _ in range(dimension))
-
-
 def _finite_control(value):
     if not math.isfinite(value.lo) or not math.isfinite(value.hi):
         raise _Unsupported('B-spline homogeneous coefficient exceeds arithmetic range')

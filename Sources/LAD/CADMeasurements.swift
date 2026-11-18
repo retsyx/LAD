@@ -13,7 +13,6 @@ struct CADFeatureID: Codable, Hashable, Sendable, Identifiable {
     var solidIndex: Int
     var localIndex: Int
     var id: String { "\(kind.rawValue):\(solidIndex):\(localIndex)" }
-    var title: String { "\(kind.title) \(localIndex + 1)" }
 }
 
 struct CADVertex: Codable, Sendable {

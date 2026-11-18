@@ -302,8 +302,4 @@ enum ResourcePaths {
         if FileManager.default.fileExists(atPath: packaged.appendingPathComponent("Engine/worker.py").path) { return packaged }
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     }
-
-    static func resource(_ name: String) -> URL? {
-        Bundle.module.url(forResource: name, withExtension: nil, subdirectory: "Resources")
-    }
 }
