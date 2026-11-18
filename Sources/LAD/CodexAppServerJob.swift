@@ -551,7 +551,8 @@ final class CodexAppServerJob: @unchecked Sendable {
         } else if status == "interrupted" { ending = .interrupted }
         else {
             let error = turn["error"] as? [String: Any]
-            ending = .failed(error?["message"] as? String ?? "The task could not complete the design.")
+            let detail = error.flatMap(CodexAppServerClient.modelUnavailableMessage) ?? error?["message"] as? String
+            ending = .failed(detail ?? "The task could not complete the design.")
         }
         lock.lock()
         if terminal == nil { terminal = ending; completedAt = Date(); turnID = nil }

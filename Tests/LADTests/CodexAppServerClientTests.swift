@@ -3,6 +3,16 @@ import XCTest
 @testable import LAD
 
 final class CodexAppServerClientTests: XCTestCase {
+    func testModelRejectionInRPCResponsesPreservesTheProviderReason() {
+        let providerError = ["code": "model_not_found", "message": "This model is unavailable for your account."]
+        let expected = "This model is unavailable for your account. Choose another model in the chat composer and send your request again."
+        XCTAssertEqual(CodexAppServerClient.errorMessage(providerError), expected)
+        XCTAssertEqual(CodexAppServerClient.errorMessage(["code": -32602, "message": "Invalid request",
+                                                          "data": ["error": providerError]]), expected)
+        let unrelated = #"{"error":{"code":"bad_request","message":"Check model_not_found handling."}}"#
+        XCTAssertEqual(CodexAppServerClient.errorMessage(["message": unrelated]), unrelated)
+    }
+
     func testPackagedReleaseVersionIsUsedForCodexAttribution() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-client-version-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }

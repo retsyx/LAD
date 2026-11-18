@@ -29,10 +29,11 @@ enum CodexExecutable {
         ])
     }
 
-    /// Stable selection order: app launchers, standalone CLI, editor extension.
-    /// Keep these installation layouts explicit so fallback changes are tested.
+    /// Prefer the independently installed CLI. A desktop app can ship an older
+    /// Codex that cannot run the model selected in the user's Codex configuration.
     static func find(applicationBundles: [URL], searchDirectories: [URL],
                      extensionDirectories: [URL]) -> String? {
+        if let binary = executable(named: "codex", in: searchDirectories) { return binary.path }
         let entries = ["Contents/Resources/codex-cli/bin/codex",
                        "Contents/Resources/codex",
                        "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"]
@@ -42,7 +43,6 @@ enum CodexExecutable {
                 if isExecutableFile(binary) { return binary.path }
             }
         }
-        if let binary = executable(named: "codex", in: searchDirectories) { return binary.path }
         for directory in extensionDirectories {
             let extensions = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
             for item in extensions.filter({ $0.lastPathComponent.hasPrefix("openai.chatgpt-") })

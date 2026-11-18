@@ -80,12 +80,21 @@ final class CodexExecutableDiscoveryTests: XCTestCase {
         XCTAssertEqual(fixture.discover(), expected.path)
     }
 
-    func testAppLauncherTakesPriorityOverPATHAndEditorExtension() throws {
+    func testStandaloneCLIPrecedesDesktopAppsAndEditorExtension() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let standalone = try fixture.executable("bin/codex")
+        _ = try fixture.executable("Applications/Codex.app/Contents/Resources/codex")
+        _ = try fixture.executable("Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
+        _ = try fixture.executable("extensions/openai.chatgpt-99.0.0/bin/macos-aarch64/codex")
+        XCTAssertEqual(fixture.discover(), standalone.path)
+    }
+
+    func testAppLauncherPrecedesNestedBinaryAndEditorExtension() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
         let launcher = try fixture.executable("Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
         _ = try fixture.executable("Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
-        _ = try fixture.executable("bin/codex")
         _ = try fixture.executable("extensions/openai.chatgpt-99.0.0/bin/macos-aarch64/codex")
         XCTAssertEqual(fixture.discover(), launcher.path)
     }
@@ -94,7 +103,6 @@ final class CodexExecutableDiscoveryTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.remove() }
         let expected = try fixture.executable("UserApplications/Codex.app/Contents/Resources/codex")
-        _ = try fixture.executable("bin/codex")
         XCTAssertEqual(fixture.discover(), expected.path)
     }
 
@@ -102,7 +110,6 @@ final class CodexExecutableDiscoveryTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.remove() }
         let expected = try fixture.executable("Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
-        _ = try fixture.executable("bin/codex")
         XCTAssertEqual(fixture.discover(), expected.path)
     }
 

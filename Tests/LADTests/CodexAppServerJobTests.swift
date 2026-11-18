@@ -6,6 +6,28 @@ import XCTest
 @testable import LAD
 
 final class CodexAppServerJobTests: XCTestCase {
+    func testModelRejectionExplainsHowToRetryAndPreservesProviderDiagnostic() async throws {
+        let fixture = try AppServerFixture(onTurn: """
+        provider = {'type': 'invalid_request_error', 'code': 'model_not_found',
+                    'message': "The 'gpt-6.2-astra' model is not supported when using Codex with a ChatGPT account."}
+        error = {'message': json.dumps({'type': 'error', 'status': 400, 'error': provider})}
+        note('error', {'error': error, 'willRetry': False})
+        note('turn/completed', {'turn': {'id': 'turn-1', 'status': 'failed', 'error': error}})
+        """)
+        defer { fixture.remove() }
+        let capture = AppServerCapture()
+        do {
+            _ = try await fixture.job(capture: capture).run(input: Data("initial request".utf8))
+            XCTFail("The rejected turn must fail")
+        } catch {
+            XCTAssertEqual(error.localizedDescription,
+                "The 'gpt-6.2-astra' model is not supported when using Codex with a ChatGPT account. Choose another model in the chat composer and send your request again.")
+        }
+        let diagnostic = try XCTUnwrap(capture.events.first { $0.title == "Task error" })
+        XCTAssertTrue(diagnostic.output?.contains("model_not_found") == true)
+        XCTAssertEqual(try fixture.requests().filter { $0["method"] as? String == "turn/start" }.count, 1)
+    }
+
     func testUnsupportedProtocolOperationsExplainHowToRepairCodex() async throws {
         for (method, code) in [("initialize", -32601), ("thread/start", -32602), ("turn/start", -32602)] {
             let fixture = try AppServerFixture(onTurn: "finish({'unexpected': True})", rejectMethod: method, rejectionCode: code)
