@@ -7,9 +7,11 @@ import XCTest
 final class ViewportStrokeTests: XCTestCase {
     @MainActor
     func testDetachedStrokePreparationPreservesSurfaceChannelsAfterSkippedSegments() async throws {
-        let segments: [[Double]] = [[0, 0, 0, 0, 0, 0], [1, 2, 3, 4, 6, 3]]
+        let segments: [[Double]] = [[0, 0, 0, 0, 0, 0], [1, 2, 3, 4, 6, 3],
+                                    [4, 6, 3, 5, 6, 3], [5, 6, 3, 7, 6, 3]]
         let surfaces = [CADStrokeSurface(first: SIMD3(1, 0, 0)),
-                        CADStrokeSurface(first: SIMD3(0, 0, 4), second: SIMD3(0, -2, 0))]
+                        CADStrokeSurface(first: SIMD3(0, 0, 4), second: SIMD3(0, -2, 0)),
+                        CADStrokeSurface(first: SIMD3(0, 0, 1))]
         let prepared = try await Task.detached {
             try CADStrokeGeometry.prepare(segments, surfaces: surfaces)
         }.value
@@ -17,19 +19,22 @@ final class ViewportStrokeTests: XCTestCase {
         let positions = try XCTUnwrap(geometry.sources(for: .vertex).first)
         let directions = try XCTUnwrap(geometry.sources(for: .normal).first)
         let channels = geometry.sources(for: .texcoord)
-        XCTAssertEqual(positions.vectorCount, 4)
+        XCTAssertEqual(positions.vectorCount, 6 + 4 + 4)
         XCTAssertEqual(channels.count, 4)
         XCTAssertEqual(try value(positions, vector: 0, component: 0), 1)
         XCTAssertEqual(try value(positions, vector: 3, component: 1), 6)
         XCTAssertEqual(try value(directions, vector: 0, component: 0), 0.6, accuracy: 1e-6)
         XCTAssertEqual(try value(directions, vector: 0, component: 1), 0.8, accuracy: 1e-6)
-        XCTAssertEqual(try value(channels[0], vector: 0, component: 1), -1)
-        XCTAssertEqual(try value(channels[0], vector: 3, component: 1), 1)
+        XCTAssertEqual(try (0..<6).map { try value(channels[0], vector: $0, component: 0) }, [-1, 0, 1, -1, 0, 1])
+        XCTAssertEqual(try (0..<6).map { try value(channels[0], vector: $0, component: 1) }, [-1, -1, -1, 1, 1, 1])
+        XCTAssertEqual(try (6..<14).map { try value(channels[0], vector: $0, component: 0) }, [-1, 1, -1, 1, -1, 1, -1, 1])
         XCTAssertEqual(try value(channels[1], vector: 0, component: 0), 0)
         XCTAssertEqual(try value(channels[2], vector: 0, component: 0), 1)
         XCTAssertEqual(try value(channels[3], vector: 0, component: 0), -1)
         let element = try XCTUnwrap(geometry.elements.first)
-        XCTAssertEqual(try (0..<6).map { try index(element, at: $0) }, [0, 1, 2, 2, 1, 3])
+        XCTAssertEqual(element.primitiveCount, 8)
+        XCTAssertEqual(try (0..<24).map { try index(element, at: $0) },
+                       [0, 1, 3, 3, 1, 4, 1, 2, 4, 4, 2, 5, 6, 7, 8, 8, 7, 9, 10, 11, 12, 12, 11, 13])
     }
 
     func testCanceledStrokePreparationDoesNotReturnBuffers() async throws {

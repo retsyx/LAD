@@ -7,6 +7,54 @@ import XCTest
 
 final class ViewportCurvedEdgeTests: XCTestCase {
     @MainActor
+    func testCylinderFootRetainsItsVisibleStrokeWidthOnAFlange() throws {
+        for separateBase in [false, true] {
+            let mesh = bossMesh(edgeHeight: 1, separateBase: separateBase)
+            let surfaces = try CADStrokeSurface.matchingCancellable(mesh)
+            XCTAssertTrue(surfaces.allSatisfy { $0.first != .zero && $0.second != .zero })
+            for orthographic in [false, true] {
+                let scene = SCNScene()
+                scene.background.contents = NSColor.white
+                let body = SCNNode(geometry: bossGeometry(mesh))
+                body.geometry?.firstMaterial?.diffuse.contents = NSColor.white
+                scene.rootNode.addChildNode(body)
+                let ink = SCNNode(geometry: CADStrokeGeometry.make(mesh.edges, color: .black,
+                                                                  viewportHeight: 256, surfaces: surfaces))
+                ink.categoryBitMask = CADViewportCategory.decorations
+                ink.renderingOrder = 1
+                scene.rootNode.addChildNode(ink)
+                let camera = SCNNode()
+                camera.camera = SCNCamera()
+                camera.camera?.fieldOfView = 38
+                camera.camera?.projectionDirection = .vertical
+                camera.camera?.usesOrthographicProjection = orthographic
+                camera.camera?.orthographicScale = 2.8
+                camera.camera?.zNear = 0.1
+                camera.camera?.zFar = 100
+                let target = SIMD3<Double>(0, 0, 1)
+                let eye = target + simd_normalize(SIMD3<Double>(6, -8, 7)) * 8
+                camera.position = SCNVector3(eye.x, eye.y, eye.z)
+                camera.look(at: SCNVector3(0, 0, 1), up: SCNVector3(0, 0, 1), localFront: SCNVector3(0, 0, -1))
+                scene.rootNode.addChildNode(camera)
+                let palette = CADHighlightPalette(selected: .yellow, hover: .white, hoverHalo: .white,
+                                                  ink: .black, background: .white)
+                func snapshot(scale: Int) throws -> NSBitmapImageRep {
+                    try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: 320 * scale, height: 256 * scale,
+                                                        referenceHeight: 256, palette: palette).image
+                }
+                for scale in [1, 2] {
+                    body.isHidden = false
+                    let visible = try snapshot(scale: scale)
+                    body.isHidden = true
+                    let reference = try snapshot(scale: scale)
+                    let label = "\(separateBase ? "touching" : "fused")-\(orthographic ? "ortho" : "perspective")-\(scale)x"
+                    assertRimCoverage(visible, reference: reference, label: label)
+                }
+            }
+        }
+    }
+
+    @MainActor
     func testSelectedRoundedBossKeepsItsWidthAcrossTheEntireProjectedCurve() throws {
         for orthographic in [false, true] {
             for close in [false, true] {
@@ -118,6 +166,37 @@ final class ViewportCurvedEdgeTests: XCTestCase {
         var front = SIMD2<Double>(6, -8) / 10
     }
 
+    /// The unobstructed ellipse crosses each column twice. Its lower arc faces
+    /// the viewer. Measuring visible area in short bands catches a continuous
+    /// half-width stroke that a centerline continuity test would accept.
+    private func assertRimCoverage(_ visible: NSBitmapImageRep, reference: NSBitmapImageRep, label: String,
+                                   file: StaticString = #filePath, line: UInt = #line) {
+        func isInk(_ image: NSBitmapImageRep, x: Int, y: Int) -> Bool {
+            guard let color = image.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return false }
+            // Include half-covered antialiased pixels on the white fixture.
+            return color.redComponent < 0.8
+        }
+        var minimumCoverage = 1.0
+        var rearInk = 0
+        let width = reference.pixelsWide
+        for band in stride(from: width / 4, to: 3 * width / 4, by: 16) {
+            var referencePixels = 0, visiblePixels = 0
+            for x in band..<(band + 16) {
+                let rows = (0..<reference.pixelsHigh).filter { isInk(reference, x: x, y: $0) }
+                guard let first = rows.first, let last = rows.last, last - first > 12 else { continue }
+                let middle = (first + last) / 2
+                let front = rows.filter { $0 > middle }
+                referencePixels += front.count
+                visiblePixels += front.filter { isInk(visible, x: x, y: $0) }.count
+                rearInk += rows.filter { $0 < middle && isInk(visible, x: x, y: $0) }.count
+            }
+            XCTAssertGreaterThanOrEqual(referencePixels, 16, label, file: file, line: line)
+            minimumCoverage = min(minimumCoverage, Double(visiblePixels) / Double(max(1, referencePixels)))
+        }
+        XCTAssertGreaterThanOrEqual(minimumCoverage, 0.9, "Visible rim width (\(label))", file: file, line: line)
+        XCTAssertEqual(rearInk, 0, "Hidden rear arc (\(label))", file: file, line: line)
+    }
+
     private func selectedCurveWidths(in shot: Shot) -> [Double] {
         func project(_ point: SIMD3<Double>) -> SIMD2<Double> {
             let clip = shot.matrix * SIMD4<Float>(Float(point.x), Float(point.y), Float(point.z), 1)
@@ -195,7 +274,7 @@ final class ViewportCurvedEdgeTests: XCTestCase {
     private func selectedBoss(orthographic: Bool, highlighted: Bool = true, occluder: Bool = false, close: Bool = true) throws -> Shot {
         let scene = SCNScene(); scene.background.contents = NSColor.white
         let mesh = bossMesh()
-        scene.rootNode.addChildNode(SCNNode(geometry: bossGeometry()))
+        scene.rootNode.addChildNode(SCNNode(geometry: bossGeometry(mesh)))
         let selectedColor = NSColor(srgbRed: 0.92, green: 0.61, blue: 0.24, alpha: 1)
         let inkColor = NSColor(srgbRed: 0.025, green: 0.035, blue: 0.05, alpha: 1)
         // Keep ordinary CAD ink beneath the unoccluded overlay, as in the
@@ -282,7 +361,7 @@ final class ViewportCurvedEdgeTests: XCTestCase {
         let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let scene = SCNScene()
         scene.background.contents = NSColor.white
-        let body = SCNNode(geometry: bossGeometry())
+        let body = SCNNode(geometry: bossGeometry(bossMesh()))
         body.isHidden = !bodyVisible
         scene.rootNode.addChildNode(body)
         let ink = NSColor(srgbRed: 0.025, green: 0.035, blue: 0.05, alpha: 1)
@@ -328,7 +407,7 @@ final class ViewportCurvedEdgeTests: XCTestCase {
         return Shot(image: image, matrix: projection * simd_inverse(camera.simdWorldTransform))
     }
 
-    private func bossMesh() -> PreviewMesh {
+    private func bossMesh(edgeHeight: Double = 2.8, separateBase: Bool = false) -> PreviewMesh {
         let count = 84
         var profile: [(Double, Double)] = [(4, 0), (4, 1), (2.2, 1), (2.2, 2.8)]
         for step in 1...16 {
@@ -336,31 +415,44 @@ final class ViewportCurvedEdgeTests: XCTestCase {
             profile.append((2 + 0.2 * cos(angle), 2.8 + 0.2 * sin(angle)))
         }
         var vertices = profile.flatMap { radius, z in Array(circle(radius: radius, z: z, count: count).dropLast()) }
-        var indices = [Int32]()
+        let bossOwner = separateBase ? 1 : 0
+        var triangles = [[Int]](), owners = [Int]()
+        func triangle(_ a: Int, _ b: Int, _ c: Int, owner: Int) {
+            triangles.append([a, b, c])
+            owners.append(owner)
+        }
         for ring in 0..<(profile.count - 1) {
+            let owner = ring < 2 ? 0 : bossOwner
             for index in 0..<count {
                 let next = (index + 1) % count
-                let a = Int32(ring * count + index), b = Int32(ring * count + next)
-                let c = Int32((ring + 1) * count + index), d = Int32((ring + 1) * count + next)
-                indices.append(contentsOf: [a, b, c, b, d, c])
+                let a = ring * count + index, b = ring * count + next
+                triangle(a, b, a + count, owner: owner)
+                triangle(b, b + count, a + count, owner: owner)
             }
         }
-        let bottom = Int32(vertices.count), top = bottom + 1
-        vertices.append(contentsOf: [[0, 0, 0], [0, 0, 3]])
-        for index in 0..<count {
-            let next = (index + 1) % count
-            indices.append(contentsOf: [bottom, Int32(next), Int32(index)])
-            indices.append(contentsOf: [top, Int32((profile.count - 1) * count + index), Int32((profile.count - 1) * count + next)])
+        func closeRing(_ ring: Int, upward: Bool, owner: Int) {
+            let center = vertices.count
+            vertices.append([0, 0, profile[ring].1])
+            for index in 0..<count {
+                let a = ring * count + index, b = ring * count + (index + 1) % count
+                triangle(center, upward ? a : b, upward ? b : a, owner: owner)
+            }
         }
-        return PreviewMesh(vertices: vertices,
-            triangles: stride(from: 0, to: indices.count, by: 3).map { [Int(indices[$0]), Int(indices[$0 + 1]), Int(indices[$0 + 2])] },
-            edges: segments(circle(radius: 2.2, z: 2.8, count: count)),
-            bounds: [-4, -4, 0, 4, 4, 3], volume: 0, area: 0, solids: 1, faces: profile.count + 1,
-            buildSeconds: 0, threads: 1, stepPath: "")
+        closeRing(0, upward: false, owner: 0)
+        closeRing(profile.count - 1, upward: true, owner: bossOwner)
+        if separateBase {
+            // The flange top and boss underside meet at the same height.
+            closeRing(2, upward: true, owner: 0)
+            closeRing(2, upward: false, owner: bossOwner)
+        }
+        return PreviewMesh(vertices: vertices, triangles: triangles,
+            edges: segments(circle(radius: 2.2, z: edgeHeight, count: count)),
+            bounds: [-4, -4, 0, 4, 4, 3], volume: 0, area: 0, solids: bossOwner + 1, faces: profile.count + 1,
+            buildSeconds: 0, threads: 1, stepPath: "", triangleSolids: owners,
+            edgeSolids: Array(repeating: bossOwner, count: count))
     }
 
-    private func bossGeometry() -> SCNGeometry {
-        let mesh = bossMesh()
+    private func bossGeometry(_ mesh: PreviewMesh) -> SCNGeometry {
         let vertices = mesh.vertices.map { SCNVector3($0[0], $0[1], $0[2]) }
         let indices = mesh.triangles.flatMap { $0.map(Int32.init) }
         let geometry = SCNGeometry(sources: [SCNGeometrySource(vertices: vertices),

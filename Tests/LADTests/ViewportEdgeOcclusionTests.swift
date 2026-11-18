@@ -6,6 +6,54 @@ import XCTest
 
 final class ViewportEdgeOcclusionTests: XCTestCase {
     @MainActor
+    func testCloseFittingGrooveCoverHidesTheEntireContactEdge() throws {
+        // Cross-section of a mating corner: the visible faces rise on either
+        // side of the edge. A fitted cover follows both faces, 0.004 units
+        // closer to the camera. No part of the underlying stroke is exposed.
+        let gap = 0.004
+        let corners = [-1.0, 0.0, 1.0].flatMap { y in
+            [-2.0, 2.0].map { x in SCNVector3(x, y, abs(y) + gap) }
+        }
+        let geometry = SCNGeometry(sources: [SCNGeometrySource(vertices: corners)],
+            elements: [SCNGeometryElement(indices: [Int32(0), 1, 2, 1, 3, 2, 2, 3, 4, 3, 5, 4], primitiveType: .triangles)])
+        let material = SCNMaterial()
+        material.lightingModel = .constant
+        material.diffuse.contents = NSColor.gray
+        geometry.materials = [material]
+        let cover = SCNNode(geometry: geometry)
+        let scene = SCNScene()
+        scene.rootNode.addChildNode(cover)
+        // The matching second plane is the underside of the part at contact.
+        let surface = CADStrokeSurface(first: SIMD3(0, -1, 1), second: SIMD3(0, -1, -1))
+        let ink = SCNNode(geometry: CADStrokeGeometry.make([[-1.2, 0, 0, 1.2, 0, 0]], color: .magenta,
+                                                          viewportHeight: 192, surfaces: [surface]))
+        ink.categoryBitMask = CADViewportCategory.decorations
+        ink.renderingOrder = 1
+        scene.rootNode.addChildNode(ink)
+        let camera = SCNNode()
+        camera.camera = SCNCamera()
+        camera.position = SCNVector3(0, 0, 8)
+        camera.camera?.fieldOfView = 38
+        camera.camera?.orthographicScale = 2
+        camera.camera?.zNear = 0.1
+        camera.camera?.zFar = 100
+        scene.rootNode.addChildNode(camera)
+        func renderInk() throws -> Int {
+            let shot = try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: 512,
+                                                          height: 384, referenceHeight: 192)
+            return magentaPixels(in: shot.image)
+        }
+        for orthographic in [false, true] {
+            camera.camera?.usesOrthographicProjection = orthographic
+            cover.isHidden = true
+            XCTAssertGreaterThan(try renderInk(), 150)
+            cover.isHidden = false
+            XCTAssertEqual(try renderInk(), 0,
+                           "Ribbon depth must follow the crease through its center (orthographic=\(orthographic)).")
+        }
+    }
+
+    @MainActor
     func testNearSurfaceInteriorCurvesNeverBleedThroughAnOpaqueCover() throws {
         // Tiny interior clearances are ordinary in assemblies. A depth bias
         // that is constant in normalized coordinates can lift these curves

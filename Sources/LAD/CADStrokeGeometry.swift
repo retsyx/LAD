@@ -45,7 +45,8 @@ enum CADStrokeGeometry {
         float cadCap = _geometry.texcoords[0].y * cadCapWeight;
         float2 cadOffset = cadAcross * _geometry.texcoords[0].x + cadAlong * cadCap;
         float2 cadClipOffset = cadOffset * cadEdgeWidth * cadScale * scn_frame.inverseResolution * cadClip.w;
-        float cadDepthOffset = _geometry.texcoords[0].y * cadBoundedCapDepth;
+        float cadFallback = _geometry.texcoords[0].y * cadBoundedCapDepth;
+        float cadDepthOffset = cadFallback;
         // Match the actual adjacent triangle planes across the complete width
         // too. Keeping a wide ribbon at centerline depth lets curved faces
         // cut repeated teeth into its inner edge. These cached planes use the
@@ -54,34 +55,47 @@ enum CADStrokeGeometry {
             float3(_geometry.texcoords[1], _geometry.texcoords[2].x),
             float3(_geometry.texcoords[2].y, _geometry.texcoords[3])
         };
+        bool cadIsCrease = dot(cadSurfaceNormals[0], cadSurfaceNormals[0]) >= 0.5
+            && dot(cadSurfaceNormals[1], cadSurfaceNormals[1]) >= 0.5;
         float3 cadEye = scn_frame.projectionTransform[3][3] == 0.0
             ? normalize(-cadViewPosition.xyz) : float3(0.0, 0.0, 1.0);
         bool cadHasSurface = false;
+        bool cadHasFrontFace = false;
         for (int cadFace = 0; cadFace < 2; ++cadFace) {
             float3 cadNormal = cadSurfaceNormals[cadFace];
             if (dot(cadNormal, cadNormal) < 0.5) { continue; }
             float3 cadViewNormal = normalize((scn_node.normalTransform * float4(cadNormal, 0.0)).xyz);
-            // An edge-on plane has an unbounded screen-depth slope. Use its
-            // other visible neighbor or the tangent fallback at silhouettes.
-            // This also bounds the local depth slope to about eight times
-            // the ribbon's view-space footprint, independent of scene units.
-            float cadFacing = dot(cadViewNormal, cadEye);
+            // Either winding gives the same plane depth. At a contact rim
+            // the cylinder's underside supplies the plane on the plate side.
+            float cadIncidence = dot(cadViewNormal, cadEye);
+            cadHasFrontFace = cadHasFrontFace || cadIncidence > 0.0;
+            // Bound the depth change near edge-on planes to eight times
+            // the ribbon's view-space footprint.
+            float cadFacing = abs(cadIncidence);
             if (cadFacing < 0.125) { continue; }
             float4 cadPlane = float4(cadNormal, -dot(cadNormal, _geometry.position.xyz));
             float4 cadClipPlane = transpose(scn_node.inverseModelViewProjectionTransform) * cadPlane;
             if (abs(cadClipPlane.z) < 1e-5 * length(cadClipPlane.xyz)) { continue; }
-            float cadSurfaceDepth = -dot(cadClipPlane.xy, cadClipOffset) / cadClipPlane.z;
+            float2 cadDepthSlope = -cadClipPlane.xy / cadClipPlane.z;
+            float cadSurfaceDepth = dot(cadDepthSlope, cadClipOffset);
+            if (cadIsCrease) {
+                // A crease's two half-ribbons rasterize independently of the
+                // faces they lie on. Convert 1/128 of a physical pixel of XY
+                // rounding into depth (zero for a screen-parallel plane).
+                float cadRoundingDepth = dot(abs(cadDepthSlope), scn_frame.inverseResolution)
+                    * (2.0 / 128.0) * abs(cadClip.w);
+                cadSurfaceDepth += copysign(cadRoundingDepth, cadCapDepthGradient);
+            }
             if (isfinite(cadSurfaceDepth)) {
                 // Ease back to the conservative centerline at silhouettes;
                 // switching the full correction on abruptly makes a notch.
                 float cadWeight = smoothstep(0.125, 0.25, cadFacing);
-                float cadFallback = _geometry.texcoords[0].y * cadBoundedCapDepth;
                 cadSurfaceDepth = mix(cadFallback, cadSurfaceDepth, cadWeight);
                 cadDepthOffset = cadHasSurface ? max(cadDepthOffset, cadSurfaceDepth) : cadSurfaceDepth;
                 cadHasSurface = true;
             }
         }
-        cadClip.z += cadDepthOffset;
+        cadClip.z += cadHasFrontFace ? cadDepthOffset : cadFallback;
         cadClip.xy += cadClipOffset;
         // Bound the precision allowance in view space. A constant normalized
         // depth offset grows quadratically with distance under reverse-Z
@@ -118,8 +132,8 @@ enum CADStrokeGeometry {
         // Keep finite, nondegenerate segments first, so each attribute buffer is
         // allocated once at its final size and written in place.
         func endpoints(_ segment: Int) -> (SIMD3<Double>, SIMD3<Double>)? {
+            guard segment >= 0, segment < points.count / 6 else { return nil }
             let base = segment * 6
-            guard segment >= 0, base + 6 <= points.count else { return nil }
             let a = SIMD3<Double>(Double(points[base]), Double(points[base + 1]), Double(points[base + 2]))
             let b = SIMD3<Double>(Double(points[base + 3]), Double(points[base + 4]), Double(points[base + 5]))
             func valid(_ point: SIMD3<Double>) -> Bool {
@@ -128,80 +142,79 @@ enum CADStrokeGeometry {
             guard valid(a), valid(b), simd_length_squared(b - a) > 1e-24 else { return nil }
             return (a, b)
         }
-        var accepted = [Int]()
-        accepted.reserveCapacity(segments.count)
-        for (position, segment) in segments.enumerated() {
-            if position.isMultiple(of: 256) { try Task.checkCancellation() }
-            guard accepted.count < (Int(Int32.max) - 4) / 4, endpoints(segment) != nil else { continue }
-            accepted.append(segment)
+        struct Ribbon {
+            let start, end, direction: SIMD3<Float>
+            let firstNormal, secondNormal: SIMD3<Float>
+
+            // Two adjacent planes can have different screen-depth slopes.
+            // Give the two half-widths a shared vertex at the actual edge depth.
+            var columns: Int { firstNormal != .zero && secondNormal != .zero ? 3 : 2 }
         }
-        func finiteNormal(_ normal: SIMD3<Double>) -> SIMD3<Double> {
-            guard normal.x.isFinite, normal.y.isFinite, normal.z.isFinite,
-                  simd_length_squared(normal) > 1e-20, simd_length_squared(normal).isFinite else { return .zero }
-            return simd_normalize(normal)
+        func finiteNormal(_ normal: SIMD3<Double>) -> SIMD3<Float> {
+            let lengthSquared = simd_length_squared(normal)
+            guard lengthSquared.isFinite, lengthSquared > 1e-20 else { return .zero }
+            return SIMD3<Float>(simd_normalize(normal))
         }
-        func surface(_ segment: Int) -> (SIMD3<Double>, SIMD3<Double>) {
-            let value = surfaces.flatMap { $0.indices.contains(segment) ? $0[segment] : nil } ?? CADStrokeSurface()
-            return (finiteNormal(value.first), finiteNormal(value.second))
+        var ribbons = [Ribbon]()
+        ribbons.reserveCapacity(segments.count)
+        var vertexCount = 0, indexCount = 0
+        for (index, segment) in segments.enumerated() {
+            if index.isMultiple(of: 256) { try Task.checkCancellation() }
+            guard let (a, b) = endpoints(segment) else { continue }
+            let surface = surfaces.flatMap { $0.indices.contains(segment) ? $0[segment] : nil } ?? CADStrokeSurface()
+            let ribbon = Ribbon(start: SIMD3<Float>(a), end: SIMD3<Float>(b),
+                                direction: SIMD3<Float>(simd_normalize(b - a)),
+                                firstNormal: finiteNormal(surface.first), secondNormal: finiteNormal(surface.second))
+            guard vertexCount <= Int(Int32.max) - 2 * ribbon.columns else { break }
+            ribbons.append(ribbon)
+            vertexCount += 2 * ribbon.columns
+            indexCount += 6 * (ribbon.columns - 1)
         }
-        // Four ribbon corners per segment: start twice, then end twice.
-        func perCorner3(_ value: (Int, Int) -> SIMD3<Float>) throws -> Data {
-            try packed(count: accepted.count * 12) { (buffer: UnsafeMutableBufferPointer<Float>) in
-                for (index, segment) in accepted.enumerated() {
+
+        func attribute<V: SIMD>(_ value: (Ribbon, Int, Int) -> V) throws -> Data where V.Scalar == Float {
+            try packed(count: vertexCount * V.scalarCount) { (buffer: UnsafeMutableBufferPointer<Float>) in
+                var offset = 0
+                for (index, ribbon) in ribbons.enumerated() {
                     if index.isMultiple(of: 256) { try Task.checkCancellation() }
-                    for corner in 0..<4 {
-                        let item = value(segment, corner), base = (index * 4 + corner) * 3
-                        buffer[base] = item.x; buffer[base + 1] = item.y; buffer[base + 2] = item.z
+                    for endpoint in 0..<2 {
+                        for column in 0..<ribbon.columns {
+                            let vector = value(ribbon, endpoint, column)
+                            for component in 0..<V.scalarCount {
+                                buffer[offset] = vector[component]
+                                offset += 1
+                            }
+                        }
                     }
                 }
             }
         }
-        func perCorner2(_ value: (Int, Int) -> SIMD2<Float>) throws -> Data {
-            try packed(count: accepted.count * 8) { (buffer: UnsafeMutableBufferPointer<Float>) in
-                for (index, segment) in accepted.enumerated() {
-                    if index.isMultiple(of: 256) { try Task.checkCancellation() }
-                    for corner in 0..<4 {
-                        let item = value(segment, corner), base = (index * 4 + corner) * 2
-                        buffer[base] = item.x; buffer[base + 1] = item.y
-                    }
-                }
-            }
+        let vertices = try attribute { ribbon, endpoint, _ in endpoint == 0 ? ribbon.start : ribbon.end }
+        // Direction stays valid if SceneKit normalizes it before the geometry entry point.
+        let directions = try attribute { ribbon, _, _ in ribbon.direction }
+        let coordinates = try attribute { ribbon, endpoint, column in
+            let across = 2 * Float(column) / Float(ribbon.columns - 1) - 1
+            return SIMD2<Float>(across, endpoint == 0 ? -1 : 1)
         }
-        let vertices = try perCorner3 { segment, corner in
-            let (a, b) = endpoints(segment)!
-            return SIMD3<Float>(corner < 2 ? a : b)
-        }
-        // Direction, rather than a second point, remains valid if SceneKit
-        // normalizes this attribute before the geometry entry point.
-        let directions = try perCorner3 { segment, _ in
-            let (a, b) = endpoints(segment)!
-            return SIMD3<Float>(simd_normalize(b - a))
-        }
-        let coordinates = try perCorner2 { _, corner in SIMD2(corner.isMultiple(of: 2) ? -1 : 1, corner < 2 ? -1 : 1) }
-        let firstNormalXY = try perCorner2 { segment, _ in
-            let (n0, _) = surface(segment)
-            return SIMD2(Float(n0.x), Float(n0.y))
-        }
-        let middleNormals = try perCorner2 { segment, _ in
-            let (n0, n1) = surface(segment)
-            return SIMD2(Float(n0.z), Float(n1.x))
-        }
-        let secondNormalYZ = try perCorner2 { segment, _ in
-            let (_, n1) = surface(segment)
-            return SIMD2(Float(n1.y), Float(n1.z))
-        }
-        let indices: Data = try packed(count: accepted.count * 6) { (buffer: UnsafeMutableBufferPointer<Int32>) in
-            for index in accepted.indices {
+        let firstNormalXY = try attribute { ribbon, _, _ in SIMD2(ribbon.firstNormal.x, ribbon.firstNormal.y) }
+        let middleNormals = try attribute { ribbon, _, _ in SIMD2(ribbon.firstNormal.z, ribbon.secondNormal.x) }
+        let secondNormalYZ = try attribute { ribbon, _, _ in SIMD2(ribbon.secondNormal.y, ribbon.secondNormal.z) }
+        let indices: Data = try packed(count: indexCount) { (buffer: UnsafeMutableBufferPointer<Int32>) in
+            var first: Int32 = 0, offset = 0
+            for (index, ribbon) in ribbons.enumerated() {
                 if index.isMultiple(of: 256) { try Task.checkCancellation() }
-                let first = Int32(index * 4), base = index * 6
-                buffer[base] = first; buffer[base + 1] = first + 1; buffer[base + 2] = first + 2
-                buffer[base + 3] = first + 2; buffer[base + 4] = first + 1; buffer[base + 5] = first + 3
+                for column in 0..<(ribbon.columns - 1) {
+                    let a = first + Int32(column), b = a + Int32(ribbon.columns)
+                    buffer[offset] = a; buffer[offset + 1] = a + 1; buffer[offset + 2] = b
+                    buffer[offset + 3] = b; buffer[offset + 4] = a + 1; buffer[offset + 5] = b + 1
+                    offset += 6
+                }
+                first += Int32(2 * ribbon.columns)
             }
         }
         try Task.checkCancellation()
         return Prepared(vertices: vertices, directions: directions, coordinates: coordinates,
                         firstNormalXY: firstNormalXY, middleNormals: middleNormals, secondNormalYZ: secondNormalYZ,
-                        indices: indices, vertexCount: accepted.count * 4, indexCount: accepted.count * 6)
+                        indices: indices, vertexCount: vertexCount, indexCount: indexCount)
     }
 
     nonisolated private static func packed<T>(count: Int, _ fill: (UnsafeMutableBufferPointer<T>) throws -> Void) rethrows -> Data {
