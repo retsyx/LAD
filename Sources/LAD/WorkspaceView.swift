@@ -279,13 +279,8 @@ private struct WorkspaceViewer: View {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
-                            Button { state.showGrid.toggle() } label: {
-                                Image(systemName: "grid").frame(width: 28, height: 28)
-                                    .foregroundStyle(state.showGrid ? Palette.accent : Palette.muted)
-                            }
-                            .buttonStyle(.plain).padding(5)
-                            .background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
-                            .help("Toggle grid").accessibilityValue(state.showGrid ? "On" : "Off")
+                            viewportToggle($state.showGrid, label: "Grid", help: "Toggle grid",
+                                           icon: Image(systemName: "grid"))
                             if state.showGrid, let gridSpacing = viewportReference.gridSpacing {
                                 let spacing = gridSpacing.formatted(.number.precision(.fractionLength(0...2)))
                                 Text("\(spacing) mm")
@@ -297,10 +292,10 @@ private struct WorkspaceViewer: View {
                             }
                         }
                         HStack(spacing: 8) {
-                            printViewToggle($state.printVersionView, label: "3D Printing Version",
-                                            help: "3D printing version", icon: PrinterIcon())
-                            printViewToggle($state.printLayoutView, label: "3D Printing Layout",
-                                            help: "3D printing orientation and layout", icon: PrintLayoutIcon())
+                            viewportToggle($state.printVersionView, label: "3D Printing Version",
+                                           help: "3D printing version", icon: PrinterIcon().frame(width: 19, height: 19))
+                            viewportToggle($state.printLayoutView, label: "3D Printing Layout",
+                                           help: "3D printing orientation and layout", icon: PrintLayoutIcon().frame(width: 19, height: 19))
                         }
                     }
                     Spacer()
@@ -337,13 +332,16 @@ private struct WorkspaceViewer: View {
         }.background(Palette.background)
     }
 
-    private func printViewToggle<Icon: View>(_ isOn: Binding<Bool>, label: String, help: String, icon: Icon) -> some View {
-        Button { isOn.wrappedValue.toggle() } label: {
-            icon.frame(width: 19, height: 19).frame(width: 28, height: 28)
+    private func viewportToggle<Icon: View>(_ isOn: Binding<Bool>, label: String, help: String, icon: Icon) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 9)
+        return Button { isOn.wrappedValue.toggle() } label: {
+            icon.frame(width: 28, height: 28)
                 .foregroundStyle(isOn.wrappedValue ? Palette.accent : Palette.muted)
+                .padding(5)
+                .background(Palette.panel.opacity(0.93), in: shape)
+                .contentShape(shape)
         }
-        .buttonStyle(.plain).padding(5)
-        .background(Palette.panel.opacity(0.93), in: RoundedRectangle(cornerRadius: 9))
+        .buttonStyle(.plain)
         .help(help).accessibilityLabel(label)
         .accessibilityValue(isOn.wrappedValue ? "On" : "Off")
     }
