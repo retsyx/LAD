@@ -33,6 +33,7 @@ MAX_PREVIEW_REFINEMENT_PASSES = 16
 MAX_PREVIEW_REFINEMENT_PROJECTIONS = 16_384
 MAX_PREVIEW_REFINEMENT_CELLS = 100_000
 MAX_PREVIEW_SHADING_SAMPLES = 64_000
+MAX_PREVIEW_SHADING_PROJECTIONS = 512
 MAX_PREVIEW_SHADING_NODES = 8_192
 MAX_PREVIEW_SHADING_PASSES = 4
 PREVIEW_SHADING_NORMAL_DOT = math.cos(math.radians(1.0))
@@ -2212,16 +2213,39 @@ def _preview_shading_dots(corners, normals, samples):
     return np.divide(dot, length, out=np.ones_like(dot), where=valid)
 
 
-def _preview_shading_split(xyz, normals, uv, cells, selected, owners, sign):
+def _preview_shading_project_midpoint(surface, parameters, position, tolerance):
+    """Find the chord midpoint's nearest surface point on this local patch."""
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.gp import gp_Pnt
+    u_min, u_max, v_min, v_max = surface.Bounds()
+    low = parameters.min(axis=0)
+    high = parameters.max(axis=0)
+    try:
+        projection = GeomAPI_ProjectPointOnSurf(
+            gp_Pnt(*position), surface, max(u_min, low[0]), min(u_max, high[0]),
+            max(v_min, low[1]), min(v_max, high[1]), 1e-7)
+        if projection.NbPoints() and projection.LowerDistance() <= tolerance:
+            return projection.LowerDistanceParameters()
+    except Exception:
+        pass  # This optional split needs a solution on the local surface.
+    return None
+
+
+def _preview_shading_split(xyz, normals, uv, cells, selected, owners, sign, projected_parameters=None):
     """Discard local splits that would fold a child, keeping independent splits."""
     import numpy as np
+    projected_parameters = projected_parameters or {}
     for _ in range(3):
         if not selected:
             break
         additions = np.asarray(list(selected.values()))
         candidate_xyz = np.concatenate((xyz, additions[:, :3]))
         candidate_normals = np.concatenate((normals, additions[:, 3:]))
-        candidate_uv = np.concatenate((uv, uv[np.asarray(list(selected))].mean(axis=1)))
+        split_uv = uv[np.asarray(list(selected))].mean(axis=1)
+        for index, key in enumerate(selected):
+            if key in projected_parameters:
+                split_uv[index] = projected_parameters[key]
+        candidate_uv = np.concatenate((uv, split_uv))
         midpoints = {key: len(xyz) + offset for offset, key in enumerate(selected)}
         affected = sorted({cell for key in selected for cell in owners[key]})
         subdivisions = [_preview_split_triangle(cells[cell].tolist(), midpoints) for cell in affected]
@@ -2243,9 +2267,10 @@ def _preview_shading_split(xyz, normals, uv, cells, selected, owners, sign):
     return None
 
 
-def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left):
+def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left, projections_left):
     """Improve an accepted face's display mesh without touching its native polygon."""
     import numpy as np
+    from OCP.BRep import BRep_Tool
     from OCP.BRepGProp import BRepGProp_Face
     from OCP.TopAbs import TopAbs_Orientation
     from OCP.gp import gp_Pnt, gp_Vec
@@ -2258,23 +2283,50 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left):
     point, normal = gp_Pnt(), gp_Vec()
     boundary = None
     samples = {}
+    projections = {}
+    exact_surface = None
+    projected_parameters = {}
     candidate_limit = samples_left // 4
+
+    def evaluate(parameters):
+        try:
+            surface.Normal(float(parameters[0]), float(parameters[1]), point, normal)
+            length = normal.Magnitude()
+            if length > 1e-12 and math.isfinite(length):
+                return (*point.Coord(), *(value / length for value in normal.Coord()))
+        except Exception:
+            pass  # A singular or unavailable sample cannot justify a split.
+        return (math.nan,) * 6
 
     def probe(key):
         if key not in samples:
             if len(samples) >= samples_left:
                 return (math.nan,) * 6
-            u, v = uv[list(key)].mean(axis=0)
-            result = (math.nan,) * 6
-            try:
-                surface.Normal(float(u), float(v), point, normal)
-                length = normal.Magnitude()
-                if length > 1e-12 and math.isfinite(length):
-                    result = (*point.Coord(), *(value / length for value in normal.Coord()))
-            except Exception:
-                pass  # A singular/unavailable sample cannot justify a split.
-            samples[key] = result
+            samples[key] = evaluate(uv[list(key)].mean(axis=0))
         return samples[key]
+
+    def project(key, adjacent):
+        nonlocal exact_surface
+        if key not in projections and len(projections) < projections_left:
+            if exact_surface is None:
+                exact_surface = BRep_Tool.Surface_s(face.wrapped)
+            parameters = uv[cells[adjacent]].reshape(-1, 2)
+            start, end = key
+            chord = xyz[end] - xyz[start]
+            midpoint = (xyz[start] + xyz[end]) / 2
+            result = _preview_shading_project_midpoint(exact_surface, parameters, midpoint, tolerance)
+            projections[key] = None
+            if result is not None:
+                sample = evaluate(result)
+                fraction = np.dot(sample[:3] - xyz[start], chord) / np.dot(chord, chord)
+                if np.all(np.isfinite(sample)) and 0.1 <= fraction <= 0.9:
+                    blend = (1 - fraction) * exact[start] + fraction * exact[end]
+                    length = np.linalg.norm(blend)
+                    if length > 1e-12:
+                        dot = float(np.dot(blend, sample[3:]) / length)
+                        projections[key] = (sample, dot)
+                        projected_parameters[key] = result
+        return projections.get(key)
 
     for _ in range(MAX_PREVIEW_SHADING_PASSES):
         corners, parameters = xyz[cells], uv[cells]
@@ -2335,23 +2387,31 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left):
                 sample = sampled[index, offset + 1]
                 delta = sample[:3] - a
                 fraction = np.dot(delta, chord) / side_squared[cell, offset]
-                if (0.1 <= fraction <= 0.9
+                dot = dots[index, offset + 1]
+                if not (0.1 <= fraction <= 0.9
                         and np.linalg.norm(delta - fraction * chord) <= tolerance):
-                    options.append((offset, key, sample))
+                    # A UV midpoint can be displaced along the surface even
+                    # when the physical midpoint can move onto it within
+                    # tolerance. Only search the two incident cells' UV patch.
+                    projected = project(key, adjacent)
+                    if projected is None:
+                        continue
+                    sample, dot = projected
+                options.append((dot, -side_squared[cell, offset], key, sample))
             # A bad sample on a locked edge is not fixable by splitting the
             # interior unless there is also error at the center or a usable edge.
-            if (not options or min(dots[index, 0], *(dots[index, offset + 1] for offset, _, _ in options))
-                    >= PREVIEW_SHADING_NORMAL_DOT):
+            if not options:
                 continue
-            _, key, sample = min(options, key=lambda option: (dots[index, option[0] + 1],
-                                                             -side_squared[cell, option[0]]))
+            dot, _, key, sample = min(options, key=lambda option: option[:2])
+            if min(dots[index, 0], dot) >= PREVIEW_SHADING_NORMAL_DOT:
+                continue
             selected[key] = sample
             if len(selected) == nodes_left:
                 break
         if not selected:
             break
 
-        refined = _preview_shading_split(xyz, exact, uv, cells, selected, owners, sign)
+        refined = _preview_shading_split(xyz, exact, uv, cells, selected, owners, sign, projected_parameters)
         if refined is None:
             break
         new_xyz, exact, uv, cells = refined
@@ -2361,12 +2421,13 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left):
             break
     if len(xyz) != len(points):
         chunk = face, edges, poly, location, xyz.tolist(), exact.tolist(), cells.tolist()
-    return chunk, len(samples)
+    return chunk, len(samples), len(projections)
 
 
 def _refine_preview_shading(mesh, tolerance):
     """Spend a bounded assembly-wide budget on lighting after mesh acceptance."""
     samples_left = MAX_PREVIEW_SHADING_SAMPLES
+    projections_left = MAX_PREVIEW_SHADING_PROJECTIONS
     nodes_left = min(MAX_PREVIEW_SHADING_NODES,
                      MAX_VERTICES - sum(len(chunk[4]) for solid in mesh for chunk in solid),
                      (MAX_TRIANGLES - sum(len(chunk[6]) for solid in mesh for chunk in solid)) // 2)
@@ -2379,8 +2440,10 @@ def _refine_preview_shading(mesh, tolerance):
                     and chunk[2].NbNodes() == len(chunk[4])]
     for solid, index in sorted(spline_faces, key=lambda item: -len(item[0][item[1]][6])):
         chunk = solid[index]
-        refined, sampled = _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left)
+        refined, sampled, projected = _refine_preview_shading_face(
+            chunk, tolerance, samples_left, nodes_left, projections_left)
         solid[index] = refined
+        projections_left -= projected
         nodes_left -= len(refined[4]) - len(chunk[4])
         samples_left -= sampled
         if samples_left < 4 or not nodes_left:

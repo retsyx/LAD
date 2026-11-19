@@ -7,10 +7,12 @@ from unittest import mock
 
 import cadquery as cq
 import numpy as np
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
-from OCP.Geom import Geom_BezierCurve
-from OCP.TColgp import TColgp_Array1OfPnt
-from OCP.gp import gp_Pnt
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace
+from OCP.Geom import Geom_BezierCurve, Geom_BezierSurface
+from OCP.Poly import Poly_Triangle, Poly_Triangulation
+from OCP.TColgp import TColgp_Array1OfPnt, TColgp_Array2OfPnt
+from OCP.TopLoc import TopLoc_Location
+from OCP.gp import gp_Pnt, gp_Pnt2d
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import worker
@@ -129,6 +131,55 @@ class PreviewShadingTests(unittest.TestCase):
                               [(0, 1, 2), (1, 0, 3), (4, 8, 6), (8, 5, 6), (5, 8, 7), (8, 4, 7)])
         self.assertEqual(self.boundary_segments({'vertices': positions}, triangles),
                          self.boundary_segments({'vertices': xyz}, cells))
+
+    def test_refines_shared_edge_when_only_the_physical_midpoint_is_close_to_the_surface(self):
+        # x = 0.2u + 3.8u³, y = v, z = 0.56u(1−u). Changing u by half
+        # reaches the highest bulge at x = .575, far from the physical midpoint.
+        poles = TColgp_Array2OfPnt(1, 4, 1, 2)
+        x_poles = (0, .2 / 3, .4 / 3, 4)
+        z_poles = (0, .56 / 3, .56 / 3, 0)
+        for index, (x, z) in enumerate(zip(x_poles, z_poles), 1):
+            poles.SetValue(index, 1, gp_Pnt(x, 0, z))
+            poles.SetValue(index, 2, gp_Pnt(x, 1, z))
+        surface = Geom_BezierSurface(poles)
+        face = cq.Face(BRepBuilderAPI_MakeFace(surface, 1e-9).Face())
+        location = TopLoc_Location()
+        poly = Poly_Triangulation(4, 2, True)
+        parameters = np.asarray([(0, .5), (1, .5), (.785, 1), (.785, 0)])
+        cells = [[0, 1, 2], [1, 0, 3]]
+        for index, (u, v) in enumerate(parameters, 1):
+            poly.SetNode(index, surface.Value(u, v))
+            poly.SetUVNode(index, gp_Pnt2d(u, v))
+        for index, cell in enumerate(cells, 1):
+            poly.SetTriangle(index, Poly_Triangle(*(node + 1 for node in cell)))
+        positions = [list(poly.Node(index).Coord()) for index in range(1, 5)]
+        normals = worker._preview_face_normals(face, poly, location)
+        chunk = face, [], poly, location, positions, normals, cells
+        midpoint = np.mean(positions[:2], axis=0)
+        tolerance = .1
+        self.assertGreater(surface.Value(.5, .5).Z(), tolerance)
+
+        with mock.patch.object(worker, 'MAX_PREVIEW_SHADING_PASSES', 1):
+            unrefined = worker._refine_preview_shading_face(chunk, tolerance, 64, 8, 0)[0]
+            refined = worker._refine_preview_shading_face(chunk, tolerance, 64, 8, 8)[0]
+        self.assertIs(unrefined, chunk)
+        self.assertEqual(len(refined[4]), 5)
+        self.assertEqual(refined[4][:4], positions)
+        self.assertEqual(refined[5][:4], normals)
+        position = np.asarray(refined[4][-1])
+        self.assertLess(np.linalg.norm(position - midpoint), tolerance)
+
+        u, v = worker._preview_shading_project_midpoint(surface, parameters[cells].reshape(-1, 2),
+                                                        midpoint, tolerance)
+        self.assertGreater(u, .75)
+        self.assertAlmostEqual(v, .5)
+        np.testing.assert_allclose(position, surface.Value(u, v).Coord(), rtol=0, atol=1e-9)
+        exact_direction = np.asarray((-.56 * (1 - 2 * u), 0, .2 + 11.4 * u ** 2))
+        exact_direction /= np.linalg.norm(exact_direction)
+        np.testing.assert_allclose(refined[5][-1], exact_direction, rtol=0, atol=1e-9)
+        self.assertEqual(len(refined[6]), 4)
+        self.assertEqual(self.boundary_segments({'vertices': refined[4]}, refined[6]),
+                         self.boundary_segments({'vertices': positions}, cells))
 
 
 if __name__ == '__main__':
