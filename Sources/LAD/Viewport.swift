@@ -90,6 +90,7 @@ struct CADViewport: NSViewRepresentable {
     var onHideSelected: (() -> Void)? = nil
     var onShowAll: (() -> Void)? = nil
     var canExport = false
+    var onExportSelectedPartsSTEP: (() -> Void)? = nil
     var onExportFaceDXF: ((CADFeatureID) -> Void)? = nil
     var onViewReady: ((CADSceneView) -> Void)? = nil
     var assemblyGrabbingEnabled = false
@@ -109,6 +110,7 @@ struct CADViewport: NSViewRepresentable {
         view.onHideSelected = onHideSelected
         view.onShowAll = onShowAll
         view.canExport = canExport
+        view.onExportSelectedPartsSTEP = onExportSelectedPartsSTEP
         view.onExportFaceDXF = onExportFaceDXF
         view.onActivated = onViewReady
         view.onAssemblyGrabBegan = onAssemblyGrabBegan
@@ -382,6 +384,7 @@ final class CADSceneView: NSView {
     var onShowAll: (() -> Void)?
     /// Whether the design can currently be exported; menu state only.
     var canExport = false
+    var onExportSelectedPartsSTEP: (() -> Void)?
     var onExportFaceDXF: ((CADFeatureID) -> Void)?
     var onActivated: ((CADSceneView) -> Void)?
     var assemblyGrabbingEnabled = false {
@@ -1927,14 +1930,23 @@ final class CADSceneView: NSView {
     override func menu(for event: NSEvent) -> NSMenu? {
         // Opening a context menu preserves both part and feature selections.
         let menu = NSMenu(title: "Viewport")
-        if selectedFeatures.count == 1, let face = selectedFeatures.first, face.kind == .face,
-           self.face(at: convert(event.locationInWindow, from: nil)) == face {
-            let export = menu.addItem(withTitle: "Export DXF…", action: #selector(menuExportFaceDXF(_:)), keyEquivalent: "")
-            export.target = self
-            export.representedObject = face
-            // A drawing is flat; curved faces have no exact 2D outline.
-            export.isEnabled = canExport && topology?.face(for: face)?.type == "PLANE"
-            menu.addItem(.separator())
+        let selectedFace = selectedFeatures.count == 1 ? selectedFeatures.first : nil
+        if !selectedSolids.isEmpty || selectedFace?.kind == .face,
+           let hit = visibleHit(at: convert(event.locationInWindow, from: nil)),
+           let solid = solidIndex(of: hit.node) {
+            if let face = selectedFace, face.kind == .face, self.face(for: hit, solid: solid) == face {
+                let export = menu.addItem(withTitle: "Export DXF…", action: #selector(menuExportFaceDXF(_:)), keyEquivalent: "")
+                export.target = self
+                export.representedObject = face
+                // A drawing is flat; curved faces have no exact 2D outline.
+                export.isEnabled = canExport && topology?.face(for: face)?.type == "PLANE"
+            }
+            if selectedSolids.contains(solid) {
+                let export = menu.addItem(withTitle: "Export STEP…", action: #selector(menuExportSelectedPartsSTEP), keyEquivalent: "")
+                export.target = self
+                export.isEnabled = canExport
+            }
+            if menu.numberOfItems > 0 { menu.addItem(.separator()) }
         }
         let fit = menu.addItem(withTitle: "Fit Design", action: #selector(menuFit), keyEquivalent: "")
         fit.target = self
@@ -1971,6 +1983,7 @@ final class CADSceneView: NSView {
     @objc private func menuDeselect() { deselectAll() }
     @objc private func menuHideSelected() { onHideSelected?() }
     @objc private func menuShowAll() { onShowAll?() }
+    @objc private func menuExportSelectedPartsSTEP() { onExportSelectedPartsSTEP?() }
     @objc private func menuExportFaceDXF(_ sender: NSMenuItem) {
         guard let face = sender.representedObject as? CADFeatureID else { return }
         onExportFaceDXF?(face)
@@ -2012,8 +2025,12 @@ final class CADSceneView: NSView {
 
     /// The nearest visible native face, ignoring nearby vertices and edges.
     private func face(at point: NSPoint) -> CADFeatureID? {
-        guard let hit = visibleHit(at: point), let solid = solidIndex(of: hit.node),
-              let faces = faceIDsBySolid[solid], faces.indices.contains(hit.faceIndex) else { return nil }
+        guard let hit = visibleHit(at: point), let solid = solidIndex(of: hit.node) else { return nil }
+        return face(for: hit, solid: solid)
+    }
+
+    private func face(for hit: SCNHitTestResult, solid: Int) -> CADFeatureID? {
+        guard let faces = faceIDsBySolid[solid], faces.indices.contains(hit.faceIndex) else { return nil }
         return faces[hit.faceIndex]
     }
 

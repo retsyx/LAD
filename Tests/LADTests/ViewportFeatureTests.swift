@@ -141,6 +141,7 @@ final class ViewportFeatureTests: XCTestCase {
         view.update(mesh: mesh(), mode: .edges, grid: false, command: nil,
                     selectedSolids: [], hiddenSolids: [], selectedFeatures: [face])
         let featureMenu = try XCTUnwrap(view.menu(for: rightClick))
+        XCTAssertNil(featureMenu.item(withTitle: "Export STEP…"))
         XCTAssertTrue(try XCTUnwrap(featureMenu.item(withTitle: "Hide Selected Parts")).isEnabled,
                       "Selected features allow hiding their owning parts without selecting the whole part.")
         XCTAssertTrue(try XCTUnwrap(featureMenu.item(withTitle: "Deselect All")).isEnabled)

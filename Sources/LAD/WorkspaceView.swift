@@ -260,7 +260,8 @@ private struct WorkspaceViewer: View {
                         onSelectionChanged: { state.selectParts($0) },
                         onFeatureSelectionChanged: { state.selectFeatures($0) }, onDeselectAll: { state.clearSelections() },
                         onHideSelected: { state.hideSelectedParts() }, onShowAll: { state.showAllParts() },
-                        canExport: state.canExport, onExportFaceDXF: { state.exportFaceDXF($0) },
+                        canExport: state.canExport, onExportSelectedPartsSTEP: { state.exportSelectedPartsSTEP() },
+                        onExportFaceDXF: { state.exportFaceDXF($0) },
                         onViewReady: { view in
                             viewportReference.bindViewport(view)
                             if view.window?.isKeyWindow == true || state.viewportView == nil { state.viewportView = view }

@@ -46,6 +46,45 @@ final class ViewportPartsTests: XCTestCase {
     }
 
     @MainActor
+    func testRightClickOffersSTEPExportOnlyOnSelectedWholeParts() async throws {
+        let view = makeView()
+        let preview = mesh()
+        view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [0], hiddenSolids: [])
+        try await waitForPreparation(view)
+
+        var exported = [[Int]]()
+        view.onExportSelectedPartsSTEP = { [weak view] in
+            if let selection = view?.agentCaptureMetadata["selectedSolidIndices"] as? [Int] {
+                exported.append(selection)
+            }
+        }
+        view.canExport = true
+        func stepItem(at point: NSPoint) throws -> NSMenuItem? {
+            let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [],
+                timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+            return view.menu(for: event)?.item(withTitle: "Export STEP…")
+        }
+        func point(forX x: Double) -> NSPoint {
+            let projected = view.projectPoint(SCNVector3(x, 0, 0))
+            return NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+        }
+        let first = point(forX: -2), second = point(forX: 2)
+        XCTAssertTrue(try XCTUnwrap(stepItem(at: first)).isEnabled)
+        XCTAssertNil(try stepItem(at: second))
+        XCTAssertNil(try stepItem(at: NSPoint(x: 4, y: 4)))
+        view.canExport = false
+        XCTAssertFalse(try XCTUnwrap(stepItem(at: first)).isEnabled)
+        view.canExport = true
+
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [0, 1], hiddenSolids: [])
+        let item = try XCTUnwrap(stepItem(at: second))
+        _ = (item.target as? NSObject)?.perform(try XCTUnwrap(item.action))
+        XCTAssertEqual(exported, [[0, 1]])
+    }
+
+    @MainActor
     func testOwnedEdgesHideTogetherWithTheirPartAndPreserveMultiselection() async throws {
         let view = makeView()
         var selectionChanges = 0
