@@ -2290,6 +2290,7 @@ final class AppState {
             do {
                 try await autosaveStore.writeCopy(newProject, to: target, preserving: sourceURL, projectID: sourceID)
                 onRecentProjectChanged?(target, nil)
+                onOpenProject?(target)
             } catch {
                 guard projectSessionID == sessionID else { return }
                 self.error = "Could not save the new design. \(error.localizedDescription)"
