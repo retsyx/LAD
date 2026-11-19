@@ -132,6 +132,30 @@ class PreviewShadingTests(unittest.TestCase):
         self.assertEqual(self.boundary_segments({'vertices': positions}, triangles),
                          self.boundary_segments({'vertices': xyz}, cells))
 
+    def test_folded_child_is_retried_at_a_projected_physical_midpoint(self):
+        uv = np.asarray([(0, 0), (2, 0), (1, .01), (1, -.01)])
+        xyz = np.column_stack((uv, np.zeros(len(uv))))
+        normals = np.tile((0, 0, 1), (len(uv), 1))
+        cells = np.asarray([(0, 1, 2), (1, 0, 3)])
+        owners = {(0, 1): [0, 1]}
+        # A small displacement from the chord can fold the narrow child.
+        proposed = {(0, 1): (1, .02, 0, 0, 0, 1)}
+        self.assertIsNone(worker._preview_shading_split(xyz, normals, uv, cells, proposed, owners, sign=1))
+
+        projected_xyz, projected_uv = (1, 0, 0), (.9, .001)
+        project = mock.Mock(return_value=((*projected_xyz, 0, 0, 1), .99, projected_uv))
+        result = worker._preview_shading_split(xyz, normals, uv, cells, proposed, owners, sign=1, project=project)
+        project.assert_called_once_with((0, 1), [0, 1])
+        self.assertIsNotNone(result)
+        positions, directions, parameters, triangles = result
+        np.testing.assert_array_equal(positions, np.vstack((xyz, projected_xyz)))
+        np.testing.assert_array_equal(directions, np.vstack((normals, (0, 0, 1))))
+        np.testing.assert_array_equal(parameters, np.vstack((uv, projected_uv)))
+        self.assertCountEqual([tuple(cell) for cell in triangles],
+                              [(0, 4, 2), (4, 1, 2), (1, 4, 3), (4, 0, 3)])
+        self.assertEqual(self.boundary_segments({'vertices': positions}, triangles),
+                         self.boundary_segments({'vertices': xyz}, cells))
+
     def test_refines_shared_edge_when_only_the_physical_midpoint_is_close_to_the_surface(self):
         # x = 0.2u + 3.8u³, y = v, z = 0.56u(1−u). Changing u by half
         # reaches the highest bulge at x = .575, far from the physical midpoint.

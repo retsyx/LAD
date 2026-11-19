@@ -2231,11 +2231,11 @@ def _preview_shading_project_midpoint(surface, parameters, position, tolerance):
     return None
 
 
-def _preview_shading_split(xyz, normals, uv, cells, selected, owners, sign, projected_parameters=None):
-    """Discard local splits that would fold a child, keeping independent splits."""
+def _preview_shading_split(xyz, normals, uv, cells, selected, owners, sign, projected_parameters=None, project=None):
+    """Retry folded children at physical midpoints and keep independent splits."""
     import numpy as np
-    projected_parameters = projected_parameters or {}
-    for _ in range(3):
+    projected_parameters = dict(projected_parameters or {})
+    for attempt in range(3):
         if not selected:
             break
         additions = np.asarray(list(selected.values()))
@@ -2261,9 +2261,21 @@ def _preview_shading_split(xyz, normals, uv, cells, selected, owners, sign, proj
             keep[affected] = False
             return candidate_xyz, candidate_normals, candidate_uv, np.concatenate((cells[keep], children))
 
+        if attempt == 2:
+            break
         parents = np.repeat(affected, [len(group) for group in subdivisions])
         rejected = set(parents[invalid])
-        selected = {edge: sample for edge, sample in selected.items() if rejected.isdisjoint(owners[edge])}
+        retry = {}
+        for edge, sample in selected.items():
+            if rejected.isdisjoint(owners[edge]):
+                retry[edge] = sample
+            elif project is not None and edge not in projected_parameters:
+                # Thin neighboring cells may fold from a small sideways
+                # displacement that was within the chord's distance tolerance.
+                projected = project(edge, owners[edge])
+                if projected is not None:
+                    retry[edge], _, projected_parameters[edge] = projected
+        selected = retry
     return None
 
 
@@ -2285,7 +2297,6 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left, pro
     samples = {}
     projections = {}
     exact_surface = None
-    projected_parameters = {}
     candidate_limit = samples_left // 4
 
     def evaluate(parameters):
@@ -2324,8 +2335,7 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left, pro
                     length = np.linalg.norm(blend)
                     if length > 1e-12:
                         dot = float(np.dot(blend, sample[3:]) / length)
-                        projections[key] = (sample, dot)
-                        projected_parameters[key] = result
+                        projections[key] = sample, dot, result
         return projections.get(key)
 
     for _ in range(MAX_PREVIEW_SHADING_PASSES):
@@ -2369,7 +2379,7 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left, pro
         for slot in owner_slots:
             cell, side = divmod(int(slot), 3)
             owners.setdefault(tuple(edge_keys[cell, side]), []).append(cell)
-        selected = {}
+        selected, projected_parameters = {}, {}
         for index in failing[np.argsort(worst[failing], kind="stable")]:
             cell = candidates[index]
             options = []
@@ -2388,6 +2398,7 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left, pro
                 delta = sample[:3] - a
                 fraction = np.dot(delta, chord) / side_squared[cell, offset]
                 dot = dots[index, offset + 1]
+                midpoint_uv = None
                 if not (0.1 <= fraction <= 0.9
                         and np.linalg.norm(delta - fraction * chord) <= tolerance):
                     # A UV midpoint can be displaced along the surface even
@@ -2396,22 +2407,24 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left, pro
                     projected = project(key, adjacent)
                     if projected is None:
                         continue
-                    sample, dot = projected
-                options.append((dot, -side_squared[cell, offset], key, sample))
+                    sample, dot, midpoint_uv = projected
+                options.append((dot, -side_squared[cell, offset], key, sample, midpoint_uv))
             # A bad sample on a locked edge is not fixable by splitting the
             # interior unless there is also error at the center or a usable edge.
             if not options:
                 continue
-            dot, _, key, sample = min(options, key=lambda option: option[:2])
+            dot, _, key, sample, midpoint_uv = min(options, key=lambda option: option[:2])
             if min(dots[index, 0], dot) >= PREVIEW_SHADING_NORMAL_DOT:
                 continue
             selected[key] = sample
+            if midpoint_uv is not None:
+                projected_parameters[key] = midpoint_uv
             if len(selected) == nodes_left:
                 break
         if not selected:
             break
 
-        refined = _preview_shading_split(xyz, exact, uv, cells, selected, owners, sign, projected_parameters)
+        refined = _preview_shading_split(xyz, exact, uv, cells, selected, owners, sign, projected_parameters, project)
         if refined is None:
             break
         new_xyz, exact, uv, cells = refined
