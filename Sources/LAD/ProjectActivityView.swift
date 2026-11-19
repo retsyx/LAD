@@ -58,7 +58,7 @@ final class ProjectActivityPanelController: NSObject, ObservableObject, NSWindow
             self.panel = panel
         }
         guard let panel else { return }
-        let host = NSHostingView(rootView: ProjectActivityView(state: state) { [weak self] in self?.hide() }
+        let host = NSHostingView(rootView: ProjectActivityView(state: state)
             .preferredColorScheme(.dark))
         // AppKit owns this user-resizable panel's frame. Intrinsic SwiftUI
         // sizing must not renegotiate its bounds during title-bar dragging or
@@ -147,13 +147,11 @@ private final class ProjectActivityPanel: NSPanel {
 struct ProjectActivityView: View {
     let state: AppState
     @ObservedObject private var activity: ProjectActivityStore
-    var onClose: () -> Void
     @State private var expandedTasks = Set<UUID>()
 
-    init(state: AppState, onClose: @escaping () -> Void) {
+    init(state: AppState) {
         self.state = state
         self.activity = state.projectActivity
-        self.onClose = onClose
     }
 
     var body: some View {
@@ -166,9 +164,6 @@ struct ProjectActivityView: View {
                 Spacer()
                 CopyButton(label: "Copy tool activity") { ProjectActivityTranscript.text(for: activity.tasks) }
                     .disabled(activity.tasks.isEmpty)
-                Button(action: onClose) { Image(systemName: "xmark").frame(width: 20, height: 20) }
-                    .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Close tool activity")
-                    .accessibilityLabel("Close tool activity")
             }.padding(16)
             Divider()
             if activity.tasks.isEmpty {
