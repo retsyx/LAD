@@ -32,6 +32,10 @@ MAX_PREVIEW_REFINEMENT_NODES = 20_000
 MAX_PREVIEW_REFINEMENT_PASSES = 16
 MAX_PREVIEW_REFINEMENT_PROJECTIONS = 16_384
 MAX_PREVIEW_REFINEMENT_CELLS = 100_000
+MAX_PREVIEW_SHADING_SAMPLES = 64_000
+MAX_PREVIEW_SHADING_NODES = 8_192
+MAX_PREVIEW_SHADING_PASSES = 4
+PREVIEW_SHADING_NORMAL_DOT = math.cos(math.radians(1.0))
 GEOMETRY_TOLERANCE_MM = 1e-4
 LIMIT = 100_000.0
 _validated_replay = ContextVar("validated_replay", default=False)
@@ -1587,6 +1591,41 @@ def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary
     return indices.tolist()
 
 
+def _preview_split_triangle(cell, midpoints):
+    """Split an oriented triangle along any marked edges, preserving its winding."""
+    middle = [midpoints.get(tuple(sorted((cell[index], cell[(index + 1) % 3])))) for index in range(3)]
+    count = sum(node is not None for node in middle)
+    if count == 0:
+        return [cell]
+    if count == 1:
+        offset = next(index for index, node in enumerate(middle) if node is not None)
+        a, b, c = [cell[(offset + index) % 3] for index in range(3)]
+        m = middle[offset]
+        return [(a, m, c), (m, b, c)]
+    if count == 2:
+        offset = (middle.index(None) + 1) % 3
+        a, b, c = [cell[(offset + index) % 3] for index in range(3)]
+        m, n = middle[offset], middle[(offset + 1) % 3]
+        return [(b, n, m), (a, m, c), (m, n, c)]
+    a, b, c = cell
+    m, n, p = middle
+    return [(a, m, p), (m, b, n), (p, n, c), (m, n, p)]
+
+
+def _preview_boundary_edges(edges, poly, location):
+    from OCP.BRep import BRep_Tool
+    from OCP.TopoDS import TopoDS
+    result = set()
+    for edge in edges:
+        for wrapped in (edge.wrapped, TopoDS.Edge(edge.wrapped.Reversed())):
+            polygon = BRep_Tool.PolygonOnTriangulation_s(wrapped, poly, location)
+            if polygon is not None:
+                nodes = polygon.Nodes()
+                sequence = [nodes.Value(index) - 1 for index in range(nodes.Lower(), nodes.Upper() + 1)]
+                result.update(tuple(sorted(pair)) for pair in zip(sequence, sequence[1:]))
+    return result
+
+
 def _preview_refine_face(face, poly, location, points, normals, triangles, boundary, tolerance):
     """Refine a coarse native mesh on its exact surface, preserving trim nodes.
 
@@ -1837,27 +1876,7 @@ def _preview_refine_face(face, poly, location, points, normals, triangles, bound
             candidate_points.append(coordinates)
             candidate_normals.append(direction)
             candidate_uv.append(center.tolist())
-        refined = []
-        for cell in indices.tolist():
-            middle = [midpoints.get(tuple(sorted((cell[index], cell[(index + 1) % 3])))) for index in range(3)]
-            count = sum(node is not None for node in middle)
-            if count == 0:
-                refined.append(cell)
-            elif count == 1:
-                offset = next(index for index, node in enumerate(middle) if node is not None)
-                a, b, c = [cell[(offset + index) % 3] for index in range(3)]
-                m = middle[offset]
-                refined.extend(((a, m, c), (m, b, c)))
-            elif count == 2:
-                missing = next(index for index, node in enumerate(middle) if node is None)
-                offset = (missing + 1) % 3
-                a, b, c = [cell[(offset + index) % 3] for index in range(3)]
-                m, n = middle[offset], middle[(offset + 1) % 3]
-                refined.extend(((b, n, m), (a, m, c), (m, n, c)))
-            else:
-                a, b, c = cell
-                m, n, p = middle
-                refined.extend(((a, m, p), (m, b, n), (p, n, c), (m, n, p)))
+        refined = [child for cell in indices.tolist() for child in _preview_split_triangle(cell, midpoints)]
         xyz = np.asarray(candidate_points)
         exact = np.asarray(candidate_normals)
         uv = np.asarray(candidate_uv)
@@ -1901,15 +1920,7 @@ def _preview_face_triangles(face, poly, location, points, normals, edges, tolera
     # Boundary edges are immutable; only interior diagonals may change. Build
     # their constraints lazily so healthy faceted imports retain the fast path.
     def boundary():
-        result = set()
-        for edge in edges:
-            for wrapped in (edge.wrapped, TopoDS.Edge(edge.wrapped.Reversed())):
-                polygon = BRep_Tool.PolygonOnTriangulation_s(wrapped, poly, location)
-                if polygon is not None:
-                    nodes = polygon.Nodes()
-                    sequence = [nodes.Value(index) - 1 for index in range(nodes.Lower(), nodes.Upper() + 1)]
-                    result.update(tuple(sorted(pair)) for pair in zip(sequence, sequence[1:]))
-        return result
+        return _preview_boundary_edges(edges, poly, location)
     if refine_surface:
         triangles = _preview_refine_face(face, poly, location, points, normals, triangles, boundary(), tolerance)
     else:
@@ -2180,6 +2191,202 @@ def _preview_mesh(shape, solids, tolerance):
     return result
 
 
+def _preview_shading_dots(corners, normals, samples):
+    """Compare at projected XYZ positions, accounting for nonuniform UV spacing."""
+    import numpy as np
+    first, second = corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]
+    plane = np.cross(first, second)
+    area_squared = np.einsum("ni,ni->n", plane, plane)
+    offset = samples[..., :3] - corners[:, None, 0]
+    w1 = np.einsum("nsi,ni->ns", np.cross(offset, second[:, None]), plane) / area_squared[:, None]
+    w2 = np.einsum("nsi,ni->ns", np.cross(first[:, None], offset), plane) / area_squared[:, None]
+    weights = np.stack((1 - w1 - w2, w1, w2), axis=-1)
+    # A curved edge may project just outside the flat cell. Ignore samples
+    # that leave it substantially, especially on sheared or singular charts.
+    within_cell = weights.min(axis=-1) >= -0.1
+    weights = np.maximum(weights, 0)
+    blend = weights @ normals
+    length = np.linalg.norm(blend, axis=-1)
+    valid = within_cell & np.isfinite(length) & (length > 1e-12)
+    dot = np.einsum("nsi,nsi->ns", blend, samples[..., 3:])
+    return np.divide(dot, length, out=np.ones_like(dot), where=valid)
+
+
+def _preview_shading_split(xyz, normals, uv, cells, selected, owners, sign):
+    """Discard local splits that would fold a child, keeping independent splits."""
+    import numpy as np
+    for _ in range(3):
+        if not selected:
+            break
+        additions = np.asarray(list(selected.values()))
+        candidate_xyz = np.concatenate((xyz, additions[:, :3]))
+        candidate_normals = np.concatenate((normals, additions[:, 3:]))
+        candidate_uv = np.concatenate((uv, uv[np.asarray(list(selected))].mean(axis=1)))
+        midpoints = {key: len(xyz) + offset for offset, key in enumerate(selected)}
+        affected = sorted({cell for key in selected for cell in owners[key]})
+        subdivisions = [_preview_split_triangle(cells[cell].tolist(), midpoints) for cell in affected]
+        children = np.asarray([child for group in subdivisions for child in group])
+        new_corners, new_uv = candidate_xyz[children], candidate_uv[children]
+        first, second = new_uv[:, 1] - new_uv[:, 0], new_uv[:, 2] - new_uv[:, 0]
+        cross_uv = sign * (first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0])
+        plane = np.cross(new_corners[:, 1] - new_corners[:, 0], new_corners[:, 2] - new_corners[:, 0])
+        outward = np.einsum("ni,ni->n", plane, candidate_normals[children].mean(axis=1))
+        invalid = ~((cross_uv > 1e-16) & (outward > 1e-12))
+        if not np.any(invalid):
+            keep = np.ones(len(cells), dtype=bool)
+            keep[affected] = False
+            return candidate_xyz, candidate_normals, candidate_uv, np.concatenate((cells[keep], children))
+
+        parents = np.repeat(affected, [len(group) for group in subdivisions])
+        rejected = set(parents[invalid])
+        selected = {edge: sample for edge, sample in selected.items() if rejected.isdisjoint(owners[edge])}
+    return None
+
+
+def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left):
+    """Improve an accepted face's display mesh without touching its native polygon."""
+    import numpy as np
+    from OCP.BRepGProp import BRepGProp_Face
+    from OCP.TopAbs import TopAbs_Orientation
+    from OCP.gp import gp_Pnt, gp_Vec
+
+    face, edges, poly, location, points, normals, triangles = chunk
+    xyz, exact, cells = np.asarray(points), np.asarray(normals), np.asarray(triangles)
+    sign = -1 if face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED else 1
+    uv = np.asarray([poly.UVNode(i).Coord() for i in range(1, len(points) + 1)])
+    surface = BRepGProp_Face(face.wrapped)
+    point, normal = gp_Pnt(), gp_Vec()
+    boundary = None
+    samples = {}
+    candidate_limit = samples_left // 4
+
+    def probe(key):
+        if key not in samples:
+            if len(samples) >= samples_left:
+                return (math.nan,) * 6
+            u, v = uv[list(key)].mean(axis=0)
+            result = (math.nan,) * 6
+            try:
+                surface.Normal(float(u), float(v), point, normal)
+                length = normal.Magnitude()
+                if length > 1e-12 and math.isfinite(length):
+                    result = (*point.Coord(), *(value / length for value in normal.Coord()))
+            except Exception:
+                pass  # A singular/unavailable sample cannot justify a split.
+            samples[key] = result
+        return samples[key]
+
+    for _ in range(MAX_PREVIEW_SHADING_PASSES):
+        corners, parameters = xyz[cells], uv[cells]
+        sides = np.roll(corners, -1, axis=1) - corners
+        side_squared = np.einsum("nsi,nsi->ns", sides, sides)
+        longest = side_squared.max(axis=1)
+        plane = np.cross(sides[:, 0], -sides[:, 2])
+        area_squared = np.einsum("ni,ni->n", plane, plane)
+        # Skip kernel-sized slivers and cells whose chords are already small
+        # compared to the preview's positional tolerance.
+        first, second = parameters[:, 1] - parameters[:, 0], parameters[:, 2] - parameters[:, 0]
+        winding = sign * (first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0])
+        suitable = ((longest >= tolerance ** 2) & (area_squared > longest * GEOMETRY_TOLERANCE_MM ** 2)
+                    & (winding > 1e-16))
+        candidates = np.flatnonzero(suitable)
+        if not len(candidates):
+            break
+        if len(candidates) > candidate_limit:
+            priority = np.argsort(-longest[candidates], kind="stable")[:candidate_limit]
+            candidates = candidates[priority]
+        directed = np.stack((cells, np.roll(cells, -1, axis=1)), axis=-1)
+        edge_keys = np.sort(directed, axis=-1)
+        sampled = np.asarray([[probe(tuple(sorted(cell))), *(probe(tuple(pair)) for pair in keys)]
+                              for cell, keys in zip(cells[candidates].tolist(), edge_keys[candidates].tolist())])
+        dots = _preview_shading_dots(corners[candidates], exact[cells[candidates]], sampled)
+        worst = dots.min(axis=1)
+        failing = np.flatnonzero(worst < PREVIEW_SHADING_NORMAL_DOT)
+        if not len(failing):
+            break
+        if boundary is None:
+            boundary = _preview_boundary_edges(edges, poly, location)
+        # An edge must be shared by two cells with sound UV winding. A native
+        # trim, a seam or an edge bordering a collapsed cell retains its chord.
+        # Search all cells for neighbors, but build Python owner lists only
+        # for edges that could be split on this pass.
+        edge_codes = edge_keys[..., 0] * len(xyz) + edge_keys[..., 1]
+        affected_edges = np.unique(edge_codes[candidates[failing]])
+        owner_slots = np.flatnonzero(np.isin(edge_codes.ravel(), affected_edges))
+        owners = {}
+        for slot in owner_slots:
+            cell, side = divmod(int(slot), 3)
+            owners.setdefault(tuple(edge_keys[cell, side]), []).append(cell)
+        selected = {}
+        for index in failing[np.argsort(worst[failing], kind="stable")]:
+            cell = candidates[index]
+            options = []
+            for offset, key in enumerate(edge_keys[cell].tolist()):
+                key = tuple(key)
+                adjacent = owners[key]
+                if (key in boundary or len(adjacent) != 2
+                        or not all(suitable[owner] for owner in adjacent)
+                        or not np.all(np.isfinite(sampled[index, offset + 1]))):
+                    continue
+                # Bound the change in positions and keep the new vertex away
+                # from either endpoint even when the UV parameter is stretched.
+                a = xyz[key[0]]
+                chord = xyz[key[1]] - a
+                sample = sampled[index, offset + 1]
+                delta = sample[:3] - a
+                fraction = np.dot(delta, chord) / side_squared[cell, offset]
+                if (0.1 <= fraction <= 0.9
+                        and np.linalg.norm(delta - fraction * chord) <= tolerance):
+                    options.append((offset, key, sample))
+            # A bad sample on a locked edge is not fixable by splitting the
+            # interior unless there is also error at the center or a usable edge.
+            if (not options or min(dots[index, 0], *(dots[index, offset + 1] for offset, _, _ in options))
+                    >= PREVIEW_SHADING_NORMAL_DOT):
+                continue
+            _, key, sample = min(options, key=lambda option: (dots[index, option[0] + 1],
+                                                             -side_squared[cell, option[0]]))
+            selected[key] = sample
+            if len(selected) == nodes_left:
+                break
+        if not selected:
+            break
+
+        refined = _preview_shading_split(xyz, exact, uv, cells, selected, owners, sign)
+        if refined is None:
+            break
+        new_xyz, exact, uv, cells = refined
+        nodes_left -= len(new_xyz) - len(xyz)
+        xyz = new_xyz
+        if not nodes_left or len(samples) == samples_left:
+            break
+    if len(xyz) != len(points):
+        chunk = face, edges, poly, location, xyz.tolist(), exact.tolist(), cells.tolist()
+    return chunk, len(samples)
+
+
+def _refine_preview_shading(mesh, tolerance):
+    """Spend a bounded assembly-wide budget on lighting after mesh acceptance."""
+    samples_left = MAX_PREVIEW_SHADING_SAMPLES
+    nodes_left = min(MAX_PREVIEW_SHADING_NODES,
+                     MAX_VERTICES - sum(len(chunk[4]) for solid in mesh for chunk in solid),
+                     (MAX_TRIANGLES - sum(len(chunk[6]) for solid in mesh for chunk in solid)) // 2)
+    if samples_left < 4 or nodes_left <= 0:
+        return
+    # Start with the most heavily tessellated spline faces so small blends
+    # cannot consume the entire budget before the main surfaces are sampled.
+    spline_faces = [(solid, index) for solid in mesh for index, chunk in enumerate(solid)
+                    if chunk[0].geomType() in {"BSPLINE", "BEZIER"} and chunk[2].HasUVNodes()
+                    and chunk[2].NbNodes() == len(chunk[4])]
+    for solid, index in sorted(spline_faces, key=lambda item: -len(item[0][item[1]][6])):
+        chunk = solid[index]
+        refined, sampled = _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left)
+        solid[index] = refined
+        nodes_left -= len(refined[4]) - len(chunk[4])
+        samples_left -= sampled
+        if samples_left < 4 or not nodes_left:
+            break
+
+
 def make_preview(shape, preview_stats=None):
     from OCP.BRep import BRep_Tool
     prepared = None
@@ -2200,6 +2407,7 @@ def make_preview(shape, preview_stats=None):
     diagonal = math.sqrt(sum((bounds[axis + 3] - bounds[axis]) ** 2 for axis in range(3)))
     tolerance = max(0.005, min(0.25, diagonal / 1000))
     mesh = _preview_mesh(shape, solids, tolerance)
+    _refine_preview_shading(mesh, tolerance)
     # Keep an explicit triangle-to-solid mapping for native part picking. A
     # fused body is one selectable solid; a disconnected union/pattern has
     # multiple selectable solids. Tessellating each solid retains CadQuery's
