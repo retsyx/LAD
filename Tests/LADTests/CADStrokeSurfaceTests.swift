@@ -85,6 +85,62 @@ final class CADStrokeSurfaceTests: XCTestCase {
         XCTAssertEqual(CADStrokeSurface.matching(collinear)[0].first, .zero)
     }
 
+    func testJoinUsesOnlyAConsecutiveNativeStrokeAndItsDirectlyMatchedFaces() throws {
+        let a = [-1.0, 0, 0], joint = [0.0, 0, 0], b = [1.0, 0, 0]
+        let vertices = [a, joint, b, [1, 1, 0], [-1, 1, 0], [0, 1, 1], [1, -1, 0], [0, -1, 1], joint]
+        var mesh = makeMesh(vertices: vertices,
+            triangles: [[0, 1, 4], [1, 2, 3], [8, 3, 5], [1, 4, 3], [1, 1, 5], [1, 6, 7], [1, 6, 7]],
+            edges: [a + joint, joint + b, joint + vertices[6]], solids: 2)
+        mesh.edgeSolids = [0, 0, 0]
+        mesh.edgeFeatures = [0, 0, 1]
+        mesh.triangleSolids = [0, 0, 0, 0, 0, 0, 1]
+        mesh.triangleFaces = [0, 0, 0, 0, 0, 1, 2]
+        mesh.topology = CADTopology(vertices: [], edges: [
+            CADEdge(id: .init(kind: .edge, solidIndex: 0, localIndex: 0), type: "BSPLINE", length: 2, polyline: [a, joint, b]),
+            CADEdge(id: .init(kind: .edge, solidIndex: 0, localIndex: 1), type: "LINE", length: 1, polyline: [joint, vertices[6]])
+        ], faces: [(0, 0), (0, 1), (1, 0)].map { owner, local in
+            CADFace(id: .init(kind: .face, solidIndex: owner, localIndex: local), type: "BSPLINE", area: 1, center: joint)
+        }, parts: [])
+
+        let joins = try CADStrokeSurface.matchingDisplay(mesh).joins
+        XCTAssertEqual(Set(joins.keys), [0])
+        let patches = try XCTUnwrap(joins[0])
+        XCTAssertEqual(patches.count, 2)
+        XCTAssertEqual(Set(patches.map(\.neighbor)), [SIMD3(-1, 0, 0), SIMD3(1, 0, 0)])
+        for patch in patches {
+            XCTAssertEqual(patch.origin, .zero)
+            XCTAssertEqual(patch.first, SIMD3(1, 1, 0))
+            XCTAssertEqual(patch.second, SIMD3(0, 1, 1))
+        }
+
+        var broken = mesh
+        broken.edgeFeatures = [0, 1, 0]
+        XCTAssertTrue(try CADStrokeSurface.matchingDisplay(broken).joins.isEmpty)
+        broken = mesh
+        broken.edgePoints[0] = .nan
+        XCTAssertTrue(try CADStrokeSurface.matchingDisplay(broken).joins.isEmpty)
+    }
+
+    func testOnlyClosedNativeEdgesJoinTheirLastSegmentToTheirFirst() throws {
+        let a = [0.0, 0, 0], b = [2.0, 0, 0], c = [0.0, 2, 0]
+        var mesh = makeMesh(vertices: [a, b, c, [-1, 0, 1], [0, -1, 0]],
+            triangles: [[0, 1, 2], [0, 3, 4]], edges: [a + b, b + c, c + a])
+        mesh.edgeSolids = [0, 0, 0]
+        mesh.edgeFeatures = [0, 0, 0]
+        mesh.triangleSolids = [0, 0]
+        mesh.triangleFaces = [0, 0]
+        mesh.topology = CADTopology(vertices: [], edges: [
+            CADEdge(id: .init(kind: .edge, solidIndex: 0, localIndex: 0), type: "BSPLINE", length: 6,
+                    polyline: [a, b, c, a], closed: false)
+        ], faces: [CADFace(id: .init(kind: .face, solidIndex: 0, localIndex: 0), type: "BSPLINE", area: 2, center: a)], parts: [])
+        XCTAssertTrue(try CADStrokeSurface.matchingDisplay(mesh).joins.isEmpty)
+        mesh.topology?.edges[0].closed = true
+        let joins = try XCTUnwrap(try CADStrokeSurface.matchingDisplay(mesh).joins[0])
+        XCTAssertEqual(joins.count, 2)
+        XCTAssertEqual(Set(joins.map(\.neighbor)), [SIMD3(2, 0, 0), SIMD3(0, 2, 0)])
+        XCTAssertTrue(joins.allSatisfy { $0.origin == .zero })
+    }
+
     func testLargeMeshMatchesOnlyRequestedSegmentsWithLinearTraversal() {
         let columns = 123, rows = 500
         var vertices: [[Double]] = [], triangles: [[Int]] = [], edges: [[Double]] = []

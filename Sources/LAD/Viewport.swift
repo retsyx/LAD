@@ -1155,6 +1155,9 @@ final class CADSceneView: NSView {
                 : Self.edgeInk
             node.geometry?.firstMaterial?.readsFromDepthBuffer = mode != .wireframe
             node.geometry?.firstMaterial?.transparency = translucent ? 0.8 : 1
+            if let geometry = node.geometry {
+                CADStrokeGeometry.setJoinsEnabled(mode == .edges, on: geometry)
+            }
         }
         var restyled = Set<Int>()
         for node in modelNode.childNodes {

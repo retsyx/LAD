@@ -90,7 +90,7 @@ struct CADViewportPreparedMesh: Sendable {
 
         let segmentCount = mesh.edgePoints.count.isMultiple(of: 6) ? min(mesh.edgeSegmentCount, 250_000) : 0
         let owners = try validOwners(mesh.edgeSolids, count: mesh.edgeSegmentCount, solids: mesh.solids)
-        let surfaces = try CADStrokeSurface.matchingCancellable(mesh)
+        let (surfaces, joins) = try CADStrokeSurface.matchingDisplay(mesh)
         // Group segment indices by owner; the stroke buffers read the packed
         // points directly.
         var edgeGroups = [Int: [Int]]()
@@ -100,7 +100,8 @@ struct CADViewportPreparedMesh: Sendable {
         }
         var edges = [Int: CADStrokeGeometry.Prepared]()
         for (solid, segments) in edgeGroups {
-            edges[solid] = try CADStrokeGeometry.prepare(points: mesh.edgePoints, segments: segments, surfaces: surfaces)
+            edges[solid] = try CADStrokeGeometry.prepare(points: mesh.edgePoints, segments: segments,
+                                                         surfaces: surfaces, joins: joins[solid] ?? [])
         }
         try Task.checkCancellation()
         return Self(mesh: mesh, vertexData: vertexData, normalData: normalData, vertexCount: vertexCount,

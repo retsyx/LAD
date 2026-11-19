@@ -6,6 +6,87 @@ import XCTest
 
 final class ViewportEdgeOcclusionTests: XCTestCase {
     @MainActor
+    func testJointCoverageFollowsOtherTrianglesOnTheSameFace() throws {
+        // The two segments share the flat triangles along the bottom of a
+        // tessellated face. Its other triangles rise in the middle and can
+        // cover half the stroke within a few pixels of their common vertex.
+        let center = SIMD3<Float>(0, 0, 0)
+        let raised = SCNVector3(0, 1, 1)
+        let vertices = [
+            SCNVector3(-2, 0, 0), SCNVector3Zero, SCNVector3(2, 0, 0),
+            SCNVector3(-1, 1, 0), raised, SCNVector3(1, 1, 0),
+            SCNVector3(-2, -1, 0), SCNVector3(2, -1, 0)
+        ]
+        let faces = SCNGeometry(sources: [SCNGeometrySource(vertices: vertices)], elements: [
+            SCNGeometryElement(indices: [Int32(0), 1, 3, 1, 4, 3, 1, 5, 4, 1, 2, 5, 0, 6, 1, 6, 7, 1, 7, 2, 1],
+                               primitiveType: .triangles)
+        ])
+        let faceMaterial = SCNMaterial()
+        faceMaterial.lightingModel = .constant
+        faceMaterial.diffuse.contents = NSColor.white
+        faces.materials = [faceMaterial]
+        let body = SCNNode(geometry: faces)
+        let cover = SCNNode(geometry: SCNPlane(width: 0.4, height: 0.4))
+        cover.geometry?.materials = [faceMaterial]
+        cover.position.z = 0.12
+        let edges: [Float] = [-2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0]
+        let planes = Array(repeating: CADStrokeSurface(first: SIMD3(0, 0, 1)), count: 2)
+        let joins = [-2.0 as Float, 2.0].flatMap { x in
+            [CADStrokeSurface.Join(origin: center, first: SIMD3(0, 1, 1), second: SIMD3(-1, 1, 0),
+                                   neighbor: SIMD3(x, 0, 0)),
+             CADStrokeSurface.Join(origin: center, first: SIMD3(1, 1, 0), second: SIMD3(0, 1, 1),
+                                   neighbor: SIMD3(x, 0, 0))]
+        }
+        let prepared = try CADStrokeGeometry.prepare(points: edges, segments: [0, 1], surfaces: planes, joins: joins)
+        let stroke = CADStrokeGeometry.make(prepared, color: .magenta, viewportHeight: 192)
+        let material = try XCTUnwrap(stroke.firstMaterial)
+        let ink = SCNNode(geometry: stroke)
+        ink.categoryBitMask = CADViewportCategory.decorations
+        ink.renderingOrder = 1
+        let camera = SCNNode()
+        camera.camera = SCNCamera()
+        camera.camera?.orthographicScale = 2
+        camera.camera?.fieldOfView = 38
+        camera.position = SCNVector3(0, 0, 8)
+        let scene = SCNScene()
+        for node in [body, cover, ink, camera] { scene.rootNode.addChildNode(node) }
+
+        for orthographic in [false, true] {
+            camera.camera?.usesOrthographicProjection = orthographic
+            for scale in [1, 2] {
+                func coverage() throws -> Double {
+                    let shot = try ViewportPassTestRenderer.render(scene: scene, camera: camera, width: 256 * scale,
+                                                                  height: 192 * scale, referenceHeight: 192)
+                    var count = 0.0
+                    let image = shot.image
+                    for x in 127 * scale..<129 * scale {
+                        for y in 96 * scale - 3 * scale..<96 * scale + 3 * scale {
+                            guard let color = image.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                            count += Double(max(0, min(color.redComponent, color.blueComponent) - color.greenComponent))
+                        }
+                    }
+                    return count
+                }
+
+                cover.isHidden = true
+                CADStrokeGeometry.setJoinsEnabled(false, on: stroke)
+                material.readsFromDepthBuffer = false
+                let exposed = try coverage()
+                material.readsFromDepthBuffer = true
+                let before = try coverage()
+                CADStrokeGeometry.setJoinsEnabled(true, on: stroke)
+                let corrected = try coverage()
+                let label = "orthographic=\(orthographic), scale=\(scale)"
+                XCTAssertGreaterThan(exposed, before, label)
+                XCTAssertGreaterThan(corrected, before * 1.10, label)
+                XCTAssertLessThanOrEqual(corrected, exposed * 1.05, label)
+                cover.isHidden = false
+                XCTAssertEqual(try coverage(), 0, accuracy: 0.01, "A nearer surface must still hide the joint.")
+            }
+        }
+    }
+
+    @MainActor
     func testCloseFittingGrooveCoverHidesTheEntireContactEdge() throws {
         // Cross-section of a mating corner: the visible faces rise on either
         // side of the edge. A fitted cover follows both faces, 0.004 units
