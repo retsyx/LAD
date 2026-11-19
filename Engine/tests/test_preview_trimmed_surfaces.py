@@ -11,6 +11,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 from OCP.BRep import BRep_Tool
 from OCP.BRepGProp import BRepGProp_Face
+from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 from OCP.Poly import Poly_Triangulation, Poly_Triangle
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS
@@ -74,22 +75,37 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
                 self.assertGreater(len(owned), 0)
                 local = owned - offset
                 self.assertGreater(len(local), 0)
-                self.assertTrue(np.all((local >= 0) & (local < count)))
-                displayed = points[offset:offset + count]
+                self.assertTrue(np.all(local >= 0))
+                display_count = max(count, int(local.max()) + 1)
+                displayed = points[offset:offset + display_count]
+                self.assertEqual(len(displayed), display_count)
+                self.assertEqual(set(local[local >= count]), set(range(count, display_count)),
+                                 'Each appended display vertex must belong to a triangle of this face.')
 
                 # Independently compare lighting and winding to exact surface
                 # derivatives, rather than accepting the supplied normals.
                 exact = []
                 surface = BRepGProp_Face(face.wrapped)
-                for node in range(1, count + 1):
-                    uv, point, vector = poly.UVNode(node), gp_Pnt(), gp_Vec()
-                    surface.Normal(uv.X(), uv.Y(), point, vector)
+                parameters = [poly.UVNode(node).Coord() for node in range(1, count + 1)]
+                if display_count > count:
+                    exact_face = BRep_Tool.Surface_s(face.wrapped)
+                    projector = GeomAPI_ProjectPointOnSurf()
+                    projector.Init(exact_face, *exact_face.Bounds())
+                    for position in displayed[count:]:
+                        projector.Perform(gp_Pnt(*position))
+                        self.assertGreater(projector.NbPoints(), 0)
+                        self.assertLessEqual(projector.LowerDistance(), 1e-7)
+                        parameters.append(projector.LowerDistanceParameters())
+                for node, (u, v) in enumerate(parameters):
+                    point, vector = gp_Pnt(), gp_Vec()
+                    surface.Normal(u, v, point, vector)
+                    actual = normals[offset + node]
                     if vector.Magnitude() > 1e-12:
                         expected = np.asarray(vector.Normalized().Coord())
-                        actual = normals[offset + node - 1]
                         self.assertGreater(np.dot(expected, actual) / np.linalg.norm(actual), 1 - 1e-10)
                     else:
-                        expected = normals[offset + node - 1]
+                        self.assertLess(node, count, 'New display vertices must have defined exact normals.')
+                        expected = actual
                     exact.append(expected)
                 exact = np.asarray(exact)
                 corners = displayed[local]
@@ -102,7 +118,7 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
 
                 # Coincident poles/seams have separate UV nodes. Compare their
                 # physical boundaries without rounding or moving coordinates.
-                parent = list(range(count))
+                parent = list(range(display_count))
 
                 def root(index):
                     while parent[index] != index:
@@ -143,7 +159,7 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
                 self.assertTrue(native_boundary <= incidence.keys(), 'A native trim segment disappeared.')
                 self.assertTrue({edge for edge, count in incidence.items() if count == 1} <= native_boundary,
                                 'A curved face contains an artificial interior crack.')
-                offset += count
+                offset += display_count
                 face_index += 1
         self.assertEqual(offset, len(points))
         for edge_index, edge in enumerate(preview['topology']['edges']):
