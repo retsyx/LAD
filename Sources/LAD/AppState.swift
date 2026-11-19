@@ -2400,14 +2400,16 @@ final class AppState {
     }
 
     func exportSelectedPartsSTEP() {
-        let solids = selectedPartSolids.intersection(Set(0..<currentSolidCount))
+        let solidCount = currentSolidCount
+        let solids = selectedPartSolids.intersection(Set(0..<solidCount))
         guard canExport, !solids.isEmpty else { return }
         let revisionID = selectedRevisionID, sessionID = projectSessionID
+        let parts = STEPIndividualExport.parts(in: partTree, selected: solids, solidCount: solidCount)
         let panel = NSSavePanel()
         panel.identifier = NSUserInterfaceItemIdentifier("LAD.ExportSelectedPartsSTEP")
         panel.title = "Export selected parts"
         panel.allowedContentTypes = [UTType(filenameExtension: "step") ?? .data]
-        panel.nameFieldStringValue = "\(safeName(title)) selected parts.step"
+        panel.nameFieldStringValue = parts.count == 1 ? parts[0].fileName : "\(safeName(title)) selected parts.step"
         let options = STEPExportOptionsView(panel: panel, projectName: STEPIndividualExport.folderName(for: title))
         panel.accessoryView = options
         guard SavePanelPresentation.runModal(panel) == .OK, let url = panel.url,
