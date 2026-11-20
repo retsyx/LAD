@@ -298,6 +298,10 @@ private struct WorkspaceViewer: View {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
+                            viewportToggle($sectionControl.isEnabled, label: "Section View", help: "Toggle section view",
+                                           icon: Image(systemName: "square.split.diagonal"))
+                                .disabled(!canSection)
+                                .accessibilityIdentifier("sectionViewToggle")
                             viewportToggle($state.showGrid, label: "Grid", help: "Toggle grid",
                                            icon: Image(systemName: "grid"))
                             if state.showGrid, let gridSpacing = viewportReference.gridSpacing {
@@ -309,10 +313,6 @@ private struct WorkspaceViewer: View {
                                     .accessibilityLabel("Grid square size: \(spacing) millimetres")
                                     .accessibilityIdentifier("gridSquareSize")
                             }
-                            viewportToggle($sectionControl.isEnabled, label: "Section View", help: "Toggle section view",
-                                           icon: Image(systemName: "square.split.diagonal"))
-                                .disabled(!canSection)
-                                .accessibilityIdentifier("sectionViewToggle")
                         }
                         HStack(spacing: 8) {
                             viewportToggle($state.printVersionView, label: "3D Printing Version",
