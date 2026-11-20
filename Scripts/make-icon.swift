@@ -2,8 +2,8 @@ import AppKit
 
 let root = URL(fileURLWithPath: CommandLine.arguments[1])
 
-// Match WorkspaceView's header exactly: the same symbol, light weight, and
-// Palette.accent color. Keep one rendered logo for every Finder icon variant.
+// The LAD logo: the cube.transparent.fill symbol at light weight in the
+// Palette.accent gold. Keep one rendered logo for every Finder icon variant.
 let gold = NSColor(srgbRed: 0.96, green: 0.70, blue: 0.36, alpha: 1)
 guard let symbol = NSImage(systemSymbolName: "cube.transparent.fill", accessibilityDescription: "LAD")?
     .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 25, weight: .light)) else {

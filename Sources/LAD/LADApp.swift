@@ -13,6 +13,7 @@ struct LADApp: App {
             ProjectWindowRoot(request: $request, coordinator: delegate.projectWindows, recentProjects: delegate.recentProjects)
         }
         .defaultSize(width: 1440, height: 900)
+        .windowStyle(.hiddenTitleBar)
         .commands { ProjectCommands(coordinator: delegate.projectWindows, recentProjects: delegate.recentProjects,
                                     helpWindow: delegate.helpWindow) }
         Settings { LADSettingsView().preferredColorScheme(.dark).tint(Palette.accent) }

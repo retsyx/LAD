@@ -108,12 +108,13 @@ struct WorkspaceView: View {
             }
             WorkspaceStatusBar(state: state)
         }
+        // The header takes the place of the hidden title bar.
+        .ignoresSafeArea(.container, edges: .top)
         .background(Palette.background)
         .background(ProjectActivityWindowAnchor {
             viewportReference.window = $0
             state.presentSaveConflict(in: $0)
         })
-        .toolbarBackground(Palette.panel, for: .windowToolbar)
         .focusedSceneValue(\.conversationSearch, conversationSearch)
         .focusedSceneObject(sectionControl)
         .onChange(of: state.projectEditingID) { _, _ in
@@ -139,17 +140,12 @@ struct WorkspaceView: View {
     }
 
     private var topBar: some View {
-        HStack(spacing: 18) {
-            HStack(spacing: 9) {
-                Image(systemName: "cube.transparent.fill").font(.system(size: 25, weight: .light)).foregroundStyle(Palette.accent)
-                Text("LAD").font(.system(size: 20, weight: .bold, design: .rounded)).tracking(2)
-            }
-            Rectangle().fill(Palette.line).frame(width: 1, height: 25)
+        WorkspaceHeaderLayout(leadingReserve: WindowHeaderChrome.windowButtonsWidth, spacing: 14) {
             projectName
-                .frame(minWidth: 120, idealWidth: 360, maxWidth: 600, alignment: .leading)
-                // Use the existing bottom padding for transient feedback;
+                .frame(maxWidth: .infinity)
+                // Use the header's bottom padding for transient feedback;
                 // changing save state must not resize the header or viewport.
-                .overlay(alignment: .bottomLeading) {
+                .overlay(alignment: .bottom) {
                     if let message = projectRenameError ?? state.saveStatus {
                         Group {
                             if projectRenameError == nil, state.saveConflict != nil {
@@ -160,47 +156,64 @@ struct WorkspaceView: View {
                         }
                             .font(.system(size: 10)).foregroundStyle(Palette.accent)
                             .lineLimit(1).truncationMode(.tail)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(maxWidth: .infinity)
                             .offset(y: 14)
                             .help(message)
                             .accessibilityLabel(projectRenameError == nil ? message : "Design name error: \(message)")
                     }
                 }
-                .layoutPriority(1)
-            Spacer()
-            Button { state.saveNewProject() } label: { Label("Save New", systemImage: "square.and.arrow.down") }
+            HStack(spacing: 14) {
+                Button { state.saveNewProject() } label: {
+                    Label("Save New", systemImage: "square.and.arrow.down").frame(height: 30)
+                }
                 .help("Save the latest design as a new file (⌘S)")
                 .disabled(!state.canSaveNew)
-            Button { state.exportSTEP() } label: {
-                HStack(spacing: 7) { Image(systemName: "arrow.up.right.square"); Text("Export STEP").fontWeight(.semibold) }
-                    .padding(.horizontal, 8).padding(.vertical, 5)
+                Button { state.exportSTEP() } label: {
+                    // A 28-point label gives the prominent bezel a 30-point height.
+                    HStack(spacing: 7) { Image(systemName: "arrow.up.right.square"); Text("Export STEP").fontWeight(.semibold) }
+                        .padding(.horizontal, 8).frame(height: 28)
+                }
+                .buttonStyle(.borderedProminent).disabled(!state.canExport)
             }
-            .buttonStyle(.borderedProminent).disabled(!state.canExport)
+            .fixedSize()
+            .padding(.trailing, 16)
         }
         .buttonStyle(.borderless)
-        .padding(.horizontal, 22).padding(.vertical, 14)
+        .frame(height: WindowHeaderChrome.height)
+        .background(WindowHeaderChrome())
         .background(Palette.panel)
     }
 
     @ViewBuilder
     private var projectName: some View {
         if isRenamingProject {
-            TextField("Design name", text: $projectNameDraft)
-                .font(.system(size: 13, weight: .semibold))
-                .textFieldStyle(.plain)
+            // The hidden text sizes the field to its contents, so the name
+            // stays centered where it was shown while it is edited.
+            Text(projectNameDraft)
+                .font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                .frame(minWidth: 120)
+                .padding(.horizontal, 6)
+                .hidden()
+                .accessibilityHidden(true)
+                .overlay {
+                    TextField("Design name", text: $projectNameDraft)
+                        .font(.system(size: 13, weight: .semibold))
+                        .textFieldStyle(.plain)
+                        .multilineTextAlignment(.center)
+                        .focused($projectNameFocused)
+                        .accessibilityLabel("Design name")
+                        .accessibilityIdentifier("projectNameField")
+                        .onSubmit { finishProjectRename() }
+                        .onExitCommand { cancelProjectRename() }
+                        .onChange(of: projectNameFocused) { _, focused in
+                            if !focused { cancelProjectRename() }
+                        }
+                        .onChange(of: projectNameDraft) { _, _ in projectRenameError = nil }
+                }
                 .padding(.horizontal, 4).padding(.vertical, 3)
                 .background(Palette.background, in: RoundedRectangle(cornerRadius: 4))
                 .overlay(RoundedRectangle(cornerRadius: 4).stroke(Palette.accent.opacity(0.6), lineWidth: 1))
-                .focused($projectNameFocused)
-                .accessibilityLabel("Design name")
-                .accessibilityIdentifier("projectNameField")
-                .onSubmit { finishProjectRename() }
-                .onExitCommand { cancelProjectRename() }
-                .onChange(of: projectNameFocused) { _, focused in
-                    if !focused { cancelProjectRename() }
-                }
                 .background(ProjectRenameOutsideClickRegion(onCancel: cancelProjectRename))
-                .onChange(of: projectNameDraft) { _, _ in projectRenameError = nil }
                 .task {
                     await Task.yield()
                     if !Task.isCancelled, isRenamingProject { projectNameFocused = true }
@@ -214,8 +227,7 @@ struct WorkspaceView: View {
                 isRenamingProject = true
             } label: {
                 Text(state.projectDisplayName)
-                    .font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.tail)
                     .padding(.horizontal, 4).padding(.vertical, 3)
                     .contentShape(Rectangle())
             }
@@ -254,6 +266,28 @@ struct WorkspaceView: View {
                                 showsSection: sectionControl.isEnabled && state.displayedMesh != nil && !state.printLayoutView)
         .background(Palette.panel)
         .accessibilityIdentifier("projectSidebarSplitView")
+    }
+}
+
+/// Centers the design name in the header, truncating it before it reaches the
+/// window buttons or the trailing actions.
+private struct WorkspaceHeaderLayout: Layout {
+    let leadingReserve: CGFloat
+    let spacing: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        CGSize(width: proposal.replacingUnspecifiedDimensions().width,
+               height: proposal.height ?? subviews.map { $0.sizeThatFits(.unspecified).height }.max() ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard subviews.count == 2 else { return }
+        let name = subviews[0], actions = subviews[1]
+        let actionsSize = actions.sizeThatFits(.unspecified)
+        actions.place(at: CGPoint(x: bounds.maxX, y: bounds.midY), anchor: .trailing, proposal: ProposedViewSize(actionsSize))
+        let reserve = max(leadingReserve, actionsSize.width) + spacing
+        name.place(at: CGPoint(x: bounds.midX, y: bounds.midY), anchor: .center,
+                   proposal: ProposedViewSize(width: max(0, bounds.width - 2 * reserve), height: nil))
     }
 }
 
