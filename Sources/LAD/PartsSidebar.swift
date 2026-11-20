@@ -247,14 +247,15 @@ private struct PartTreeItem: View {
                     }
                     .padding(.leading, 5).padding(.vertical, 7)
                     .contentShape(Rectangle())
+                    // The label owns the draggable area inside the plain button.
+                    .onDrag {
+                        onFinishRename(false)
+                        let ids = state.selectedPartNodeIDs.contains(node.id) ? state.selectedPartNodeIDs : [node.id]
+                        return PartTreeDrag.provider(for: PartTreeDrag.Session(
+                            projectSessionID: state.projectEditingID, revisionID: state.selectedRevisionID, nodeIDs: ids))
+                    }
                 }
                 .buttonStyle(.plain)
-                .onDrag {
-                    onFinishRename(false)
-                    let ids = state.selectedPartNodeIDs.contains(node.id) ? state.selectedPartNodeIDs : [node.id]
-                    return PartTreeDrag.provider(for: PartTreeDrag.Session(
-                        projectSessionID: state.projectEditingID, revisionID: state.selectedRevisionID, nodeIDs: ids))
-                }
                 .help(node.name)
                 .accessibilityLabel(node.name)
                 .accessibilityAddTraits(selection.isSelected ? .isSelected : [])
