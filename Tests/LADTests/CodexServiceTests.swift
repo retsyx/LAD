@@ -160,6 +160,7 @@ final class CodexServiceTests: XCTestCase {
         XCTAssertTrue(instructions.contains("Never use lad_import for geometry you create or modify as part of this design"))
         XCTAssertTrue(instructions.contains("design-generated SDF/mesh outputs"))
         XCTAssertTrue(instructions.contains("faithful format conversions of user-provided inputs"))
+        XCTAssertTrue(instructions.contains("Never mention LAD or its tool names in commentary, messages, questions, titles or summaries"))
         XCTAssertFalse(request.contains("Never use lad_import for geometry you create"),
                        "Design instructions travel as developer instructions, not in the request.")
         XCTAssertFalse((request + instructions).contains("before invoking you"), "The prompt must not describe the removed automatic dispatch.")
