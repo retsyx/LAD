@@ -148,6 +148,86 @@ final class ViewportSectionRenderingTests: XCTestCase {
     }
 
     @MainActor
+    func testSectionHatchesOnlyOverlapOfVisibleParts() async throws {
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        view.preparesRendererResources = false
+        let preview = interferenceFixture()
+        let overlap = SCNVector3(0, 8, 0)
+        let barOnly = SCNVector3Zero
+        let wallOnly = SCNVector3(0, 8, 4)
+
+        for projection in ViewportProjectionMode.allCases {
+            for mode in ViewportDisplayMode.allCases {
+                view.update(mesh: preview, mode: mode, grid: false, command: ViewportCommand(.right),
+                            selectedSolids: [], hiddenSolids: [], projection: projection, sectionEnabled: true)
+                let image = try await capture(view)
+                XCTAssertTrue(try hasRedHatching(view, image, at: overlap), "\(projection), \(mode)")
+                XCTAssertFalse(try hasRedHatching(view, image, at: barOnly), "The tube opening contains only the bar.")
+                XCTAssertFalse(try hasRedHatching(view, image, at: wallOnly), "The tube wall outside the bar stays neutral.")
+            }
+        }
+
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [1],
+                    projection: .isometric, sectionEnabled: true)
+        let hidden = try await capture(view)
+        XCTAssertFalse(try hasRedHatching(view, hidden, at: overlap))
+
+        var onePart = preview
+        onePart.parts = [PartNode(id: "one-part", name: "Part", solidIndices: [0, 1])]
+        view.update(mesh: onePart, mode: .edges, grid: false, command: ViewportCommand(.right), selectedSolids: [],
+                    hiddenSolids: [], projection: .isometric, sectionEnabled: true)
+        let sameOwner = try await capture(view)
+        XCTAssertFalse(try hasRedHatching(view, sameOwner, at: overlap), "Subsolids belong to the same physical part.")
+    }
+
+    @MainActor
+    func testSectionInterferenceFollowsThePresentedPoseAndExcludesContact() async throws {
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        view.preparesRendererResources = false
+        let preview = interferenceFixture()
+        view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.right),
+                    selectedSolids: [], hiddenSolids: [], projection: .isometric, sectionEnabled: true)
+        let initial = try await capture(view)
+        let rightWall = SCNVector3(0, 8, 0)
+        let leftWall = SCNVector3(0, -8, 0)
+        XCTAssertTrue(try hasRedHatching(view, initial, at: rightWall))
+        XCTAssertFalse(try hasRedHatching(view, initial, at: leftWall))
+
+        let body = try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:1", recursively: true))
+        let cap = try XCTUnwrap(view.scene.rootNode.childNodes.first { $0.categoryBitMask == CADViewportCategory.sectionCaps })
+        let initialCap = try XCTUnwrap(cap.geometry)
+        func moveBar(x: Double = 0, y: Double = 0) {
+            let transform = [1.0, 0, 0, x, 0, 1, 0, y, 0, 0, 1, 0, 0, 0, 0, 1]
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [],
+                        projection: .isometric, solidTransforms: [1: transform], sectionEnabled: true)
+        }
+
+        moveBar(y: -8)
+        XCTAssertIdentical(cap.geometry, initialCap)
+        XCTAssertEqual(body.simdWorldTransform.columns.3.y, 0)
+        let moved = try await capture(view)
+        XCTAssertEqual(body.simdWorldTransform.columns.3.y, -8)
+        XCTAssertTrue(try hasRedHatching(view, moved, at: leftWall))
+        XCTAssertFalse(try hasRedHatching(view, moved, at: rightWall))
+
+        // Here the ends of the bar touch both side walls of the tube opening.
+        moveBar(y: -3)
+        let touching = try await capture(view)
+        for y in [-6.0, 6.0] {
+            XCTAssertFalse(try hasRedHatching(view, touching, at: SCNVector3(0, y, 0)))
+        }
+
+        moveBar(y: 15)
+        let separated = try await capture(view)
+        XCTAssertFalse(try hasRedHatching(view, separated, at: rightWall))
+
+        // These parts still intersect in 3D, away from this plane.
+        moveBar(x: 6)
+        let outsideCut = try await capture(view)
+        XCTAssertFalse(try hasRedHatching(view, outsideCut, at: rightWall))
+    }
+
+    @MainActor
     func testMovingSectionKeepsTheLastMatchingCapAndCoalescesPendingCuts() async throws {
         let preview = tube()
         let mesh = try XCTUnwrap(CADViewportPreparedMesh.prepare(preview))
@@ -380,6 +460,42 @@ final class ViewportSectionRenderingTests: XCTestCase {
                 try XCTUnwrap(image.colorAt(x: column, y: row)?.usingColorSpace(.sRGB))
             }
         }
+    }
+
+    @MainActor
+    private func hasRedHatching(_ view: CADSceneView, _ image: NSBitmapImageRep, at point: SCNVector3) throws -> Bool {
+        try pixelBlock(view, image, around: point, radius: 4).contains { color in
+            color.redComponent - max(color.greenComponent, color.blueComponent) > 0.14
+        }
+    }
+
+    private func interferenceFixture() -> PreviewMesh {
+        var preview = tube()
+        let base = UInt32(preview.positions.count / 3)
+        let tubeTriangles = preview.triangleIndices.count / 3
+        for x: Float in [-4, 4] {
+            preview.positions.append(contentsOf: [x, -3, -2, x, 9, -2, x, 9, 2, x, -3, 2])
+        }
+        func quad(_ a: UInt32, _ b: UInt32, _ c: UInt32, _ d: UInt32) {
+            preview.triangleIndices.append(contentsOf: [a, b, c, a, c, d].map { base + $0 })
+        }
+        quad(0, 3, 2, 1)
+        quad(4, 5, 6, 7)
+        for i: UInt32 in 0..<4 {
+            let j = (i + 1) % 4
+            quad(i, j, j + 4, i + 4)
+        }
+        preview.triangleSolids = Array(repeating: 0, count: tubeTriangles) + Array(repeating: 1, count: 12)
+        preview.solids = 2
+        preview.faces += 6
+        preview.volume += 384
+        preview.area += 352
+        preview.stepPath = "section-interference"
+        preview.parts = [PartNode(id: "assembly", name: "Assembly", solidIndices: [], children: [
+            PartNode(id: "tube", name: "Tube", solidIndices: [0]),
+            PartNode(id: "bar", name: "Bar", solidIndices: [1])
+        ])]
+        return preview
     }
 
     /// A closed rectangular tube with one hole through the section plane.

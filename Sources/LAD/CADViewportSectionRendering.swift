@@ -20,7 +20,7 @@ enum CADViewportSectionRendering {
     }
     """
 
-    private static let hatching = """
+    private static let hatchPattern = """
     #pragma arguments
     float4 cadSectionHatchAxis;
     #pragma body
@@ -29,8 +29,12 @@ enum CADViewportSectionRendering {
     float cadPhase = abs(fract(cadBand) - 0.5);
     float cadFeather = max(fwidth(cadBand), 0.01);
     float cadHatch = 1.0 - smoothstep(0.067, 0.067 + cadFeather, cadPhase);
-    _output.color.rgb *= 1.0 - 0.50 * cadHatch * (1.0 - smoothstep(0.1, 0.6, cadFeather));
+
     """
+    private static let hatching = hatchPattern
+        + "_output.color.rgb *= 1.0 - 0.50 * cadHatch * (1.0 - smoothstep(0.1, 0.6, cadFeather));"
+    private static let hatchLines = hatchPattern
+        + "if (cadHatch < 0.5 && cadFeather < 0.6) { discard_fragment(); }"
 
     static func apply(_ plane: CADSectionPlane?, to material: SCNMaterial) {
         var modifiers = material.shaderModifiers ?? [:]
@@ -46,8 +50,8 @@ enum CADViewportSectionRendering {
         }
     }
 
-    static func hatch(_ axis: SIMD4<Float>, on material: SCNMaterial) {
-        material.shaderModifiers = [.fragment: hatching]
+    static func hatch(_ axis: SIMD4<Float>, on material: SCNMaterial, linesOnly: Bool = false) {
+        material.shaderModifiers = [.fragment: linesOnly ? hatchLines : hatching]
         bind(axis, to: material, key: hatchAxisKey)
     }
 
@@ -56,7 +60,8 @@ enum CADViewportSectionRendering {
         if modifiers?[.surface] == clipping, let value = source.value(forKey: planeKey) {
             destination.setValue(value, forKey: planeKey)
         }
-        if modifiers?[.fragment] == hatching, let value = source.value(forKey: hatchAxisKey) {
+        let fragment = modifiers?[.fragment]
+        if fragment == hatching || fragment == hatchLines, let value = source.value(forKey: hatchAxisKey) {
             destination.setValue(value, forKey: hatchAxisKey)
         }
     }
@@ -76,6 +81,7 @@ final class CADViewportSectionCaps {
         let mesh: CADViewportPreparedMesh
         let transforms: [Int: simd_double4x4]
         let hidden: Set<Int>
+        let partOwners: [Int: Int]
         let wire: Bool
         let renderer: SCNRenderer?
         let present: @MainActor (CADSectionPlane?, SCNGeometry?) -> Void
@@ -91,7 +97,8 @@ final class CADViewportSectionCaps {
     deinit { task?.cancel() }
 
     func update(plane: CADSectionPlane?, mesh: CADViewportPreparedMesh?, transforms: [Int: simd_double4x4],
-                hidden: Set<Int>, mode: ViewportDisplayMode, renderer: SCNRenderer?, replacingInputs: Bool = false,
+                hidden: Set<Int>, partOwners: [Int: Int] = [:], mode: ViewportDisplayMode, renderer: SCNRenderer?,
+                replacingInputs: Bool = false,
                 present: @escaping @MainActor (CADSectionPlane?, SCNGeometry?) -> Void) {
         if replacingInputs || plane == nil || mesh == nil {
             task?.cancel()
@@ -99,7 +106,7 @@ final class CADViewportSectionCaps {
             pending = nil
         }
         guard let plane, let mesh else { present(nil, nil); return }
-        pending = Request(plane: plane, mesh: mesh, transforms: transforms, hidden: hidden,
+        pending = Request(plane: plane, mesh: mesh, transforms: transforms, hidden: hidden, partOwners: partOwners,
                           wire: mode == .wireframe, renderer: renderer, present: present)
         startNext()
         if replacingInputs { present(nil, nil) }
@@ -109,14 +116,14 @@ final class CADViewportSectionCaps {
         guard task == nil, let request = pending else { return }
         pending = nil
         let worker = Task.detached(priority: .userInitiated) { [mesh = request.mesh, plane = request.plane,
-                transforms = request.transforms, hidden = request.hidden, wire = request.wire] in
-            try CADSectionCapMesh(mesh: mesh, plane: plane, transforms: transforms, hidden: hidden, wire: wire)
+                transforms = request.transforms, hidden = request.hidden, partOwners = request.partOwners, wire = request.wire] in
+            try CADSectionCapMesh(mesh: mesh, plane: plane, transforms: transforms, hidden: hidden, partOwners: partOwners, wire: wire)
         }
         task = Task { [weak self] in
             let result = await withTaskCancellationHandler { try? await worker.value } onCancel: { worker.cancel() }
             guard !Task.isCancelled else { return }
             let geometry: SCNGeometry? = result.flatMap {
-                $0.positions.isEmpty ? nil : Self.geometry($0, wire: request.wire)
+                $0.positions.isEmpty && $0.interferencePositions.isEmpty ? nil : Self.geometry($0, wire: request.wire)
             }
             let ready: Bool
             if let geometry, let renderer = request.renderer {
@@ -134,29 +141,45 @@ final class CADViewportSectionCaps {
     }
 
     private static func geometry(_ cap: CADSectionCapMesh, wire: Bool) -> SCNGeometry {
-        let positions = cap.positions.withUnsafeBufferPointer { Data(buffer: $0) }
-        let indices = Array(UInt32(0)..<UInt32(cap.positions.count)).withUnsafeBufferPointer { Data(buffer: $0) }
-        let element = SCNGeometryElement(data: indices, primitiveType: wire ? .line : .triangles,
-                                         primitiveCount: cap.positions.count / (wire ? 2 : 3),
-                                         bytesPerIndex: MemoryLayout<UInt32>.size)
-        let vertices = SCNGeometrySource(data: positions, semantic: .vertex, vectorCount: cap.positions.count,
+        let points = cap.interferencePositions.isEmpty ? cap.positions : cap.positions + cap.interferencePositions
+        let positions = points.withUnsafeBufferPointer { Data(buffer: $0) }
+        let vertices = SCNGeometrySource(data: positions, semantic: .vertex, vectorCount: points.count,
                                         usesFloatComponents: true, componentsPerVector: 3, bytesPerComponent: 4,
                                         dataOffset: 0, dataStride: MemoryLayout<SIMD3<Float>>.stride)
-        let geometry = SCNGeometry(sources: [vertices], elements: [element])
-        let material = SCNMaterial()
-        material.lightingModel = .constant
-        material.diffuse.contents = NSColor(srgbRed: 0.59, green: 0.61, blue: 0.64, alpha: 1)
-        material.isDoubleSided = true
-        material.readsFromDepthBuffer = !wire
-        material.writesToDepthBuffer = !wire
-        if !wire { CADViewportSectionRendering.hatch(cap.hatchAxis, on: material) }
-        geometry.materials = [material]
+        var elements = [SCNGeometryElement]()
+        var materials = [SCNMaterial]()
+
+        func appendElement(_ range: Range<Int>, lines: Bool, color: NSColor, hatched: Bool) {
+            let indices = Array(UInt32(range.lowerBound)..<UInt32(range.upperBound)).withUnsafeBufferPointer { Data(buffer: $0) }
+            elements.append(SCNGeometryElement(data: indices, primitiveType: lines ? .line : .triangles,
+                                               primitiveCount: range.count / (lines ? 2 : 3), bytesPerIndex: MemoryLayout<UInt32>.size))
+            let material = SCNMaterial()
+            material.lightingModel = .constant
+            material.diffuse.contents = color
+            material.isDoubleSided = true
+            material.readsFromDepthBuffer = !wire
+            material.writesToDepthBuffer = !wire
+            if hatched { CADViewportSectionRendering.hatch(cap.hatchAxis, on: material, linesOnly: wire) }
+            materials.append(material)
+        }
+
+        if !cap.positions.isEmpty {
+            appendElement(0..<cap.positions.count, lines: wire, color: NSColor(srgbRed: 0.59, green: 0.61, blue: 0.64, alpha: 1),
+                          hatched: !wire)
+        }
+        if !cap.interferencePositions.isEmpty {
+            appendElement(cap.positions.count..<points.count, lines: false,
+                          color: NSColor(srgbRed: 0.92, green: 0.22, blue: 0.23, alpha: 1), hatched: true)
+        }
+        let geometry = SCNGeometry(sources: [vertices], elements: elements)
+        geometry.materials = materials
         return geometry
     }
 }
 
 struct CADSectionCapMesh: Sendable {
     private(set) var positions = [SIMD3<Float>]()
+    private(set) var interferencePositions = [SIMD3<Float>]()
     let hatchAxis: SIMD4<Float>
 
     private struct Segment {
@@ -175,7 +198,7 @@ struct CADSectionCapMesh: Sendable {
     /// across each slab fills material by odd/even coverage, including
     /// concave sections, separate islands and holes in one solid.
     init(mesh: CADViewportPreparedMesh, plane: CADSectionPlane,
-         transforms: [Int: simd_double4x4], hidden: Set<Int>, wire: Bool) throws {
+         transforms: [Int: simd_double4x4], hidden: Set<Int>, partOwners: [Int: Int], wire: Bool) throws {
         let span = Self.span(mesh.mesh.bounds)
         let spacing = max(span / 55, 1e-7)
         let axis = (plane.horizontal + plane.vertical) / spacing
@@ -190,11 +213,19 @@ struct CADSectionCapMesh: Sendable {
         let worldHorizontal = SIMD4(plane.horizontal, -simd_dot(plane.horizontal, plane.origin))
         let worldVertical = SIMD4(plane.vertical, -simd_dot(plane.vertical, plane.origin))
 
-        for (solid, indices) in mesh.groups.sorted(by: { $0.key < $1.key }) where !hidden.contains(solid) {
-            try Task.checkCancellation()
+        let sections = mesh.groups.sorted { $0.key < $1.key }.compactMap { solid, indices
+            -> (solid: Int, indices: [Int32], transform: simd_double4x4, plane: SIMD4<Double>)? in
+            guard !hidden.contains(solid) else { return nil }
             let transform = simd_transpose(transforms[solid] ?? matrix_identity_double4x4)
             let localPlane = transform * worldPlane
-            if let bounds = mesh.solidBounds[solid], !Self.intersects(bounds, plane: localPlane) { continue }
+            if let bounds = mesh.solidBounds[solid], !Self.intersects(bounds, plane: localPlane) { return nil }
+            return (solid, indices, transform, localPlane)
+        }
+        var trapezoids = [CADSectionInterference.Trapezoid]()
+        var collectInterference = Set(sections.map { partOwners[$0.solid] ?? $0.solid }).count > 1
+
+        for (solid, indices, transform, localPlane) in sections {
+            try Task.checkCancellation()
             let horizontal = transform * worldHorizontal
             let vertical = transform * worldVertical
             func project(_ p: SIMD4<Double>) -> SIMD2<Double> {
@@ -234,7 +265,7 @@ struct CADSectionCapMesh: Sendable {
                     append(segment.start, in: plane)
                     append(segment.end, in: plane)
                 }
-                continue
+                if !collectInterference { continue }
             }
             let sides = segments.filter { $0.minY < $0.maxY }.sorted { $0.minY < $1.minY }
             let ordinates = Set(sides.flatMap { [$0.minY, $0.maxY] }).sorted()
@@ -258,22 +289,47 @@ struct CADSectionCapMesh: Sendable {
                 for index in stride(from: 0, to: crossed.count, by: 2) {
                     let left = crossed[index], right = crossed[index + 1]
                     guard right.x - left.x > coordinateTolerance else { continue }
-                    guard positions.count + 6 <= maximumVertices else { exceededBudget = true; break }
+                    if !wire, positions.count + 6 > maximumVertices {
+                        exceededBudget = true
+                        break
+                    }
                     let a = SIMD2(left.edge.x(at: y), y), b = SIMD2(right.edge.x(at: y), y)
                     let c = SIMD2(right.edge.x(at: topY), topY), d = SIMD2(left.edge.x(at: topY), topY)
-                    for point in [a, b, c, a, c, d] { append(point, in: plane) }
+                    if !wire {
+                        for point in [a, b, c, a, c, d] { append(point, in: plane) }
+                    }
+                    if collectInterference {
+                        if trapezoids.count < maximumVertices / 6 {
+                            trapezoids.append(.init(owner: partOwners[solid] ?? solid, bottomLeft: a, bottomRight: b, topRight: c, topLeft: d))
+                        } else {
+                            // Ignore incomplete overlap candidates while retaining the ordinary wire contours.
+                            trapezoids.removeAll()
+                            collectInterference = false
+                        }
+                    }
                 }
-                if exceededBudget { break }
+                if exceededBudget || (wire && !collectInterference) { break }
             }
             if exceededBudget {
                 positions.removeSubrange(solidStart...)
                 return
             }
         }
+        let availableVertices = wire ? maximumVertices - positions.count : maximumVertices
+        if collectInterference, let overlap = try CADSectionInterference.triangulate(
+            trapezoids, tolerance: coordinateTolerance, maximumVertices: availableVertices, includesNormal: !wire
+        ) {
+            if !wire { positions = overlap.normal.map { Self.world($0, in: plane) } }
+            interferencePositions = overlap.interfering.map { Self.world($0, in: plane) }
+        }
     }
 
     private mutating func append(_ uv: SIMD2<Double>, in plane: CADSectionPlane) {
-        positions.append(SIMD3<Float>(plane.origin + uv.x * plane.horizontal + uv.y * plane.vertical))
+        positions.append(Self.world(uv, in: plane))
+    }
+
+    private static func world(_ uv: SIMD2<Double>, in plane: CADSectionPlane) -> SIMD3<Float> {
+        SIMD3<Float>(plane.origin + uv.x * plane.horizontal + uv.y * plane.vertical)
     }
 
     private static func span(_ bounds: [Double]) -> Double {

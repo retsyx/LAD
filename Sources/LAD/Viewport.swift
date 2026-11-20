@@ -248,6 +248,8 @@ final class CADSceneView: NSView {
     private var presentedSectionPlane: CADSectionPlane?
     private var retainedSectionPlane: CADSectionPlane?
     private var sectionMesh: CADViewportPreparedMesh?
+    private var sectionParts: [PartNode]?
+    private var sectionPartOwners = [Int: Int]()
     private let sectionCaps = CADViewportSectionCaps()
     private var sectionManipulator: CADSectionManipulator?
     private struct SectionFaceTarget {
@@ -556,6 +558,7 @@ final class CADSceneView: NSView {
         finishes.merge(solidColors.filter { (0..<4_096).contains($0.key) && $0.value.isValid },
                        uniquingKeysWith: { _, override in override })
         self.solidColors = finishes
+        let sectionOwnersChanged = updateSectionPartOwners(mesh?.parts)
         let requestedPoseChanged = requestedSolidTransforms != solidTransforms
         requestedSolidTransforms = solidTransforms
         if gridChanged { gridNode.isHidden = !grid }
@@ -618,8 +621,8 @@ final class CADSceneView: NSView {
         }
         if sectionPlane == nil {
             openSectionIfRequested()
-        } else if requestedPoseChanged || visibilityChanged || sectionStyleChanged {
-            updateSectionCaps(replacingInputs: visibilityChanged || sectionStyleChanged)
+        } else if requestedPoseChanged || visibilityChanged || sectionStyleChanged || sectionOwnersChanged {
+            updateSectionCaps(replacingInputs: visibilityChanged || sectionStyleChanged || sectionOwnersChanged)
         }
         if meshChanged || poseChanged || styleChanged || featuresChanged || gridChanged { requestRedraw() }
     }
@@ -689,13 +692,28 @@ final class CADSceneView: NSView {
         requestRedraw()
     }
 
+    private func updateSectionPartOwners(_ parts: [PartNode]?) -> Bool {
+        guard sectionParts != parts else { return false }
+        sectionParts = parts
+        // The prepared display cache shares geometry independently of the part tree.
+        var owners = [Int: Int]()
+        for part in (parts ?? []).flatMap(\.flattened) where !part.isGroup && part.solidIndices.count > 1 {
+            guard let owner = part.solidIndices.min() else { continue }
+            for solid in part.solidIndices where solid != owner { owners[solid] = owner }
+        }
+        guard owners != sectionPartOwners else { return false }
+        sectionPartOwners = owners
+        return true
+    }
+
     private func updateSectionCaps(replacingInputs: Bool = false) {
         let pose = sectionPlane.map { _ in
             requestedSolidTransforms == solidTransforms
                 ? SolidPose(transforms: solidTransforms, matrices: solidMatrices) : validatedPose(requestedSolidTransforms)
         }
         sectionCaps.update(plane: sectionPlane, mesh: sectionMesh, transforms: pose?.matrices ?? [:],
-                           hidden: hiddenSolids, mode: mode, renderer: preparesRendererResources ? renderer : nil,
+                           hidden: hiddenSolids, partOwners: sectionPartOwners, mode: mode,
+                           renderer: preparesRendererResources ? renderer : nil,
                            replacingInputs: replacingInputs) { [weak self] plane, cap in
             guard let self else { return }
             // Visibility and wire styling can invalidate the displayed cap.
