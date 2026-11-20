@@ -9,12 +9,12 @@ enum PreviewMeshBuffers {
     static let fileName = "mesh.bin"
     static let maximumBytes = 256_000_000
 
-    struct Section: Decodable {
+    struct Section: Codable {
         let offset: Int
         let count: Int
     }
 
-    struct Manifest: Decodable {
+    struct Manifest: Codable {
         let path: String
         let sections: [String: Section]
     }
@@ -67,5 +67,40 @@ enum PreviewMeshBuffers {
         mesh.triangleFaces = try owners("triangleFaces")
         mesh.edgeSolids = try owners("edgeSolids")
         mesh.edgeFeatures = try owners("edgeFeatures")
+    }
+
+    /// Write a preview's display arrays to `url` in the worker's layout and
+    /// return the manifest that `read` accepts. The local geometry cache keeps
+    /// displayed geometry this way.
+    static func write(_ mesh: PreviewMesh, to url: URL) throws -> Manifest {
+        var owners: [(String, [Int])] = []
+        for (name, values) in [("triangleSolids", mesh.triangleSolids), ("triangleFaces", mesh.triangleFaces),
+                               ("edgeSolids", mesh.edgeSolids), ("edgeFeatures", mesh.edgeFeatures)] {
+            if let values { owners.append((name, values)) }
+        }
+        let count = mesh.positions.count + (mesh.vertexNormals?.count ?? 0) + mesh.triangleIndices.count
+            + mesh.edgePoints.count + owners.reduce(0) { $0 + $1.1.count }
+        guard count <= maximumBytes / 4 else { throw LADError.message("The design preview exceeds its size limit.") }
+        var data = Data(capacity: count * 4)
+        var sections: [String: Section] = [:]
+        func append<T>(_ name: String, _ values: [T]) {
+            sections[name] = Section(offset: data.count, count: values.count)
+            values.withUnsafeBytes { data.append(contentsOf: $0) }
+        }
+        append("positions", mesh.positions)
+        if let normals = mesh.vertexNormals { append("normals", normals) }
+        append("triangles", mesh.triangleIndices)
+        append("edges", mesh.edgePoints)
+        for (name, values) in owners {
+            let packed = try values.map { value -> Int32 in
+                guard let packed = Int32(exactly: value) else {
+                    throw LADError.message("The design preview contains an invalid owner index.")
+                }
+                return packed
+            }
+            append(name, packed)
+        }
+        try data.write(to: url, options: .withoutOverwriting)
+        return Manifest(path: fileName, sections: sections)
     }
 }

@@ -50,7 +50,9 @@ and a private session `model.brep`, with no retained STEP file. The native BREP 
 normals; it is temporary worker IPC, never a project asset. Once the app has
 decoded a build, it deletes everything in the scratch folder except `model.brep`
 (and `model.step` when present). It keeps display data in memory for the few most
-recently displayed revisions; older ones replay their program when shown again. An export request containing
+recently displayed revisions; older ones load from the app's local viewport
+geometry cache or replay their program when shown again. Cache keys include the
+bundled engine sources, so any worker change leaves earlier entries unused. An export request containing
 `{"operation":"export","brepAsset":"source.brep"}` converts a privately staged
 native solid to STEP without rerunning the model or tessellating it again.
 Repeated app exports reuse the exact STEP bytes in memory.
@@ -518,5 +520,6 @@ build or verification returns a new receipt. This is an
 accidental-change detector, not an authenticity mechanism or proof that Python
 is deterministic. Replay keeps its process sandbox, solid-only and size limits,
 finite analytic measurements, and app-side preview/topology checks. Native
-geometry, topology and meshes remain session-only. No local receipt database is
+geometry, topology and meshes never enter design files; only the app's local
+viewport geometry cache keeps verified copies. No local receipt database is
 used. New receipts are autosaved with the revision.

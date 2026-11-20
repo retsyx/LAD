@@ -6,6 +6,8 @@ import UniformTypeIdentifiers
 struct LADApp: App {
     @NSApplicationDelegateAdaptor(LADAppDelegate.self) private var delegate
 
+    init() { CADGeometryCache.viewport = CADGeometryCache() }
+
     var body: some Scene {
         WindowGroup("LAD", id: "project", for: ProjectWindowRequest.self) { $request in
             ProjectWindowRoot(request: $request, coordinator: delegate.projectWindows, recentProjects: delegate.recentProjects)

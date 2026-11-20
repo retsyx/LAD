@@ -227,6 +227,8 @@ final class AppState {
     private let codex = CodexService()
     @ObservationIgnored private var agentPreferenceSubscription: AnyCancellable?
     private let engine = EngineService()
+    /// Displayed versions' validated geometry kept across launches.
+    private let geometryCache: CADGeometryCache?
     private var operation: Task<Void, Never>?
     private var operationID = UUID()
     private var generationFeedback: CodexConversationFeedback?
@@ -258,8 +260,9 @@ final class AppState {
         }
     }
     /// Recently displayed revisions keep their session previews for fast
-    /// history navigation. Older ones rebuild from their saved program when
-    /// shown again; previews are never part of the saved design.
+    /// history navigation. Older ones load from the local geometry cache or
+    /// rebuild from their saved program when shown again; previews are never
+    /// part of the saved design.
     static let retainedRevisionPreviews = 4
     private var recentPreviewRevisionIDs: [UUID] = []
     private var projectSessionID = UUID()
@@ -333,8 +336,10 @@ final class AppState {
          },
          assemblyGrabSolver: @escaping @Sendable (AssemblyGrabContext, [String: Double], [Double]) async throws -> AssemblyPose = {
              try $0.solve(positions: $1, screenPoint: $2)
-         }) {
+         },
+         geometryCache: CADGeometryCache? = CADGeometryCache.viewport) {
         self.autosaveStore = autosaveStore
+        self.geometryCache = geometryCache
         runtimeOverride = python
         projectThumbnailRenderer = thumbnailRenderer
         self.assemblyGrabSolver = assemblyGrabSolver
@@ -1332,7 +1337,10 @@ final class AppState {
                     !$0.solidIndices.isEmpty && Set($0.solidIndices).isSubset(of: liveHidden)
                 }.map(\.id))
                 // The printing views and export reuse the validated printing version.
-                if let printPreview { printVersions[Self.printKey(preview)] = printPreview }
+                if let printPreview {
+                    printVersions[Self.printKey(preview)] = printPreview
+                    storeViewportGeometry(printPreview, for: spec, print: true)
+                }
                 try commit(spec, preview: preview, previousLayout: liveLayout, previouslyHidden: hiddenIDs, userMessageID: userMessage.id,
                            previousColors: Self.completePartColors(in: liveLayout.nodes, stored: sourceRevision?.partColors ?? [:]),
                            colorChanges: codex.partColorChanges,
@@ -1422,6 +1430,7 @@ final class AppState {
         selectedRevisionID = revision.id; builtRevisionID = revision.id
         mesh = preview; selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = hidden
         viewportCommand = ViewportCommand(.fit)
+        storeViewportGeometry(preview, for: spec)
         return revision.id
     }
 
@@ -1944,10 +1953,16 @@ final class AppState {
         let task: Task<PreviewMesh, Error>
         if let pending = printPreviewTasks[key] { task = pending }
         else {
-            let engine = printEngine, runtime = python, cores = threads
+            let engine = printEngine, runtime = python, cores = threads, cache = geometryCache
             task = Task { @MainActor in
+                if let cached = await cache?.preview(for: model, print: true, python: runtime) {
+                    try PrintLayout.validateParts(of: cached, matching: preview)
+                    return cached
+                }
+                try Task.checkCancellation()
                 let result = try await engine.buildPreview(model, print: true, python: runtime, threads: cores)
                 try PrintLayout.validateParts(of: result, matching: preview)
+                cache?.store(result, for: model, print: true, python: runtime)
                 return result
             }
             printPreviewTasks[key] = task
@@ -2353,6 +2368,7 @@ final class AppState {
                 viewportCommand = ViewportCommand(.fit)
                 isWorking = false; activity = "Ready"; operation = nil
                 autosave()
+                storeViewportGeometry(preview, for: spec)
                 if let revisionID { verifyReplay(preview, revisionID: revisionID) }
             } catch is CancellationError {
                 if operationID == token { isWorking = false; operation = nil }
@@ -2900,12 +2916,16 @@ final class AppState {
         // Generated geometry is reconstructed from the exact saved program. A
         // saved receipt that no longer matches is earned again after display.
         let token = UUID(); operationID = token
-        let runtime = python, cores = threads
+        let runtime = python, cores = threads, cache = geometryCache
         isWorking = true; activity = "Preparing preview…"; error = nil
         operation = Task {
             do {
-                let preview = try await engine.buildPreview(revision.model, python: runtime, threads: cores, validatedHash: revision.validatedHash,
-                                                            verifyLater: true)
+                let cached = await cache?.preview(for: revision.model, python: runtime)
+                try Task.checkCancellation()
+                let preview: PreviewMesh
+                if let cached { preview = cached }
+                else { preview = try await engine.buildPreview(revision.model, python: runtime, threads: cores,
+                                                               validatedHash: revision.validatedHash, verifyLater: true) }
                 guard operationID == token, selectedRevisionID == revision.id, !Task.isCancelled,
                       let index = revisions.firstIndex(where: { $0.id == revision.id }) else { return }
                 // Only transient geometry changes here. User edits made while
@@ -2915,6 +2935,7 @@ final class AppState {
                 if revisions[index].validatedHash != receipt { autosave() }
                 viewportCommand = ViewportCommand(.fit)
                 activity = "Ready"; isWorking = false; operation = nil
+                if cached == nil { storeViewportGeometry(preview, for: revision.model) }
                 verifyReplay(preview, revisionID: revision.id)
             } catch is CancellationError {
                 if operationID == token { isWorking = false; activity = "Ready"; operation = nil }
@@ -2941,6 +2962,7 @@ final class AppState {
                       let index = revisions.firstIndex(where: { $0.id == revisionID }),
                       revisions[index].preview?.brepPath == path else { return }
                 verifiedReplayReceipts[path] = receipt
+                storeViewportGeometry(verified, for: revisions[index].model)
                 var revision = revisions[index]
                 revision.preview?.validatedHash = receipt
                 revision.preview?.pendingValidationHash = nil
@@ -2954,6 +2976,14 @@ final class AppState {
                 self.error = error.localizedDescription
             }
         }
+    }
+
+    /// Keep a newly built, displayed version's geometry for later sessions
+    /// once it is validated; a replay still verifying is kept when its
+    /// receipt arrives. Geometry loaded from the cache is not stored again.
+    private func storeViewportGeometry(_ preview: PreviewMesh, for spec: ModelSpec, print: Bool = false) {
+        guard preview.pendingValidationHash == nil, preview.validatedHash != nil else { return }
+        geometryCache?.store(preview, for: spec, print: print, python: python)
     }
 
     private func retainRecentRevisionPreviews(including id: UUID) {

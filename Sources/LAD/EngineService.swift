@@ -909,21 +909,7 @@ final class EngineService {
         let folder = output.folder, artifacts = output.artifacts
         let resultURL = folder.appendingPathComponent("result.json")
         let decoding = Task.detached(priority: .userInitiated) {
-            let data = try EngineArtifact.read(resultURL, in: folder, maximumBytes: 256_000_000)
-            var result = try JSONDecoder().decode(PreviewMesh.self, from: data)
-            guard let buffers = try PreviewMeshBuffers.manifest(in: data) else {
-                throw LADError.message("The CAD engine returned an incomplete design preview.")
-            }
-            try PreviewMeshBuffers.read(buffers, in: folder, into: &result)
-            guard result.vertexNormals != nil else {
-                throw LADError.message("The CAD engine returned an incomplete design preview.")
-            }
-            try ProjectStore.validatePreview(result)
-            try CADMeasurements.validateTopology(result)
-            try PrintLayout.validatePins(result)
-            if let motion = result.assemblyMotion {
-                result.assemblyPose = try motion.solve(parts: result.parts ?? [])
-            }
+            let result = try Self.decodePreview(resultURL, in: folder)
             // Generated code cannot redirect the app to read an unrelated file.
             guard URL(fileURLWithPath: result.stepPath).path == folder.appendingPathComponent("model.step").path else {
                 throw LADError.message("CAD engine returned an unexpected STEP asset path.")
@@ -932,12 +918,7 @@ final class EngineService {
                 guard path == folder.appendingPathComponent("model.brep").path else {
                     throw LADError.message("CAD engine returned an unexpected native solid path.")
                 }
-                let marker = Data("DBRep_DrawableShape\n".utf8)
-                let brep = try EngineArtifact.boundaries(folder.appendingPathComponent("model.brep"), in: folder,
-                                                         headerBytes: marker.count)
-                guard brep.header == marker else {
-                    throw LADError.message("CAD engine did not return native solid geometry.")
-                }
+                try Self.validateNativeSolid(in: folder)
             }
             if deferSTEP {
                 guard result.brepPath == folder.appendingPathComponent("model.brep").path else {
@@ -959,6 +940,37 @@ final class EngineService {
         guard output.token == generation, !Task.isCancelled else { throw CancellationError() }
         mesh.buildArtifacts = output.artifacts
         return mesh
+    }
+
+    /// A preview in the worker's format, `result.json` plus its packed buffers
+    /// in `folder`, decoded and completely checked.
+    nonisolated static func decodePreview(_ resultURL: URL, in folder: URL) throws -> PreviewMesh {
+        let data = try EngineArtifact.read(resultURL, in: folder, maximumBytes: 256_000_000)
+        var result = try JSONDecoder().decode(PreviewMesh.self, from: data)
+        guard let buffers = try PreviewMeshBuffers.manifest(in: data) else {
+            throw LADError.message("The CAD engine returned an incomplete design preview.")
+        }
+        try PreviewMeshBuffers.read(buffers, in: folder, into: &result)
+        guard result.vertexNormals != nil else {
+            throw LADError.message("The CAD engine returned an incomplete design preview.")
+        }
+        try ProjectStore.validatePreview(result)
+        try CADMeasurements.validateTopology(result)
+        try PrintLayout.validatePins(result)
+        if let motion = result.assemblyMotion {
+            result.assemblyPose = try motion.solve(parts: result.parts ?? [])
+        }
+        return result
+    }
+
+    /// `folder/model.brep` is a native solid file.
+    nonisolated static func validateNativeSolid(in folder: URL) throws {
+        let marker = Data("DBRep_DrawableShape\n".utf8)
+        let brep = try EngineArtifact.boundaries(folder.appendingPathComponent("model.brep"), in: folder,
+                                                 headerBytes: marker.count)
+        guard brep.header == marker else {
+            throw LADError.message("CAD engine did not return native solid geometry.")
+        }
     }
 
     func cancel() {
