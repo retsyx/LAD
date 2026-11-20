@@ -3,6 +3,7 @@ import SwiftUI
 struct MeasurementInfoView: View {
     let state: AppState
     var contentPadding: CGFloat = 15
+    var showsSection = false
 
     private var metrics: [CADMeasurementMetric] { state.measurementReport?.metrics ?? [] }
     private var summaryMetrics: [CADMeasurementMetric] {
@@ -76,7 +77,8 @@ struct MeasurementInfoView: View {
     }
 
     private func metricLabel(_ metric: CADMeasurementMetric) -> String {
-        metric.label.components(separatedBy: " · ").last ?? metric.label
+        if showsSection, metric.id.hasPrefix("face:"), metric.id.hasSuffix(":area") { return "Full face area" }
+        return metric.label.components(separatedBy: " · ").last ?? metric.label
     }
 
     private var copyText: String {

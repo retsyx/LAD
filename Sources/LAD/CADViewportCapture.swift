@@ -99,7 +99,11 @@ final class CADViewportCapture: @unchecked Sendable {
                 if let originalGeometry = original.geometry {
                     CADStrokeGeometry.copyParameters(from: originalGeometry, to: geometry)
                 }
-                geometry.materials = original.geometry?.materials.map { ($0.copy() as? SCNMaterial) ?? $0 } ?? []
+                geometry.materials = original.geometry?.materials.map { material in
+                    guard let copy = material.copy() as? SCNMaterial else { return material }
+                    CADViewportSectionRendering.copyParameters(from: material, to: copy)
+                    return copy
+                } ?? []
                 copy.geometry = geometry
             }
             copy.camera = original.camera?.copy() as? SCNCamera

@@ -19,9 +19,11 @@ enum CADViewportCategory {
     /// Translucent mode's highlight fills, which replace a highlighted face's
     /// share of the accumulated face color.
     static let featureAccumulation = 64
+    /// Section material and cut contours are separate from native features.
+    static let sectionCaps = 128
 
-    static let opaqueScene = faces | decorations | featureFaces | probe
-    static let translucentDecorations = visibility | decorations | probe
+    static let opaqueScene = faces | decorations | featureFaces | probe | sectionCaps
+    static let translucentDecorations = visibility | decorations | probe | sectionCaps
     static let translucentAccumulation = faces | featureAccumulation
     static let translucentRevealage = revealage
 }
@@ -159,6 +161,8 @@ struct CADViewportFrame: @unchecked Sendable {
     /// Projected bounds of every seed and mask, before the highlight kernel.
     var highlightBounds: CADSilhouetteBatching.Rect?
     var verticesEnabled = false
+    /// World clipping equation. A zero equation retains the entire design.
+    var sectionPlane: SIMD4<Float> = .zero
 
     var hasHighlights: Bool { !seeds.isEmpty || !batches.isEmpty }
 
@@ -482,7 +486,8 @@ final class CADViewportPasses: @unchecked Sendable {
             let points = item.buffer.primitive == .point
             seedEncoder.setRenderPipelineState(points ? pipelines.seedPoints : pipelines.seedLines)
             var mask = MaskUniforms(modelViewProjection: viewProjection * item.model, remap: areaRemap,
-                                    channel: Self.channel(item.channel))
+                                    channel: Self.channel(item.channel),
+                                    localSectionPlane: simd_transpose(item.model) * frame.sectionPlane)
             seedEncoder.setVertexBuffer(item.buffer.positions, offset: 0, index: 0)
             seedEncoder.setVertexBytes(&mask, length: MemoryLayout<MaskUniforms>.stride, index: 1)
             seedEncoder.setFragmentBytes(&mask, length: MemoryLayout<MaskUniforms>.stride, index: 1)
@@ -505,7 +510,8 @@ final class CADViewportPasses: @unchecked Sendable {
             let batchRemap = remap(x: pixels.x, y: pixels.y, width: pixels.width, height: pixels.height, frame: frame)
             for item in batch.masks {
                 var mask = MaskUniforms(modelViewProjection: viewProjection * item.model, remap: batchRemap,
-                                        channel: item.selected ? SIMD4(1, 0, 0, 0) : SIMD4(0, 1, 0, 0))
+                                        channel: item.selected ? SIMD4(1, 0, 0, 0) : SIMD4(0, 1, 0, 0),
+                                        localSectionPlane: simd_transpose(item.model) * frame.sectionPlane)
                 encoder.setVertexBuffer(item.buffer.positions, offset: 0, index: 0)
                 encoder.setVertexBytes(&mask, length: MemoryLayout<MaskUniforms>.stride, index: 1)
                 encoder.setFragmentBytes(&mask, length: MemoryLayout<MaskUniforms>.stride, index: 1)
@@ -649,6 +655,7 @@ final class CADViewportPasses: @unchecked Sendable {
         var modelViewProjection: simd_float4x4
         var remap: SIMD4<Float>
         var channel: SIMD4<Float>
+        var localSectionPlane: SIMD4<Float>
     }
 
     /// Mirrors `CADHighlightUniforms` in the shader source.
@@ -762,8 +769,9 @@ final class CADViewportPasses: @unchecked Sendable {
     using namespace metal;
 
     struct CADQuadOut { float4 position [[position]]; };
-    struct CADPointOut { float4 position [[position]]; float size [[point_size]]; };
-    struct CADMaskUniforms { float4x4 modelViewProjection; float4 remap; float4 channel; };
+    struct CADMaskOut { float4 position [[position]]; float sectionDistance; };
+    struct CADPointOut { float4 position [[position]]; float size [[point_size]]; float sectionDistance; };
+    struct CADMaskUniforms { float4x4 modelViewProjection; float4 remap; float4 channel; float4 localSectionPlane; };
     struct CADHighlightUniforms {
         float4 selectedColor;
         float4 hoverColor;
@@ -808,22 +816,29 @@ final class CADViewportPasses: @unchecked Sendable {
         return clip;
     }
 
-    vertex CADQuadOut cad_mask_vertex(const device packed_float3 *positions [[buffer(0)]],
+    vertex CADMaskOut cad_mask_vertex(const device packed_float3 *positions [[buffer(0)]],
                                       constant CADMaskUniforms &u [[buffer(1)]], uint vid [[vertex_id]]) {
-        CADQuadOut out;
-        out.position = cad_mask_clip(float3(positions[vid]), u);
+        CADMaskOut out;
+        float3 point = float3(positions[vid]);
+        out.position = cad_mask_clip(point, u);
+        out.sectionDistance = dot(float4(point, 1.0), u.localSectionPlane);
         return out;
     }
 
     vertex CADPointOut cad_point_vertex(const device packed_float3 *positions [[buffer(0)]],
                                         constant CADMaskUniforms &u [[buffer(1)]], uint vid [[vertex_id]]) {
         CADPointOut out;
-        out.position = cad_mask_clip(float3(positions[vid]), u);
+        float3 point = float3(positions[vid]);
+        out.position = cad_mask_clip(point, u);
         out.size = 1.0f;
+        out.sectionDistance = dot(float4(point, 1.0), u.localSectionPlane);
         return out;
     }
 
-    fragment float4 cad_mask_fragment(constant CADMaskUniforms &u [[buffer(1)]]) { return u.channel; }
+    fragment float4 cad_mask_fragment(CADMaskOut in [[stage_in]], constant CADMaskUniforms &u [[buffer(1)]]) {
+        if (in.sectionDistance > 0.0) { discard_fragment(); }
+        return u.channel;
+    }
 
     // Coverage minus its four-neighbor interior is the projected outline.
     // Reads clamp to this batch's region, which is padded inside the frame

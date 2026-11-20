@@ -84,6 +84,7 @@ struct CADViewport: NSViewRepresentable {
     var solidTransforms: [Int: [Double]] = [:]
     /// Replacing the mesh under the same key keeps the camera.
     var cameraKey: String? = nil
+    var sectionEnabled = false
     var onSelectionChanged: ((Set<Int>) -> Void)? = nil
     var onFeatureSelectionChanged: (([CADFeatureID]) -> Void)? = nil
     var onDeselectAll: (() -> Void)? = nil
@@ -121,7 +122,7 @@ struct CADViewport: NSViewRepresentable {
         view.update(mesh: mesh, mode: displayMode, grid: showGrid, command: command,
                     selectedSolids: selectedSolids, hiddenSolids: hiddenSolids, projection: projectionMode,
                     solidColors: solidColors, selectedFeatures: selectedFeatures, solidTransforms: solidTransforms,
-                    cameraKey: cameraKey)
+                    cameraKey: cameraKey, sectionEnabled: sectionEnabled)
         onViewReady?(view)
     }
 }
@@ -233,6 +234,12 @@ final class CADSceneView: NSView {
     private var solidMatrices: [Int: simd_double4x4] = [:]
     private var solidBounds: [Int: [Double]] = [:]
     private var originalMeshBounds: [Double] = []
+    private var sectionEnabled = false
+    private(set) var sectionPlane: CADSectionPlane?
+    private var retainedSectionPlane: CADSectionPlane?
+    private var sectionMesh: CADViewportPreparedMesh?
+    private let sectionCaps = CADViewportSectionCaps()
+    private var sectionManipulator: CADSectionManipulator?
     private var faceIDsBySolid = [Int: [CADFeatureID?]]()
     private var faceIndices = [CADFeatureID: [Int32]]()
     private var faceBounds = [CADFeatureID: CADSilhouetteBatching.Bounds]()
@@ -305,7 +312,7 @@ final class CADSceneView: NSView {
     var preparesRendererResources = true
     var hasRenderableGeometry: Bool { hasModel }
     var isPreparingCaptureResources: Bool {
-        isPreparingResources || highlightedFeatures.contains {
+        isPreparingResources || sectionCaps.isPreparing || highlightedFeatures.contains {
             featureNodes[$0] != nil && !hiddenSolids.contains($0.solidIndex) && !preparedFeatures.contains($0)
         }
     }
@@ -468,6 +475,7 @@ final class CADSceneView: NSView {
         scene.rootNode.addChildNode(edgeNode)
         scene.rootNode.addChildNode(gridNode)
         scene.rootNode.addChildNode(featureNode)
+        scene.rootNode.addChildNode(sectionCaps.node)
         modelNode.categoryBitMask = CADViewportCategory.faces
         edgeNode.categoryBitMask = CADViewportCategory.decorations
         gridNode.categoryBitMask = CADViewportCategory.decorations
@@ -498,13 +506,17 @@ final class CADSceneView: NSView {
     func update(mesh: PreviewMesh?, mode: ViewportDisplayMode, grid: Bool, command: ViewportCommand?,
                 selectedSolids: Set<Int>, hiddenSolids: Set<Int>, projection: ViewportProjectionMode = .perspective,
                 solidColors: [Int: PartColor] = [:], selectedFeatures: [CADFeatureID] = [],
-                solidTransforms: [Int: [Double]] = [:], cameraKey: String? = nil) {
+                solidTransforms: [Int: [Double]] = [:], cameraKey: String? = nil, sectionEnabled: Bool = false) {
         let orthographic = projection == .isometric
         let projectionChanged = rig.usesOrthographicProjection != orthographic
         let gridChanged = gridVisible != grid
         let meshChanged = mesh?.stepPath != loadedPath || mesh?.brepPath != loadedNativePath
         let visibilityChanged = self.hiddenSolids != hiddenSolids
         let modeChanged = self.mode != mode
+        let sectionStyleChanged = (self.mode == .wireframe) != (mode == .wireframe)
+        self.sectionEnabled = sectionEnabled
+        if meshChanged { retainedSectionPlane = nil }
+        if meshChanged || !sectionEnabled { setSectionPlane(nil) }
         if meshChanged || projectionChanged {
             cancelAssemblyGrab()
             cancelCameraTransition()
@@ -583,7 +595,69 @@ final class CADSceneView: NSView {
         } else {
             updateModelVisibility()
         }
+        if sectionPlane == nil {
+            openSectionIfRequested()
+        } else {
+            if poseChanged || visibilityChanged || sectionStyleChanged { updateSectionCaps() }
+            if poseChanged { updateSectionManipulator() }
+        }
         if meshChanged || poseChanged || styleChanged || featuresChanged || gridChanged { requestRedraw() }
+    }
+
+    private func openSectionIfRequested() {
+        guard sectionEnabled, hasModel, sectionPlane == nil else { return }
+        setSectionPlane(retainedSectionPlane ?? CADSectionPlane(bounds: meshBounds, toward: rig.backward))
+    }
+
+    private func setSectionPlane(_ plane: CADSectionPlane?) {
+        guard sectionPlane != plane else { return }
+        sectionPlane = plane
+        if let plane { retainedSectionPlane = plane }
+        projectedFeatures = nil
+        zoomAnchor = nil
+        setHoveredFeature(nil)
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
+        for root in [modelNode, edgeNode, featureNode] {
+            root.enumerateChildNodes { node, _ in
+                for material in node.geometry?.materials ?? [] {
+                    CADViewportSectionRendering.apply(plane, to: material)
+                }
+            }
+        }
+        SCNTransaction.commit()
+        updateSectionCaps()
+        updateSectionManipulator()
+        requestRedraw()
+    }
+
+    private func updateSectionCaps() {
+        sectionCaps.update(plane: sectionPlane, mesh: sectionMesh, transforms: solidMatrices,
+                           hidden: hiddenSolids, mode: mode, renderer: preparesRendererResources ? renderer : nil) { [weak self] in
+            self?.resumeCaptureWaitersIfReady()
+            self?.requestRedraw()
+        }
+        resumeCaptureWaitersIfReady()
+    }
+
+    private func updateSectionManipulator() {
+        if sectionPlane != nil, sectionManipulator == nil {
+            let manipulator = CADSectionManipulator(onBegin: { [weak self] in
+                self?.cancelAssemblyGrab()
+                self?.cancelCameraTransition()
+                self?.clearPointerFeedback()
+            }, onChange: { [weak self] plane in self?.setSectionPlane(plane) })
+            manipulator.frame = bounds
+            manipulator.autoresizingMask = [.width, .height]
+            addSubview(manipulator)
+            sectionManipulator = manipulator
+        }
+        sectionManipulator?.update(plane: sectionPlane,
+                                   projection: rig.projection(width: bounds.width, height: bounds.height), bounds: meshBounds)
+        if sectionPlane == nil {
+            sectionManipulator?.removeFromSuperview()
+            sectionManipulator = nil
+        }
     }
 
     /// Moving a rigid body changes node poses only. Display buffers, native
@@ -641,6 +715,7 @@ final class CADSceneView: NSView {
 
     private func install(_ prepared: CADViewportPreparedMesh) {
         let mesh = prepared.mesh
+        sectionMesh = prepared
         appliedStyle = nil
         func makeSource(_ data: Data, semantic: SCNGeometrySource.Semantic) -> SCNGeometrySource {
             SCNGeometrySource(data: data, semantic: semantic, vectorCount: prepared.vertexCount,
@@ -705,6 +780,9 @@ final class CADSceneView: NSView {
 
     private func clearModel() {
         invalidateResourcePreparation()
+        setSectionPlane(nil)
+        sectionMesh = nil
+        retainedSectionPlane = nil
         resetFeatureResources()
         modelNode.geometry = nil
         modelNode.childNodes.forEach { $0.removeFromParentNode() }
@@ -824,6 +902,7 @@ final class CADSceneView: NSView {
                 case nil: break
                 }
                 self.prepareModelResources()
+                self.openSectionIfRequested()
                 self.requestRedraw()
             } catch {
                 guard let self, self.resourcePreparationID == token else { return }
@@ -921,6 +1000,11 @@ final class CADSceneView: NSView {
                    let part = solidNodes[feature.solidIndex]?.geometry?.firstMaterial {
                     node.addChildNode(Self.translucentFeatureCopy(of: geometry, shadedAs: overlay, removal: false))
                     node.addChildNode(Self.translucentFeatureCopy(of: geometry, shadedAs: part, removal: true))
+                }
+                if let sectionPlane {
+                    for surface in [node] + node.childNodes {
+                        surface.geometry?.materials.forEach { CADViewportSectionRendering.apply(sectionPlane, to: $0) }
+                    }
                 }
                 featureNode.addChildNode(node)
                 featureNodes[feature] = node
@@ -1059,6 +1143,7 @@ final class CADSceneView: NSView {
         var frame = CADViewportFrame(width: width, height: height, referenceHeight: Double(bounds.height),
                                      translucent: mode == .translucent, palette: Self.highlightPalette)
         guard hasModel, !isPreparingResources, width > 0, height > 0 else { return frame }
+        frame.sectionPlane = sectionPlane?.equation ?? .zero
         let projection = assemblyGrabProjection(viewportSize: CGSize(width: width, height: height))
         let pixels = SIMD2(Double(width), Double(height))
         var area: CADSilhouetteBatching.Rect?
@@ -1179,7 +1264,10 @@ final class CADSceneView: NSView {
             node.geometry?.firstMaterial?.fillMode = mode == .wireframe ? .lines : .fill
             // Let interior parts show through the filled surfaces. Restore
             // depth writing and opaque materials when leaving this mode.
-            if let material = node.geometry?.firstMaterial { Self.configureFaceMaterial(material, translucent: translucent) }
+            if let material = node.geometry?.firstMaterial {
+                Self.configureFaceMaterial(material, translucent: translucent)
+                if let sectionPlane { CADViewportSectionRendering.apply(sectionPlane, to: material) }
+            }
             for copy in node.childNodes where copy.isHidden == translucent { copy.isHidden = !translucent }
             node.geometry?.firstMaterial?.diffuse.contents = selected && mode != .wireframe
                 ? selectionColor
@@ -1407,6 +1495,7 @@ final class CADSceneView: NSView {
         sceneSource.synchronizeCameras()
         SCNTransaction.commit()
         notifyCameraOrientation()
+        updateSectionManipulator()
         requestRedraw()
     }
 
@@ -1434,6 +1523,7 @@ final class CADSceneView: NSView {
         sceneSource?.synchronizeCameras()
         SCNTransaction.commit()
         notifyCameraOrientation()
+        updateSectionManipulator()
         requestRedraw()
     }
 
@@ -1454,7 +1544,10 @@ final class CADSceneView: NSView {
             rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
             applyCamera()
         }
-        if sizeChanged { requestRedraw() }
+        if sizeChanged {
+            updateSectionManipulator()
+            requestRedraw()
+        }
     }
 
     override func viewDidChangeBackingProperties() {
@@ -1548,6 +1641,7 @@ final class CADSceneView: NSView {
         return resigned
     }
     override func viewWillMove(toWindow newWindow: NSWindow?) {
+        sectionManipulator?.cancelInteraction()
         if let modifierMonitor { NSEvent.removeMonitor(modifierMonitor) }
         modifierMonitor = nil
         clearPointerFeedback()
@@ -1620,6 +1714,7 @@ final class CADSceneView: NSView {
     }
 
     @objc private func windowResignedKey() {
+        sectionManipulator?.cancelInteraction()
         clearPointerFeedback()
         cancelAssemblyGrab()
         cancelCameraTransition()
@@ -1636,6 +1731,7 @@ final class CADSceneView: NSView {
         if window?.occlusionState.contains(.visible) == true {
             requestRedraw()
         } else {
+            sectionManipulator?.cancelInteraction()
             cancelAssemblyGrab()
             cancelCameraTransition()
         }
@@ -1658,6 +1754,7 @@ final class CADSceneView: NSView {
         guard let window else { return true }
         guard let content = window.contentView,
               let hit = content.hitTest(convert(point, to: content.superview)) else { return false }
+        if let sectionManipulator, hit === sectionManipulator || hit.isDescendant(of: sectionManipulator) { return false }
         return hit === self || hit.isDescendant(of: self)
     }
 
@@ -2004,7 +2101,7 @@ final class CADSceneView: NSView {
     }
 
     private func anchor(at point: NSPoint) -> SIMD3<Double> {
-        if let p = visibleHit(at: point)?.worldCoordinates { return SIMD3(Double(p.x), Double(p.y), Double(p.z)) }
+        if let p = surfaceHit(at: point)?.worldCoordinates { return SIMD3(Double(p.x), Double(p.y), Double(p.z)) }
         return rig.planeAnchor(x: point.x, y: point.y, width: bounds.width, height: bounds.height)
     }
 
@@ -2019,7 +2116,7 @@ final class CADSceneView: NSView {
             // Test at the candidate's screen position so a nearby visible
             // corner remains pickable even when the cursor is just outside
             // its silhouette. Never select topology through another part.
-            guard let hit = visibleHit(at: NSPoint(x: screen.x, y: screen.y)) else { return true }
+            guard let hit = surfaceHit(at: NSPoint(x: screen.x, y: screen.y)) else { return true }
             let hitWorld = SIMD3(Double(hit.worldCoordinates.x), Double(hit.worldCoordinates.y), Double(hit.worldCoordinates.z))
             let unitsPerPoint = 2 * rig.orthographicScale / max(bounds.height, 1)
             return simd_dot(hitWorld - world, rig.backward) <= max(rig.radius * 1e-5, unitsPerPoint * 1.5)
@@ -2041,23 +2138,41 @@ final class CADSceneView: NSView {
         // Snapshot the camera once. Recomputing its trigonometric basis for
         // every polyline endpoint stalls the first hover after navigation.
         let projection = rig.projection(width: Double(bounds.width), height: max(Double(bounds.height), 1))
-        func projected(_ position: [Double], id: CADFeatureID) -> ViewportFeaturePicking.Vertex? {
-            guard validFeaturePoint(position), !hiddenSolids.contains(id.solidIndex) else { return nil }
+        let plane = sectionPlane
+        func worldPoint(_ position: [Double], solid: Int) -> SIMD3<Double>? {
+            guard validFeaturePoint(position) else { return nil }
             let original = SIMD4(position[0], position[1], position[2], 1)
-            let transformed = solidMatrices[id.solidIndex].map { $0 * original } ?? original
-            let world = SIMD3(transformed.x, transformed.y, transformed.z)
+            let transformed = solidMatrices[solid].map { $0 * original } ?? original
+            return SIMD3(transformed.x, transformed.y, transformed.z)
+        }
+        func projected(_ world: SIMD3<Double>, id: CADFeatureID) -> ViewportFeaturePicking.Vertex? {
             let (screen, depth) = projection.project(world)
             guard depth > 0, screen.x.isFinite, screen.y.isFinite else { return nil }
             return .init(id: id, world: world, screen: screen, depth: depth)
         }
-        let vertices = topology.vertices.compactMap { $0.seam == true ? nil : projected($0.position, id: $0.id) }
+        let vertices = topology.vertices.compactMap { vertex -> ViewportFeaturePicking.Vertex? in
+            guard vertex.seam != true, !hiddenSolids.contains(vertex.id.solidIndex),
+                  let world = worldPoint(vertex.position, solid: vertex.id.solidIndex),
+                  plane?.contains(world) != false else { return nil }
+            return projected(world, id: vertex.id)
+        }
         var edges = [ViewportFeaturePicking.Edge]()
         edges.reserveCapacity(topology.edges.count * 4)
         for edge in topology.edges where !hiddenSolids.contains(edge.id.solidIndex) {
             var previous: ViewportFeaturePicking.Vertex?
             for point in edge.polyline {
-                let current = projected(point, id: edge.id)
-                if let start = previous, let end = current { edges.append(.init(id: edge.id, start: start, end: end)) }
+                let current = worldPoint(point, solid: edge.id.solidIndex).flatMap { projected($0, id: edge.id) }
+                if let start = previous, let end = current {
+                    if let plane {
+                        if let segment = plane.clippedSegment(from: start.world, to: end.world),
+                           let clippedStart = segment.from == start.world ? start : projected(segment.from, id: edge.id),
+                           let clippedEnd = segment.to == end.world ? end : projected(segment.to, id: edge.id) {
+                            edges.append(.init(id: edge.id, start: clippedStart, end: clippedEnd))
+                        }
+                    } else {
+                        edges.append(.init(id: edge.id, start: start, end: end))
+                    }
+                }
                 previous = current
             }
         }
@@ -2065,25 +2180,56 @@ final class CADSceneView: NSView {
     }
 
     private func visibleHit(at point: NSPoint) -> SCNHitTestResult? {
-        guard !isPreparingResources else { return nil }
+        guard let hit = surfaceHit(at: point), solidIndex(of: hit.node) != nil else { return nil }
+        return hit
+    }
+
+    /// Section caps occlude native geometry, but never become CAD features.
+    private func surfaceHit(at point: NSPoint) -> SCNHitTestResult? {
+        guard !isPreparingResources, var ray = cameraRay(at: point) else { return nil }
         // Wireframe solids can be visually hidden while their analytic edges
         // remain visible. Query those surfaces too, then explicitly discard
         // user-hidden parts before either selecting or anchoring a zoom.
-        let search = hiddenSolids.isEmpty ? SCNHitTestSearchMode.closest : .all
+        let plane = sectionPlane
+        if let plane {
+            guard let kept = plane.clippedSegment(from: ray.from, to: ray.to) else { return nil }
+            // Include the intersection itself despite rounding when SceneKit
+            // narrows the ray to float. Clipped faces in this margin are still
+            // rejected below.
+            let margin = max(rig.radius * 1e-6, 1e-6)
+            let direction = simd_normalize(ray.to - ray.from)
+            if kept.from != ray.from { ray.from = kept.from - direction * margin }
+            if kept.to != ray.to { ray.to = kept.to + direction * margin }
+        }
+        let caps = plane != nil && mode != .wireframe ? CADViewportCategory.sectionCaps : 0
+        func includes(_ hit: SCNHitTestResult) -> Bool {
+            if hit.node.categoryBitMask & caps != 0 { return true }
+            guard let solid = solidIndex(of: hit.node), !hiddenSolids.contains(solid) else { return false }
+            let point = hit.worldCoordinates
+            return plane?.contains(SIMD3(Double(point.x), Double(point.y), Double(point.z))) != false
+        }
         // The deprecated sortResults option overrides nearest-hit ordering,
         // even with searchMode.closest, and can return a farther solid first.
-        return hitTest(point, options: [.categoryBitMask: CADViewportCategory.faces, .ignoreHiddenNodes: false,
-                                 .searchMode: search.rawValue])
-            .first { hit in
-                guard let solid = solidIndex(of: hit.node) else { return false }
-                return !hiddenSolids.contains(solid)
-            }
+        var options: [SCNHitTestOption: Any] = [.categoryBitMask: CADViewportCategory.faces | caps, .ignoreHiddenNodes: false]
+        if hiddenSolids.isEmpty {
+            options[.searchMode] = SCNHitTestSearchMode.closest.rawValue
+            guard let hit = nativeHits(along: ray, options: options).first else { return nil }
+            if includes(hit) { return hit }
+            if plane == nil { return nil }
+        }
+        options[.searchMode] = SCNHitTestSearchMode.all.rawValue
+        return nativeHits(along: ray, options: options).first(where: includes)
     }
 
     /// Scene hits along the design camera's ray through a point in view
     /// coordinates, ordered from the eye like the rendered frame's depth.
     func hitTest(_ point: NSPoint, options: [SCNHitTestOption: Any] = [:]) -> [SCNHitTestResult] {
         guard let ray = cameraRay(at: point) else { return [] }
+        return nativeHits(along: ray, options: options)
+    }
+
+    private func nativeHits(along ray: (from: SIMD3<Double>, to: SIMD3<Double>),
+                            options: [SCNHitTestOption: Any]) -> [SCNHitTestResult] {
         var native = [String: Any]()
         for (key, value) in options { native[key.rawValue] = value }
         return scene.rootNode.hitTestWithSegment(from: SCNVector3(ray.from), to: SCNVector3(ray.to), options: native)

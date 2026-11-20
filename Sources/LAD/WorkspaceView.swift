@@ -1,6 +1,11 @@
 import SwiftUI
 
 @MainActor
+final class ViewportSectionControl: ObservableObject {
+    @Published var isEnabled = false
+}
+
+@MainActor
 private final class WorkspaceViewportReference: ObservableObject {
     let assemblyGrabOwnerID = UUID()
     weak var view: CADSceneView?
@@ -80,6 +85,7 @@ struct WorkspaceView: View {
     @State private var previewImageAttachment: SourceAttachment?
     @StateObject private var activityPanel = ProjectActivityPanelController()
     @StateObject private var viewportReference = WorkspaceViewportReference()
+    @StateObject private var sectionControl = ViewportSectionControl()
     @State private var conversationSearch: ConversationSearchController
 
     init(state: AppState, conversationSearch: ConversationSearchController? = nil) {
@@ -93,7 +99,7 @@ struct WorkspaceView: View {
             Rectangle().fill(Palette.line).frame(height: 1)
             HSplitView {
                 partsPanel.frame(minWidth: 180, idealWidth: 230, maxWidth: 340, maxHeight: .infinity)
-                WorkspaceViewer(state: state, viewportReference: viewportReference)
+                WorkspaceViewer(state: state, viewportReference: viewportReference, sectionControl: sectionControl)
                     .frame(minWidth: 540, maxWidth: .infinity, maxHeight: .infinity)
                 WorkspaceConversation(state: state, activityPanel: activityPanel, viewportReference: viewportReference,
                                       search: conversationSearch,
@@ -109,12 +115,18 @@ struct WorkspaceView: View {
         })
         .toolbarBackground(Palette.panel, for: .windowToolbar)
         .focusedSceneValue(\.conversationSearch, conversationSearch)
+        .focusedSceneObject(sectionControl)
         .onChange(of: state.projectEditingID) { _, _ in
             cancelProjectRename()
+            sectionControl.isEnabled = false
             isProgramExpanded = false
             previewImageAttachment = nil
             activityPanel.close()
             conversationSearch.hide()
+        }
+        .onChange(of: state.selectedRevisionID) { _, _ in sectionControl.isEnabled = false }
+        .onChange(of: state.printLayoutView) { _, enabled in
+            if enabled { sectionControl.isEnabled = false }
         }
         .onDisappear { activityPanel.close() }
         .onChange(of: state.canRenameProject) { _, allowed in
@@ -239,7 +251,8 @@ struct WorkspaceView: View {
     }
 
     private var partsPanel: some View {
-        ProjectSidebarSplitView(state: state, isProgramExpanded: $isProgramExpanded)
+        ProjectSidebarSplitView(state: state, isProgramExpanded: $isProgramExpanded,
+                                showsSection: sectionControl.isEnabled && state.displayedMesh != nil && !state.printLayoutView)
         .background(Palette.panel)
         .accessibilityIdentifier("projectSidebarSplitView")
     }
@@ -249,6 +262,9 @@ struct WorkspaceView: View {
 private struct WorkspaceViewer: View {
     @Bindable var state: AppState
     @ObservedObject var viewportReference: WorkspaceViewportReference
+    @ObservedObject var sectionControl: ViewportSectionControl
+
+    private var canSection: Bool { state.displayedMesh != nil && !state.printLayoutView }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -257,6 +273,7 @@ private struct WorkspaceViewer: View {
                         selectedSolids: state.selectedSolids, hiddenSolids: state.hiddenSolids, solidColors: state.solidColors,
                         selectedFeatures: state.selectedFeatures,
                         solidTransforms: state.displayedSolidTransforms, cameraKey: state.viewportCameraKey,
+                        sectionEnabled: canSection && sectionControl.isEnabled,
                         onSelectionChanged: { state.selectParts($0) },
                         onFeatureSelectionChanged: { state.selectFeatures($0) }, onDeselectAll: { state.clearSelections() },
                         onHideSelected: { state.hideSelectedParts() }, onShowAll: { state.showAllParts() },
@@ -291,6 +308,10 @@ private struct WorkspaceViewer: View {
                                     .accessibilityLabel("Grid square size: \(spacing) millimetres")
                                     .accessibilityIdentifier("gridSquareSize")
                             }
+                            viewportToggle($sectionControl.isEnabled, label: "Section View", help: "Toggle section view",
+                                           icon: Image(systemName: "square.split.diagonal"))
+                                .disabled(!canSection)
+                                .accessibilityIdentifier("sectionViewToggle")
                         }
                         HStack(spacing: 8) {
                             viewportToggle($state.printVersionView, label: "3D Printing Version",

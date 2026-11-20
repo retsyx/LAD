@@ -144,6 +144,7 @@ private struct ProjectCommands: Commands {
     @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.projectState) private var state: AppState?
     @FocusedValue(\.conversationSearch) private var search: ConversationSearchController?
+    @FocusedObject private var sectionControl: ViewportSectionControl?
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -200,6 +201,9 @@ private struct ProjectCommands: Commands {
             Divider()
             Toggle("Show Grid", isOn: Binding(get: { state?.showGrid ?? true }, set: { state?.showGrid = $0 }))
                 .disabled(state == nil)
+            Toggle("Section View", isOn: Binding(get: { sectionControl?.isEnabled ?? false },
+                                                  set: { sectionControl?.isEnabled = $0 }))
+                .disabled(sectionControl == nil || state?.displayedMesh == nil || state?.printLayoutView == true)
             Toggle("3D Printing Version", isOn: Binding(get: { state?.printVersionView ?? false },
                                                         set: { state?.printVersionView = $0 }))
                 .disabled(state == nil)

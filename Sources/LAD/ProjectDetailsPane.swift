@@ -4,6 +4,7 @@ struct ProjectDetailsPane: View {
     let state: AppState
     let project: ModelSpec?
     @Binding var isProgramExpanded: Bool
+    var showsSection = false
     @State private var infoHeight: CGFloat = 160
 
     var body: some View {
@@ -13,7 +14,7 @@ struct ProjectDetailsPane: View {
                     VStack(alignment: .leading, spacing: 12) {
                         if project != nil { projectInfo }
                         if state.hasMeasurementSelection {
-                            MeasurementInfoView(state: state, contentPadding: 0)
+                            MeasurementInfoView(state: state, contentPadding: 0, showsSection: showsSection)
                         }
                         if let motion = state.mesh?.assemblyMotion, motion.joints.contains(where: \.isMovable) {
                             AssemblyMotionControls(state: state, motion: motion)

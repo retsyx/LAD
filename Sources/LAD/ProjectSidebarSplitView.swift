@@ -6,13 +6,14 @@ import SwiftUI
 struct ProjectSidebarSplitView: NSViewRepresentable {
     let state: AppState
     @Binding var isProgramExpanded: Bool
+    var showsSection = false
 
     func makeNSView(context: Context) -> ProjectSidebarNativeSplitView {
-        ProjectSidebarNativeSplitView(state: state, isProgramExpanded: $isProgramExpanded)
+        ProjectSidebarNativeSplitView(state: state, isProgramExpanded: $isProgramExpanded, showsSection: showsSection)
     }
 
     func updateNSView(_ view: ProjectSidebarNativeSplitView, context: Context) {
-        view.update(state: state, isProgramExpanded: $isProgramExpanded)
+        view.update(state: state, isProgramExpanded: $isProgramExpanded, showsSection: showsSection)
     }
 }
 
@@ -25,6 +26,7 @@ final class ProjectSidebarNativeSplitView: NSSplitView, NSSplitViewDelegate {
     private var projectID: UUID
     private var project: ModelSpec?
     private var programExpanded: Bool
+    private var showsSection: Bool
     private var preferredFraction: Double
     private var applyingLayout = false
     private var laidOutSize = NSSize.zero
@@ -33,15 +35,16 @@ final class ProjectSidebarNativeSplitView: NSSplitView, NSSplitViewDelegate {
     override var isFlipped: Bool { true }
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric) }
 
-    init(state: AppState, isProgramExpanded: Binding<Bool>) {
+    init(state: AppState, isProgramExpanded: Binding<Bool>, showsSection: Bool = false) {
         self.state = state
+        self.showsSection = showsSection
         projectID = state.projectEditingID
         project = state.current
         programExpanded = isProgramExpanded.wrappedValue
         preferredFraction = state.partsPaneFraction
         partsHost = NSHostingView(rootView: PartsSidebar(state: state))
         detailsHost = NSHostingView(rootView: ProjectDetailsPane(state: state, project: state.current,
-                                                               isProgramExpanded: isProgramExpanded))
+                                                               isProgramExpanded: isProgramExpanded, showsSection: showsSection))
         super.init(frame: .zero)
         isVertical = false
         dividerStyle = .thin
@@ -60,18 +63,20 @@ final class ProjectSidebarNativeSplitView: NSSplitView, NSSplitViewDelegate {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(state: AppState, isProgramExpanded: Binding<Bool>) {
+    func update(state: AppState, isProgramExpanded: Binding<Bool>, showsSection: Bool = false) {
         let replaced = self.state !== state || projectID != state.projectEditingID
         if replaced {
             self.state = state
             projectID = state.projectEditingID
             partsHost.rootView = PartsSidebar(state: state)
         }
-        if replaced || project != state.current || programExpanded != isProgramExpanded.wrappedValue {
+        if replaced || project != state.current || programExpanded != isProgramExpanded.wrappedValue
+            || self.showsSection != showsSection {
+            self.showsSection = showsSection
             project = state.current
             programExpanded = isProgramExpanded.wrappedValue
             detailsHost.rootView = ProjectDetailsPane(state: state, project: state.current,
-                                                      isProgramExpanded: isProgramExpanded)
+                                                      isProgramExpanded: isProgramExpanded, showsSection: showsSection)
         }
         // A shared design's other window can move its divider too. Content
         // changes alone do not reassign host roots or touch the preferred split.

@@ -18,6 +18,11 @@ struct LADHelpView: View {
                 control("Double-click empty space / Escape", "Deselect all")
                 control("F", "Fit design")
             }
+            Section("Section View") {
+                control("Drag the arrow", "Move the cut along the section plane’s normal")
+                control("Drag a rotation bar", "Tilt or turn the section plane")
+                control("Type a value, then press Return", "Apply the active handle’s offset or angle")
+            }
         }
         .formStyle(.grouped)
         .frame(minWidth: 520, idealWidth: 560, minHeight: 420, idealHeight: 480)
