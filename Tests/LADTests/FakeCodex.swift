@@ -16,6 +16,9 @@ struct FakeCodex {
     let turnRequestURL: URL
     let rpcRequestsURL: URL
     let steeringURL: URL
+    /// In "finish-before-released-ack" mode, the steering acknowledgement
+    /// waits for `releaseSteeringAcknowledgement()`.
+    let steeringReleaseURL: URL
 
     init(body: String) throws {
         try self.init(body: body, responseJSON: nil, delay: 0, steeringMode: "ack")
@@ -38,10 +41,12 @@ struct FakeCodex {
         turnRequestURL = directory.appendingPathComponent("turn-request.json")
         rpcRequestsURL = directory.appendingPathComponent("rpc-requests.jsonl")
         steeringURL = directory.appendingPathComponent("steering.jsonl")
+        steeringReleaseURL = directory.appendingPathComponent("steering-release")
         var configuration: [String: Any] = [
             "inputPath": inputURL.path, "argumentsPath": argumentsURL.path, "capturePath": captureURL.path,
             "workingPath": workingDirectoryURL.path, "threadPath": threadRequestURL.path,
             "turnPath": turnRequestURL.path, "rpcPath": rpcRequestsURL.path, "steeringPath": steeringURL.path,
+            "steeringReleasePath": steeringReleaseURL.path,
             "delay": delay, "steeringMode": steeringMode, "resumable": resumable,
             "ignoreTerm": body?.contains("trap '' TERM") == true,
             "inheritOutput": body?.contains(" &") == true
@@ -68,6 +73,10 @@ struct FakeCodex {
 
     func threadRequest() throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: threadRequestURL)) as? [String: Any])
+    }
+
+    func releaseSteeringAcknowledgement() throws {
+        try Data().write(to: steeringReleaseURL)
     }
 
     func rpcRequests() throws -> [[String: Any]] {
@@ -262,8 +271,13 @@ try:
             mode=CONFIG['steeringMode']
             if mode=='reject':frame({'id':identity,'error':{'code':-32602,'message':'Steering rejected by fixture.'}})
             else:
-                if mode=='finish-before-ack':
-                    finish_event.set();finish();time.sleep(0.1)
+                if mode in ('finish-before-ack','finish-before-released-ack'):
+                    finish_event.set();finish()
+                if mode=='finish-before-ack':time.sleep(0.1)
+                elif mode=='finish-before-released-ack':
+                    release=pathlib.Path(CONFIG['steeringReleasePath'])
+                    deadline=time.monotonic()+120
+                    while not release.exists() and time.monotonic()<deadline:time.sleep(0.01)
                 reply(identity,{'turnId':turn_id})
         elif method=='turn/interrupt':
             if not CONFIG['ignoreTerm']:

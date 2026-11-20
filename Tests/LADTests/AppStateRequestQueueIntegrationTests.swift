@@ -103,7 +103,7 @@ final class AppStateRequestQueueIntegrationTests: XCTestCase {
 
     @MainActor
     func testSendNowAcknowledgementAfterTurnCompletionDoesNotDuplicateOrLoseTheRequest() async throws {
-        let fixture = try Fixture(delay: 2, steeringMode: "finish-before-ack")
+        let fixture = try Fixture(delay: 2, steeringMode: "finish-before-released-ack")
         defer { fixture.cleanUp() }
         let state = fixture.state()
         defer { state.cancel() }
@@ -127,9 +127,15 @@ final class AppStateRequestQueueIntegrationTests: XCTestCase {
         XCTAssertNil(state.editingQueuedRequestID)
         XCTAssertEqual(state.queuedRequests.first?.id, supplementalID)
         XCTAssertEqual(state.queuedRequests.first?.content, information)
-        try await Task.sleep(for: .milliseconds(40))
+        // The fixture holds the acknowledgement until LAD has received the
+        // turn's completion.
+        guard try await waitUntil("The turn's completion did not arrive while the acknowledgement was held.", {
+            state.taskAudits.first?.events.contains { $0.id == "project:server:turn:turn" } == true
+        }) else { return }
+        XCTAssertEqual(state.isSendingQueuedRequestID, supplementalID)
         XCTAssertTrue(state.queuedRequests.contains(where: { $0.id == supplementalID }),
                       "A terminal notification before the RPC acknowledgement must not consume an unacknowledged item.")
+        try fixture.codex.releaseSteeringAcknowledgement()
         guard try await waitUntil("The acknowledged information and next queued turn did not finish.", {
             state.revisions.count == 2 && !state.isWorking && state.queuedRequests.isEmpty
         }) else { return }
@@ -184,7 +190,8 @@ final class AppStateRequestQueueIntegrationTests: XCTestCase {
 
     @MainActor
     private func waitUntil(_ reason: String, _ predicate: () -> Bool) async throws -> Bool {
-        let deadline = ContinuousClock.now + .seconds(30)
+        // Each scenario's first validation starts a cold CAD worker.
+        let deadline = ContinuousClock.now + .seconds(120)
         while !predicate(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
         guard predicate() else { XCTFail(reason); return false }
         return true
