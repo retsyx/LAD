@@ -15,7 +15,8 @@ final class CADSectionManipulatorTests: XCTestCase {
     }
 
     @MainActor
-    func testHandlesStayAnchoredAndKeepTheirScreenSizeAcrossCameraChanges() throws {
+    func testHandlesStayAnchoredAndRotationBarsKeepTheirSizeAcrossCameraChanges() throws {
+        _ = NSApplication.shared
         let viewport = NSRect(x: 0, y: 0, width: 640, height: 480)
         let meshBounds: [Double] = [-30, -15, -10, 30, 15, 10]
         var rig = CameraRig()
@@ -43,13 +44,113 @@ final class CADSectionManipulatorTests: XCTestCase {
             let currentHandles = try handles(in: manipulator)
             let center = currentHandles.hub
             XCTAssertEqual(simd_distance(center, projection.project(plane.origin).screen), 0, accuracy: 0.01)
-            for (current, initial) in zip(currentHandles.lengths, initialLengths) {
+            for (current, initial) in zip(currentHandles.lengths.dropFirst(), initialLengths.dropFirst()) {
                 XCTAssertEqual(current, initial, accuracy: 0.01)
             }
-            for tip in currentHandles.tips {
+            for tip in currentHandles.tips where tip != center {
                 let point = tip + 13.5 * simd_normalize(tip - center)
                 XCTAssertTrue(manipulator.hitTest(NSPoint(x: point.x, y: point.y)) === manipulator)
             }
+        }
+    }
+
+    @MainActor
+    func testOffsetArrowFollowsTheProjectedNormalOnEitherSideOfAHeadOnView() throws {
+        _ = NSApplication.shared
+        let viewport = NSRect(x: 0, y: 0, width: 640, height: 480)
+        let plane = try XCTUnwrap(CADSectionPlane(point: .zero, normal: SIMD3(1, 0, 0), cameraRight: SIMD3(0, 1, 0)))
+        let manipulator = CADSectionManipulator(onBegin: {}, onChange: { _ in })
+        manipulator.frame = viewport
+
+        for orthographic in [false, true] {
+            var rig = CameraRig()
+            rig.elevation = 0
+            rig.roll = 0.24
+            rig.usesOrthographicProjection = orthographic
+            for yaw in [-0.64, -0.24, -0.04, 0, 0.04, 0.24, 0.64] {
+                rig.yaw = yaw
+                let projection = rig.projection(width: viewport.width, height: viewport.height)
+                manipulator.update(plane: plane, projection: projection)
+                let currentHandles = try handles(in: manipulator)
+                let arrow = currentHandles.arrow - currentHandles.hub
+                let gain = abs(sin(yaw))
+                if gain < 0.12 {
+                    XCTAssertEqual(simd_length(arrow), 0, accuracy: 0.01)
+                    let hub = currentHandles.hub
+                    XCTAssertTrue(manipulator.hitTest(NSPoint(x: hub.x, y: hub.y)) === manipulator)
+                } else {
+                    let forward = projection.project(plane.origin + plane.normal).screen
+                    let expected = forward - projection.project(plane.origin).screen
+                    XCTAssertEqual(simd_dot(simd_normalize(arrow), simd_normalize(expected)), 1, accuracy: 1e-8)
+                    XCTAssertEqual(simd_length(arrow), 50 * min(1, gain / 0.48), accuracy: 0.01)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func testPerspectiveArrowUsesTheSightlineAtTheOffCenterAnchor() throws {
+        let viewport = NSRect(x: 0, y: 0, width: 640, height: 480)
+        let plane = try XCTUnwrap(CADSectionPlane(point: .zero, normal: SIMD3(1, 0, 0), cameraRight: SIMD3(0, 1, 0)))
+        let manipulator = CADSectionManipulator(onBegin: {}, onChange: { _ in })
+        manipulator.frame = viewport
+        var rig = CameraRig()
+        rig.target = SIMD3(0, 52, -21)
+        rig.yaw = 0
+        rig.elevation = 0
+
+        let projection = rig.projection(width: viewport.width, height: viewport.height)
+        manipulator.update(plane: plane, projection: projection)
+        let perspective = try handles(in: manipulator)
+        let arrow = perspective.arrow - perspective.hub
+        let offset = projection.project(plane.origin + plane.normal).screen - projection.project(plane.origin).screen
+        XCTAssertGreaterThan(simd_length(arrow), 0)
+        XCTAssertEqual(simd_dot(simd_normalize(arrow), simd_normalize(offset)), 1, accuracy: 1e-8)
+
+        rig.usesOrthographicProjection = true
+        manipulator.update(plane: plane, projection: rig.projection(width: viewport.width, height: viewport.height))
+        let orthographic = try handles(in: manipulator)
+        XCTAssertEqual(simd_distance(orthographic.arrow, orthographic.hub), 0, accuracy: 0.01)
+    }
+
+    @MainActor
+    func testDraggingDepthMarkerUpMovesTheSectionAlongItsNormal() throws {
+        _ = NSApplication.shared
+        let viewport = NSRect(x: 0, y: 0, width: 640, height: 480)
+        let window = NSWindow(contentRect: viewport, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let content = FocusableViewport(frame: viewport)
+        window.contentView = content
+        var rig = CameraRig()
+        rig.yaw = 0
+        rig.elevation = 0
+        rig.usesOrthographicProjection = true
+        let projection = rig.projection(width: viewport.width, height: viewport.height)
+        var plane = try XCTUnwrap(CADSectionPlane(point: .zero, normal: rig.backward, cameraRight: rig.right))
+        weak var overlay: CADSectionManipulator?
+        let manipulator = CADSectionManipulator(onBegin: {}, onChange: { next in
+            plane = next
+            overlay?.update(plane: next, projection: projection)
+        })
+        overlay = manipulator
+        manipulator.frame = viewport
+        content.addSubview(manipulator)
+
+        let dragPoints = 20.0
+        let expectedOffset = dragPoints * 2 * projection.orthographicScale / projection.height
+        for normal in [rig.backward, -rig.backward] {
+            plane = try XCTUnwrap(CADSectionPlane(point: .zero, normal: normal, cameraRight: rig.right))
+            manipulator.update(plane: plane, projection: projection)
+            let currentHandles = try handles(in: manipulator)
+            XCTAssertEqual(simd_distance(currentHandles.arrow, currentHandles.hub), 0, accuracy: 0.01)
+            let point = CGPoint(x: currentHandles.hub.x, y: currentHandles.hub.y)
+            let end = CGPoint(x: point.x, y: point.y + dragPoints)
+            manipulator.mouseDown(with: try mouse(.leftMouseDown, at: point, in: window))
+            manipulator.mouseDragged(with: try mouse(.leftMouseDragged, at: end, in: window))
+            XCTAssertEqual(plane.value(for: .offset), expectedOffset, accuracy: 1e-8)
+            XCTAssertEqual(simd_distance(plane.origin, expectedOffset * normal), 0, accuracy: 1e-8)
+            manipulator.mouseUp(with: try mouse(.leftMouseUp, at: end, in: window))
         }
     }
 

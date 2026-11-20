@@ -4,15 +4,25 @@ import simd
 
 /// The viewport's section handles and the native numeric editor they activate.
 final class CADSectionManipulator: NSView, NSTextFieldDelegate {
+    private enum OffsetShape: Equatable {
+        case arrow(length: Double)
+        case depth(towardViewer: Bool)
+    }
+
     @MainActor private struct Layout: Equatable {
+        static let fullArrowLength = 50.0
+
         let center: SIMD2<Double>
         let direction: SIMD2<Double>
         let pointsPerMillimeter: Double
         let relativeDepthChange: Double
+        let offsetShape: OffsetShape
 
         func line(for handle: CADSectionHandle) -> (start: SIMD2<Double>, end: SIMD2<Double>) {
             switch handle {
-            case .offset: return (center, center + 50 * direction)
+            case .offset:
+                if case let .arrow(length) = offsetShape { return (center, center + length * direction) }
+                return (center, center)
             case .vertical: return (center - SIMD2(0, 28), center + SIMD2(0, 37))
             case .horizontal: return (center + SIMD2(28, 0), center - SIMD2(37, 0))
             }
@@ -44,15 +54,17 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
             let velocity = normalInView / unitsPerPoint - (hub.screen - screenCenter) * depthChange
             let speed = simd_length(velocity)
             guard speed.isFinite else { return nil }
-            if speed * unitsPerPoint < 1e-6 {
-                // A face-on normal has no screen direction. Keep the handle
-                // usable while its motion remains along the same world axis.
-                return Self(center: hub.screen, direction: SIMD2(-sqrt(0.75), -0.5),
-                            pointsPerMillimeter: 1 / unitsPerPoint, relativeDepthChange: 0)
+            let projectedGain = speed * unitsPerPoint
+            if projectedGain < 0.12 {
+                // Near the sightline, the normal has little screen extent.
+                // Show its depth direction and use vertical motion for offset.
+                return Self(center: hub.screen, direction: SIMD2(0, 1),
+                            pointsPerMillimeter: 1 / unitsPerPoint, relativeDepthChange: 0,
+                            offsetShape: .depth(towardViewer: simd_dot(plane.normal, projection.backward) > 0))
             }
-            let minimumSpeed = 0.12 / unitsPerPoint
             return Self(center: hub.screen, direction: velocity / speed,
-                        pointsPerMillimeter: max(speed, minimumSpeed), relativeDepthChange: speed >= minimumSpeed ? depthChange : 0)
+                        pointsPerMillimeter: speed, relativeDepthChange: depthChange,
+                        offsetShape: .arrow(length: fullArrowLength * min(1, projectedGain / 0.48)))
         }
     }
 
@@ -195,7 +207,9 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         for handle in CADSectionHandle.allCases {
             let line = handles.line(for: handle)
             let delta = line.end - line.start
-            let fraction = min(1, max(0, simd_dot(point - line.start, delta) / simd_length_squared(delta)))
+            let lengthSquared = simd_length_squared(delta)
+            guard lengthSquared > 0 else { continue }
+            let fraction = min(1, max(0, simd_dot(point - line.start, delta) / lengthSquared))
             let distance = simd_distance(point, line.start + fraction * delta)
             if distance < nearest {
                 target = handle
@@ -210,13 +224,15 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         let gold = NSColor(Palette.accent)
         for handle in [CADSectionHandle.offset, .horizontal, .vertical] {
             let line = handles.line(for: handle)
+            guard line.start != line.end else { continue }
+            let arrowScale = handle == .offset ? simd_distance(line.start, line.end) / Layout.fullArrowLength : 1
             let color = gold.withAlphaComponent(edit == nil || edit?.handle == handle ? 1 : 0.53)
             color.setStroke()
             color.setFill()
             let shaft = NSBezierPath()
             shaft.move(to: NSPoint(line.start))
-            shaft.line(to: NSPoint(handle == .offset ? line.end - 12 * handles.direction : line.end))
-            shaft.lineWidth = handle == .offset ? 6 : 4
+            shaft.line(to: NSPoint(handle == .offset ? line.end - 12 * arrowScale * handles.direction : line.end))
+            shaft.lineWidth = handle == .offset ? max(3, 6 * arrowScale) : 4
             shaft.lineCapStyle = .round
             shaft.stroke()
             if handle == .offset {
@@ -224,8 +240,8 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
                 let tangent = SIMD2(-direction.y, direction.x)
                 let arrow = NSBezierPath()
                 arrow.move(to: NSPoint(line.end))
-                arrow.line(to: NSPoint(line.end - 16 * direction + 11 * tangent))
-                arrow.line(to: NSPoint(line.end - 16 * direction - 11 * tangent))
+                arrow.line(to: NSPoint(line.end + arrowScale * (-16 * direction + 11 * tangent)))
+                arrow.line(to: NSPoint(line.end + arrowScale * (-16 * direction - 11 * tangent)))
                 arrow.close()
                 arrow.fill()
             } else {
@@ -235,9 +251,37 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
                 NSBezierPath(roundedRect: grip, xRadius: 6, yRadius: 6).fill()
             }
         }
-        gold.setFill()
-        NSBezierPath(ovalIn: NSRect(x: handles.center.x - 6, y: handles.center.y - 6,
-                                   width: 12, height: 12)).fill()
+        if case let .depth(towardViewer) = handles.offsetShape {
+            drawDepthHandle(at: handles.center, towardViewer: towardViewer, color: gold)
+        } else {
+            gold.setFill()
+            NSBezierPath(ovalIn: NSRect(x: handles.center.x - 6, y: handles.center.y - 6,
+                                       width: 12, height: 12)).fill()
+        }
+    }
+
+    private func drawDepthHandle(at center: SIMD2<Double>, towardViewer: Bool, color: NSColor) {
+        let tint = color.withAlphaComponent(edit == nil || edit?.handle == .offset ? 1 : 0.53)
+        let ring = NSBezierPath(ovalIn: NSRect(x: center.x - 9, y: center.y - 9, width: 18, height: 18))
+        NSColor(Palette.panel).setFill()
+        ring.fill()
+        tint.setStroke()
+        ring.lineWidth = 2
+        ring.stroke()
+        if towardViewer {
+            tint.setFill()
+            NSBezierPath(ovalIn: NSRect(x: center.x - 2, y: center.y - 2, width: 4, height: 4)).fill()
+        } else {
+            let cross = NSBezierPath()
+            for slope in [-3.0, 3.0] {
+                let diagonal = SIMD2(3, slope)
+                cross.move(to: NSPoint(center - diagonal))
+                cross.line(to: NSPoint(center + diagonal))
+            }
+            cross.lineWidth = 2
+            cross.lineCapStyle = .round
+            cross.stroke()
+        }
     }
 
     fileprivate func beginEditing(_ handle: CADSectionHandle, mouseStart: SIMD2<Double>? = nil) {

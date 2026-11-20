@@ -22,6 +22,7 @@ struct LADHelpView: View {
                 control("Select one planar face and turn on Section View", "Start the cut on that face")
                 control("Right-click a planar face", "Choose Section from This Face")
                 control("Drag the arrow", "Move the cut along the section plane’s normal")
+                control("Drag the depth handle up or down", "Move the cut when looking along the normal")
                 control("Drag a rotation bar", "Tilt or turn the section plane")
                 control("Type a value, then press Return", "Apply the active handle’s offset or angle")
             }
