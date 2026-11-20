@@ -164,6 +164,16 @@ final class CADMeasurementTests: XCTestCase {
         XCTAssertEqual(CADMeasurementMetric(id: "vector", label: "Point", values: [-0.00000001, 3, 4], unit: .length).formattedValue, "0, 3, 4 mm")
     }
 
+    func testPaneRoundsEachCoordinateAndHoverPreservesFullPrecision() {
+        let position = CADMeasurementMetric(id: "position", label: "Point", values: [1.234567891, -0.005, -1e-8], unit: .length)
+        XCTAssertEqual(position.displayValue, "1.23, 0, 0 mm")
+        XCTAssertEqual(position.fullPrecisionValue, "1.234567891, -0.005, -1e-08 mm")
+
+        let angle = CADMeasurementMetric(id: "angle", label: "Angle", values: [12.6789], unit: .angle)
+        XCTAssertEqual(angle.displayValue, "12.68°")
+        XCTAssertEqual(angle.fullPrecisionValue, "12.6789°")
+    }
+
     private func id(_ kind: CADFeatureKind, _ index: Int) -> CADFeatureID { CADFeatureID(kind: kind, solidIndex: 0, localIndex: index) }
 
     private func values(_ report: CADMeasurementReport, _ key: String) throws -> [Double] {

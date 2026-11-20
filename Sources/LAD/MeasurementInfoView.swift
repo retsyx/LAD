@@ -65,8 +65,9 @@ struct MeasurementInfoView: View {
                     Text(metricLabel(metric))
                         .font(.system(size: 9)).foregroundStyle(Palette.muted)
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text(metric.formattedValue).font(.system(size: 10, design: .monospaced))
+                        Text(metric.displayValue).font(.system(size: 10, design: .monospaced))
                             .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                            .help(metric.fullPrecisionValue)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         CopyButton(text: metric.formattedValue, label: "Copy \(metricLabel(metric))")
                     }

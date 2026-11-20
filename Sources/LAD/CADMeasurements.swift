@@ -105,9 +105,23 @@ struct CADMeasurementMetric: Codable, Sendable, Identifiable {
     var unit: CADMeasurementUnit
 
     var formattedValue: String {
-        let number = values.map { value in
+        formatValues { value in
             (abs(value) < 0.0000005 ? 0 : value).formatted(.number.precision(.fractionLength(0...6)))
-        }.joined(separator: ", ")
+        }
+    }
+
+    var displayValue: String {
+        formatValues { value in
+            (abs(value) <= 0.005 ? 0 : value).formatted(.number.precision(.fractionLength(0...2)))
+        }
+    }
+
+    var fullPrecisionValue: String {
+        formatValues { $0 == 0 ? "0" : String($0) }
+    }
+
+    private func formatValues(_ format: (Double) -> String) -> String {
+        let number = values.map(format).joined(separator: ", ")
         return number + (unit == .scalar ? "" : unit == .angle ? unit.rawValue : " " + unit.rawValue)
     }
 }
