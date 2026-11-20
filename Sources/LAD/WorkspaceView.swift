@@ -168,7 +168,6 @@ struct WorkspaceView: View {
                 }
                 .layoutPriority(1)
             Spacer()
-            Button { state.openProject() } label: { Image(systemName: "folder") }.help("Open design (⌘O)")
             Button { state.saveNewProject() } label: { Label("Save New", systemImage: "square.and.arrow.down") }
                 .help("Save the latest design as a new file (⌘S)")
                 .disabled(!state.canSaveNew)

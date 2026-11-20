@@ -2445,15 +2445,6 @@ final class AppState {
         }
     }
 
-    func openProject() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "lad") ?? .package]
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        if let onOpenProject { onOpenProject(url) }
-        else { openProject(url) }
-    }
-
     func openProject(_ url: URL, restoringProjectID: UUID? = nil) {
         cancel(); isWorking = true; activity = "Opening design…"
         let wasReady = projectReady
