@@ -241,6 +241,126 @@ final class PartsSidebarScrollTests: XCTestCase {
     }
 
     @MainActor
+    func testStationaryDragScrollsAtBothEdgesAndStopsOnExit() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let state = fixture.state
+        let window = makeWindow(PartsSidebar(state: state), size: NSSize(width: 340, height: 420))
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+        let scroll = try await partsScroll(in: host)
+        try await scrollTo(1400, scroll: scroll, host: host)
+        let destination = try XCTUnwrap(descendants(host).compactMap { $0 as? PartDropDestinationView }.last)
+        let clip = scroll.contentView
+        let viewport = clip.convert(clip.bounds, to: nil)
+        let bottom = NSPoint(x: viewport.midX, y: viewport.minY + 3)
+        let top = NSPoint(x: viewport.midX, y: viewport.maxY - 3)
+        for point in [top, bottom] {
+            XCTAssertEqual(destination.drop.folderID(at: point, among: ["group-1", "nested-1"]), "nested-1")
+        }
+        // Both edges start inside this part's current folder. It must still
+        // be possible to scroll to another destination from there.
+        let sender = try dragPart("part-40", in: state, window: window, at: bottom)
+        defer { sender.draggingPasteboard.releaseGlobally() }
+
+        let before = scroll.documentVisibleRect.minY
+        XCTAssertTrue(destination.draggingEntered(sender).isEmpty)
+        defer { destination.draggingEnded(sender) }
+        let scrolledDown = waitForDragTrackingEffect { scroll.documentVisibleRect.minY > before + 15 }
+        guard scrolledDown else {
+            XCTFail("Holding at the bottom edge must scroll without additional drag updates.")
+            return
+        }
+
+        let afterDown = scroll.documentVisibleRect.minY
+        sender.draggingLocation = top
+        XCTAssertTrue(destination.draggingUpdated(sender).isEmpty)
+        let scrolledUp = try await waitForHoverEffect { scroll.documentVisibleRect.minY < afterDown - 15 }
+        XCTAssertTrue(scrolledUp, "Moving to the top edge must reverse the scroll.")
+
+        destination.draggingExited(sender)
+        let afterExit = scroll.documentVisibleRect.minY
+        await settle(host)
+        XCTAssertEqual(scroll.documentVisibleRect.minY, afterExit, accuracy: 1)
+    }
+
+    @MainActor
+    func testHoverOpensClosedFolderAndRetargetsTheSameDrag() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let state = fixture.state
+        state.setPartFolderExpanded("group-0", isExpanded: false)
+        state.setPartFolderExpanded("group-1", isExpanded: false)
+        let window = makeWindow(PartsSidebar(state: state), size: NSSize(width: 340, height: 420))
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+        let scroll = try await partsScroll(in: host)
+        let destination = try XCTUnwrap(descendants(host).compactMap { $0 as? PartDropDestinationView }.last)
+        await settle(host)
+        let anchor = try XCTUnwrap(destination.drop.contentAnchor)
+        let folder = try XCTUnwrap(destination.drop.folderFrames["group-1"])
+        let point = anchor.convert(NSPoint(x: folder.midX, y: folder.midY), to: nil)
+        XCTAssertTrue(scroll.contentView.convert(scroll.contentView.bounds, to: nil).insetBy(dx: 0, dy: 40).contains(point))
+        let sender = try dragPart("part-0", in: state, window: window, at: point)
+        defer { sender.draggingPasteboard.releaseGlobally() }
+
+        XCTAssertEqual(destination.draggingEntered(sender), .copy)
+        defer { destination.draggingEnded(sender) }
+        XCTAssertFalse(state.isPartFolderExpanded("group-1"), "Folder expansion must wait for the hover.")
+        destination.draggingExited(sender)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertFalse(state.isPartFolderExpanded("group-1"), "Leaving the pane must cancel the pending expansion.")
+
+        XCTAssertEqual(destination.draggingEntered(sender), .copy)
+        let opened = try await waitForHoverEffect { state.isPartFolderExpanded("group-1") }
+        guard opened else {
+            XCTFail("A stationary drag over the folder must open it.")
+            return
+        }
+        await settle(host)
+        let nested = try XCTUnwrap(destination.drop.folderFrames["nested-1"])
+        sender.draggingLocation = anchor.convert(NSPoint(x: nested.midX, y: nested.minY + 12), to: nil)
+        XCTAssertEqual(destination.draggingUpdated(sender), .copy)
+        XCTAssertEqual(destination.drop.target, .folder("nested-1"))
+        XCTAssertTrue(destination.prepareForDragOperation(sender))
+        XCTAssertTrue(destination.performDragOperation(sender))
+        let parent = state.partTree.flatMap(\.flattened).first { $0.children?.contains { $0.id == "part-0" } == true }
+        XCTAssertEqual(parent?.id, "nested-1")
+    }
+
+    @MainActor
+    private func dragPart(_ nodeID: String, in state: AppState, window: NSWindow, at point: NSPoint) throws -> PartDropTestDraggingInfo {
+        _ = PartTreeDrag.provider(for: PartTreeDrag.Session(projectSessionID: state.projectEditingID,
+                                                            revisionID: state.selectedRevisionID, nodeIDs: [nodeID]))
+        let board = NSPasteboard.withUniqueName()
+        guard board.setData(Data(), forType: PartTreeDrag.pasteboardType) else {
+            board.releaseGlobally()
+            throw LADError.message("The Parts drag fixture could not write its pasteboard type.")
+        }
+        let sender = PartDropTestDraggingInfo(pasteboard: board, window: window, location: point)
+        sender.draggingSourceOperationMask = .copy
+        return sender
+    }
+
+    @MainActor
+    private func waitForDragTrackingEffect(_ condition: () -> Bool) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: 3)
+        while !condition(), Date() < deadline {
+            guard RunLoop.main.run(mode: .eventTracking, before: Date(timeIntervalSinceNow: 0.05)) else { break }
+        }
+        return condition()
+    }
+
+    @MainActor
+    private func waitForHoverEffect(_ condition: () -> Bool) async throws -> Bool {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !condition(), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        return condition()
+    }
+
+    @MainActor
     private func assertPreservedOffset(_ requested: CGFloat, scroll: NSScrollView,
                                        file: StaticString = #filePath, line: UInt = #line) {
         let maximum = max(0, (scroll.documentView?.bounds.maxY ?? 0) - scroll.contentSize.height)

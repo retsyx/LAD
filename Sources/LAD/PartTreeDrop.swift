@@ -13,6 +13,11 @@ enum PartTreeDrag {
         var projectSessionID: UUID
         var revisionID: UUID?
         var nodeIDs: Set<String>
+
+        @MainActor
+        func matches(_ state: AppState) -> Bool {
+            projectSessionID == state.projectEditingID && revisionID == state.selectedRevisionID
+        }
     }
 
     /// Drop targets are validated while hovering, before the provider's data
@@ -31,15 +36,6 @@ enum PartTreeDrag {
             return nil
         }
         return provider
-    }
-
-    /// The dragged parts and folders that a drop into `parentID` (the top
-    /// level when nil) would relocate. Items already there keep their place.
-    @MainActor
-    static func movableNodeIDs(in state: AppState, toParent parentID: String?) -> Set<String> {
-        guard let session, session.projectSessionID == state.projectEditingID,
-              session.revisionID == state.selectedRevisionID else { return [] }
-        return state.partNodeIDsChangingParent(session.nodeIDs, toParent: parentID)
     }
 }
 
@@ -70,7 +66,7 @@ final class PartDropState {
         guard let anchor = contentAnchor, anchor.window != nil else { return nil }
         let point = anchor.convert(windowLocation, from: nil)
         guard anchor.visibleRect.contains(point) else { return nil }
-        return folderFrames.filter { folders.contains($0.key) && $0.value.contains(point) }
+        return folderFrames.lazy.filter { folders.contains($0.key) && $0.value.contains(point) }
             .min { $0.value.width * $0.value.height < $1.value.width * $1.value.height }?.key
     }
 }
@@ -110,20 +106,32 @@ struct PartDropDestination: NSViewRepresentable {
 
     func makeNSView(context: Context) -> PartDropDestinationView { PartDropDestinationView(state: state, drop: drop) }
     func updateNSView(_ view: PartDropDestinationView, context: Context) {
+        guard view.state !== state || view.drop !== drop else { return }
+        view.finish()
         view.state = state
         view.drop = drop
     }
-    static func dismantleNSView(_ view: PartDropDestinationView, coordinator: ()) { view.drop.show(nil) }
+    static func dismantleNSView(_ view: PartDropDestinationView, coordinator: ()) { view.finish() }
 }
 
 @MainActor
 final class PartDropDestinationView: NSView {
     var state: AppState
     var drop: PartDropState
+    private var drag: Drag?
     private var proposal: Proposal?
+    private var folderHover: (id: String, deadline: ContinuousClock.Instant)?
+    private var trackingTimer: Timer?
+
+    private struct Drag {
+        let sequence: Int
+        let session: PartTreeDrag.Session
+        let location: NSPoint
+    }
 
     private struct Proposal {
-        var sequence: Int
+        var tree: [PartNode]
+        var collapsedFolders: Set<String>
         var visibleFolders: Set<String>
         var parentID: String?
         var nodeIDs: Set<String>
@@ -142,8 +150,13 @@ final class PartDropDestinationView: NSView {
     override var acceptsFirstResponder: Bool { false }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if window !== newWindow { finish() }
+    }
+
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        proposal = nil
+        finish()
         return update(sender)
     }
 
@@ -152,54 +165,143 @@ final class PartDropDestinationView: NSView {
     override func draggingExited(_ sender: (any NSDraggingInfo)?) { finish() }
     override func draggingEnded(_ sender: any NSDraggingInfo) { finish() }
 
-    override func prepareForDragOperation(_ sender: any NSDraggingInfo) -> Bool { !update(sender).isEmpty }
+    override func prepareForDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        finish()
+        guard let (session, _) = acceptedDrag(sender) else { return false }
+        return !destination(at: sender.draggingLocation, for: session).nodeIDs.isEmpty
+    }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-        // Revalidate against the current design rather than the hover state.
-        proposal = nil
-        let operation = update(sender)
-        let move = proposal
+        // Use the release location and current hierarchy, independent of hover feedback.
         finish()
-        guard !operation.isEmpty, let move else { return false }
+        guard let (session, _) = acceptedDrag(sender) else { return false }
+        let move = destination(at: sender.draggingLocation, for: session)
+        guard !move.nodeIDs.isEmpty else { return false }
         state.movePartNodes(move.nodeIDs, toParent: move.parentID)
         return true
     }
 
     private func update(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        // AppKit reports a source only for drags that start in this application.
-        guard sender.draggingSource != nil,
-              sender.draggingPasteboard.availableType(from: [PartTreeDrag.pasteboardType]) != nil,
-              let operation = [NSDragOperation.move, .generic, .private, .copy].first(where: sender.draggingSourceOperationMask.contains)
-        else {
+        guard let (session, operation) = acceptedDrag(sender) else {
             finish()
             return []
         }
-        let sequence = sender.draggingSequenceNumber
-        let current = proposal.flatMap { $0.sequence == sequence ? $0 : nil }
-        let folders = current?.visibleFolders ?? visibleFolderIDs()
-        let parentID = drop.folderID(at: sender.draggingLocation, among: folders)
-        // Validation indexes the whole tree; repeat it only when the pointer
-        // reaches a different destination.
-        if current == nil || current?.parentID != parentID {
-            proposal = Proposal(sequence: sequence, visibleFolders: folders, parentID: parentID,
-                                nodeIDs: PartTreeDrag.movableNodeIDs(in: state, toParent: parentID))
-        }
-        guard let proposal, !proposal.nodeIDs.isEmpty else {
-            drop.show(nil)
-            return []
-        }
-        drop.show(parentID.map(PartDropTarget.folder) ?? .root)
-        return operation
+        if drag?.sequence != sender.draggingSequenceNumber || drag?.session != session { finish() }
+        drag = Drag(sequence: sender.draggingSequenceNumber, session: session, location: sender.draggingLocation)
+        trackDrag(scrolling: false)
+        return drop.target == nil ? [] : operation
     }
 
-    private func finish() {
+    private func acceptedDrag(_ sender: any NSDraggingInfo) -> (PartTreeDrag.Session, NSDragOperation)? {
+        // AppKit reports a source only for drags that start in this application.
+        guard sender.draggingDestinationWindow === window, containsDragPoint(sender.draggingLocation),
+              sender.draggingSource != nil,
+              sender.draggingPasteboard.availableType(from: [PartTreeDrag.pasteboardType]) != nil,
+              let session = PartTreeDrag.session, session.matches(state),
+              let operation = [NSDragOperation.move, .generic, .private, .copy].first(where: sender.draggingSourceOperationMask.contains)
+        else { return nil }
+        return (session, operation)
+    }
+
+    private func trackDrag(scrolling: Bool) {
+        guard let drag, drag.session == PartTreeDrag.session, drag.session.matches(state),
+              containsDragPoint(drag.location) else {
+            finish()
+            return
+        }
+        let scrollStep = nextScrollStep(at: drag.location)
+        if scrolling, let (scroll, origin) = scrollStep {
+            scroll.contentView.scroll(to: origin)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+        let move = destination(at: drag.location, for: drag.session)
+        proposal = move
+        drop.show(move.nodeIDs.isEmpty ? nil : (move.parentID.map(PartDropTarget.folder) ?? .root))
+        updateFolderHover(move)
+        setTrackingTimer(active: scrollStep != nil || folderHover != nil)
+    }
+
+    private func containsDragPoint(_ location: NSPoint) -> Bool {
+        window != nil && !isHiddenOrHasHiddenAncestor && visibleRect.contains(convert(location, from: nil))
+    }
+
+    private func destination(at location: NSPoint, for session: PartTreeDrag.Session) -> Proposal {
+        let tree = state.partTree
+        let collapsed = state.collapsedPartFolderIDs
+        let current = proposal.flatMap { $0.tree == tree && $0.collapsedFolders == collapsed ? $0 : nil }
+        let folders = current?.visibleFolders ?? visibleFolderIDs(in: tree, collapsed: collapsed)
+        let parentID = drop.folderID(at: location, among: folders)
+        // Validation indexes the whole tree; repeat it only when the pointer
+        // reaches a different destination or the hierarchy changes.
+        if let current, current.parentID == parentID { return current }
+        return Proposal(tree: tree, collapsedFolders: collapsed, visibleFolders: folders, parentID: parentID,
+                        nodeIDs: state.partNodeIDsChangingParent(session.nodeIDs, toParent: parentID))
+    }
+
+    private func updateFolderHover(_ move: Proposal) {
+        guard let id = move.parentID, !move.nodeIDs.isEmpty, move.collapsedFolders.contains(id) else {
+            folderHover = nil
+            return
+        }
+        let now = ContinuousClock.now
+        if let hover = folderHover, hover.id == id {
+            guard now >= hover.deadline else { return }
+            folderHover = nil
+            state.setPartFolderExpanded(id, isExpanded: true)
+        } else {
+            folderHover = (id, now + .milliseconds(650))
+        }
+    }
+
+    private func nextScrollStep(at location: NSPoint) -> (NSScrollView, NSPoint)? {
+        guard let scroll = drop.contentAnchor?.enclosingScrollView else { return nil }
+        let clip = scroll.contentView
+        let viewport = clip.visibleRect.intersection(clip.bounds)
+        let point = clip.convert(location, from: nil)
+        guard viewport.contains(point) else { return nil }
+        let band = min(28, viewport.height / 3)
+        let fromMinY = point.y - viewport.minY
+        let fromMaxY = viewport.maxY - point.y
+        let proximity = band - min(fromMinY, fromMaxY)
+        guard proximity > 0 else { return nil }
+        let distance = 2 + 12 * proximity / band
+        var nextBounds = clip.bounds
+        nextBounds.origin.y += fromMinY < fromMaxY ? -distance : distance
+        let origin = clip.constrainBoundsRect(nextBounds).origin
+        return origin == clip.bounds.origin ? nil : (scroll, origin)
+    }
+
+    private func setTrackingTimer(active: Bool) {
+        guard active else {
+            trackingTimer?.invalidate()
+            trackingTimer = nil
+            return
+        }
+        guard trackingTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                guard let self else {
+                    timer.invalidate()
+                    return
+                }
+                self.trackDrag(scrolling: true)
+            }
+        }
+        trackingTimer = timer
+        // Keep tracking while AppKit runs the drag session's event loop.
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    fileprivate func finish() {
+        drag = nil
         proposal = nil
+        folderHover = nil
+        setTrackingTimer(active: false)
         drop.show(nil)
     }
 
     /// Folders inside collapsed folders keep no rendered area.
-    private func visibleFolderIDs() -> Set<String> {
-        let collapsed = state.collapsedPartFolderIDs
+    private func visibleFolderIDs(in tree: [PartNode], collapsed: Set<String>) -> Set<String> {
         var result = Set<String>()
         func visit(_ nodes: [PartNode]) {
             for node in nodes where node.isGroup {
@@ -207,7 +309,7 @@ final class PartDropDestinationView: NSView {
                 if !collapsed.contains(node.id) { visit(node.children ?? []) }
             }
         }
-        visit(state.partTree)
+        visit(tree)
         return result
     }
 }
