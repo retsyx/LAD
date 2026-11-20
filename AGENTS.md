@@ -12,6 +12,7 @@
 - When restarting LAD, do not save open designs. Files are autosaved already.
 - Do not byline commits with co-authorship claims.
 - When asked to make a change, make the change in a new temporary workspace, and commit the change to the current branch when done.
+- Code must compile cleanly without errors or warnings.
 
 ## Naming
 
