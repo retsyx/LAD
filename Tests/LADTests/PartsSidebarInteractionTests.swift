@@ -218,6 +218,85 @@ final class PartsSidebarInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testDroppingDraggedPartsMovesThemBetweenFoldersAndTheTopLevel() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let state = fixture.state
+        let window = makeWindow(state: state, onProjectDrop: { _ in XCTFail("Part drags must not open a design.") })
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let headerPoint = NSPoint(x: host.bounds.midX, y: host.isFlipped ? 24 : host.bounds.height - 24)
+
+        func drop(_ ids: Set<String>, at point: NSPoint, session: UUID? = nil, inApplication: Bool = true) async throws -> Bool {
+            _ = PartTreeDrag.provider(for: PartTreeDrag.Session(projectSessionID: session ?? state.projectEditingID,
+                                                                revisionID: state.selectedRevisionID, nodeIDs: ids))
+            board.clearContents()
+            XCTAssertTrue(board.setData(Data(), forType: NSPasteboard.PasteboardType(PartTreeDrag.type.identifier)))
+            let sender = PartsTextDraggingInfo(pasteboard: board)
+            sender.draggingDestinationWindow = window
+            sender.draggingSourceOperationMask = .move
+            sender.draggingSource = inApplication ? host : nil
+            sender.draggingLocation = host.convert(point, to: nil)
+            let destination = try XCTUnwrap(descendants(host).last { view in
+                !view.isHiddenOrHasHiddenAncestor && host.convert(view.bounds, from: view).contains(point) &&
+                    view.registeredDraggedTypes.contains(NSPasteboard.PasteboardType(PartTreeDrag.type.identifier))
+            }, "The Parts pane must accept its private drag type at \(point).")
+            _ = destination.draggingEntered(sender)
+            let operation = destination.draggingUpdated(sender)
+            let accepted = operation.contains(.move) && destination.prepareForDragOperation(sender) &&
+                destination.performDragOperation(sender)
+            if accepted { destination.concludeDragOperation(sender) } else { destination.draggingExited(sender) }
+            destination.draggingEnded(sender)
+            host.layoutSubtreeIfNeeded()
+            await Task.yield()
+            return accepted
+        }
+        func center(_ frame: NSRect?) throws -> NSPoint {
+            let frame = try XCTUnwrap(frame)
+            return NSPoint(x: frame.midX, y: frame.midY)
+        }
+
+        // A part row inside a folder stands for that folder.
+        var rows = try await rowFrames(in: host)
+        let accepted = try await drop(["board"], at: center(rows["lid"]))
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(state.partTree.map(\.id), ["case"])
+        XCTAssertEqual(state.partTree.first?.children?.map(\.id), ["base", "lid", "board"])
+
+        // The header stands for the top level.
+        let toRoot = try await drop(["base"], at: headerPoint)
+        XCTAssertTrue(toRoot)
+        XCTAssertEqual(state.partTree.map(\.id), ["case", "base"])
+        XCTAssertEqual(state.partTree.first?.children?.map(\.id), ["lid", "board"])
+
+        // A top-level part row stands for the top level as well.
+        rows = try await rowFrames(in: host, nodeIDs: ["case", "lid", "board", "base"])
+        let fromFolder = try await drop(["lid"], at: center(rows["base"]))
+        XCTAssertTrue(fromFolder)
+        XCTAssertEqual(state.partTree.map(\.id), ["case", "base", "lid"])
+
+        // Dropping into a folder's current location, into itself, from
+        // another design session or from another application leaves the
+        // organization untouched.
+        rows = try await rowFrames(in: host, nodeIDs: ["case", "board", "base", "lid"])
+        let unchanged = state.partTree
+        let rejections: [(Set<String>, NSPoint, UUID?, Bool)] = [(["board"], try center(rows["case"]), nil, true),
+                                                                 (["case"], try center(rows["board"]), nil, true),
+                                                                 (["base"], headerPoint, nil, true),
+                                                                 (["lid"], try center(rows["case"]), UUID(), true),
+                                                                 (["lid"], try center(rows["case"]), nil, false)]
+        for (ids, point, session, inApplication) in rejections {
+            let rejected = try await drop(ids, at: point, session: session, inApplication: inApplication)
+            XCTAssertFalse(rejected, "\(ids)")
+            XCTAssertEqual(state.partTree, unchanged, "\(ids)")
+        }
+        XCTAssertNil(state.error)
+        XCTAssertFalse(state.isWorking)
+    }
+
+    @MainActor
     private func rowFrames(in host: NSView, nodeIDs: [String] = ["case", "base", "lid", "board"]) async throws -> [String: NSRect] {
         let deadline = ContinuousClock.now + .seconds(5)
         while ContinuousClock.now < deadline {
@@ -381,7 +460,7 @@ private final class PartsTextDraggingInfo: NSObject, NSDraggingInfo {
     var draggedImageLocation: NSPoint = .zero
     let draggedImage: NSImage? = nil
     let draggingPasteboard: NSPasteboard
-    let draggingSource: Any? = nil
+    var draggingSource: Any?
     var draggingSequenceNumber = 1
     var draggingFormation: NSDraggingFormation = .default
     var animatesToDestination = false

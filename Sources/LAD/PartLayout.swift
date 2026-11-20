@@ -60,15 +60,7 @@ struct PartLayout: Codable, Sendable, Equatable {
     }
 
     mutating func move(_ ids: Set<String>, toParent parentID: String?) throws {
-        let records = Self.index(nodes)
-        for id in ids where records[id] == nil { throw PartLayoutError.unknownNode(id) }
-        try validateParent(parentID, records: records)
-        let roots = records.values.filter { record in
-            ids.contains(record.node.id) && !Self.ancestors(of: record.node.id, in: records).contains(where: ids.contains)
-        }.sorted { $0.order < $1.order }
-        if let parentID, roots.contains(where: { $0.node.allNodeIDs.contains(parentID) }) {
-            throw PartLayoutError.recursiveMove
-        }
+        let roots = try movingRoots(ids, toParent: parentID)
         let movedIDs = Set(roots.map { $0.node.id })
         var updated = Self.removing(movedIDs, from: nodes)
         let moving = roots.map { $0.node }
@@ -79,6 +71,26 @@ struct PartLayout: Codable, Sendable, Equatable {
         }
         nodes = updated
         markMoved(moving.map(\.id))
+    }
+
+    /// The moved items, excluding descendants that travel with them, that are
+    /// not already directly inside the destination. Empty when the move is invalid.
+    func nodeIDsChangingParent(_ ids: Set<String>, toParent parentID: String?) -> Set<String> {
+        guard let roots = try? movingRoots(ids, toParent: parentID) else { return [] }
+        return Set(roots.filter { $0.parent != parentID }.map(\.node.id))
+    }
+
+    private func movingRoots(_ ids: Set<String>, toParent parentID: String?) throws -> [Record] {
+        let records = Self.index(nodes)
+        for id in ids where records[id] == nil { throw PartLayoutError.unknownNode(id) }
+        try validateParent(parentID, records: records)
+        let roots = records.values.filter { record in
+            ids.contains(record.node.id) && !Self.ancestors(of: record.node.id, in: records).contains(where: ids.contains)
+        }.sorted { $0.order < $1.order }
+        if let parentID, roots.contains(where: { $0.node.allNodeIDs.contains(parentID) }) {
+            throw PartLayoutError.recursiveMove
+        }
+        return roots
     }
 
     @discardableResult

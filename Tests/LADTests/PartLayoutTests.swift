@@ -62,6 +62,28 @@ final class PartLayoutTests: XCTestCase {
         XCTAssertEqual(solids(layout), [0, 1, 2])
     }
 
+    func testParentChangesExcludeItemsAlreadyInTheDestinationAndCarriedDescendants() {
+        let layout = PartLayout(nodes: [group("case", [part("base", 0), part("lid", 1)]), part("board", 2), group("pcb", [])])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["base"], toParent: "case"), [])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["board", "pcb"], toParent: nil), [])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["case", "base"], toParent: nil), [], "Descendants travel with their folder.")
+        XCTAssertEqual(layout.nodeIDsChangingParent([], toParent: "case"), [])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["base", "board"], toParent: "case"), ["board"])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["case", "lid", "board"], toParent: "pcb"), ["case", "board"])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["base"], toParent: nil), ["base"])
+    }
+
+    func testParentChangesRejectCyclesUnknownNodesAndNonFolderTargets() {
+        let layout = PartLayout(nodes: [group("case", [group("inner", [part("base", 0)])]), part("board", 1)])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["case"], toParent: "inner"), [])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["inner"], toParent: "inner"), [])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["board"], toParent: "base"), [])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["missing", "board"], toParent: nil), [])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["board"], toParent: "missing"), [])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["board"], toParent: "inner"), ["board"])
+        XCTAssertEqual(layout.nodeIDsChangingParent(["inner"], toParent: nil), ["inner"])
+    }
+
     func testMoveRejectsCyclesUnknownNodesAndNonFolderTargets() throws {
         var layout = PartLayout(nodes: [group("case", [group("inner", [part("base", 0)])])])
         let original = layout

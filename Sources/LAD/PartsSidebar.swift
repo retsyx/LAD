@@ -9,6 +9,7 @@ struct PartsSidebar: View {
     @State private var renamingNodeID: String?
     @State private var renamingRevisionID: UUID?
     @State private var renameText = ""
+    @State private var partDrop = PartDropState()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -40,19 +41,25 @@ struct PartsSidebar: View {
                 VStack(alignment: .leading, spacing: 3) {
                     let collapsed = state.collapsedPartFolderIDs
                     ForEach(state.partTree) { node in
-                        PartTreeItem(node: node, state: state, collapsedFolderIDs: collapsed, renamingNodeID: $renamingNodeID,
-                                     renameText: $renameText, onFinishRename: finishRename,
+                        PartTreeItem(node: node, state: state, collapsedFolderIDs: collapsed, partDrop: partDrop,
+                                     renamingNodeID: $renamingNodeID, renameText: $renameText, onFinishRename: finishRename,
                                      onNewFolder: newFolder, onRename: rename)
                     }
                 }
                 .padding(.horizontal, 8).padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(PartsScrollAnchor(state: state).allowsHitTesting(false))
+                .background(PartDropContentAnchor(drop: partDrop))
+                .coordinateSpace(name: PartDropState.contentSpace)
             }
+            .background { PartDropHighlightView(drop: partDrop, target: .root).padding(3) }
             .contextMenu {
                 PartActionsMenu(state: state, onNewFolder: newFolder, onRename: rename)
             }
         }
+        // Parts dropped outside every folder, including on the header, move
+        // to the top level.
+        .background { PartDropDestination(state: state, drop: partDrop) }
         .background(Palette.panel)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Parts")
@@ -101,6 +108,7 @@ private struct PartTreeItem: View {
     let state: AppState
     /// Read once by the tree rather than once per folder row.
     let collapsedFolderIDs: Set<String>
+    let partDrop: PartDropState
     @Binding var renamingNodeID: String?
     @Binding var renameText: String
     let onFinishRename: (Bool) -> Void
@@ -116,12 +124,13 @@ private struct PartTreeItem: View {
     @State private var materialProjectID: UUID?
     @FocusState private var renameFocused: Bool
 
-    init(node: PartNode, state: AppState, collapsedFolderIDs: Set<String>, renamingNodeID: Binding<String?>,
-         renameText: Binding<String>, onFinishRename: @escaping (Bool) -> Void,
+    init(node: PartNode, state: AppState, collapsedFolderIDs: Set<String>, partDrop: PartDropState,
+         renamingNodeID: Binding<String?>, renameText: Binding<String>, onFinishRename: @escaping (Bool) -> Void,
          onNewFolder: @escaping (String?) -> Void, onRename: @escaping (PartNode) -> Void) {
         self.node = node
         self.state = state
         self.collapsedFolderIDs = collapsedFolderIDs
+        self.partDrop = partDrop
         _renamingNodeID = renamingNodeID
         _renameText = renameText
         self.onFinishRename = onFinishRename
@@ -152,7 +161,8 @@ private struct PartTreeItem: View {
                 )) {
                     VStack(alignment: .leading, spacing: 3) {
                         ForEach(node.children ?? []) { child in
-                            PartTreeItem(node: child, state: state, collapsedFolderIDs: collapsedFolderIDs, renamingNodeID: $renamingNodeID,
+                            PartTreeItem(node: child, state: state, collapsedFolderIDs: collapsedFolderIDs,
+                                         partDrop: partDrop, renamingNodeID: $renamingNodeID,
                                          renameText: $renameText, onFinishRename: onFinishRename,
                                          onNewFolder: onNewFolder, onRename: onRename)
                         }
@@ -162,6 +172,12 @@ private struct PartTreeItem: View {
                     row
                 }
                 .tint(Palette.muted)
+                // The folder's complete area, including its parts, receives
+                // drops; nested folders are more specific destinations.
+                .background { PartDropHighlightView(drop: partDrop, target: .folder(node.id)) }
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(PartDropState.contentSpace)) } action: {
+                    partDrop.folderFrames[node.id] = $0
+                }
             } else {
                 row.padding(.leading, 17)
             }
@@ -233,6 +249,12 @@ private struct PartTreeItem: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .onDrag {
+                    onFinishRename(false)
+                    let ids = state.selectedPartNodeIDs.contains(node.id) ? state.selectedPartNodeIDs : [node.id]
+                    return PartTreeDrag.provider(for: PartTreeDrag.Session(
+                        projectSessionID: state.projectEditingID, revisionID: state.selectedRevisionID, nodeIDs: ids))
+                }
                 .help(node.name)
                 .accessibilityLabel(node.name)
                 .accessibilityAddTraits(selection.isSelected ? .isSelected : [])

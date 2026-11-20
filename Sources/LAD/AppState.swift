@@ -2251,6 +2251,10 @@ final class AppState {
         editPartLayout { try $0.move(ids, toParent: parentID) }
     }
 
+    func partNodeIDsChangingParent(_ ids: Set<String>, toParent parentID: String?) -> Set<String> {
+        selectedPartLayout.nodeIDsChangingParent(ids, toParent: parentID)
+    }
+
     func createPartFolder(named name: String, parentID: String? = nil) {
         editPartLayout { _ = try $0.createFolder(named: name, parentID: parentID) }
     }

@@ -183,6 +183,64 @@ final class PartsSidebarScrollTests: XCTestCase {
     }
 
     @MainActor
+    func testScrolledPartDropUsesTheInnermostFolderUnderThePointer() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let state = fixture.state
+        let window = makeWindow(PartsSidebar(state: state), size: NSSize(width: 340, height: 420))
+        defer { close(window) }
+        let host = try XCTUnwrap(window.contentView)
+        let scroll = try await partsScroll(in: host)
+        try await scrollTo(1400, scroll: scroll, host: host)
+        let before = scroll.documentVisibleRect.minY
+        let document = try XCTUnwrap(scroll.documentView)
+        let visible = host.convert(scroll.documentVisibleRect, from: document)
+
+        // Rendered rows follow the fully expanded tree's order. Pick a part
+        // row well inside the scrolled viewport.
+        var rows = [NSRect]()
+        for leaf in descendants(document) where leaf.subviews.isEmpty && !leaf.isHiddenOrHasHiddenAncestor {
+            let frame = host.convert(leaf.bounds, from: leaf)
+            guard frame.width > 120, (20...40).contains(frame.height) else { continue }
+            if let index = rows.firstIndex(where: { abs($0.midY - frame.midY) < 1 }) {
+                if frame.width < rows[index].width { rows[index] = frame }
+            } else { rows.append(frame) }
+        }
+        rows.sort { host.isFlipped ? $0.midY < $1.midY : $0.midY > $1.midY }
+        let nodes = state.partTree.flatMap(\.flattened)
+        XCTAssertEqual(rows.count, nodes.count, "Every expanded row must be rendered.")
+        let (id, frame) = try XCTUnwrap(zip(nodes.map(\.id), rows).first { id, frame in
+            id.hasPrefix("part-") && visible.insetBy(dx: 0, dy: 60).contains(NSPoint(x: frame.midX, y: frame.midY))
+        }, "No part row is visible after scrolling.")
+        let folder = try XCTUnwrap(nodes.first {
+            $0.children?.contains { $0.id == id } == true
+        }?.id)
+        XCTAssertTrue(folder.hasPrefix("nested-"))
+
+        _ = PartTreeDrag.provider(for: PartTreeDrag.Session(projectSessionID: state.projectEditingID,
+                                                            revisionID: state.selectedRevisionID, nodeIDs: ["part-0"]))
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        XCTAssertTrue(board.setData(Data(), forType: PartTreeDrag.pasteboardType))
+        let point = NSPoint(x: frame.midX, y: frame.midY)
+        let sender = PartDropTestDraggingInfo(pasteboard: board, window: window, location: host.convert(point, to: nil))
+        let destination = try XCTUnwrap(descendants(host).last {
+            $0.registeredDraggedTypes.contains(PartTreeDrag.pasteboardType) && host.convert($0.bounds, from: $0).contains(point)
+        })
+        XCTAssertEqual(destination.draggingEntered(sender), .move)
+        XCTAssertTrue(destination.prepareForDragOperation(sender))
+        XCTAssertTrue(destination.performDragOperation(sender))
+        destination.draggingEnded(sender)
+        await settle(host)
+
+        let parent = state.partTree.flatMap(\.flattened).first { $0.children?.contains { $0.id == "part-0" } == true }
+        XCTAssertEqual(parent?.id, folder, "\(id) is inside \(folder), not its enclosing assembly.")
+        XCTAssertEqual(parent?.children?.last?.id, "part-0")
+        XCTAssertNil(state.error)
+        assertPreservedOffset(before, scroll: scroll)
+    }
+
+    @MainActor
     private func assertPreservedOffset(_ requested: CGFloat, scroll: NSScrollView,
                                        file: StaticString = #filePath, line: UInt = #line) {
         let maximum = max(0, (scroll.documentView?.bounds.maxY ?? 0) - scroll.contentSize.height)
@@ -337,4 +395,32 @@ final class PartsSidebarScrollTests: XCTestCase {
             try? FileManager.default.removeItem(at: directory)
         }
     }
+}
+
+@MainActor
+private final class PartDropTestDraggingInfo: NSObject, NSDraggingInfo {
+    var draggingDestinationWindow: NSWindow?
+    var draggingSourceOperationMask: NSDragOperation = .every
+    var draggingLocation: NSPoint
+    var draggedImageLocation: NSPoint = .zero
+    let draggedImage: NSImage? = nil
+    let draggingPasteboard: NSPasteboard
+    let draggingSource: Any? = NSObject()
+    var draggingSequenceNumber = 1
+    var draggingFormation: NSDraggingFormation = .default
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 1
+    let springLoadingHighlight: NSSpringLoadingHighlight = .none
+
+    init(pasteboard: NSPasteboard, window: NSWindow, location: NSPoint) {
+        draggingPasteboard = pasteboard
+        draggingDestinationWindow = window
+        draggingLocation = location
+    }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    nonisolated override func namesOfPromisedFilesDropped(atDestination dropDestination: URL) -> [String]? { nil }
+    func resetSpringLoading() {}
+    func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions, for view: NSView?, classes classArray: [AnyClass],
+                                searchOptions: [NSPasteboard.ReadingOptionKey: Any],
+                                using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
 }
