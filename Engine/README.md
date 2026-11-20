@@ -391,7 +391,7 @@ Denied/canceled requests authorize nothing; do not rephrase or retry the same op
 without new user direction. The shared runtime, global settings,
 original files and paths outside the workspace stay protected. The final CAD
 program must replay with bundled dependencies only; task environments disappear
-after the turn. Permission requests and results use the ordinary tool audit. Codex is instructed
+with the design's task workspace when the design closes. Permission requests and results use the ordinary tool audit. Codex is instructed
 to use `lad_import` only for pre-existing external inputs and faithful conversions
 of user sources, never geometry it creates or modifies as part of the design,
 including LAD exports or newly authored SDF/mesh outputs. Generated geometry must

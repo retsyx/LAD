@@ -21,8 +21,9 @@ enum CodexSteeringError: LocalizedError {
     }
 }
 
-/// One private app-server process and one ephemeral thread per LAD generation.
-/// The input pipe stays open so additional information can steer its active turn.
+/// One private app-server process per LAD generation. It starts the design's
+/// thread, or resumes it so the agent keeps its earlier context, and runs one
+/// turn. The input pipe stays open so additional information can steer it.
 final class CodexAppServerJob: @unchecked Sendable {
     private enum Purpose: Equatable { case initialize, threadStart, turnStart, steer, interrupt }
     private struct PendingRPC {
@@ -48,6 +49,8 @@ final class CodexAppServerJob: @unchecked Sendable {
     private var finished = false
     private var threadID: String?
     private var turnID: String?
+    /// The started or resumed thread; unlike `threadID`, kept after shutdown.
+    private var establishedThreadID: String?
     /// Turn sandboxes start without network access until a permission grant.
     private var networkAccess = false
     private var networkRestartPending = false
@@ -63,6 +66,8 @@ final class CodexAppServerJob: @unchecked Sendable {
     private let model: String
     private let effort: String?
     private let schema: Data
+    private let instructions: String
+    private let resumeThreadID: String?
     private let onProgress: @Sendable (String) -> Void
     private let onMessage: @Sendable (CodexProgressMessage) -> Void
     private let onActivity: @Sendable (ProjectActivityEvent) -> Void
@@ -82,6 +87,7 @@ final class CodexAppServerJob: @unchecked Sendable {
     private static let maximumFinalBytes = 4_000_000
 
     init(executable: URL, arguments: [String], directory: URL, model: String, effort: String?, schema: Data,
+         instructions: String = "", resumeThreadID: String? = nil,
          onProgress: @escaping @Sendable (String) -> Void,
          onMessage: @escaping @Sendable (CodexProgressMessage) -> Void,
          onActivity: @escaping @Sendable (ProjectActivityEvent) -> Void,
@@ -92,6 +98,8 @@ final class CodexAppServerJob: @unchecked Sendable {
         self.model = model
         self.effort = effort
         self.schema = schema
+        self.instructions = instructions
+        self.resumeThreadID = resumeThreadID
         self.onProgress = onProgress
         self.onMessage = onMessage
         self.onActivity = onActivity
@@ -117,6 +125,10 @@ final class CodexAppServerJob: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return !cancelled && !finished && terminal == nil ? turnID : nil
     }
+    var conversationID: String? {
+        lock.lock(); defer { lock.unlock() }
+        return establishedThreadID
+    }
 
     /// The app-server resolves each image file directly. Media bytes never
     /// become text or JSON base64 in LAD's bounded design request.
@@ -133,7 +145,11 @@ final class CodexAppServerJob: @unchecked Sendable {
                 do {
                     let data = try execute(input: input, imagePaths: imagePaths)
                     continuation.resume(returning: data)
-                } catch { continuation.resume(throwing: error) }
+                } catch {
+                    lock.lock(); let unresumed = resumeThreadID != nil && establishedThreadID == nil && !cancelled; lock.unlock()
+                    continuation.resume(throwing: unresumed && !(error is CancellationError)
+                        ? AgentConversationUnavailable(detail: error.localizedDescription) : error)
+                }
             }
         }
     }
@@ -367,16 +383,31 @@ final class CodexAppServerJob: @unchecked Sendable {
         switch request.purpose {
         case .initialize:
             try notification("initialized")
-            var params: [String: Any] = ["cwd": directory.path, "sandbox": "workspace-write", "approvalPolicy": "never", "ephemeral": true,
-                                       "experimentalRawEvents": false]
-            if !model.isEmpty { params["model"] = model }
-            try enqueue("thread/start", purpose: .threadStart, params: params)
+            // The thread is saved by the app-server so a later request can
+            // resume it. LAD's design instructions are developer instructions,
+            // which survive the agent's own context compaction.
+            var params: [String: Any] = ["cwd": directory.path, "sandbox": "workspace-write", "approvalPolicy": "never"]
+            if !instructions.isEmpty { params["developerInstructions"] = instructions }
+            if let resumeThreadID {
+                // The agent already holds its history; LAD needs only the thread.
+                params["threadId"] = resumeThreadID
+                params["excludeTurns"] = true
+                try enqueue("thread/resume", purpose: .threadStart, params: params)
+            } else {
+                params["ephemeral"] = false
+                params["experimentalRawEvents"] = false
+                if !model.isEmpty { params["model"] = model }
+                try enqueue("thread/start", purpose: .threadStart, params: params)
+            }
         case .threadStart:
-            guard let thread = result["thread"] as? [String: Any], let id = thread["id"] as? String, !id.isEmpty else {
+            guard let thread = result["thread"] as? [String: Any], let id = thread["id"] as? String, !id.isEmpty,
+                  resumeThreadID == nil || id == resumeThreadID else {
                 throw CodexError.failed("The task returned an unreadable session identifier.")
             }
-            lock.lock(); threadID = id; lock.unlock()
-            onActivity(ProjectActivityEvent(id: "server:thread:\(id)", category: "lifecycle", title: "Session started", status: "completed", output: "Ephemeral thread \(id)"))
+            lock.lock(); threadID = id; establishedThreadID = id; lock.unlock()
+            let resumed = resumeThreadID != nil
+            onActivity(ProjectActivityEvent(id: "server:thread:\(id)", category: "lifecycle",
+                title: resumed ? "Session resumed" : "Session started", status: "completed", output: "Thread \(id)"))
             onProgress("Creating your design…")
             try startTurn(threadID: id, input: Self.userInput(text: prompt, imagePaths: imagePaths))
         case .turnStart:

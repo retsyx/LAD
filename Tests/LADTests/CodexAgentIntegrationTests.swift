@@ -42,6 +42,40 @@ final class CodexAgentIntegrationTests: XCTestCase {
         print("Live Codex verified LAD tools: \(completed.sorted().joined(separator: ", ")); \(preview.solids) solid, \(preview.volume) mm³; validated native geometry reused.")
         try? FileManager.default.removeItem(at: URL(fileURLWithPath: preview.stepPath).deletingLastPathComponent())
     }
+
+    /// A follow-up resumes the design's conversation. The resumed request
+    /// omits the earlier user message, so only the agent's own context holds
+    /// the code word. Set LAD_TEST_AGENT=claude to check Claude Code instead.
+    @MainActor
+    func testInstalledAgentRemembersEarlierRequestsInTheDesignConversation() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["LAD_RUN_CODEX_AGENT_TESTS"] == "1" else {
+            throw XCTSkip("Set LAD_RUN_CODEX_AGENT_TESTS=1 for the signed-in design conversation check.")
+        }
+        let vendor = AgentVendor(rawValue: environment["LAD_TEST_AGENT"] ?? "codex") ?? .codex
+        let executable = environment["LAD_TEST_AGENT_PATH"] ?? (vendor == .codex ? CodexExecutable.find() : ClaudeExecutable.find()) ?? ""
+        guard !executable.isEmpty else { throw XCTSkip("Install and sign in to \(vendor.displayName) first.") }
+        let model = environment["LAD_TEST_CODEX_MODEL"] ?? ""
+        let service = CodexService()
+        defer { service.endConversation() }
+        let first = "This is a LAD conversation check in an empty design. Remember this code word for later in our conversation: TANGERINE-58. Do not call tools. Reply with a message response that says only: Noted."
+        let noted = try await service.generate(vendor: vendor, prompt: first, current: nil, history: [], executable: executable,
+            model: model, reasoningEffort: .low, onProgress: { _ in }, python: EngineService.defaultPython, threads: 2)
+        guard case .response(let acknowledgement) = noted else { return XCTFail("Expected a message response, received \(noted).") }
+
+        let capture = AgentIntegrationCapture()
+        let history = [ChatMessage(role: "user", content: first),
+                       ChatMessage(role: "assistant", content: acknowledgement, phase: "response")]
+        let recalled = try await service.generate(vendor: vendor,
+            prompt: "What code word did I ask you to remember? Do not call tools. Reply with a message response containing only the code word.",
+            current: nil, history: history, executable: executable, model: model, reasoningEffort: .low,
+            onProgress: { _ in }, onActivity: { capture.append($0) }, python: EngineService.defaultPython, threads: 2)
+        guard case .response(let answer) = recalled else { return XCTFail("Expected a message response, received \(recalled).") }
+        XCTAssertTrue(capture.events.contains { $0.title == "Session resumed" }, "The follow-up must resume the design's conversation.")
+        XCTAssertFalse(capture.events.contains { $0.title == "Earlier session not resumed" })
+        XCTAssertTrue(answer.contains("TANGERINE-58"), "The resumed agent must remember the earlier request; it answered: \(answer)")
+        print("Live \(vendor.displayName) resumed the design conversation and recalled: \(answer)")
+    }
 }
 
 private final class AgentIntegrationCapture: @unchecked Sendable {

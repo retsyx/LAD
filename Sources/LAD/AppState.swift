@@ -607,6 +607,7 @@ final class AppState {
         onProjectAgentInvalidated?()
         await finishAssemblyMotion(cancelActiveGrab: true)
         cancel()
+        codex.endConversation()
         cancelProjectThumbnail(clearImage: false)
         projectActivity.cancelPendingSave()
         autosaveDebounceTask?.cancel(); autosaveDebounceTask = nil
@@ -699,6 +700,7 @@ final class AppState {
     func newProject() {
         onProjectAgentInvalidated?()
         cancel()
+        codex.endConversation()
         cancelProjectThumbnail()
         projectReady = false
         projectSavingEnabled = false
@@ -2704,6 +2706,7 @@ final class AppState {
 
     private func restore(_ project: LADProject) {
         onProjectAgentInvalidated?()
+        codex.endConversation()
         cancelProjectThumbnail()
         projectReady = false
         // Existing files retain normal autosaving, including empty archives.

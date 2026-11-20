@@ -2,21 +2,28 @@ import Darwin
 import Foundation
 
 /// One private Claude Code process per LAD generation, using the CLI's
-/// stream-json protocol. Input stays open so user messages that the CLI
-/// acknowledges join the same task instead of starting another one.
+/// stream-json protocol. It starts the design's session, or resumes it so the
+/// agent keeps its earlier context. Input stays open so user messages that the
+/// CLI acknowledges join the same task instead of starting another one.
 final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
-    /// A non-interactive control connection without session persistence or
-    /// globally configured MCP servers. No prompt is sent by these arguments.
-    static let controlArguments = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                                   "--no-session-persistence", "--strict-mcp-config"]
+    /// A non-interactive stream-json connection without globally configured
+    /// MCP servers. No prompt is sent by these arguments.
+    static let streamArguments = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                                  "--strict-mcp-config"]
+    /// A control connection that leaves no saved session behind.
+    static let controlArguments = streamArguments + ["--no-session-persistence"]
 
     /// File edits are accepted only inside the task workspace, and Bash runs in
     /// the CLI's OS sandbox with writes limited to that workspace. No host is
     /// pre-allowed: each network connection and web fetch asks LAD, which allows
     /// it only after an allowed permission decision in this task. Anything else
     /// that would prompt is declined.
+    /// Design tasks save their session so the design's next request can resume
+    /// it; the CLI finds it again from the same task workspace. LAD's design
+    /// instructions extend the system prompt on every launch, so they survive
+    /// the agent's own context compaction.
     static func arguments(model: String, effort: String?, schema: Data, workspace: URL, python: String,
-                          server: URL) throws -> [String] {
+                          server: URL, instructions: String = "", resumeSessionID: String? = nil) throws -> [String] {
         func json(_ value: Any) throws -> String {
             String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes]),
                    as: UTF8.self)
@@ -28,12 +35,14 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
                         "network": ["allowedDomains": [String]()]],
             "permissions": ["allow": ["Read", "Glob", "Grep", "WebSearch", "mcp__lad"]]
         ]
-        var arguments = controlArguments + ["--replay-user-messages", "--mcp-config", try json(mcp),
+        var arguments = streamArguments + ["--replay-user-messages", "--mcp-config", try json(mcp),
                                             "--permission-mode", "acceptEdits", "--settings", try json(settings),
                                             "--json-schema", try json(try JSONSerialization.jsonObject(with: schema))]
         // `default` is Claude Code's recommended model, not its configured one.
         if !model.isEmpty { arguments += ["--model", model] }
         if let effort, !effort.isEmpty { arguments += ["--effort", effort] }
+        if !instructions.isEmpty { arguments += ["--append-system-prompt", instructions] }
+        if let resumeSessionID { arguments += ["--resume", resumeSessionID] }
         return arguments
     }
 
@@ -75,6 +84,9 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
     private var running = false
     private var finished = false
     private var sessionID: String?
+    /// The started or resumed session; unlike `sessionID`, kept after shutdown.
+    private var establishedSessionID: String?
+    private let resuming: Bool
     private var result: Terminal?
     private var resultDate: Date?
     private var outbound: [Data] = []
@@ -102,12 +114,13 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
     private static let maximumEventBytes = 32_000_000
     private static let maximumFinalBytes = 4_000_000
 
-    init(executable: URL, arguments: [String], directory: URL,
+    init(executable: URL, arguments: [String], directory: URL, resuming: Bool = false,
          onProgress: @escaping @Sendable (String) -> Void,
          onMessage: @escaping @Sendable (CodexProgressMessage) -> Void,
          onActivity: @escaping @Sendable (ProjectActivityEvent) -> Void,
          onSteeringAvailability: @escaping @Sendable (Bool) -> Void,
          environment overrides: [String: String]) {
+        self.resuming = resuming
         self.onProgress = onProgress
         self.onMessage = onMessage
         self.onActivity = onActivity
@@ -129,13 +142,24 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
         return !cancelled && !finished && result == nil ? sessionID : nil
     }
 
+    var conversationID: String? {
+        lock.lock(); defer { lock.unlock() }
+        return establishedSessionID
+    }
+
     /// Image references are part of the text: Claude views the staged files
     /// with its file reader, so no image bytes enter the request.
     func run(input: Data, imagePaths: [String] = []) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async { [self] in
                 do { continuation.resume(returning: try execute(input: input)) }
-                catch { continuation.resume(throwing: error) }
+                catch {
+                    // An unknown or unreadable session fails before the CLI
+                    // reports a started session.
+                    lock.lock(); let unresumed = resuming && establishedSessionID == nil && !cancelled; lock.unlock()
+                    continuation.resume(throwing: unresumed && !(error is CancellationError)
+                        ? AgentConversationUnavailable(detail: error.localizedDescription) : error)
+                }
             }
         }
     }
@@ -354,6 +378,7 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
         lock.lock()
         let first = sessionID == nil
         sessionID = session
+        if session != "claude" { establishedSessionID = session }
         if first, status != "connected", status != "pending", result == nil {
             result = .failed("LAD’s CAD tools could not start for this Claude Code task (\(status ?? "not connected")). Check the installed Claude Code and its MCP configuration, then try again.")
             resultDate = Date()
@@ -361,7 +386,8 @@ final class ClaudeCodeJob: AgentTaskJob, @unchecked Sendable {
         let failed = result != nil
         lock.unlock()
         guard first else { return }
-        onActivity(ProjectActivityEvent(id: "server:session:\(session)", category: "lifecycle", title: "Session started",
+        onActivity(ProjectActivityEvent(id: "server:session:\(session)", category: "lifecycle",
+            title: resuming ? "Session resumed" : "Session started",
             status: "completed", output: "Session \(session)\((object["model"] as? String).map { " · \($0)" } ?? "")"))
         guard !failed else { return }
         onProgress("Creating your design…")

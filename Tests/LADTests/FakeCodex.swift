@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+@testable import LAD
 
 /// A real JSON-RPC stdio app-server fixture. Legacy shell scenarios are kept
 /// behind this adapter so reference/error/stream/cancellation coverage stays
@@ -20,11 +21,12 @@ struct FakeCodex {
         try self.init(body: body, responseJSON: nil, delay: 0, steeringMode: "ack")
     }
 
-    init(responseJSON: String, delay: Double = 0.25, steeringMode: String = "ack") throws {
-        try self.init(body: nil, responseJSON: responseJSON, delay: delay, steeringMode: steeringMode)
+    /// `resumable` lets later app-server processes resume the saved thread.
+    init(responseJSON: String, delay: Double = 0.25, steeringMode: String = "ack", resumable: Bool = false) throws {
+        try self.init(body: nil, responseJSON: responseJSON, delay: delay, steeringMode: steeringMode, resumable: resumable)
     }
 
-    private init(body: String?, responseJSON: String?, delay: Double, steeringMode: String) throws {
+    private init(body: String?, responseJSON: String?, delay: Double, steeringMode: String, resumable: Bool = false) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-FakeCodex-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         executable = directory.appendingPathComponent("codex")
@@ -40,7 +42,7 @@ struct FakeCodex {
             "inputPath": inputURL.path, "argumentsPath": argumentsURL.path, "capturePath": captureURL.path,
             "workingPath": workingDirectoryURL.path, "threadPath": threadRequestURL.path,
             "turnPath": turnRequestURL.path, "rpcPath": rpcRequestsURL.path, "steeringPath": steeringURL.path,
-            "delay": delay, "steeringMode": steeringMode,
+            "delay": delay, "steeringMode": steeringMode, "resumable": resumable,
             "ignoreTerm": body?.contains("trap '' TERM") == true,
             "inheritOutput": body?.contains(" &") == true
         ]
@@ -87,10 +89,13 @@ struct FakeCodex {
         return try Data(contentsOf: captured)
     }
 
-    func assertJobWasCleanedUp(file: StaticString = #filePath, line: UInt = #line) throws {
+    /// The task workspace lives as long as the design's agent conversation.
+    @MainActor
+    func assertJobWasCleanedUp(ending service: CodexService? = nil, file: StaticString = #filePath, line: UInt = #line) throws {
+        service?.endConversation()
         let path = try String(contentsOf: workingDirectoryURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
         XCTAssertTrue(path.contains("LAD-Codex-"), file: file, line: line)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: path), "Private staged files must be removed when the request finishes", file: file, line: line)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path), "Private task files must be removed when the design's agent conversation ends", file: file, line: line)
     }
 
     func remove() { try? FileManager.default.removeItem(at: directory) }
@@ -239,6 +244,10 @@ try:
         elif method=='thread/start':
             record(CONFIG['threadPath'],params)
             reply(identity,{'thread':{'id':thread_id}})
+        elif method=='thread/resume':
+            record(CONFIG['threadPath'],params)
+            if CONFIG['resumable'] and params.get('threadId')==thread_id:reply(identity,{'thread':{'id':thread_id}})
+            else:frame({'id':identity,'error':{'code':-32600,'message':'No saved thread was found.'}})
         elif method=='turn/start':
             record(CONFIG['turnPath'],params)
             prompt='\n'.join(entry.get('text','') for entry in params.get('input',[]) if entry.get('type')=='text')

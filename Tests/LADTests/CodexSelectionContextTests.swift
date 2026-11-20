@@ -128,7 +128,7 @@ final class CodexSelectionContextTests: XCTestCase {
         XCTAssertNotEqual(URL(fileURLWithPath: paths[0]).deletingLastPathComponent(),
                           URL(fileURLWithPath: paths[1]).deletingLastPathComponent())
         XCTAssertEqual(try fixture.rpcRequests().filter { $0["method"] as? String == "turn/start" }.count, 1)
-        try fixture.assertJobWasCleanedUp()
+        try fixture.assertJobWasCleanedUp(ending: service)
     }
 
     @MainActor

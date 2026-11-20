@@ -42,7 +42,7 @@ final class CodexImageInputTests: XCTestCase {
         XCTAssertFalse(request.contains(source.content))
         XCTAssertFalse(input.dropFirst().contains { $0["url"] != nil || $0["data"] != nil },
                        "Images must use local paths, never embedded data URLs.")
-        try fixture.assertJobWasCleanedUp()
+        try fixture.assertJobWasCleanedUp(ending: service)
     }
 
     @MainActor
@@ -102,7 +102,7 @@ final class CodexImageInputTests: XCTestCase {
         }
         XCTAssertLessThan(request.utf8.count, 65_536)
         XCTAssertFalse(FileManager.default.fileExists(atPath: original.path))
-        try fixture.assertJobWasCleanedUp()
+        try fixture.assertJobWasCleanedUp(ending: service)
     }
 
     @MainActor
@@ -134,7 +134,7 @@ final class CodexImageInputTests: XCTestCase {
             XCTAssertNotEqual(path, originalURL.path)
             XCTAssertEqual(try fixture.capturedData(at: path), attachments[0].data)
             stagedPaths.append(path)
-            try fixture.assertJobWasCleanedUp()
+            try fixture.assertJobWasCleanedUp(ending: service)
         }
         XCTAssertNotEqual(stagedPaths[0], stagedPaths[1], "Each task must own and clean up its extracted image files.")
         XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
@@ -174,7 +174,7 @@ final class CodexImageInputTests: XCTestCase {
             XCTAssertEqual(try fixture.capturedData(at: reference.readPath), image.data)
             XCTAssertFalse(text.contains(image.data.base64EncodedString()))
         }
-        try fixture.assertJobWasCleanedUp()
+        try fixture.assertJobWasCleanedUp(ending: service)
     }
 
     @MainActor

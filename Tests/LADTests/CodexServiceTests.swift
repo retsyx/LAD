@@ -156,10 +156,13 @@ final class CodexServiceTests: XCTestCase {
         XCTAssertTrue(request.contains("without new user direction"))
         XCTAssertTrue(request.contains("bundled CAD dependencies only"))
         XCTAssertFalse(request.contains("never download or install tools or dependencies"))
-        XCTAssertTrue(request.contains("Never use lad_import for geometry you create or modify as part of this design"))
-        XCTAssertTrue(request.contains("design-generated SDF/mesh outputs"))
-        XCTAssertTrue(request.contains("faithful format conversions of user-provided inputs"))
-        XCTAssertFalse(request.contains("before invoking you"), "The prompt must not describe the removed automatic dispatch.")
+        let instructions = try XCTUnwrap(try fixture.threadRequest()["developerInstructions"] as? String)
+        XCTAssertTrue(instructions.contains("Never use lad_import for geometry you create or modify as part of this design"))
+        XCTAssertTrue(instructions.contains("design-generated SDF/mesh outputs"))
+        XCTAssertTrue(instructions.contains("faithful format conversions of user-provided inputs"))
+        XCTAssertFalse(request.contains("Never use lad_import for geometry you create"),
+                       "Design instructions travel as developer instructions, not in the request.")
+        XCTAssertFalse((request + instructions).contains("before invoking you"), "The prompt must not describe the removed automatic dispatch.")
     }
 
     @MainActor
@@ -308,12 +311,13 @@ final class CodexServiceTests: XCTestCase {
             XCTAssertNil(service.validatedPreview(for: .bracket), "A conversation reply must not supply replacement geometry.")
             let request = try String(contentsOf: fixture.inputURL, encoding: .utf8)
             XCTAssertTrue(request.contains("For questions, explanations or clarification, return a message response"))
-            XCTAssertTrue(request.contains("Do not create or change geometry merely to answer a question."))
+            XCTAssertTrue((try fixture.threadRequest()["developerInstructions"] as? String)?
+                .contains("Do not create or change geometry merely to answer a question.") == true)
             let schema = try XCTUnwrap(try fixture.turnRequest()["outputSchema"] as? [String: Any])
             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
             let statusSchema = try XCTUnwrap(properties["status"] as? [String: Any])
             XCTAssertTrue((statusSchema["enum"] as? [String])?.contains("message") == true)
-            try fixture.assertJobWasCleanedUp()
+            try fixture.assertJobWasCleanedUp(ending: service)
         }
     }
 
@@ -578,7 +582,7 @@ final class CodexServiceTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(elapsed, 0.5, "The silent process must require the delayed SIGKILL fallback")
             XCTAssertLessThan(elapsed, 4, "Stop must finish promptly even when Codex ignores SIGTERM")
         }
-        try fixture.assertJobWasCleanedUp()
+        try fixture.assertJobWasCleanedUp(ending: service)
     }
 
     private func attachment(_ name: String, content: String) -> SourceAttachment {

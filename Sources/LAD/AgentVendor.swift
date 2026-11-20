@@ -114,6 +114,10 @@ enum AgentVendorChoicePrompt {
 protocol AgentTaskJob: AnyObject, Sendable {
     var canSteer: Bool { get }
     var currentTurnID: String? { get }
+    /// The agent's own thread or session once the task has started or resumed
+    /// it. It stays readable after the task ends so the design's next request
+    /// can continue that conversation.
+    var conversationID: String? { get }
     func run(input: Data, imagePaths: [String]) async throws -> Data
     func steer(text: String, imagePaths: [String]) async throws -> String
     func cancel()
@@ -123,6 +127,55 @@ protocol AgentTaskJob: AnyObject, Sendable {
 }
 
 extension CodexAppServerJob: AgentTaskJob {}
+
+/// A task asked to continue an earlier conversation that the agent could not
+/// resume. Nothing was started; the request can run in a new conversation.
+struct AgentConversationUnavailable: LocalizedError {
+    let detail: String
+    var errorDescription: String? { "The earlier design conversation could not be resumed. \(detail)" }
+}
+
+/// One open design's continuing agent conversation and its private task
+/// workspace. Each request resumes the agent's own thread or session in the
+/// same workspace, so what the agent already read and analyzed stays in its
+/// context. Both end together when the design closes or is replaced, its agent
+/// changes, or a task fails; the workspace is removed then.
+final class AgentConversation: @unchecked Sendable {
+    let vendor: AgentVendor
+    let workspace: URL
+    /// The agent's thread or session; nil until a task has started one.
+    var sessionID: String?
+
+    init(vendor: AgentVendor) throws {
+        self.vendor = vendor
+        workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LAD-\(vendor.displayName)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+    }
+
+    deinit { try? FileManager.default.removeItem(at: workspace) }
+
+    /// LAD restages its own folders for every request; the agent's files and
+    /// any isolated environments elsewhere in the workspace remain.
+    static let restagedFolders = ["context", "artifacts", ".lad-tools"]
+
+    func prepareForRequest() throws {
+        let manager = FileManager.default
+        for name in Self.restagedFolders {
+            let url = workspace.appendingPathComponent(name)
+            if (try? url.checkResourceIsReachable()) == true || (try? manager.destinationOfSymbolicLink(atPath: url.path)) != nil {
+                try manager.removeItem(at: url)
+            }
+        }
+        for name in ["tmp", ".cache"] {
+            let url = workspace.appendingPathComponent(name, isDirectory: true)
+            var info = stat()
+            if lstat(url.path, &info) == 0, info.st_mode & S_IFMT != S_IFDIR { try manager.removeItem(at: url) }
+            try manager.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+    }
+}
 
 /// Progress commentary is user-facing prose. Code, JSON and tool output stay in
 /// the activity record and the final structured response.

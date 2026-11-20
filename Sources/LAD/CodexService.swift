@@ -45,6 +45,8 @@ final class CodexService {
     private var activeJob: AgentTaskJob?
     private var activeWorkspace: URL?
     private var activeVendor: AgentVendor = .codex
+    /// The open design's continuing agent conversation, if one has started.
+    private var conversation: AgentConversation?
 
     var canSteer: Bool { activeJob?.canSteer ?? false }
     var currentTurnID: String? { activeJob?.currentTurnID }
@@ -106,156 +108,215 @@ final class CodexService {
             throw CodexError.resourcesMissing
         }
         let instructions = try String(contentsOf: instructionsURL, encoding: .utf8)
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LAD-\(vendor.displayName)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        defer { try? FileManager.default.removeItem(at: directory) }
         let runtime = try await CADRuntimeManager.resolvePython(python)
         try Task.checkCancellation()
         let taskRuntime = URL(fileURLWithPath: (runtime as NSString).expandingTildeInPath).standardizedFileURL.path
         let server = ResourcePaths.root.appendingPathComponent("Engine/agent_server.py")
         guard FileManager.default.fileExists(atPath: server.path) else { throw CodexError.resourcesMissing }
-        let bridge = try CADAgentBridge(workspace: directory, python: taskRuntime,
-            threads: threads > 0 ? threads : ProcessInfo.processInfo.activeProcessorCount,
-            current: current, currentPreview: currentPreview, engine: engine ?? EngineService(),
-            viewport: viewport, hiddenSolids: hiddenSolids, solidColors: solidColors, onActivity: onActivity,
-            referenceAssets: selectionModel?.inputAssets ?? [], versions: versions,
-            partLayout: partLayout, partColors: partColors, materials: materials, permissionController: permissionController)
-        activeBridge = bridge
-        defer { bridge.stop(); if activeBridge === bridge { activeBridge = nil } }
         let selectedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let effort = reasoningEffort == .defaultConfiguration ? nil : reasoningEffort.rawValue
         let schema = try Data(contentsOf: schemaURL)
-        let arguments: [String]
-        switch vendor {
-        case .codex:
-            arguments = ["app-server", "--listen", "stdio://"]
-                + (try CADAgentBridge.codexArguments(workspace: directory, python: taskRuntime, server: server))
-        case .claude:
-            arguments = try ClaudeCodeJob.arguments(model: selectedModel, effort: effort, schema: schema,
-                                                    workspace: directory, python: taskRuntime, server: server)
+
+        // A design keeps one conversation with one agent. Another agent cannot
+        // resume it, and a conversation the agent cannot resume is replaced.
+        if conversation?.vendor != vendor { conversation = nil }
+        let continuing = try conversation ?? AgentConversation(vendor: vendor)
+        conversation = continuing
+
+        func runTurn(in conversation: AgentConversation) async throws -> CodexProjectResult {
+            let directory = conversation.workspace
+            let resumeID = conversation.sessionID
+            let bridge: CADAgentBridge
+            do {
+                try conversation.prepareForRequest()
+                bridge = try CADAgentBridge(workspace: directory, python: taskRuntime,
+                    threads: threads > 0 ? threads : ProcessInfo.processInfo.activeProcessorCount,
+                    current: current, currentPreview: currentPreview, engine: engine ?? EngineService(),
+                    viewport: viewport, hiddenSolids: hiddenSolids, solidColors: solidColors, onActivity: onActivity,
+                    referenceAssets: selectionModel?.inputAssets ?? [], versions: versions,
+                    partLayout: partLayout, partColors: partColors, materials: materials, permissionController: permissionController)
+            } catch {
+                // Never leave a design with a workspace that cannot host its tasks.
+                if self.conversation === conversation { self.conversation = nil }
+                throw error
+            }
+            activeBridge = bridge
+            defer { bridge.stop(); if activeBridge === bridge { activeBridge = nil } }
+            let arguments: [String]
+            switch vendor {
+            case .codex:
+                arguments = ["app-server", "--listen", "stdio://"]
+                    + (try CADAgentBridge.codexArguments(workspace: directory, python: taskRuntime, server: server))
+            case .claude:
+                arguments = try ClaudeCodeJob.arguments(model: selectedModel, effort: effort, schema: schema,
+                                                        workspace: directory, python: taskRuntime, server: server,
+                                                        instructions: instructions, resumeSessionID: resumeID)
+            }
+
+            let request = try await Task.detached(priority: .userInitiated) {
+                try SourceImport.validateAttachments(attachments.filter(\.isImage))
+                let contextLayout = partLayout.map { layout in
+                    var copy = layout
+                    copy.nodes = PartColorState.nodesWithCurrentColors(layout.nodes, stored: partColors)
+                    return copy
+                }
+                let files = try CodexFileContext.prepare(current: current, history: history, attachments: attachments, directory: directory,
+                    partLayout: contextLayout, selection: selection, selectionModel: selectionModel,
+                    selectionModelsByRevision: selectionModelsByRevision)
+                return (text: try Self.makeRequest(prompt: prompt, current: current, history: history, files: files,
+                                                   workspace: directory, python: taskRuntime, versions: versions, vendor: vendor,
+                                                   resuming: resumeID != nil),
+                        images: files.currentImagePaths)
+            }.value
+
+            let temporary = directory.appendingPathComponent("tmp", isDirectory: true)
+            let cache = directory.appendingPathComponent(".cache", isDirectory: true)
+            let taskEnvironment = ["LAD_PYTHON": taskRuntime, "LAD_WORKSPACE": directory.path, "TMPDIR": temporary.path,
+                                   "XDG_CACHE_HOME": cache.path, "PIP_CACHE_DIR": cache.appendingPathComponent("pip").path,
+                                   "MPLCONFIGDIR": cache.appendingPathComponent("matplotlib").path, "PYTHONDONTWRITEBYTECODE": "1"]
+            let job: AgentTaskJob
+            switch vendor {
+            case .codex:
+                job = CodexAppServerJob(executable: executableURL, arguments: arguments, directory: directory,
+                    model: selectedModel, effort: effort, schema: schema, instructions: instructions, resumeThreadID: resumeID,
+                    onProgress: onProgress, onMessage: onMessage,
+                    onActivity: onActivity, onSteeringAvailability: onSteeringAvailability, environment: taskEnvironment)
+            case .claude:
+                job = ClaudeCodeJob(executable: executableURL, arguments: arguments, directory: directory, resuming: resumeID != nil,
+                    onProgress: onProgress, onMessage: onMessage, onActivity: onActivity,
+                    onSteeringAvailability: onSteeringAvailability, environment: taskEnvironment)
+            }
+            // Network access in the task sandbox follows allowed permission decisions.
+            bridge.tools.onPermissionAllowed = { [weak job] operation in job?.grantNetworkAccess(for: operation) }
+            activeJob = job
+            activeWorkspace = directory
+            activeVendor = vendor
+            defer { if activeJob === job { activeJob = nil; activeWorkspace = nil } }
+            try Task.checkCancellation()
+            bridge.start()
+            let data: Data
+            do {
+                data = try await withTaskCancellationHandler {
+                    try await job.run(input: Data(request.text.utf8), imagePaths: request.images)
+                } onCancel: { job.cancel() }
+                record(job, in: conversation, failed: false)
+            } catch {
+                // A stopped task can continue next time. After a failed task the
+                // next request starts a new conversation rather than resuming one
+                // that may not recover.
+                record(job, in: conversation, failed: !(error is CancellationError) && !Task.isCancelled)
+                guard let error = error as? CodexError else { throw error }
+                let diagnostic = error.localizedDescription
+                let lower = diagnostic.lowercased()
+                if ["unauthorized", "not logged in", "authentication", "401", "sign in", "login required", "/login", "invalid api key"].contains(where: lower.contains) {
+                    throw CodexError.failed("Configuration and sign-in are required. Complete setup in your installed app or CLI, then try again.\n\n\(String(diagnostic.suffix(1_600)))")
+                }
+                throw error
+            }
+            try Task.checkCancellation()
+            do {
+                let response = try JSONDecoder().decode(CodexProjectResponse.self, from: data)
+                guard ["ready", "message", "unsupported"].contains(response.status) else {
+                    throw CodexError.invalidModel("The response has an unknown design status.")
+                }
+                if response.status != "ready" {
+                    guard response.model == nil else {
+                        throw CodexError.invalidModel("A conversational response must not contain a replacement design.")
+                    }
+                    let message = response.message.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !message.isEmpty, message.utf8.count <= 1_000_000 else {
+                        throw CodexError.invalidModel("A conversational response must include a message of at most 1 MB.")
+                    }
+                    if response.status == "message" {
+                        partColorChanges = bridge.tools.partColorChanges(for: nil)
+                        partMaterialPatch = bridge.tools.partMaterialPatch(for: nil)
+                    }
+                    return .response(message)
+                }
+                guard var specification = response.model else { throw CodexError.invalidModel("No completed design was provided.") }
+                if specification.reorganizePartIDs?.isEmpty == true { specification.reorganizePartIDs = nil }
+                if let ids = specification.reorganizePartIDs {
+                    guard ids.count <= 8_192, ids.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 1_024 && $0.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) } }) else {
+                        throw CodexError.invalidModel("The requested parts layout changes are invalid.")
+                    }
+                }
+                specification.sourceSTEP = current?.sourceSTEP
+                specification.sourceName = current?.sourceName
+                let assets = try bridge.tools.resolveAssets(ids: response.assetIDs ?? current?.inputAssets?.map(\.id) ?? [])
+                specification.inputAssets = assets.isEmpty ? nil : assets
+                specification = bridge.tools.resolvingReconstructionInputs(in: specification)
+                guard specification.units == "mm" else {
+                    throw CodexError.invalidModel("The response uses unsupported units.")
+                }
+                guard !specification.script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      specification.script.utf8.count <= 200_000 else {
+                    throw CodexError.invalidModel("The response must include a CAD program of at most 200,000 UTF-8 bytes.")
+                }
+                if attachments.contains(where: { !$0.isImage }), let current,
+                   specification.script == current.script {
+                    throw CodexError.unsupported("Source file references were provided, but the existing design was returned without importing their geometry. The current design has been preserved. Try describing the features you want translated, or request an approximation explicitly.")
+                }
+                // Construction reuse skips the worker. Validate the complete final
+                // metadata here so every accepted revision can be saved.
+                try ProjectStore.validateModel(specification)
+                // Retain any explicit intermediate classification and complete
+                // limitation in the saved design, including native preview reuse.
+                specification = try bridge.tools.resolvingFinalDelivery(in: specification)
+                try ProjectStore.validateModel(specification)
+                validatedModel = specification
+                validatedMesh = bridge.tools.validatedPreview(for: specification)
+                validatedPrintMesh = bridge.tools.validatedPrintPreview(for: specification)
+                partColorChanges = bridge.tools.partColorChanges(for: specification)
+                partMaterialPatch = bridge.tools.partMaterialPatch(for: specification)
+                return .ready(specification)
+            } catch let error as CodexError {
+                throw error
+            } catch {
+                throw CodexError.invalidModel(error.localizedDescription)
+            }
         }
 
-        let request = try await Task.detached(priority: .userInitiated) {
-            try SourceImport.validateAttachments(attachments.filter(\.isImage))
-            let contextLayout = partLayout.map { layout in
-                var copy = layout
-                copy.nodes = PartColorState.nodesWithCurrentColors(layout.nodes, stored: partColors)
-                return copy
-            }
-            let files = try CodexFileContext.prepare(current: current, history: history, attachments: attachments, directory: directory,
-                partLayout: contextLayout, selection: selection, selectionModel: selectionModel,
-                selectionModelsByRevision: selectionModelsByRevision)
-            return (text: try Self.makeRequest(instructions: instructions, prompt: prompt, current: current, history: history, files: files,
-                                               workspace: directory, python: taskRuntime, versions: versions, vendor: vendor),
-                    images: files.currentImagePaths)
-        }.value
-
-        let temporary = directory.appendingPathComponent("tmp", isDirectory: true)
-        let cache = directory.appendingPathComponent(".cache", isDirectory: true)
-        for folder in [temporary, cache] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false) }
-        let taskEnvironment = ["LAD_PYTHON": taskRuntime, "LAD_WORKSPACE": directory.path, "TMPDIR": temporary.path,
-                               "XDG_CACHE_HOME": cache.path, "PIP_CACHE_DIR": cache.appendingPathComponent("pip").path,
-                               "MPLCONFIGDIR": cache.appendingPathComponent("matplotlib").path, "PYTHONDONTWRITEBYTECODE": "1"]
-        let job: AgentTaskJob
-        switch vendor {
-        case .codex:
-            job = CodexAppServerJob(executable: executableURL, arguments: arguments, directory: directory,
-                model: selectedModel, effort: effort, schema: schema, onProgress: onProgress, onMessage: onMessage,
-                onActivity: onActivity, onSteeringAvailability: onSteeringAvailability, environment: taskEnvironment)
-        case .claude:
-            job = ClaudeCodeJob(executable: executableURL, arguments: arguments, directory: directory,
-                onProgress: onProgress, onMessage: onMessage, onActivity: onActivity,
-                onSteeringAvailability: onSteeringAvailability, environment: taskEnvironment)
-        }
-        // Network access in the task sandbox follows allowed permission decisions.
-        bridge.tools.onPermissionAllowed = { [weak job] operation in job?.grantNetworkAccess(for: operation) }
-        activeJob = job
-        activeWorkspace = directory
-        activeVendor = vendor
-        defer { if activeJob === job { activeJob = nil; activeWorkspace = nil } }
-        try Task.checkCancellation()
-        bridge.start()
-        let data: Data
         do {
-            data = try await withTaskCancellationHandler {
-                try await job.run(input: Data(request.text.utf8), imagePaths: request.images)
-            } onCancel: { job.cancel() }
-        } catch let error as CodexError {
-            let diagnostic = error.localizedDescription
-            let lower = diagnostic.lowercased()
-            if ["unauthorized", "not logged in", "authentication", "401", "sign in", "login required", "/login", "invalid api key"].contains(where: lower.contains) {
-                throw CodexError.failed("Configuration and sign-in are required. Complete setup in your installed app or CLI, then try again.\n\n\(String(diagnostic.suffix(1_600)))")
-            }
-            throw error
-        }
-        try Task.checkCancellation()
-        do {
-            let response = try JSONDecoder().decode(CodexProjectResponse.self, from: data)
-            guard ["ready", "message", "unsupported"].contains(response.status) else {
-                throw CodexError.invalidModel("The response has an unknown design status.")
-            }
-            if response.status != "ready" {
-                guard response.model == nil else {
-                    throw CodexError.invalidModel("A conversational response must not contain a replacement design.")
-                }
-                let message = response.message.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !message.isEmpty, message.utf8.count <= 1_000_000 else {
-                    throw CodexError.invalidModel("A conversational response must include a message of at most 1 MB.")
-                }
-                if response.status == "message" {
-                    partColorChanges = bridge.tools.partColorChanges(for: nil)
-                    partMaterialPatch = bridge.tools.partMaterialPatch(for: nil)
-                }
-                return .response(message)
-            }
-            guard var specification = response.model else { throw CodexError.invalidModel("No completed design was provided.") }
-            if specification.reorganizePartIDs?.isEmpty == true { specification.reorganizePartIDs = nil }
-            if let ids = specification.reorganizePartIDs {
-                guard ids.count <= 8_192, ids.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 1_024 && $0.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) } }) else {
-                    throw CodexError.invalidModel("The requested parts layout changes are invalid.")
-                }
-            }
-            specification.sourceSTEP = current?.sourceSTEP
-            specification.sourceName = current?.sourceName
-            let assets = try bridge.tools.resolveAssets(ids: response.assetIDs ?? current?.inputAssets?.map(\.id) ?? [])
-            specification.inputAssets = assets.isEmpty ? nil : assets
-            specification = bridge.tools.resolvingReconstructionInputs(in: specification)
-            guard specification.units == "mm" else {
-                throw CodexError.invalidModel("The response uses unsupported units.")
-            }
-            guard !specification.script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  specification.script.utf8.count <= 200_000 else {
-                throw CodexError.invalidModel("The response must include a CAD program of at most 200,000 UTF-8 bytes.")
-            }
-            if attachments.contains(where: { !$0.isImage }), let current,
-               specification.script == current.script {
-                throw CodexError.unsupported("Source file references were provided, but the existing design was returned without importing their geometry. The current design has been preserved. Try describing the features you want translated, or request an approximation explicitly.")
-            }
-            // Construction reuse skips the worker. Validate the complete final
-            // metadata here so every accepted revision can be saved.
-            try ProjectStore.validateModel(specification)
-            // Retain any explicit intermediate classification and complete
-            // limitation in the saved design, including native preview reuse.
-            specification = try bridge.tools.resolvingFinalDelivery(in: specification)
-            try ProjectStore.validateModel(specification)
-            validatedModel = specification
-            validatedMesh = bridge.tools.validatedPreview(for: specification)
-            validatedPrintMesh = bridge.tools.validatedPrintPreview(for: specification)
-            partColorChanges = bridge.tools.partColorChanges(for: specification)
-            partMaterialPatch = bridge.tools.partMaterialPatch(for: specification)
-            return .ready(specification)
-        } catch let error as CodexError {
-            throw error
-        } catch {
-            throw CodexError.invalidModel(error.localizedDescription)
+            return try await runTurn(in: continuing)
+        } catch let unavailable as AgentConversationUnavailable {
+            try Task.checkCancellation()
+            onActivity(ProjectActivityEvent(id: "server:conversation:\(UUID().uuidString)", category: "lifecycle",
+                title: "Earlier session not resumed", status: "failed",
+                output: String(unavailable.detail.suffix(2_400)) + "\n\nThe request continues in a new session."))
+            let fresh = try AgentConversation(vendor: vendor)
+            conversation = fresh
+            return try await runTurn(in: fresh)
         }
     }
 
-    nonisolated private static func makeRequest(instructions: String, prompt: String, current: ModelSpec?, history: [ChatMessage], files: CodexFileContext,
+    /// Keeps the agent's thread or session for the design's next request.
+    private func record(_ job: AgentTaskJob, in conversation: AgentConversation, failed: Bool) {
+        guard self.conversation === conversation else { return }
+        if failed { self.conversation = nil; return }
+        if let id = job.conversationID { conversation.sessionID = id }
+    }
+
+    /// Ends the design's agent conversation when the design closes or is
+    /// replaced. Its workspace is removed once no task still uses it.
+    func endConversation() {
+        cancel()
+        conversation = nil
+    }
+
+    /// LAD's design instructions travel as the agent's system or developer
+    /// instructions, not in this request. A resumed conversation already holds
+    /// the earlier requests and the agent's own work, so it receives only what
+    /// LAD recorded since the agent's last turn instead of recent conversation.
+    nonisolated private static func makeRequest(prompt: String, current: ModelSpec?, history: [ChatMessage], files: CodexFileContext,
                                                 workspace: URL, python: String, versions: ProjectVersionContext,
-                                                vendor: AgentVendor = .codex) throws -> String {
+                                                vendor: AgentVendor = .codex, resuming: Bool = false) throws -> String {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        var request = instructions + "\n\nDESIGN CONTEXT\n"
+        var request = ""
+        if resuming {
+            request += "CONTINUING THIS DESIGN'S CONVERSATION\n"
+            request += "This request continues your earlier conversation about this design, in the same task workspace. Reuse what you already learned from inputs that have not changed instead of reading or analyzing them again; matching SHA-256 values identify unchanged source files. Files you wrote in the task workspace remain available. LAD restages context/ and artifacts/ for every request, and LAD tool artifact IDs from earlier turns are no longer valid. The design context below is current and authoritative: since your last turn the user may have selected another version or changed the design, its parts, colors or materials, so read the current files it references before refining the design.\n\n"
+        }
+        request += "DESIGN CONTEXT\n"
         request += "TASK WORKSPACE: \(workspace.path)\nLAD PYTHON RUNTIME: \(python)\n"
         request += "The LAD MCP server is connected for this turn. When constructing or modifying geometry, call lad_runtime, then build/inspect/measure/render with LAD tools while iterating. For questions, explanations or clarification, return a message response without building or changing the design; use tools only when their results are needed for an accurate answer. Write scripts and optional external-tool outputs only inside this task workspace. Use this Python for bundled CadQuery/OCP and as the base of any approved isolated helper environment; do not replace the CAD runtime or modify LAD’s shared environment. External tools are user-managed. Before downloading or installing optional tools or dependencies, call lad_request_permission with the proposed operation and reason and proceed only when allowed is true. The tool returns a decision only; you execute approved operations yourself in an isolated environment inside TASK WORKSPACE. "
         request += "Shell commands in this task start without network access. LAD enables network access for the rest of the task only after lad_request_permission returns allowed true\(vendor == .codex ? ", by briefly interrupting your turn and then continuing it" : ""); never try to reach the network without such a decision. "
@@ -302,15 +363,25 @@ final class CodexService {
             request += "SAVED SELECTION REFERENCE MANIFEST FILE:\n" + String(decoding: try encoder.encode(path), as: UTF8.self) + "\n\n"
             request += "This complete local index links saved user messages to their immutable selected parts/features and originating revision recipes when available. Use it when the user refers to a previous selection; do not apply historical native indices directly to another revision. Missing origin recipes are explicitly unavailable; use saved anchors and stable part IDs, inspect/reconcile the current design, and ask if the intended target remains ambiguous. No selection or recipe contents are embedded here.\n\n"
         }
-        request += "RECENT CONVERSATION:\n"
         // Keep milestones in the saved conversation, without letting them
         // displace the user's design requirements from the bounded context.
         let projectHistory = history.filter { $0.role != "assistant" || $0.phase != "commentary" }
-        for message in projectHistory.suffix(16) {
+        let shown: ArraySlice<ChatMessage>
+        if resuming {
+            // LAD's outcome of the previous request: its validated result, a
+            // failure, cancellation or repair notice.
+            let previousRequest = projectHistory.lastIndex { $0.role == "user" }
+            shown = projectHistory[(previousRequest.map { $0 + 1 } ?? projectHistory.endIndex)...].suffix(16)
+            if !shown.isEmpty { request += "SINCE YOUR LAST TURN:\n" }
+        } else {
+            shown = projectHistory.suffix(16)
+            request += "RECENT CONVERSATION:\n"
+        }
+        for message in shown {
             let phase = message.role == "assistant" ? message.phase.map { " [\($0)]" } ?? "" : ""
             request += "\(message.role.uppercased())\(phase): \(String(message.content.prefix(6_000)))\n\n"
         }
-        request += "USER REQUEST:\n\(prompt)\n\nFor construction work, start with the brief user-facing plan described above and provide useful progress commentary while working. "
+        request += "USER REQUEST:\n\(prompt)\n\nFor construction work, start with the brief user-facing plan described in LAD's instructions and provide useful progress commentary while working. "
         request += vendor == .claude
             ? "Finish by delivering the response JSON through the structured output tool, using status message for an answer or clarification that does not change geometry. Do not restate the final response as text."
             : "Finish with only the response JSON, using status message for an answer or clarification that does not change geometry."

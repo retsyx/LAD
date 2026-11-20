@@ -44,6 +44,52 @@ final class ClaudeCodeJobTests: XCTestCase {
         XCTAssertEqual(capture.availability.last, false)
     }
 
+    func testResumedSessionContinuesAndReportsItsConversation() async throws {
+        let fixture = try ClaudeFixture(scenario: """
+        init()
+        result({'status': 'message', 'message': 'continued', 'model': None, 'assetIDs': []})
+        """)
+        defer { fixture.remove() }
+        let capture = ClaudeCapture()
+        let job = fixture.job(capture: capture, resuming: true)
+        _ = try await job.run(input: Data("Continue the design".utf8))
+        XCTAssertEqual(job.conversationID, "session-1", "The session stays known after the task ends so the next request can resume it.")
+        XCTAssertTrue(capture.events.contains { $0.title == "Session resumed" })
+    }
+
+    func testUnresumableSessionIsReportedBeforeAnyTaskStarts() async throws {
+        // Claude Code reports an unknown session as an error result without
+        // starting a session.
+        let fixture = try ClaudeFixture(scenario: """
+        send({'type': 'result', 'subtype': 'error_during_execution', 'is_error': True, 'session_id': 'replacement', 'num_turns': 0})
+        sys.exit(1)
+        """)
+        defer { fixture.remove() }
+        let job = fixture.job(resuming: true)
+        do {
+            _ = try await job.run(input: Data("Continue the design".utf8))
+            XCTFail("An unresumable session must not complete.")
+        } catch is AgentConversationUnavailable {
+        }
+        XCTAssertNil(job.conversationID)
+    }
+
+    func testResumedSessionFailureAfterStartingIsAnOrdinaryFailure() async throws {
+        let fixture = try ClaudeFixture(scenario: """
+        init()
+        send({'type': 'result', 'subtype': 'error_during_execution', 'is_error': True, 'num_turns': 1})
+        """)
+        defer { fixture.remove() }
+        let job = fixture.job(resuming: true)
+        do {
+            _ = try await job.run(input: Data("Continue the design".utf8))
+            XCTFail("The failed task must not complete.")
+        } catch is AgentConversationUnavailable {
+            XCTFail("Work may have started, so the request must not silently run again in a new conversation.")
+        } catch {}
+        XCTAssertEqual(job.conversationID, "session-1")
+    }
+
     func testAcknowledgedSteeringJoinsTheActiveTask() async throws {
         let fixture = try ClaudeFixture(scenario: """
         init()
@@ -211,13 +257,18 @@ final class ClaudeCodeJobTests: XCTestCase {
         let workspace = URL(fileURLWithPath: "/tmp/LAD-Claude-task")
         let schema = Data(#"{"type":"object","properties":{"status":{"type":"string"}}}"#.utf8)
         let arguments = try ClaudeCodeJob.arguments(model: "opus", effort: "xhigh", schema: schema, workspace: workspace,
-                                                    python: "/runtime/bin/python3", server: URL(fileURLWithPath: "/app/agent_server.py"))
+                                                    python: "/runtime/bin/python3", server: URL(fileURLWithPath: "/app/agent_server.py"),
+                                                    instructions: "LAD DESIGN INSTRUCTIONS")
         func value(after flag: String) -> String? {
             arguments.firstIndex(of: flag).flatMap { $0 + 1 < arguments.count ? arguments[$0 + 1] : nil }
         }
-        for flag in ["-p", "--no-session-persistence", "--strict-mcp-config", "--replay-user-messages", "--verbose"] {
+        for flag in ["-p", "--strict-mcp-config", "--replay-user-messages", "--verbose"] {
             XCTAssertTrue(arguments.contains(flag), flag)
         }
+        XCTAssertFalse(arguments.contains("--no-session-persistence"), "The design's next request resumes this saved session.")
+        XCTAssertFalse(arguments.contains("--resume"), "A new conversation must not resume another session.")
+        XCTAssertEqual(value(after: "--append-system-prompt"), "LAD DESIGN INSTRUCTIONS",
+                       "Design instructions extend the system prompt, which survives context compaction.")
         XCTAssertEqual(value(after: "--input-format"), "stream-json")
         XCTAssertEqual(value(after: "--output-format"), "stream-json")
         XCTAssertEqual(value(after: "--permission-mode"), "acceptEdits")
@@ -246,6 +297,14 @@ final class ClaudeCodeJobTests: XCTestCase {
                                                       python: "/runtime/bin/python3", server: URL(fileURLWithPath: "/app/agent_server.py"))
         XCTAssertEqual(recommended.firstIndex(of: "--model").map { recommended[$0 + 1] }, "default")
         XCTAssertFalse(recommended.contains("--effort"))
+        let resumed = try ClaudeCodeJob.arguments(model: "opus", effort: "", schema: schema, workspace: workspace,
+                                                  python: "/runtime/bin/python3", server: URL(fileURLWithPath: "/app/agent_server.py"),
+                                                  instructions: "LAD DESIGN INSTRUCTIONS", resumeSessionID: "session-1")
+        XCTAssertEqual(resumed.firstIndex(of: "--resume").map { resumed[$0 + 1] }, "session-1")
+        XCTAssertEqual(resumed.firstIndex(of: "--append-system-prompt").map { resumed[$0 + 1] }, "LAD DESIGN INSTRUCTIONS",
+                       "Every launch supplies the design instructions again.")
+        XCTAssertTrue(ClaudeCodeJob.controlArguments.contains("--no-session-persistence"),
+                      "Control connections such as model discovery leave no saved session.")
     }
 
     func testTaskEnvironmentNeverUpdatesTheInstallationOrInheritsAnotherSession() async throws {
@@ -339,9 +398,9 @@ private struct ClaudeFixture {
             .split(separator: "\n").map { try XCTUnwrap(try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]) }
     }
 
-    func job(capture: ClaudeCapture = ClaudeCapture(), environment: [String: String] = [:]) -> ClaudeCodeJob {
+    func job(capture: ClaudeCapture = ClaudeCapture(), environment: [String: String] = [:], resuming: Bool = false) -> ClaudeCodeJob {
         ClaudeCodeJob(executable: executable, arguments: ClaudeCodeJob.controlArguments + ["--replay-user-messages"], directory: directory,
-            onProgress: { _ in }, onMessage: { capture.append($0) }, onActivity: { capture.append($0) },
+            resuming: resuming, onProgress: { _ in }, onMessage: { capture.append($0) }, onActivity: { capture.append($0) },
             onSteeringAvailability: { capture.setAvailability($0) }, environment: environment)
     }
 }

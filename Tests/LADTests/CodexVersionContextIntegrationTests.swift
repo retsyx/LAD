@@ -58,7 +58,7 @@ final class CodexVersionContextIntegrationTests: XCTestCase {
         XCTAssertFalse(completed.contains { $0.output?.contains("HISTORICAL_RECIPE_PRIVATE_MARKER") == true })
         XCTAssertNil(service.validatedPreview(for: selected.model))
         XCTAssertFalse(FileManager.default.fileExists(atPath: harness.runtimeMarker.path), "A lookup must not launch the CAD worker.")
-        try harness.codex.assertJobWasCleanedUp()
+        try harness.codex.assertJobWasCleanedUp(ending: service)
     }
 
     @MainActor
@@ -167,7 +167,7 @@ final class CodexVersionContextIntegrationTests: XCTestCase {
         XCTAssertTrue(steeringText.contains("Compare it with v3"))
         XCTAssertFalse(steeringText.contains("HISTORICAL_RECIPE_PRIVATE_MARKER"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: harness.runtimeMarker.path))
-        try harness.codex.assertJobWasCleanedUp()
+        try harness.codex.assertJobWasCleanedUp(ending: service)
     }
 
     private var historicalAsset: Data { Data("# HISTORICAL_INPUT_PRIVATE_MARKER\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".utf8) }

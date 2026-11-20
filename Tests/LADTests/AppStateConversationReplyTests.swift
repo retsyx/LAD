@@ -54,8 +54,8 @@ final class AppStateConversationReplyTests: XCTestCase {
             XCTAssertNotNil(audit.finishedAt)
             XCTAssertFalse(audit.events.contains { $0.category == "validation" },
                 "A conversational reply must not enter CAD validation or create a revision.")
-            try fixture.codex.assertJobWasCleanedUp()
             await state.prepareToQuit()
+            try fixture.codex.assertJobWasCleanedUp()
         }
     }
 

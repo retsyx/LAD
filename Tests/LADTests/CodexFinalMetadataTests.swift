@@ -60,7 +60,7 @@ final class CodexFinalMetadataTests: XCTestCase {
         let project = LADProject(messages: [], revisions: [revision], selectedRevisionID: revision.id)
         let restored = try ProjectStore.decode(ProjectStore.encode(project))
         XCTAssertEqual(restored.revisions.first?.model, accepted, "An accepted final design must survive portable saving.")
-        try codex.assertJobWasCleanedUp()
+        try codex.assertJobWasCleanedUp(ending: service)
     }
 
     @MainActor
@@ -80,7 +80,7 @@ final class CodexFinalMetadataTests: XCTestCase {
         }
         XCTAssertNil(service.validatedPreview(for: candidate), "Rejected final metadata must not expose a reusable candidate.",
                      file: file, line: line)
-        try codex.assertJobWasCleanedUp(file: file, line: line)
+        try codex.assertJobWasCleanedUp(ending: service, file: file, line: line)
     }
 
     private func readyResponse(_ candidate: ModelSpec) throws -> String {
