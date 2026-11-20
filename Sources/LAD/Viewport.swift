@@ -660,7 +660,10 @@ final class CADSceneView: NSView {
         SCNTransaction.disableActions = true
         sectionCaps.node.geometry = cap
         if changed {
-            for root in [modelNode, edgeNode, featureNode] {
+            for node in edgeNode.childNodes {
+                if let geometry = node.geometry { CADStrokeGeometry.setSectionPlane(plane, on: geometry) }
+            }
+            for root in [modelNode, featureNode] {
                 root.enumerateChildNodes { node, _ in
                     for material in node.geometry?.materials ?? [] {
                         CADViewportSectionRendering.apply(plane, to: material)

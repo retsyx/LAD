@@ -9,13 +9,31 @@ import simd
 enum CADStrokeGeometry {
     static let viewportHeightKey = "cadEdgeViewportHeight"
     private static let joinsEnabledKey = "cadEdgeJoinsEnabled"
+    private static let sectionPlaneKey = "cadStrokeSectionPlane"
     static let normalWidth: CGFloat = 1.6
 
     private static let modifier = """
     #pragma arguments
     float cadEdgeViewportHeight;
     float cadEdgeJoinsEnabled;
+    float4 cadStrokeSectionPlane;
+    #pragma varyings
+    float cadStrokeSectionDistance;
     #pragma body
+    out.cadStrokeSectionDistance = 0.0;
+    float cadSectionSlope = 0.0;
+    bool cadSectioned = any(cadStrokeSectionPlane.xyz != 0.0);
+    if (cadSectioned) {
+        // Clip the actual CAD edge, before its ribbon is widened and aligned to face depth.
+        float4 cadWorld = scn_node.modelTransform * _geometry.position;
+        float3 cadView = (scn_node.modelViewTransform * _geometry.position).xyz;
+        float3 cadScale = abs(cadWorld.xyz) + abs(cadView);
+        float cadMagnitude = max(max(cadScale.x, cadScale.y), max(cadScale.z, abs(cadStrokeSectionPlane.w)));
+        out.cadStrokeSectionDistance = dot(cadStrokeSectionPlane, cadWorld)
+            - \(CADSectionPlane.renderRoundoff) * max(1.0, cadMagnitude);
+        float4 cadWorldTangent = scn_node.modelTransform * float4(_geometry.normal, 0.0);
+        cadSectionSlope = dot(cadStrokeSectionPlane, cadWorldTangent);
+    }
     float cadEdgeWidth = \(Float(normalWidth));
     // At a polyline joint the stroke can reach other triangles of its own
     // face. Clip those actual triangles to the local stroke rectangle.
@@ -88,6 +106,14 @@ enum CADStrokeGeometry {
                         if (abs(cadPosition.w) > 1e-8) {
                             cadPosition /= cadPosition.w;
                             cadClip = scn_node.modelViewProjectionTransform * cadPosition;
+                            if (cadSectioned) {
+                                // Interpolate the section distance along the projected centerline.
+                                // Restore clip W for the hardware's perspective interpolation.
+                                float cadDistance = out.cadStrokeSectionDistance;
+                                float cadNeighborDistance = cadDistance + cadSectionSlope * _geometry.texcoords[0].x;
+                                out.cadStrokeSectionDistance = cadClip.w
+                                    * mix(cadDistance / cadA.w, cadNeighborDistance / cadNeighbor.w, cadVertex.x / cadLength);
+                            }
                             float4 cadViewPosition = scn_node.modelViewTransform * cadPosition;
                             float cadDepthGradient = (scn_frame.projectionTransform[2][2] * cadClip.w
                                 - scn_frame.projectionTransform[2][3] * cadClip.z) / cadClip.w;
@@ -127,6 +153,13 @@ enum CADStrokeGeometry {
                 ? cadCapDepthLimit / abs(cadCapDepth) : 1.0;
             float cadBoundedCapDepth = clamp(cadCapDepth, -cadCapDepthLimit, cadCapDepthLimit);
             float cadCap = _geometry.texcoords[0].y * cadCapWeight;
+            if (cadSectioned) {
+                // Carry the plane distance along the projected cap tangent.
+                // Keep the value constant across the width of the ribbon.
+                float cadSpan = cadCap * cadEdgeWidth * cadScale * cadClip.w * rsqrt(cadLengthSquared);
+                out.cadStrokeSectionDistance += cadSpan
+                    * (cadClip.w * cadSectionSlope - cadDirection.w * out.cadStrokeSectionDistance);
+            }
             float2 cadOffset = cadAcross * _geometry.texcoords[0].x + cadAlong * cadCap;
             float2 cadClipOffset = cadOffset * cadEdgeWidth * cadScale * scn_frame.inverseResolution * cadClip.w;
             float cadFallback = _geometry.texcoords[0].y * cadBoundedCapDepth;
@@ -191,6 +224,13 @@ enum CADStrokeGeometry {
             cadClip.z += 2e-6 * abs(cadViewPosition.z) * cadDepthGradient;
             _geometry.position = scn_node.inverseModelViewProjectionTransform * cadClip;
         }
+    }
+    """
+
+    private static let sectionClipping = """
+    #pragma body
+    if (in.cadStrokeSectionDistance > 0.0) {
+        discard_fragment();
     }
     """
 
@@ -368,7 +408,7 @@ enum CADStrokeGeometry {
                                    elements: [SCNGeometryElement(data: prepared.indices, primitiveType: .triangles,
                                                                  primitiveCount: prepared.indexCount / 3,
                                                                  bytesPerIndex: MemoryLayout<Int32>.size)])
-        geometry.shaderModifiers = [.geometry: modifier]
+        setSectionPlane(nil, on: geometry)
         setJoinsEnabled(true, on: geometry)
         setViewportHeight(viewportHeight, on: geometry)
         let material = SCNMaterial()
@@ -389,9 +429,19 @@ enum CADStrokeGeometry {
         geometry.setValue(NSNumber(value: enabled ? 1.0 : 0.0), forKey: joinsEnabledKey)
     }
 
+    static func setSectionPlane(_ plane: CADSectionPlane?, on geometry: SCNGeometry) {
+        if plane != nil, geometry.shaderModifiers?[.fragment] != sectionClipping {
+            geometry.shaderModifiers = [.geometry: modifier, .fragment: sectionClipping]
+        } else if plane == nil, geometry.shaderModifiers?[.fragment] != nil || geometry.shaderModifiers?[.geometry] == nil {
+            geometry.shaderModifiers = [.geometry: modifier]
+        }
+        let equation = plane?.equation ?? .zero
+        geometry.setValue(NSValue(scnVector4: SCNVector4(equation.x, equation.y, equation.z, equation.w)), forKey: sectionPlaneKey)
+    }
+
     static func copyParameters(from source: SCNGeometry, to destination: SCNGeometry) {
         guard source.shaderModifiers?[.geometry] == modifier else { return }
-        for key in [viewportHeightKey, joinsEnabledKey] {
+        for key in [viewportHeightKey, joinsEnabledKey, sectionPlaneKey] {
             if let value = source.value(forKey: key) { destination.setValue(value, forKey: key) }
         }
     }

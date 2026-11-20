@@ -67,6 +67,67 @@ final class ViewportSectionRenderingTests: XCTestCase {
     }
 
     @MainActor
+    func testEnablingSectionPreservesOrdinaryEdgeWidthAndClipsCrossingEdges() async throws {
+        // Both faces are retained so the cut cannot change edge occlusion.
+        // Their shared rim lies in the plane, while its ribbon straddles it.
+        let preview = PreviewMesh(positions: [-10, -8, -2.5, 0, -8, 0, 0, 8, 0, -10, 8, -2.5,
+                                              0, -8, -4, 0, 8, -4],
+            triangleIndices: [0, 1, 2, 0, 2, 3, 1, 4, 5, 1, 5, 2],
+            edgePoints: [-10, -8, -2.5, -10, 8, -2.5, 0, -8, 0, 0, 8, 0,
+                         -10, -10, 0, 10, -10, 0],
+            bounds: [-10, -10, -4, 10, 8, 0], volume: 0, area: 229, solids: 1, faces: 2,
+            buildSeconds: 0, threads: 1, stepPath: "section-edge-ribbons",
+            triangleSolids: [0, 0, 0, 0], edgeSolids: [0, 0, 0])
+        var camera = CADAgentCamera()
+        camera.position = [11, -7, 61]
+        camera.target = [0, 0, 0]
+
+        for projection in ViewportProjectionMode.allCases {
+            let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 512, height: 360))
+            view.preparesRendererResources = false
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                        selectedSolids: [], hiddenSolids: [], projection: projection)
+            try view.configureAgentView(named: "isometric", camera: camera)
+            let ready = try await view.waitForCaptureResources(until: .now + .seconds(3))
+            XCTAssertTrue(ready)
+            let edge = try XCTUnwrap(view.scene.rootNode.childNode(withName: "edges:0", recursively: true))
+            edge.geometry?.firstMaterial?.diffuse.contents = NSColor.magenta
+            let whole = try await capture(view)
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                        selectedSolids: [], hiddenSolids: [], projection: projection, sectionEnabled: true)
+            let section = try await capture(view)
+            XCTAssertEqual(view.sectionPlane?.equation, SIMD4<Float>(1, 0, 0, 0))
+
+            func ink(_ image: NSBitmapImageRep, at point: SCNVector3) throws -> CGFloat {
+                try pixelBlock(view, image, around: point, radius: 3).reduce(0) { coverage, color in
+                    coverage + max(0, min(color.redComponent, color.blueComponent) - color.greenComponent)
+                }
+            }
+            for y in [-5.0, 0.0, 5.0] {
+                for point in [SCNVector3(-10, y, -2.5), SCNVector3(0, y, 0)] {
+                    let original = try ink(whole, at: point)
+                    XCTAssertGreaterThan(original, 3, "\(projection) must render the original edge.")
+                    XCTAssertEqual(try ink(section, at: point), original, accuracy: original * 0.12,
+                                   "\(projection) section changed the width near \(point).")
+                }
+            }
+            let kept = SCNVector3(-5, -10, 0)
+            let removed = SCNVector3(5, -10, 0)
+            let original = try ink(whole, at: kept)
+            XCTAssertGreaterThan(original, 3)
+            XCTAssertEqual(try ink(section, at: kept), original, accuracy: original * 0.12)
+            XCTAssertGreaterThan(try ink(whole, at: removed), 3)
+            XCTAssertEqual(try ink(section, at: removed), 0, accuracy: 0.1,
+                           "The crossing stroke must still end at the cut.")
+
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                        selectedSolids: [], hiddenSolids: [], projection: projection)
+            let restored = try await capture(view)
+            XCTAssertEqual(try ink(restored, at: removed), try ink(whole, at: removed), accuracy: 0.1)
+        }
+    }
+
+    @MainActor
     func testSectionCapsHatchSolidAndLeaveAThroughHoleOpen() async throws {
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 320))
         let preview = tube()
