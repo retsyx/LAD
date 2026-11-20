@@ -51,7 +51,7 @@ enum PartDropTarget: Hashable {
 /// Drop feedback and folder geometry for one Parts pane.
 @MainActor @Observable
 final class PartDropState {
-    static let contentSpace = "lad-parts-drop-content"
+    nonisolated static let contentSpace = "lad-parts-drop-content"
 
     /// The destination of a valid drop at the pointer.
     private(set) var target: PartDropTarget?

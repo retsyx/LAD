@@ -1,4 +1,5 @@
 import Observation
+import os
 import XCTest
 @testable import LAD
 
@@ -15,19 +16,20 @@ final class AppStateObservationTests: XCTestCase {
         state.prompt = "First keystroke"
         XCTAssertTrue(state.hasUnsavedChanges)
 
-        var otherStateChanged = false, promptChanged = false
+        let otherStateChanged = OSAllocatedUnfairLock(initialState: false)
+        let promptChanged = OSAllocatedUnfairLock(initialState: false)
         withObservationTracking {
             _ = (state.mesh?.stepPath, state.selectedSolids, state.hiddenSolids, state.selectedFeatures,
                  state.displayMode, state.projectionMode, state.showGrid, state.viewportCommand?.id,
                  state.solidColors, state.messages, state.isWorking, state.activityStatus, state.error,
                  state.hasUnsavedChanges, state.saveStatus, state.projectDisplayName, state.projectURL,
                  state.canExport, state.canSaveNew, state.partTree)
-        } onChange: { otherStateChanged = true }
-        withObservationTracking { _ = state.prompt } onChange: { promptChanged = true }
+        } onChange: { otherStateChanged.withLock { $0 = true } }
+        withObservationTracking { _ = state.prompt } onChange: { promptChanged.withLock { $0 = true } }
 
         state.prompt = "Second keystroke"
-        XCTAssertTrue(promptChanged)
-        XCTAssertFalse(otherStateChanged, "A keystroke must not invalidate panes that do not show the prompt")
+        XCTAssertTrue(promptChanged.withLock { $0 })
+        XCTAssertFalse(otherStateChanged.withLock { $0 }, "A keystroke must not invalidate panes that do not show the prompt")
         state.cancel()
     }
 }

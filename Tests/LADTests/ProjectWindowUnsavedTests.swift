@@ -77,7 +77,7 @@ final class ProjectWindowUnsavedTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         var state: AppState? = fixture.state()
-        weak var retained = state
+        weak let retained = state
         let identity = ObjectIdentifier(try XCTUnwrap(state))
         var offered: [ObjectIdentifier] = []
         let coordinator = ProjectWindowCoordinator(saveUnsavedProject: { offered.append(ObjectIdentifier($0)); return true })
@@ -145,7 +145,7 @@ final class ProjectWindowUnsavedTests: XCTestCase {
         await Task.yield()
         XCTAssertEqual(prompts, 0)
         gate.continuation.finish()
-        await quitting.value
+        _ = await quitting.value
         XCTAssertEqual(prompts, 1)
     }
 

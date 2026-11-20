@@ -61,13 +61,14 @@ enum ViewportPassTestRenderer {
     }
 
     static func render(scene: SCNScene, camera: SCNNode, width: Int, height: Int, referenceHeight: Double? = nil,
-                       translucent: Bool = false, palette: CADHighlightPalette = CADSceneView.highlightPalette,
+                       translucent: Bool = false, palette: CADHighlightPalette? = nil,
                        seeds: [CADViewportFrame.Seeds] = [], batches: [CADViewportFrame.Batch] = [],
                        verticesEnabled: Bool? = nil, passes: CADViewportPasses? = nil) throws -> ViewportPassShot {
         let device = try XCTUnwrap(device)
         let source = source(scene: scene, camera: camera)
         var frame = CADViewportFrame(width: width, height: height, referenceHeight: referenceHeight ?? Double(height),
-                                     translucent: translucent, palette: palette, seeds: seeds, batches: batches)
+                                     translucent: translucent, palette: palette ?? CADSceneView.highlightPalette,
+                                     seeds: seeds, batches: batches)
         frame.verticesEnabled = verticesEnabled ?? seeds.contains { $0.channel == .selectedVertex || $0.channel == .hoveredVertex }
         if frame.hasHighlights { frame.highlightBounds = .full }
         let renderer = SCNRenderer(device: device, options: nil)
