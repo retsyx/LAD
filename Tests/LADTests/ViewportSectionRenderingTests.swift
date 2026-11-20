@@ -236,6 +236,135 @@ final class ViewportSectionRenderingTests: XCTestCase {
     }
 
     @MainActor
+    func testMovingPartKeepsRenderedPoseAndCapTogether() async throws {
+        guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for live section movement.") }
+        let app = NSApplication.shared
+        let policy = app.activationPolicy()
+        XCTAssertTrue(app.setActivationPolicy(.regular))
+        defer { _ = app.setActivationPolicy(policy) }
+        app.finishLaunching()
+
+        let size = NSRect(x: 50, y: 50, width: 640, height: 480)
+        let view = CADSceneView(frame: size)
+        let frames = ViewportRenderCounter(view)
+        let window = NSWindow(contentRect: size, styleMask: [.titled], backing: .buffered, defer: false)
+        window.title = "LAD moving section test"
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        defer { window.orderOut(nil); window.contentView = nil; window.close() }
+
+        let preview = tube()
+        view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.right),
+                    selectedSolids: [], hiddenSolids: [], projection: .isometric, sectionEnabled: true)
+        var camera = CADAgentCamera()
+        camera.position = [20, -35, 20]
+        camera.target = [0, 0, 0]
+        try view.configureAgentView(named: "isometric", camera: camera)
+        app.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.displayIfNeeded()
+        view.layout()
+
+        func waitForSettledFrame(after generation: Int) async throws {
+            let deadline = ContinuousClock.now + .seconds(10)
+            let ready = try await view.waitForCaptureResources(until: deadline)
+            XCTAssertTrue(ready)
+            while (frames.count <= generation || view.hasPendingFrames), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertGreaterThan(frames.count, generation)
+            XCTAssertFalse(view.hasPendingFrames)
+        }
+
+        try await waitForSettledFrame(after: 0)
+        let body = try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:0", recursively: true))
+        let cap = try XCTUnwrap(view.scene.rootNode.childNodes.first { $0.categoryBitMask == CADViewportCategory.sectionCaps })
+        let section = try XCTUnwrap(view.sectionPlane)
+        func assertMatchingSection(file: StaticString = #filePath, line: UInt = #line) throws {
+            _ = try XCTUnwrap(cap.geometry, "The section cap disappeared during motion.", file: file, line: line)
+            let bounds = cap.boundingBox
+            let low = cap.convertPosition(bounds.min, to: nil)
+            let high = cap.convertPosition(bounds.max, to: nil)
+            let bodyY = Double(body.simdWorldTransform.columns.3.y)
+            XCTAssertEqual(Double(low.y), preview.bounds[1] + bodyY, accuracy: 1e-5, file: file, line: line)
+            XCTAssertEqual(Double(high.y), preview.bounds[4] + bodyY, accuracy: 1e-5, file: file, line: line)
+            XCTAssertEqual(view.makeFrame(width: 640, height: 480).sectionPlane, section.equation, file: file, line: line)
+        }
+        func applyPose(to view: CADSceneView, y: Double, x: Double = 0, sectionEnabled: Bool = true) {
+            let transform = [1.0, 0, 0, x, 0, 1, 0, y, 0, 0, 1, 0, 0, 0, 0, 1]
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [],
+                        projection: .isometric, solidTransforms: [0: transform], sectionEnabled: sectionEnabled)
+        }
+
+        try assertMatchingSection()
+        let original = try await CADAgentRenderer.capturePNG(view: view)
+
+        // Repeated slider values reach the viewport before a fresh cap can finish.
+        let beforeSlider = frames.count
+        for y in [1.0, 2.0, 3.0] {
+            applyPose(to: view, y: y)
+            try assertMatchingSection()
+        }
+        try await waitForSettledFrame(after: beforeSlider)
+        XCTAssertEqual(body.simdWorldTransform.columns.3.y, 3)
+        try assertMatchingSection()
+
+        // Grab the exposed outer wall, which lies behind the cut and outside its cap.
+        let hit = view.projectPoint(SCNVector3(-4, -7, 0))
+        let start = NSPoint(x: CGFloat(hit.x), y: CGFloat(hit.y))
+        func mouse(_ type: NSEvent.EventType, x: CGFloat, modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
+            let point = view.convert(NSPoint(x: start.x + x, y: start.y), to: nil)
+            return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: modifiers, timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 0))
+        }
+        view.assemblyGrabbingEnabled = true
+        view.onAssemblyGrabBegan = { solid, _, _ in solid == 0 }
+        view.onAssemblyGrabMoved = { [weak view] point in
+            if let view { applyPose(to: view, y: 3 + (point[0] - Double(start.x)) / 10) }
+        }
+        let beforeGrab = frames.count
+        view.mouseDown(with: try mouse(.leftMouseDown, x: 0, modifiers: .command))
+        XCTAssertTrue(view.isGrabbingAssembly)
+        for x: CGFloat in [10, 20, 30] {
+            view.mouseDragged(with: try mouse(.leftMouseDragged, x: x))
+            try assertMatchingSection()
+        }
+        view.mouseUp(with: try mouse(.leftMouseUp, x: 30))
+        try await waitForSettledFrame(after: beforeGrab)
+        XCTAssertEqual(body.simdWorldTransform.columns.3.y, 6, accuracy: 1e-5)
+        try assertMatchingSection()
+        let moved = try await CADAgentRenderer.capturePNG(view: view)
+        XCTAssertNotEqual(moved, original)
+
+        // A reversal must settle at the most recently requested pose.
+        applyPose(to: view, y: 8)
+        applyPose(to: view, y: 6)
+        try assertMatchingSection()
+        let reversed = try await view.waitForCaptureResources(until: .now + .seconds(10))
+        XCTAssertTrue(reversed)
+        XCTAssertEqual(body.simdWorldTransform.columns.3.y, 6)
+        try assertMatchingSection()
+
+        // Turning off the section during preparation should display the requested pose immediately.
+        applyPose(to: view, y: 9)
+        try assertMatchingSection()
+        applyPose(to: view, y: 9, sectionEnabled: false)
+        XCTAssertEqual(body.simdWorldTransform.columns.3.y, 9)
+        XCTAssertNil(cap.geometry)
+        XCTAssertEqual(view.makeFrame(width: 640, height: 480).sectionPlane, .zero)
+
+        // A completed pose still needs a new frame when neither position intersects the cut.
+        for x in [-9.0, -10.0] {
+            let before = frames.count
+            applyPose(to: view, y: 9, x: x)
+            try await waitForSettledFrame(after: before)
+            XCTAssertEqual(Double(body.simdWorldTransform.columns.3.x), x)
+            XCTAssertNil(cap.geometry)
+            XCTAssertEqual(view.makeFrame(width: 640, height: 480).sectionPlane, section.equation)
+        }
+    }
+
+    @MainActor
     private func capture(_ view: CADSceneView) async throws -> NSBitmapImageRep {
         let png = try await CADAgentRenderer.capturePNG(view: view)
         return try XCTUnwrap(NSBitmapImageRep(data: png))

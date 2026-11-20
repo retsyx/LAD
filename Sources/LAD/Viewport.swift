@@ -234,6 +234,10 @@ final class CADSceneView: NSView {
     private var modifierMonitor: Any?
     var isGrabbingAssembly: Bool { assemblyGrab != nil }
     private var topology: CADTopology?
+    private struct SolidPose {
+        let transforms: [Int: [Double]]
+        let matrices: [Int: simd_double4x4]
+    }
     private var solidTransforms: [Int: [Double]] = [:]
     private var solidMatrices: [Int: simd_double4x4] = [:]
     private var solidBounds: [Int: [Double]] = [:]
@@ -552,6 +556,7 @@ final class CADSceneView: NSView {
         finishes.merge(solidColors.filter { (0..<4_096).contains($0.key) && $0.value.isValid },
                        uniquingKeysWith: { _, override in override })
         self.solidColors = finishes
+        let requestedPoseChanged = requestedSolidTransforms != solidTransforms
         requestedSolidTransforms = solidTransforms
         if gridChanged { gridNode.isHidden = !grid }
         var installedModel = false
@@ -592,7 +597,10 @@ final class CADSceneView: NSView {
             if meshChanged || projectionChanged || visibilityChanged || modeChanged || gridChanged { requestRedraw() }
             return
         }
-        let poseChanged = updateSolidTransforms(solidTransforms, reinstalling: meshChanged)
+        // A sectioned pose is published by the cap completion. Compare new
+        // requests to each other so a move back to the displayed pose still queues.
+        let poseChanged = sectionPlane == nil && (meshChanged || solidTransforms != self.solidTransforms)
+            && applySolidPose(validatedPose(solidTransforms), reinstalling: meshChanged)
         let styleChanged = applyStyle()
         let featuresChanged = updateFeatureHighlights()
         if let command, command.id != lastCommand {
@@ -610,8 +618,8 @@ final class CADSceneView: NSView {
         }
         if sectionPlane == nil {
             openSectionIfRequested()
-        } else if poseChanged || visibilityChanged || sectionStyleChanged {
-            updateSectionCaps(replacingInputs: true)
+        } else if requestedPoseChanged || visibilityChanged || sectionStyleChanged {
+            updateSectionCaps(replacingInputs: visibilityChanged || sectionStyleChanged)
         }
         if meshChanged || poseChanged || styleChanged || featuresChanged || gridChanged { requestRedraw() }
     }
@@ -646,18 +654,23 @@ final class CADSceneView: NSView {
         updateSectionManipulator()
     }
 
-    private func presentSection(_ plane: CADSectionPlane?, cap: SCNGeometry?) {
+    private func presentSection(_ plane: CADSectionPlane?, cap: SCNGeometry?, pose: SolidPose?) {
         let changed = presentedSectionPlane != plane
-        guard changed || sectionCaps.node.geometry !== cap else {
+        let poseChanged = pose.map { $0.transforms != solidTransforms } ?? false
+        guard changed || poseChanged || sectionCaps.node.geometry !== cap else {
             resumeCaptureWaitersIfReady()
             return
         }
         presentedSectionPlane = plane
         projectedFeatures = nil
         zoomAnchor = nil
-        setHoveredFeature(nil)
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
+        if let pose, applySolidPose(pose, reinstalling: false) {
+            _ = updateFeatureHighlights()
+        } else {
+            setHoveredFeature(nil)
+        }
         sectionCaps.node.geometry = cap
         if changed {
             for node in edgeNode.childNodes {
@@ -677,14 +690,18 @@ final class CADSceneView: NSView {
     }
 
     private func updateSectionCaps(replacingInputs: Bool = false) {
-        sectionCaps.update(plane: sectionPlane, mesh: sectionMesh, transforms: solidMatrices,
+        let pose = sectionPlane.map { _ in
+            requestedSolidTransforms == solidTransforms
+                ? SolidPose(transforms: solidTransforms, matrices: solidMatrices) : validatedPose(requestedSolidTransforms)
+        }
+        sectionCaps.update(plane: sectionPlane, mesh: sectionMesh, transforms: pose?.matrices ?? [:],
                            hidden: hiddenSolids, mode: mode, renderer: preparesRendererResources ? renderer : nil,
                            replacingInputs: replacingInputs) { [weak self] plane, cap in
             guard let self else { return }
-            // New poses, visibility or wire styling invalidate the old cap,
-            // but the published clipping plane still applies to those solids.
+            // Visibility and wire styling can invalidate the displayed cap.
+            // A pose update keeps the displayed geometry until its cap is ready.
             let resetCap = replacingInputs && plane == nil && self.sectionPlane != nil
-            self.presentSection(resetCap ? self.presentedSectionPlane : plane, cap: cap)
+            self.presentSection(resetCap ? self.presentedSectionPlane : plane, cap: cap, pose: plane == nil ? nil : pose)
         }
     }
 
@@ -709,21 +726,23 @@ final class CADSceneView: NSView {
                                    projection: rig.projection(width: bounds.width, height: bounds.height))
     }
 
-    /// Moving a rigid body changes node poses only. Display buffers, native
-    /// feature identities, and materials stay attached to the original preview.
-    @discardableResult
-    private func updateSolidTransforms(_ requested: [Int: [Double]], reinstalling: Bool) -> Bool {
-        if !reinstalling, requested == solidTransforms { return false }
+    private func validatedPose(_ requested: [Int: [Double]]) -> SolidPose {
         var matrices: [Int: simd_double4x4] = [:]
         let valid = requested.count <= 4_096 && requested.allSatisfy { solid, values in
             guard solidBounds[solid] != nil, let matrix = ViewportRigidTransform.matrix(values) else { return false }
             matrices[solid] = matrix
             return true
         }
-        let next = valid ? requested : [:]
-        guard reinstalling || next != solidTransforms else { return false }
-        solidTransforms = next
-        solidMatrices = valid ? matrices : [:]
+        return valid ? SolidPose(transforms: requested, matrices: matrices) : SolidPose(transforms: [:], matrices: [:])
+    }
+
+    /// Moving a rigid body changes node poses only. Display buffers, native
+    /// feature identities, and materials stay attached to the original preview.
+    @discardableResult
+    private func applySolidPose(_ pose: SolidPose, reinstalling: Bool) -> Bool {
+        guard reinstalling || pose.transforms != solidTransforms else { return false }
+        solidTransforms = pose.transforms
+        solidMatrices = pose.matrices
         projectedFeatures = nil
         hoveredFeature = nil
         zoomAnchor = nil
@@ -742,18 +761,8 @@ final class CADSceneView: NSView {
         }
         for (feature, node) in featureNodes { apply(node, solid: feature.solidIndex) }
         SCNTransaction.commit()
-        if next.isEmpty {
-            if !originalMeshBounds.isEmpty { meshBounds = originalMeshBounds }
-        } else {
-            let bounds = solidBounds.map { solid, bounds in
-                ViewportRigidTransform.bounds(bounds, matrix: solidMatrices[solid] ?? matrix_identity_double4x4)
-            }
-            if !bounds.isEmpty {
-                meshBounds = (0..<3).map { axis in bounds.map { $0[axis] }.min()! }
-                    + (0..<3).map { axis in bounds.map { $0[axis + 3] }.max()! }
-            }
-        }
-        if reinstalling, !next.isEmpty {
+        meshBounds = bounds(for: pose)
+        if reinstalling, !pose.transforms.isEmpty {
             if installKeepsCamera { rig.adoptBounds(meshBounds) }
             else { rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height) }
             rebuildGrid()
@@ -936,7 +945,7 @@ final class CADSceneView: NSView {
                 self.pendingMesh = nil
                 guard let prepared else { self.clearModel(); self.requestRedraw(); return }
                 self.install(prepared)
-                _ = self.updateSolidTransforms(self.requestedSolidTransforms, reinstalling: true)
+                self.applySolidPose(self.validatedPose(self.requestedSolidTransforms), reinstalling: true)
                 _ = self.applyStyle()
                 _ = self.updateFeatureHighlights()
                 let camera = self.pendingCamera
@@ -1364,7 +1373,22 @@ final class CADSceneView: NSView {
         return geometry
     }
 
-    private func rebuildGrid() {
+    private func bounds(for pose: SolidPose) -> [Double] {
+        if pose.matrices.isEmpty { return originalMeshBounds.isEmpty ? meshBounds : originalMeshBounds }
+        let posed = solidBounds.map { solid, bounds in
+            ViewportRigidTransform.bounds(bounds, matrix: pose.matrices[solid] ?? matrix_identity_double4x4)
+        }
+        guard !posed.isEmpty else { return meshBounds }
+        return (0..<3).map { axis in posed.map { $0[axis] }.min()! }
+            + (0..<3).map { axis in posed.map { $0[axis + 3] }.max()! }
+    }
+
+    private var fittingBounds: [Double] {
+        guard sectionPlane != nil, requestedSolidTransforms != solidTransforms else { return meshBounds }
+        return bounds(for: validatedPose(requestedSolidTransforms))
+    }
+
+    private func rebuildGrid(minimumZ: Double? = nil) {
         gridNode.childNodes.forEach { $0.removeFromParentNode() }
         let extent = max(rig.radius * 2.8, 1)
         let ideal = extent / 16
@@ -1377,7 +1401,7 @@ final class CADSceneView: NSView {
         let center = rig.orbitCenter
         let centerX = center.x
         let centerY = center.y
-        let z = meshBounds[2] - max(rig.radius * 0.0005, 0.0001)
+        let z = (minimumZ ?? meshBounds[2]) - max(rig.radius * 0.0005, 0.0001)
         var minor = [[Double]]()
         var major = [[Double]]()
         for i in -count...count {
@@ -1408,9 +1432,10 @@ final class CADSceneView: NSView {
         switch action {
         case .fit:
             zoomAnchor = nil
-            rig.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+            let fitted = fittingBounds
+            rig.fit(bounds: fitted, width: bounds.width, height: bounds.height)
             // Guides follow the placed parts, such as a 3D printing plate.
-            if hasModel { rebuildGrid() }
+            if hasModel { rebuildGrid(minimumZ: fitted[2]) }
         case .isometric: rig.yaw = -.pi / 4; rig.elevation = 0.6154797087
         case .front: rig.yaw = -.pi / 2; rig.elevation = 0
         case .back: rig.yaw = .pi / 2; rig.elevation = 0
@@ -1455,7 +1480,7 @@ final class CADSceneView: NSView {
         zoomAnchor = nil
         var destination = destination
         destination.roll = 0
-        destination.fit(bounds: meshBounds, width: bounds.width, height: bounds.height)
+        destination.fit(bounds: fittingBounds, width: bounds.width, height: bounds.height)
         // Activation and occlusion notifications can lag the click that
         // brings a design window forward. Do not let those bits skip motion.
         guard let window, window.isVisible, !window.isMiniaturized, !isHiddenOrHasHiddenAncestor,
