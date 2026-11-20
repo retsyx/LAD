@@ -47,4 +47,19 @@ final class CADSectionPlaneTests: XCTestCase {
         XCTAssertEqual(reverse.to, retained)
         XCTAssertNil(section.clippedSegment(from: removed, to: SIMD3(3, 7, 1)))
     }
+
+    func testRotatingAnOffsetSectionPreservesItsPivot() throws {
+        let initial = try XCTUnwrap(CADSectionPlane(bounds: [-20, -10, -5, 20, 10, 5],
+                                                   toward: SIMD3(1, -1, 1), cameraRight: SIMD3(1, 1, 0)))
+        let placed = try XCTUnwrap(initial.setting(8, for: .offset))
+        let swung = try XCTUnwrap(placed.setting(65, for: .horizontal))
+        let tilted = try XCTUnwrap(swung.setting(25, for: .vertical))
+        XCTAssertEqual(tilted.origin, placed.origin)
+        XCTAssertEqual(tilted.value(for: .offset), -tilted.signedDistance(to: tilted.center), accuracy: 1e-12)
+
+        let moved = try XCTUnwrap(tilted.setting(tilted.value(for: .offset) + 3, for: .offset))
+        XCTAssertEqual(simd_length(moved.origin - tilted.origin - 3 * tilted.normal), 0, accuracy: 1e-12)
+        let centered = try XCTUnwrap(moved.setting(0, for: .offset))
+        XCTAssertEqual(centered.signedDistance(to: centered.center), 0, accuracy: 1e-12)
+    }
 }

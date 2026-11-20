@@ -9,6 +9,7 @@ enum CADSectionHandle: CaseIterable, Hashable {
 /// removed half-space. Angles are relative to the initial centered YZ cut.
 struct CADSectionPlane: Equatable, Sendable {
     let center: SIMD3<Double>
+    let origin: SIMD3<Double>
     let normal: SIMD3<Double>
     let horizontal: SIMD3<Double>
     let vertical: SIMD3<Double>
@@ -18,25 +19,37 @@ struct CADSectionPlane: Equatable, Sendable {
     private let tilt: Double
     private let swing: Double
 
-    var origin: SIMD3<Double> { center + normal * offset }
     var equation: SIMD4<Float> {
-        SIMD4(SIMD3<Float>(normal), Float(-simd_dot(center, normal) - offset))
+        SIMD4(SIMD3<Float>(normal), Float(-simd_dot(origin, normal)))
     }
 
-    init?(bounds: [Double], toward cameraBackward: SIMD3<Double>) {
+    init?(bounds: [Double], toward cameraBackward: SIMD3<Double>, cameraRight: SIMD3<Double>? = nil) {
         guard bounds.count == 6, bounds.allSatisfy({ Float($0).isFinite }),
               bounds[0] <= bounds[3], bounds[1] <= bounds[4], bounds[2] <= bounds[5],
               cameraBackward.x.isFinite else { return nil }
         let low = SIMD3(bounds[0], bounds[1], bounds[2])
         let high = SIMD3(bounds[3], bounds[4], bounds[5])
-        self.init(center: (low + high) / 2, initialSide: cameraBackward.x < 0 ? -1 : 1,
-                  offset: 0, tilt: 0, swing: 0)
+        let center = (low + high) / 2
+        let side = cameraBackward.x < 0 ? -1.0 : 1.0
+        var origin = center
+        if let right = cameraRight {
+            // Place the hub at the edge of the initial cut just once. Orbiting
+            // never chooses another edge, and rotation keeps this pivot fixed.
+            let axis = abs(right.y) >= abs(right.z) ? 1 : 2
+            if abs(right[axis]) > 1e-6 {
+                let left = side * right.x < 0
+                let towardHigh = left == (right[axis] < 0)
+                origin[axis] = towardHigh ? high[axis] : low[axis]
+            }
+        }
+        self.init(center: center, origin: origin, initialSide: side, offset: 0, tilt: 0, swing: 0)
     }
 
-    private init(center: SIMD3<Double>, initialSide: Double, offset: Double, tilt: Double, swing: Double) {
+    private init(center: SIMD3<Double>, origin: SIMD3<Double>, initialSide: Double,
+                 offset: Double? = nil, tilt: Double, swing: Double) {
         self.center = center
+        self.origin = origin
         self.initialSide = initialSide
-        self.offset = offset
         self.tilt = tilt
         self.swing = swing
 
@@ -46,6 +59,7 @@ struct CADSectionPlane: Equatable, Sendable {
         normal = baseline * cos(pitch) + SIMD3(0, 0, sin(pitch))
         horizontal = SIMD3(-baseline.y, baseline.x, 0)
         vertical = simd_cross(normal, horizontal)
+        self.offset = offset ?? simd_dot(origin - center, normal)
     }
 
     func value(for handle: CADSectionHandle) -> Double {
@@ -58,15 +72,17 @@ struct CADSectionPlane: Equatable, Sendable {
 
     func setting(_ value: Double, for handle: CADSectionHandle) -> CADSectionPlane? {
         guard value.isFinite else { return nil }
-        let plane = CADSectionPlane(center: center, initialSide: initialSide,
-                                    offset: handle == .offset ? value : offset,
+        if value == self.value(for: handle) { return self }
+        let nextOrigin = handle == .offset ? origin + normal * (value - offset) : origin
+        let plane = CADSectionPlane(center: center, origin: nextOrigin, initialSide: initialSide,
+                                    offset: handle == .offset ? value : nil,
                                     tilt: handle == .vertical ? value : tilt,
                                     swing: handle == .horizontal ? value : swing)
         return plane.equation.w.isFinite ? plane : nil
     }
 
     func signedDistance(to point: SIMD3<Double>) -> Double {
-        simd_dot(point - center, normal) - offset
+        simd_dot(point - origin, normal)
     }
 
     func contains(_ point: SIMD3<Double>) -> Bool {

@@ -63,13 +63,23 @@ enum CADViewportSectionRendering {
 }
 
 /// Visual section caps use the same display triangles as the clipped scene.
-/// CPU tessellation is cancellable and the renderer prepares its own buffers
-/// before the matching cap replaces the pending one.
+/// Preparation keeps one cut in flight and coalesces later edits to the most
+/// recent request. The caller installs its plane and cap in the same scene update.
 @MainActor
 final class CADViewportSectionCaps {
+    private struct Request {
+        let plane: CADSectionPlane
+        let mesh: CADViewportPreparedMesh
+        let transforms: [Int: simd_double4x4]
+        let hidden: Set<Int>
+        let wire: Bool
+        let renderer: SCNRenderer?
+        let present: @MainActor (CADSectionPlane?, SCNGeometry?) -> Void
+    }
+
     let node = SCNNode()
     private var task: Task<Void, Never>?
-    private var updateID = UUID()
+    private var pending: Request?
     var isPreparing: Bool { task != nil }
 
     init() { node.categoryBitMask = CADViewportCategory.sectionCaps }
@@ -77,36 +87,45 @@ final class CADViewportSectionCaps {
     deinit { task?.cancel() }
 
     func update(plane: CADSectionPlane?, mesh: CADViewportPreparedMesh?, transforms: [Int: simd_double4x4],
-                hidden: Set<Int>, mode: ViewportDisplayMode, renderer: SCNRenderer?, redraw: @escaping @MainActor () -> Void) {
-        task?.cancel()
-        let id = UUID()
-        updateID = id
-        node.geometry = nil
-        task = nil
-        guard let plane, let mesh else { return }
+                hidden: Set<Int>, mode: ViewportDisplayMode, renderer: SCNRenderer?, replacingInputs: Bool = false,
+                present: @escaping @MainActor (CADSectionPlane?, SCNGeometry?) -> Void) {
+        if replacingInputs || plane == nil || mesh == nil {
+            task?.cancel()
+            task = nil
+            pending = nil
+        }
+        guard let plane, let mesh else { present(nil, nil); return }
+        pending = Request(plane: plane, mesh: mesh, transforms: transforms, hidden: hidden,
+                          wire: mode == .wireframe, renderer: renderer, present: present)
+        startNext()
+        if replacingInputs { present(nil, nil) }
+    }
 
-        let wire = mode == .wireframe
-        let worker = Task.detached(priority: .userInitiated) {
+    private func startNext() {
+        guard task == nil, let request = pending else { return }
+        pending = nil
+        let worker = Task.detached(priority: .userInitiated) { [mesh = request.mesh, plane = request.plane,
+                transforms = request.transforms, hidden = request.hidden, wire = request.wire] in
             try CADSectionCapMesh(mesh: mesh, plane: plane, transforms: transforms, hidden: hidden, wire: wire)
         }
         task = Task { [weak self] in
             let result = await withTaskCancellationHandler { try? await worker.value } onCancel: { worker.cancel() }
-            guard !Task.isCancelled, self?.updateID == id else { return }
+            guard !Task.isCancelled else { return }
             let geometry: SCNGeometry? = result.flatMap {
-                $0.positions.isEmpty ? nil : Self.geometry($0, wire: wire)
+                $0.positions.isEmpty ? nil : Self.geometry($0, wire: request.wire)
             }
             let ready: Bool
-            if let geometry, let renderer {
+            if let geometry, let renderer = request.renderer {
                 ready = await withCheckedContinuation { continuation in
                     renderer.prepare([geometry]) { continuation.resume(returning: $0) }
                 }
             } else {
                 ready = geometry != nil
             }
-            guard !Task.isCancelled, let self, self.updateID == id else { return }
-            if ready { self.node.geometry = geometry }
+            guard !Task.isCancelled, let self else { return }
             self.task = nil
-            redraw()
+            self.startNext()
+            request.present(request.plane, ready ? geometry : nil)
         }
     }
 

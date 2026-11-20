@@ -55,6 +55,94 @@ final class ViewportSectionRenderingTests: XCTestCase {
     }
 
     @MainActor
+    func testMovingSectionKeepsTheLastMatchingCapAndCoalescesPendingCuts() async throws {
+        let preview = tube()
+        let mesh = try XCTUnwrap(CADViewportPreparedMesh.prepare(preview))
+        let initial = try XCTUnwrap(CADSectionPlane(bounds: preview.bounds, toward: SIMD3(1, 0, 0)))
+        let firstMove = try XCTUnwrap(initial.setting(1, for: .offset))
+        let skipped = try XCTUnwrap(initial.setting(2, for: .offset))
+        let latest = try XCTUnwrap(initial.setting(3, for: .offset))
+        let caps = CADViewportSectionCaps()
+        let initialReady = expectation(description: "Initial section cap prepared")
+        let latestReady = expectation(description: "Newest section cap prepared")
+        var presented: [CADSectionPlane] = []
+        func request(_ cut: CADSectionPlane) {
+            caps.update(plane: cut, mesh: mesh, transforms: [:], hidden: [], mode: .edges, renderer: nil) { plane, geometry in
+                guard let plane, let geometry else {
+                    XCTFail("Moving an intersecting cut must publish its matching cap.")
+                    return
+                }
+                let offset = plane.value(for: .offset)
+                XCTAssertEqual(Double(geometry.boundingBox.min.x), offset, accuracy: 1e-6)
+                XCTAssertEqual(Double(geometry.boundingBox.max.x), offset, accuracy: 1e-6)
+                caps.node.geometry = geometry
+                presented.append(plane)
+                if plane == initial { initialReady.fulfill() }
+                if plane == firstMove { XCTAssertTrue(caps.isPreparing) }
+                if plane == latest { latestReady.fulfill() }
+            }
+        }
+        request(initial)
+        await fulfillment(of: [initialReady], timeout: 3)
+        let originalCap = try XCTUnwrap(caps.node.geometry)
+
+        request(firstMove)
+        request(skipped)
+        request(latest)
+        XCTAssertIdentical(caps.node.geometry, originalCap)
+        XCTAssertEqual(presented, [initial])
+        await fulfillment(of: [latestReady], timeout: 3)
+        XCTAssertEqual(presented, [initial, firstMove, latest])
+        XCTAssertFalse(caps.isPreparing)
+    }
+
+    @MainActor
+    func testDraggingSectionKeepsTheFramePlaneAndCapTogether() async throws {
+        _ = NSApplication.shared
+        let frame = NSRect(x: 0, y: 0, width: 640, height: 480)
+        let window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let view = CADSceneView(frame: frame)
+        view.preparesRendererResources = false
+        window.contentView = view
+        view.update(mesh: tube(), mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [],
+                    projection: .isometric, sectionEnabled: true)
+        let initialReady = try await view.waitForCaptureResources(until: .now + .seconds(3))
+        XCTAssertTrue(initialReady)
+        let initialPlane = try XCTUnwrap(view.sectionPlane)
+        let cap = try XCTUnwrap(view.scene.rootNode.childNodes.first { $0.categoryBitMask == CADViewportCategory.sectionCaps })
+        let initialGeometry = try XCTUnwrap(cap.geometry)
+        let manipulator = try XCTUnwrap(view.subviews.compactMap { $0 as? CADSectionManipulator }.first)
+        let handles = try XCTUnwrap(manipulator.accessibilityChildren()?.compactMap { $0 as? NSAccessibilityElement })
+        guard handles.count == 3 else { XCTFail("The section manipulator needs three handles."); return }
+        func center(_ handle: NSAccessibilityElement) -> SIMD2<Double> {
+            let rect = window.convertFromScreen(handle.accessibilityFrame())
+            return SIMD2(rect.midX, rect.midY)
+        }
+        let arrow = center(handles[0])
+        let hub = SIMD2(center(handles[1]).x, center(handles[2]).y)
+        let end = arrow + 12 * simd_normalize(arrow - hub)
+        func mouse(_ type: NSEvent.EventType, at point: SIMD2<Double>) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: CGPoint(x: point.x, y: point.y), modifierFlags: [],
+                timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        }
+        manipulator.mouseDown(with: try mouse(.leftMouseDown, at: arrow))
+        manipulator.mouseDragged(with: try mouse(.leftMouseDragged, at: end))
+        let latestPlane = try XCTUnwrap(view.sectionPlane)
+        XCTAssertNotEqual(latestPlane, initialPlane)
+        XCTAssertIdentical(cap.geometry, initialGeometry)
+        XCTAssertEqual(view.makeFrame(width: 640, height: 480).sectionPlane, initialPlane.equation)
+
+        let movedReady = try await view.waitForCaptureResources(until: .now + .seconds(3))
+        XCTAssertTrue(movedReady)
+        let movedGeometry = try XCTUnwrap(cap.geometry)
+        XCTAssertFalse(movedGeometry === initialGeometry)
+        XCTAssertEqual(view.makeFrame(width: 640, height: 480).sectionPlane, latestPlane.equation)
+        XCTAssertEqual(Double(movedGeometry.boundingBox.min.x), latestPlane.origin.x, accuracy: 1e-6)
+    }
+
+    @MainActor
     private func capture(_ view: CADSceneView) async throws -> NSBitmapImageRep {
         let png = try await CADAgentRenderer.capturePNG(view: view)
         return try XCTUnwrap(NSBitmapImageRep(data: png))

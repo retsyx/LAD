@@ -7,75 +7,52 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
     @MainActor private struct Layout: Equatable {
         let center: SIMD2<Double>
         let direction: SIMD2<Double>
-        let unitsPerPoint: Double
-        let sitsLeft: Bool
+        let pointsPerMillimeter: Double
+        let relativeDepthChange: Double
 
         func line(for handle: CADSectionHandle) -> (start: SIMD2<Double>, end: SIMD2<Double>) {
             switch handle {
-            case .offset: return (center, center + 64 * direction)
-            case .vertical: return (center - SIMD2(0, 25), center + SIMD2(0, 35))
-            case .horizontal: return (center + SIMD2(25, 0), center - SIMD2(35, 0))
+            case .offset: return (center, center + 44 * direction)
+            case .vertical: return (center - SIMD2(0, 15), center + SIMD2(0, 23))
+            case .horizontal: return (center + SIMD2(15, 0), center - SIMD2(23, 0))
             }
         }
 
         var drawingBounds: NSRect {
-            NSRect(x: center.x - 76, y: center.y - 76, width: 152, height: 152)
+            NSRect(x: center.x - 60, y: center.y - 60, width: 120, height: 120)
         }
 
-        static func make(plane: CADSectionPlane, projection: CameraRig.Projection, bounds: [Double],
-                         editing: Layout?, rotates: Bool) -> Self? {
-            guard projection.width > 0, projection.height > 0, bounds.count == 6 else { return nil }
-            let low = SIMD3(bounds[0], bounds[1], bounds[2])
-            let high = SIMD3(bounds[3], bounds[4], bounds[5])
-            let corners = (0..<8).map {
-                SIMD3($0 & 1 == 0 ? low.x : high.x, $0 & 2 == 0 ? low.y : high.y, $0 & 4 == 0 ? low.z : high.z)
+        func offsetChange(for drag: SIMD2<Double>) -> Double {
+            let travel = simd_dot(drag, direction)
+            // Perspective travel is pointsPerMillimeter * offset / (1 + depth change).
+            // Invert it and bound the gain near the line's vanishing point.
+            let rate = max(pointsPerMillimeter - travel * relativeDepthChange, 0.1 * pointsPerMillimeter)
+            return travel / rate
+        }
+
+        static func make(plane: CADSectionPlane, projection: CameraRig.Projection) -> Self? {
+            guard projection.width > 0, projection.height > 0 else { return nil }
+            let hub = projection.project(plane.origin)
+            guard hub.depth > 0, hub.screen.x.isFinite, hub.screen.y.isFinite else { return nil }
+            let extent = projection.orthographic ? projection.orthographicScale : hub.depth * projection.tangent
+            let unitsPerPoint = 2 * extent / projection.height
+            guard unitsPerPoint.isFinite, unitsPerPoint > 0 else { return nil }
+
+            let depthChange = projection.orthographic ? 0 : -simd_dot(plane.normal, projection.backward) / hub.depth
+            let screenCenter = SIMD2(projection.width, projection.height) / 2
+            let normalInView = SIMD2(simd_dot(plane.normal, projection.right), simd_dot(plane.normal, projection.up))
+            let velocity = normalInView / unitsPerPoint - (hub.screen - screenCenter) * depthChange
+            let speed = simd_length(velocity)
+            guard speed.isFinite else { return nil }
+            if speed * unitsPerPoint < 1e-6 {
+                // A face-on normal has no screen direction. Keep the handle
+                // usable while its motion remains along the same world axis.
+                return Self(center: hub.screen, direction: SIMD2(-sqrt(0.75), -0.5),
+                            pointsPerMillimeter: 1 / unitsPerPoint, relativeDepthChange: 0)
             }
-            let distances = corners.map { simd_dot($0 - plane.origin, plane.normal) }
-            var cut = [SIMD3<Double>]()
-            for index in corners.indices {
-                for bit in [1, 2, 4] where index & bit == 0 {
-                    let other = index | bit
-                    let a = distances[index], b = distances[other]
-                    if a == 0 { cut.append(corners[index]) }
-                    if b == 0 { cut.append(corners[other]) }
-                    if (a < 0 && b > 0) || (a > 0 && b < 0) {
-                        cut.append(simd_mix(corners[index], corners[other], SIMD3(repeating: a / (a - b))))
-                    }
-                }
-            }
-            let points = (cut.isEmpty ? corners : cut).map(projection.project)
-                .filter { $0.depth > 0 && $0.screen.x.isFinite && $0.screen.y.isFinite }.map(\.screen)
-            let sample = cut.isEmpty ? plane.center : cut.reduce(.zero, +) / Double(cut.count)
-            let start = projection.project(sample)
-            let step = max(0.001, simd_length(high - low) * 0.001)
-            let end = projection.project(sample + plane.normal * step)
-            let projectedNormal = (end.screen - start.screen) / step
-            let normalLength = simd_length(projectedNormal)
-            let viewDepth = start.depth > 0 ? start.depth : projection.orthographicScale / projection.tangent
-            let unitsPerPoint = 2 * (projection.orthographic ? projection.orthographicScale : viewDepth * projection.tangent)
-                / projection.height
-            let direction: SIMD2<Double>
-            let dragScale: Double
-            if end.depth > 0, start.depth > 0, normalLength.isFinite, normalLength * unitsPerPoint >= 0.12 {
-                direction = projectedNormal / normalLength
-                dragScale = 1 / normalLength
-            } else {
-                // A plane facing the camera has no useful projected normal.
-                // Keep the arrow operable with a stable screen-space direction.
-                direction = SIMD2(-0.8660254, -0.5)
-                dragScale = unitsPerPoint
-            }
-            guard dragScale.isFinite, dragScale > 0 else { return nil }
-            let xs = points.map(\.x), ys = points.map(\.y)
-            let left = editing?.sitsLeft ?? (direction.x <= 0)
-            let x = left ? (xs.min() ?? projection.width / 2) - 38 : (xs.max() ?? projection.width / 2) + 38
-            let y = ((ys.min() ?? projection.height / 2) + (ys.max() ?? projection.height / 2)) / 2
-            let clampedCenter = SIMD2(
-                min(max(x, min(82, projection.width / 2)), max(projection.width - 82, projection.width / 2)),
-                min(max(y, min(110, projection.height / 2)), max(projection.height - 146, projection.height / 2))
-            )
-            return Self(center: rotates ? (editing?.center ?? clampedCenter) : clampedCenter,
-                        direction: direction, unitsPerPoint: dragScale, sitsLeft: left)
+            let minimumSpeed = 0.12 / unitsPerPoint
+            return Self(center: hub.screen, direction: velocity / speed,
+                        pointsPerMillimeter: max(speed, minimumSpeed), relativeDepthChange: speed >= minimumSpeed ? depthChange : 0)
         }
     }
 
@@ -140,10 +117,9 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(plane: CADSectionPlane?, projection: CameraRig.Projection, bounds: [Double]) {
+    func update(plane: CADSectionPlane?, projection: CameraRig.Projection) {
         self.plane = plane
-        guard let plane, let layout = Layout.make(plane: plane, projection: projection, bounds: bounds,
-                                                   editing: edit?.layout, rotates: edit.map { $0.handle != .offset } == true) else {
+        guard let plane, let layout = Layout.make(plane: plane, projection: projection) else {
             finishEdit()
             handles = nil
             isHidden = true
@@ -207,10 +183,10 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         guard let handles else { return nil }
         // A foreshortened normal can project on top of a rotation bar.
         // Give the visible rotation grips their own reliable targets.
-        for bar in [CADSectionHandle.vertical, .horizontal] where simd_distance(point, handles.line(for: bar).end) < 9 {
+        for bar in [CADSectionHandle.vertical, .horizontal] where simd_distance(point, handles.line(for: bar).end) <= 13 {
             return bar
         }
-        var nearest = 10.0
+        var nearest = 13.0
         var target: CADSectionHandle?
         for handle in CADSectionHandle.allCases {
             let line = handles.line(for: handle)
@@ -236,7 +212,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
             let shaft = NSBezierPath()
             shaft.move(to: NSPoint(line.start))
             shaft.line(to: NSPoint(handle == .offset ? line.end - 11 * handles.direction : line.end))
-            shaft.lineWidth = handle == .offset ? 3.5 : 1.75
+            shaft.lineWidth = handle == .offset ? 5 : 3
             shaft.lineCapStyle = .round
             shaft.stroke()
             if handle == .offset {
@@ -244,20 +220,20 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
                 let tangent = SIMD2(-direction.y, direction.x)
                 let arrow = NSBezierPath()
                 arrow.move(to: NSPoint(line.end))
-                arrow.line(to: NSPoint(line.end - 13 * direction + 6 * tangent))
-                arrow.line(to: NSPoint(line.end - 13 * direction - 6 * tangent))
+                arrow.line(to: NSPoint(line.end - 14 * direction + 9 * tangent))
+                arrow.line(to: NSPoint(line.end - 14 * direction - 9 * tangent))
                 arrow.close()
                 arrow.fill()
             } else {
                 let grip = handle == .vertical
-                    ? NSRect(x: line.end.x - 3, y: line.end.y - 7, width: 6, height: 14)
-                    : NSRect(x: line.end.x - 7, y: line.end.y - 3, width: 14, height: 6)
-                NSBezierPath(roundedRect: grip, xRadius: 3, yRadius: 3).fill()
+                    ? NSRect(x: line.end.x - 5, y: line.end.y - 8, width: 10, height: 16)
+                    : NSRect(x: line.end.x - 8, y: line.end.y - 5, width: 16, height: 10)
+                NSBezierPath(roundedRect: grip, xRadius: 5, yRadius: 5).fill()
             }
         }
         gold.setFill()
-        NSBezierPath(ovalIn: NSRect(x: handles.center.x - 5, y: handles.center.y - 5,
-                                   width: 10, height: 10)).fill()
+        NSBezierPath(ovalIn: NSRect(x: handles.center.x - 6, y: handles.center.y - 6,
+                                   width: 12, height: 12)).fill()
     }
 
     fileprivate func beginEditing(_ handle: CADSectionHandle, mouseStart: SIMD2<Double>? = nil) {
@@ -281,7 +257,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         let value = edit.startingPlane.value(for: edit.handle)
         let change: Double
         switch edit.handle {
-        case .offset: change = simd_dot(delta, edit.layout.direction) * edit.layout.unitsPerPoint
+        case .offset: change = edit.layout.offsetChange(for: delta)
         case .vertical: change = delta.y * 0.5
         case .horizontal: change = delta.x * 0.5
         }

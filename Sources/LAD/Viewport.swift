@@ -235,7 +235,9 @@ final class CADSceneView: NSView {
     private var solidBounds: [Int: [Double]] = [:]
     private var originalMeshBounds: [Double] = []
     private var sectionEnabled = false
+    /// The manipulator can lead the cut while the matching cap is prepared.
     private(set) var sectionPlane: CADSectionPlane?
+    private var presentedSectionPlane: CADSectionPlane?
     private var retainedSectionPlane: CADSectionPlane?
     private var sectionMesh: CADViewportPreparedMesh?
     private let sectionCaps = CADViewportSectionCaps()
@@ -597,47 +599,62 @@ final class CADSceneView: NSView {
         }
         if sectionPlane == nil {
             openSectionIfRequested()
-        } else {
-            if poseChanged || visibilityChanged || sectionStyleChanged { updateSectionCaps() }
-            if poseChanged { updateSectionManipulator() }
+        } else if poseChanged || visibilityChanged || sectionStyleChanged {
+            updateSectionCaps(replacingInputs: true)
         }
         if meshChanged || poseChanged || styleChanged || featuresChanged || gridChanged { requestRedraw() }
     }
 
     private func openSectionIfRequested() {
         guard sectionEnabled, hasModel, sectionPlane == nil else { return }
-        setSectionPlane(retainedSectionPlane ?? CADSectionPlane(bounds: meshBounds, toward: rig.backward))
+        setSectionPlane(retainedSectionPlane ?? CADSectionPlane(bounds: meshBounds, toward: rig.backward, cameraRight: rig.right))
     }
 
     private func setSectionPlane(_ plane: CADSectionPlane?) {
         guard sectionPlane != plane else { return }
         sectionPlane = plane
         if let plane { retainedSectionPlane = plane }
+        updateSectionCaps()
+        updateSectionManipulator()
+    }
+
+    private func presentSection(_ plane: CADSectionPlane?, cap: SCNGeometry?) {
+        let changed = presentedSectionPlane != plane
+        guard changed || sectionCaps.node.geometry !== cap else {
+            resumeCaptureWaitersIfReady()
+            return
+        }
+        presentedSectionPlane = plane
         projectedFeatures = nil
         zoomAnchor = nil
         setHoveredFeature(nil)
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
-        for root in [modelNode, edgeNode, featureNode] {
-            root.enumerateChildNodes { node, _ in
-                for material in node.geometry?.materials ?? [] {
-                    CADViewportSectionRendering.apply(plane, to: material)
+        sectionCaps.node.geometry = cap
+        if changed {
+            for root in [modelNode, edgeNode, featureNode] {
+                root.enumerateChildNodes { node, _ in
+                    for material in node.geometry?.materials ?? [] {
+                        CADViewportSectionRendering.apply(plane, to: material)
+                    }
                 }
             }
         }
         SCNTransaction.commit()
-        updateSectionCaps()
-        updateSectionManipulator()
+        resumeCaptureWaitersIfReady()
         requestRedraw()
     }
 
-    private func updateSectionCaps() {
+    private func updateSectionCaps(replacingInputs: Bool = false) {
         sectionCaps.update(plane: sectionPlane, mesh: sectionMesh, transforms: solidMatrices,
-                           hidden: hiddenSolids, mode: mode, renderer: preparesRendererResources ? renderer : nil) { [weak self] in
-            self?.resumeCaptureWaitersIfReady()
-            self?.requestRedraw()
+                           hidden: hiddenSolids, mode: mode, renderer: preparesRendererResources ? renderer : nil,
+                           replacingInputs: replacingInputs) { [weak self] plane, cap in
+            guard let self else { return }
+            // New poses, visibility or wire styling invalidate the old cap,
+            // but the published clipping plane still applies to those solids.
+            let resetCap = replacingInputs && plane == nil && self.sectionPlane != nil
+            self.presentSection(resetCap ? self.presentedSectionPlane : plane, cap: cap)
         }
-        resumeCaptureWaitersIfReady()
     }
 
     private func updateSectionManipulator() {
@@ -653,7 +670,7 @@ final class CADSceneView: NSView {
             sectionManipulator = manipulator
         }
         sectionManipulator?.update(plane: sectionPlane,
-                                   projection: rig.projection(width: bounds.width, height: bounds.height), bounds: meshBounds)
+                                   projection: rig.projection(width: bounds.width, height: bounds.height))
         if sectionPlane == nil {
             sectionManipulator?.removeFromSuperview()
             sectionManipulator = nil
@@ -1001,9 +1018,9 @@ final class CADSceneView: NSView {
                     node.addChildNode(Self.translucentFeatureCopy(of: geometry, shadedAs: overlay, removal: false))
                     node.addChildNode(Self.translucentFeatureCopy(of: geometry, shadedAs: part, removal: true))
                 }
-                if let sectionPlane {
+                if let plane = presentedSectionPlane {
                     for surface in [node] + node.childNodes {
-                        surface.geometry?.materials.forEach { CADViewportSectionRendering.apply(sectionPlane, to: $0) }
+                        surface.geometry?.materials.forEach { CADViewportSectionRendering.apply(plane, to: $0) }
                     }
                 }
                 featureNode.addChildNode(node)
@@ -1143,7 +1160,7 @@ final class CADSceneView: NSView {
         var frame = CADViewportFrame(width: width, height: height, referenceHeight: Double(bounds.height),
                                      translucent: mode == .translucent, palette: Self.highlightPalette)
         guard hasModel, !isPreparingResources, width > 0, height > 0 else { return frame }
-        frame.sectionPlane = sectionPlane?.equation ?? .zero
+        frame.sectionPlane = presentedSectionPlane?.equation ?? .zero
         let projection = assemblyGrabProjection(viewportSize: CGSize(width: width, height: height))
         let pixels = SIMD2(Double(width), Double(height))
         var area: CADSilhouetteBatching.Rect?
@@ -1266,7 +1283,7 @@ final class CADSceneView: NSView {
             // depth writing and opaque materials when leaving this mode.
             if let material = node.geometry?.firstMaterial {
                 Self.configureFaceMaterial(material, translucent: translucent)
-                if let sectionPlane { CADViewportSectionRendering.apply(sectionPlane, to: material) }
+                if let plane = presentedSectionPlane { CADViewportSectionRendering.apply(plane, to: material) }
             }
             for copy in node.childNodes where copy.isHidden == translucent { copy.isHidden = !translucent }
             node.geometry?.firstMaterial?.diffuse.contents = selected && mode != .wireframe
@@ -2138,7 +2155,7 @@ final class CADSceneView: NSView {
         // Snapshot the camera once. Recomputing its trigonometric basis for
         // every polyline endpoint stalls the first hover after navigation.
         let projection = rig.projection(width: Double(bounds.width), height: max(Double(bounds.height), 1))
-        let plane = sectionPlane
+        let plane = presentedSectionPlane
         func worldPoint(_ position: [Double], solid: Int) -> SIMD3<Double>? {
             guard validFeaturePoint(position) else { return nil }
             let original = SIMD4(position[0], position[1], position[2], 1)
@@ -2190,7 +2207,7 @@ final class CADSceneView: NSView {
         // Wireframe solids can be visually hidden while their analytic edges
         // remain visible. Query those surfaces too, then explicitly discard
         // user-hidden parts before either selecting or anchoring a zoom.
-        let plane = sectionPlane
+        let plane = presentedSectionPlane
         if let plane {
             guard let kept = plane.clippedSegment(from: ray.from, to: ray.to) else { return nil }
             // Include the intersection itself despite rounding when SceneKit
