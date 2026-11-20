@@ -634,6 +634,10 @@ final class CADSceneView: NSView {
                                normal: SIMD3(direction.x, direction.y, direction.z), cameraRight: rig.right)
     }
 
+    func configureAgentSection(_ plane: CADSectionPlane) {
+        setSectionPlane(plane)
+    }
+
     private func setSectionPlane(_ plane: CADSectionPlane?) {
         guard sectionPlane != plane else { return }
         sectionPlane = plane
@@ -682,7 +686,12 @@ final class CADSceneView: NSView {
     }
 
     private func updateSectionManipulator() {
-        if sectionPlane != nil, sectionManipulator == nil {
+        guard sectionEnabled, let sectionPlane else {
+            sectionManipulator?.removeFromSuperview()
+            sectionManipulator = nil
+            return
+        }
+        if sectionManipulator == nil {
             let manipulator = CADSectionManipulator(onBegin: { [weak self] in
                 self?.cancelAssemblyGrab()
                 self?.cancelCameraTransition()
@@ -695,10 +704,6 @@ final class CADSceneView: NSView {
         }
         sectionManipulator?.update(plane: sectionPlane,
                                    projection: rig.projection(width: bounds.width, height: bounds.height))
-        if sectionPlane == nil {
-            sectionManipulator?.removeFromSuperview()
-            sectionManipulator = nil
-        }
     }
 
     /// Moving a rigid body changes node poses only. Display buffers, native

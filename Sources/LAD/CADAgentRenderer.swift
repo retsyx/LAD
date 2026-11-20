@@ -30,13 +30,13 @@ enum CADAgentRenderer {
         return captured.png
     }
 
-    /// The returned pose and projection describe the actual detached camera
-    /// captured with these pixels, rather than the optional requested controls.
+    /// Render the detached camera and optional section with their effective parameters.
     static func renderWithMetadata(preview: PreviewMesh, view: String = "isometric",
                                    projection: ViewportProjectionMode = .isometric,
                                    display: ViewportDisplayMode = .edges, hiddenSolids: Set<Int> = [],
                                    solidColors: [Int: PartColor] = [:], width: Int = 1_024, height: Int = 768,
-                                   camera: CADAgentCamera = .init()) async throws -> (png: Data, metadata: [String: Any]) {
+                                   camera: CADAgentCamera = .init(), sectionPlane: CADSectionPlane? = nil) async throws
+        -> (png: Data, metadata: [String: Any]) {
         try validateDimensions(width: width, height: height)
         try camera.validate()
         guard ["isometric", "front", "back", "left", "right", "top", "bottom"].contains(view) else {
@@ -64,8 +64,16 @@ enum CADAgentRenderer {
         guard surface.hasRenderableGeometry else { throw LADError.message("The design has no renderable geometry.") }
         try surface.configureAgentView(named: view, camera: camera)
         surface.layout()
+        if let sectionPlane { surface.configureAgentSection(sectionPlane) }
         try await waitForPreparation(surface)
-        return try await snapshotWithMetadata(of: surface, width: width, height: height)
+        var captured = try await snapshotWithMetadata(of: surface, width: width, height: height)
+        if let sectionPlane {
+            captured.metadata["sectionPlane"] = [
+                "point": [sectionPlane.origin.x, sectionPlane.origin.y, sectionPlane.origin.z],
+                "normal": [sectionPlane.normal.x, sectionPlane.normal.y, sectionPlane.normal.z]
+            ]
+        }
+        return captured
     }
 
     static func capturePNG(view: CADSceneView) async throws -> Data {

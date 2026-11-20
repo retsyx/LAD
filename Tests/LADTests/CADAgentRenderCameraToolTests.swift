@@ -56,6 +56,79 @@ final class CADAgentRenderCameraToolTests: XCTestCase {
         XCTAssertEqual(metadata["byteCount"] as? Int, png.count)
     }
 
+    @MainActor
+    func testInvalidSectionPlaneFailsBeforeAnyBuildOrImage() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tools = try CADAgentTools(directory: root, python: "/missing/python", threads: 1,
+            current: nil, currentPreview: nil, engine: EngineService())
+        let invalid: [Any] = [
+            true,
+            ["normal": [1, 0, 0]],
+            ["point": [0, 0, 0]],
+            ["point": [0, 0], "normal": [1, 0, 0]],
+            ["point": [0, Double.infinity, 0], "normal": [1, 0, 0]],
+            ["point": [1_000_001, 0, 0], "normal": [1, 0, 0]],
+            ["point": [0, 0, 0], "normal": [true, 0, 0]],
+            ["point": [0, 0, 0], "normal": [Double.nan, 0, 0]],
+            ["point": [0, 0, 0], "normal": [0, 0, 0]]
+        ]
+        for plane in invalid {
+            do {
+                _ = try await tools.handle(name: "lad_render", arguments: ["sectionPlane": plane])
+                XCTFail("Invalid section plane was accepted: \(plane)")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.localizedCaseInsensitiveContains("section"), error.localizedDescription)
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("renders").path))
+    }
+
+    @MainActor
+    func testToolRendersOnlyTheRequestedSectionInBothProjections() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let preview = box()
+        let tools = try CADAgentTools(directory: root, python: "/missing/python", threads: 1,
+            current: .bracket, currentPreview: preview, engine: EngineService())
+        for projection in ["perspective", "isometric"] {
+            var arguments: [String: Any] = [
+                "view": "top", "projection": projection, "display": "shaded", "width": 320, "height": 256
+            ]
+            arguments["sectionPlane"] = ["point": [1.25, 0, 0], "normal": [3, 0, 0]]
+            let section = try await tools.handle(name: "lad_render", arguments: arguments)
+            let plane = try XCTUnwrap(section.metadata["sectionPlane"] as? [String: Any])
+            XCTAssertEqual(plane["point"] as? [Double], [1.25, 0, 0])
+            XCTAssertEqual(plane["normal"] as? [Double], [1, 0, 0])
+
+            arguments.removeValue(forKey: "sectionPlane")
+            let whole = try await tools.handle(name: "lad_render", arguments: arguments)
+            XCTAssertNil(whole.metadata["sectionPlane"])
+            XCTAssertEqual(section.metadata["cameraPosition"] as? [Double], whole.metadata["cameraPosition"] as? [Double])
+
+            let rig = try CADAgentCamera().resolved(view: "top", bounds: preview.bounds, width: 320, height: 256,
+                                                    orthographic: projection == "isometric").rig
+            let retained = rig.project(SIMD3(0.65, 0, 1), width: 320, height: 256)
+            let removed = rig.project(SIMD3(2.25, 0, 1), width: 320, height: 256)
+            let sectionPNG = try XCTUnwrap(section.image?.data)
+            let wholePNG = try XCTUnwrap(whole.image?.data)
+            let sectionImage = try XCTUnwrap(NSBitmapImageRep(data: sectionPNG))
+            let wholeImage = try XCTUnwrap(NSBitmapImageRep(data: wholePNG))
+            let background = SIMD2<Double>(4, 4)
+            let sectionBackground = try red(sectionImage, at: background)
+            let wholeBackground = try red(wholeImage, at: background)
+            XCTAssertGreaterThan(abs(try red(wholeImage, at: retained) - wholeBackground), 0.1, projection)
+            XCTAssertGreaterThan(abs(try red(wholeImage, at: removed) - wholeBackground), 0.1, projection)
+            XCTAssertGreaterThan(abs(try red(sectionImage, at: retained) - sectionBackground), 0.1, projection)
+            XCTAssertEqual(try red(sectionImage, at: removed), sectionBackground, accuracy: 0.02, projection)
+        }
+    }
+
+    private func red(_ image: NSBitmapImageRep, at point: SIMD2<Double>) throws -> CGFloat {
+        let x = Int(point.x.rounded()), y = image.pixelsHigh - Int(point.y.rounded())
+        return try XCTUnwrap(image.colorAt(x: x, y: y)?.usingColorSpace(.sRGB)).redComponent
+    }
+
     private func content(_ result: CADAgentToolResult) throws -> [String: Any] {
         result.metadata
     }

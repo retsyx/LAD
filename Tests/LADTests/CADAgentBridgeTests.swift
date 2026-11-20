@@ -136,8 +136,12 @@ final class CADAgentBridgeTests: XCTestCase {
         let valid = try object(try await tool(client, name: "lad_validate", arguments: ["artifactID": artifact]))
         XCTAssertEqual(valid["valid"] as? Bool, true)
         let rendered = try await tool(client, name: "lad_render", arguments: ["artifactID": artifact, "view": "isometric",
-            "yawDegrees": 28.5, "elevationDegrees": 38.2, "rollDegrees": -12, "zoom": 1.5, "width": 512, "height": 512])
+            "yawDegrees": 28.5, "elevationDegrees": 38.2, "rollDegrees": -12, "zoom": 1.5, "width": 512, "height": 512,
+            "sectionPlane": ["point": [2.5, 0, 0], "normal": [2, 0, 0]]])
         let camera = try object(rendered)
+        let section = try XCTUnwrap(camera["sectionPlane"] as? [String: Any])
+        XCTAssertEqual(section["point"] as? [Double], [2.5, 0, 0])
+        XCTAssertEqual(section["normal"] as? [Double], [1, 0, 0])
         XCTAssertEqual(camera["customCamera"] as? Bool, true)
         XCTAssertEqual(camera["zoom"] as? Double, 1.5)
         XCTAssertEqual((camera["cameraParameters"] as? [String: Any])?["yawDegrees"] as? Double, 28.5)

@@ -24,6 +24,26 @@ final class AgentToolCatalogTests: XCTestCase {
         }
     }
 
+    func testRenderSectionPlaneIsAdvertisedAsAnOptionalPairOfVectors() throws {
+        for catalog in [try AgentToolCatalog.native(), try AgentToolCatalog.external()] {
+            let render = try XCTUnwrap(catalog["lad_render"])
+            let properties = try XCTUnwrap(render.inputSchema["properties"] as? [String: [String: Any]])
+            let sectionPlane = try XCTUnwrap(properties["sectionPlane"])
+            let vectors = try XCTUnwrap(sectionPlane["properties"] as? [String: [String: Any]])
+            XCTAssertFalse((render.inputSchema["required"] as? [String])?.contains("sectionPlane") == true)
+            XCTAssertEqual(sectionPlane["type"] as? String, "object")
+            XCTAssertEqual(Set(sectionPlane["required"] as? [String] ?? []), ["point", "normal"])
+            XCTAssertEqual(Set(vectors.keys), ["point", "normal"])
+            XCTAssertEqual(sectionPlane["additionalProperties"] as? Bool, false)
+            for vector in vectors.values {
+                XCTAssertEqual(vector["type"] as? String, "array")
+                XCTAssertEqual(vector["minItems"] as? Int, 3)
+                XCTAssertEqual(vector["maxItems"] as? Int, 3)
+                XCTAssertEqual((vector["items"] as? [String: Any])?["type"] as? String, "number")
+            }
+        }
+    }
+
     func testCatalogRejectsDuplicateToolsAndHostArgumentsOutsideTheSchema() throws {
         func catalog(_ tools: [[String: Any]]) throws -> Data { try JSONSerialization.data(withJSONObject: tools) }
         func tool(_ name: String, host: [String: Any]) -> [String: Any] {

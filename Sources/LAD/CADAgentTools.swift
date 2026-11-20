@@ -669,7 +669,7 @@ final class CADAgentTools {
         case "lad_render":
             try allowed(arguments, ["artifactID", "view", "projection", "display", "width", "height", "solidIndices",
                                     "yawDegrees", "elevationDegrees", "rollDegrees", "cameraPosition", "cameraTarget", "zoom",
-                                    "jointPositions", "drivingJoint", "printLayout"])
+                                    "jointPositions", "drivingJoint", "printLayout", "sectionPlane"])
             let printLayout = try bool("printLayout", arguments) ?? false
             let view = try string("view", arguments) ?? "isometric"
             guard ["isometric", "front", "back", "top", "bottom", "left", "right"].contains(view),
@@ -680,6 +680,7 @@ final class CADAgentTools {
             let width = try integer("width", arguments, fallback: 1024, range: 256...2048)
             let height = try integer("height", arguments, fallback: 768, range: 256...2048)
             let camera = try renderCamera(arguments)
+            let sectionPlane = try renderSectionPlane(arguments)
             let jointPositions = try renderJointPositions(arguments)
             let drivingJoint = try string("drivingJoint", arguments)
             if let drivingJoint {
@@ -722,7 +723,8 @@ final class CADAgentTools {
             let selected = try indices(arguments, preview: preview)
             let hidden = selected.map { Set(0..<preview.solids).subtracting($0) } ?? []
             let captured = try await CADAgentRenderer.renderWithMetadata(preview: preview, view: view, projection: projection,
-                display: display, hiddenSolids: hidden, solidColors: renderColors(for: artifact), width: width, height: height, camera: camera)
+                display: display, hiddenSolids: hidden, solidColors: renderColors(for: artifact), width: width, height: height,
+                camera: camera, sectionPlane: sectionPlane)
             try checkCancellation()
             let url = try workspace.write(captured.png, path: "renders/\(UUID().uuidString).png")
             var metadata = captured.metadata
@@ -1349,6 +1351,34 @@ final class CADAgentTools {
         camera.zoom = try scalar("zoom") ?? 1
         try camera.validate()
         return camera
+    }
+    private func renderSectionPlane(_ values: [String: Any]) throws -> CADSectionPlane? {
+        guard let raw = values["sectionPlane"] else { return nil }
+        guard let section = raw as? [String: Any], Set(section.keys) == ["point", "normal"] else {
+            throw LADError.message("The sectionPlane must contain a point and normal.")
+        }
+        func vector(_ key: String) throws -> SIMD3<Double> {
+            let invalid = LADError.message("The sectionPlane.\(key) must contain three finite numbers.")
+            guard let list = section[key] as? [Any], list.count == 3 else { throw invalid }
+            let components = try list.map { raw -> Double in
+                guard let value = raw as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+                      value.doubleValue.isFinite else { throw invalid }
+                return value.doubleValue
+            }
+            return SIMD3(components[0], components[1], components[2])
+        }
+        let point = try vector("point")
+        guard (0..<3).allSatisfy({ abs(point[$0]) <= 1_000_000 }) else {
+            throw LADError.message("The sectionPlane.point coordinates must be within ±1,000,000 mm.")
+        }
+        let normal = try vector("normal")
+        // Rescale first so the length calculation handles any finite nonzero direction.
+        let scale = max(abs(normal.x), abs(normal.y), abs(normal.z))
+        guard scale > 0,
+              let plane = CADSectionPlane(point: point, normal: normal / scale, cameraRight: SIMD3(1, 0, 0)) else {
+            throw LADError.message("The sectionPlane.normal must be nonzero.")
+        }
+        return plane
     }
     private func renderJointPositions(_ values: [String: Any]) throws -> [String: Double]? {
         guard let raw = values["jointPositions"] else { return nil }

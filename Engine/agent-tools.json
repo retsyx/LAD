@@ -518,7 +518,7 @@
   },
   {
     "name": "lad_render",
-    "description": "Render an artifact through LAD's native camera, lights and display pipeline using a preset or arbitrary camera. Returns a PNG image attachment for visual review without changing the user's view. Camera coordinates are CAD-world millimetres; angles are degrees. Zoom 1 uses automatic fit, 2 doubles magnification, and 0.5 halves it. An explicit cameraPosition defines the base eye position. Perspective zoom dollies that position around cameraTarget by dividing its target distance; orthographic zoom keeps the eye position unchanged and divides the view scale. Do not combine cameraPosition with yawDegrees or elevationDegrees.",
+    "description": "Render an artifact through LAD's native camera, lights and display pipeline using a preset or arbitrary camera. Returns a PNG image attachment for visual review without changing the user's view. Use sectionPlane to inspect a cross-section in the rendered image. Camera coordinates are CAD-world millimetres; angles are degrees. Zoom 1 uses automatic fit, 2 doubles magnification, and 0.5 halves it. An explicit cameraPosition defines the base eye position. Perspective zoom dollies that position around cameraTarget by dividing its target distance; orthographic zoom keeps the eye position unchanged and divides the view scale. Do not combine cameraPosition with yawDegrees or elevationDegrees.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -583,6 +583,37 @@
           "maximum": 1000000,
           "default": 1,
           "description": "Positive magnification multiplier: 1 is automatic fit, 2 zooms in, 0.5 zooms out. With cameraPosition, 1 uses that exact base position. Perspective zoom divides the base eye-to-target distance; orthographic zoom keeps the eye unchanged and divides the orthographic view scale. Does not change geometry."
+        },
+        "sectionPlane": {
+          "type": "object",
+          "description": "Optional section cut for this render. Geometry on the positive side of the plane is clipped. The result reports the plane with a unit normal.",
+          "properties": {
+            "point": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "minimum": -1000000,
+                "maximum": 1000000
+              },
+              "minItems": 3,
+              "maxItems": 3,
+              "description": "[x,y,z] point on the plane in CAD-world millimetres, after any assembly pose or printing layout is applied."
+            },
+            "normal": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              },
+              "minItems": 3,
+              "maxItems": 3,
+              "description": "Finite nonzero CAD-world [x,y,z] direction toward the clipped side. LAD normalizes this vector."
+            }
+          },
+          "required": [
+            "point",
+            "normal"
+          ],
+          "additionalProperties": false
         },
         "jointPositions": {
           "type": "object",
