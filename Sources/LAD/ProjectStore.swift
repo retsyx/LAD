@@ -96,6 +96,10 @@ enum ProjectStore {
                 throw invalid("The saved recent part colors are invalid.")
             }
         }
+        if let materials = project.projectMaterials {
+            do { try PartMaterialState.validateDesignMaterials(materials) }
+            catch { throw invalid("The saved design materials are invalid.") }
+        }
         guard project.revisions.count <= 1_000, project.messages.count <= 10_000 else {
             throw invalid("Design contains too many revisions or messages.")
         }
@@ -197,6 +201,16 @@ enum ProjectStore {
             let physicalIDs = Set(colorNodes.flatMap(\.flattened).filter { !$0.solidIndices.isEmpty }.map(\.id))
             guard colors.count <= 4_096, colors.allSatisfy({ physicalIDs.contains($0.key) && $0.value.isValid }) else {
                 throw invalid("The saved part colors are invalid or refer to missing parts.")
+            }
+        }
+        if let materials = revision.partMaterials {
+            let nodes = revision.partLayout?.nodes ?? parts ?? (0..<solidCount).map {
+                PartNode(id: "solid/\($0)", name: "Part \($0 + 1)", solidIndices: [$0])
+            }
+            let physicalIDs = PartMaterialState.physicalIDs(in: nodes)
+            guard materials.count <= PartMaterialState.maximumAssignments,
+                  materials.allSatisfy({ physicalIDs.contains($0.key) && $0.value.isValid }) else {
+                throw invalid("The saved part materials are invalid or refer to missing parts.")
             }
         }
     }

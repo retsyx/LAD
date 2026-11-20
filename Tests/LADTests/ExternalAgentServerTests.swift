@@ -110,6 +110,37 @@ final class ExternalAgentServerTests: XCTestCase {
     }
 
     @MainActor
+    func testCommittedCandidatesCarryMaterialAssignmentsAndDesignMaterials() throws {
+        let fixture = try makeFixture()
+        let state = try fixture.addProject()
+        let client = ProjectExternalAgentIdentity(clientID: "test-client", name: "Test assistant")
+        let resin = PartMaterial(name: "Tough resin", density: 1.18)
+        let library = PartMaterialLibrary.shared.customMaterials
+        var built = candidate()
+        built.materials = CADPartMaterialPatch(changes: [CADPartMaterialChange(partID: "body", material: resin)], definitions: [resin])
+        let snapshot = state.agentSnapshot(), taskID = UUID()
+        try state.beginExternalAgentAudit(id: taskID, client: client, request: "Create a resin box")
+        let revisionID = try state.commitExternalAgent(built, taskID: taskID, artifactID: "candidate",
+            expectedStateToken: snapshot.stateToken, key: "resin", snapshot: snapshot)
+        XCTAssertEqual(state.revisions.first { $0.id == revisionID }?.partMaterials, ["body": resin])
+        XCTAssertEqual(state.projectMaterials, [resin])
+
+        let steel = PartMaterial(name: "Steel, Mild", density: 7.85)
+        let current = ProjectAgentCandidate(model: try XCTUnwrap(state.current), preview: try XCTUnwrap(state.mesh), colorChanges: [],
+            materials: CADPartMaterialPatch(changes: [CADPartMaterialChange(partID: "body", material: steel)]))
+        let materialSnapshot = state.agentSnapshot(), materialTask = UUID()
+        XCTAssertEqual(materialSnapshot.materials.assignments, ["body": resin])
+        try state.beginExternalAgentAudit(id: materialTask, client: client, request: "Make it steel")
+        let sameID = try state.commitExternalAgent(current, taskID: materialTask, artifactID: "current",
+            expectedStateToken: materialSnapshot.stateToken, key: "steel", snapshot: materialSnapshot)
+        XCTAssertEqual(sameID, revisionID)
+        XCTAssertEqual(state.revisions.count, 1)
+        XCTAssertEqual(state.revisions[0].partMaterials, ["body": steel])
+        XCTAssertEqual(state.projectMaterials, [resin])
+        XCTAssertEqual(PartMaterialLibrary.shared.customMaterials, library, "Agent materials never enter the library")
+    }
+
+    @MainActor
     func testCommitRetryUsesPersistedReceiptAfterTaskEndAndReopenWithoutDuplicateRevision() async throws {
         let fixture = try makeFixture()
         let state = try fixture.addProject()

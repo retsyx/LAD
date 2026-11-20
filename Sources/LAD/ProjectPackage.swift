@@ -116,6 +116,7 @@ enum ProjectPackage {
         var displayMode: ViewportDisplayMode?
         var partsPaneFraction: Double?
         var recentPartColors: [PartColor]?
+        var projectMaterials: [PartMaterial]?
         var queuedRequests: [ProjectArchive.ArchivedQueuedRequest]?
         var draftPrompt: String?
         var draftAttachments: [ProjectArchive.ArchivedAttachment]?
@@ -199,7 +200,7 @@ enum ProjectPackage {
         }
 
         init(from decoder: Decoder) throws {
-            let fields: Set = ["parts", "partLayout", "hiddenSolids", "partColors", "jointPositions"]
+            let fields: Set = ["parts", "partLayout", "hiddenSolids", "partColors", "partMaterials", "jointPositions"]
             guard try decoder.container(keyedBy: Field.self).allKeys.allSatisfy({ fields.contains($0.stringValue) }) else {
                 throw invalid("A parts record contains unsupported fields.")
             }
@@ -472,7 +473,7 @@ enum ProjectPackage {
                                 printVersionView: portable.printVersionView, printLayoutView: portable.printLayoutView,
                                 projectionMode: portable.projectionMode, displayMode: portable.displayMode,
                                 partsPaneFraction: portable.partsPaneFraction, recentPartColors: portable.recentPartColors,
-                                queuedRequests: queue, draftPrompt: portable.draftPrompt, draftAttachments: draftAttachments,
+                                projectMaterials: portable.projectMaterials, queuedRequests: queue, draftPrompt: portable.draftPrompt, draftAttachments: draftAttachments,
                                 queuePaused: portable.queuePaused, revisions: revisions, conversation: conversation,
                                 activity: activity, catalog: catalog, thumbnail: savedThumbnail?.reference,
                                 thumbnailIdentity: savedThumbnail == nil ? nil : identity)
@@ -972,7 +973,8 @@ enum ProjectPackage {
             printVersionView: manifest.printVersionView, printLayoutView: manifest.printLayoutView,
             projectionMode: manifest.projectionMode,
             displayMode: manifest.displayMode, partsPaneFraction: manifest.partsPaneFraction,
-            recentPartColors: manifest.recentPartColors, taskAudits: tasks.isEmpty ? nil : tasks,
+            recentPartColors: manifest.recentPartColors, projectMaterials: manifest.projectMaterials,
+            taskAudits: tasks.isEmpty ? nil : tasks,
             queuedRequests: manifest.queuedRequests, draftPrompt: manifest.draftPrompt,
             draftAttachments: manifest.draftAttachments, queuePaused: manifest.queuePaused, assets: assets)
         var project = try ProjectArchive.restore(document, verifiedAssets: true)
@@ -1047,7 +1049,8 @@ enum ProjectPackage {
     }
 
     private static func sameParts(_ lhs: ProjectRevision, _ rhs: ProjectRevision) -> Bool {
-        lhs.partLayout == rhs.partLayout && lhs.hiddenSolids == rhs.hiddenSolids && lhs.parts == rhs.parts && lhs.partColors == rhs.partColors && lhs.jointPositions == rhs.jointPositions
+        lhs.partLayout == rhs.partLayout && lhs.hiddenSolids == rhs.hiddenSolids && lhs.parts == rhs.parts && lhs.partColors == rhs.partColors &&
+            lhs.partMaterials == rhs.partMaterials && lhs.jointPositions == rhs.jointPositions
     }
 
     private static func sameHistory(_ lhs: LADProject, _ rhs: LADProject) -> Bool {
@@ -1059,7 +1062,8 @@ enum ProjectPackage {
         lhs.id == rhs.id && lhs.model == rhs.model && lhs.date == rhs.date && lhs.partLayout == rhs.partLayout &&
         lhs.hiddenSolids == rhs.hiddenSolids && lhs.parts == rhs.parts && lhs.runtime == rhs.runtime &&
         lhs.userMessageID == rhs.userMessageID && lhs.responseMessageID == rhs.responseMessageID &&
-        lhs.partColors == rhs.partColors && lhs.jointPositions == rhs.jointPositions && lhs.name == rhs.name && lhs.validatedHash == rhs.validatedHash
+        lhs.partColors == rhs.partColors && lhs.partMaterials == rhs.partMaterials && lhs.jointPositions == rhs.jointPositions &&
+        lhs.name == rhs.name && lhs.validatedHash == rhs.validatedHash
     }
 
     // MARK: - Files

@@ -14,6 +14,7 @@ struct ProjectVersionContext: Sendable {
         let parts: [PartNode]?
         let hiddenSolids: [Int]?
         let partColors: [String: PartColor]?
+        let partMaterials: [String: PartMaterial]?
         let jointPositions: [String: Double]?
         let isCurrent: Bool
 
@@ -32,6 +33,7 @@ struct ProjectVersionContext: Sendable {
                     model: revision.model, runtime: revision.runtime ?? revision.preview?.runtime,
                     partLayout: revision.partLayout, parts: revision.parts ?? revision.preview?.parts,
                     hiddenSolids: revision.hiddenSolids, partColors: revision.partColors,
+                    partMaterials: revision.partMaterials,
                     jointPositions: revision.jointPositions,
                     isCurrent: revision.id == selectedRevisionID)
         }

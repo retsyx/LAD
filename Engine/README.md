@@ -306,7 +306,8 @@ original. Copies are never saved.
 stdio MCP adapter. The native app connects it for each Codex invocation and
 serves requests through private descriptor-confined filesystem IPC. Its tools
 are `lad_runtime`, `lad_request_permission`, `lad_versions`, `lad_version`, `lad_build`, `lad_inspect`,
-`lad_get_part_colors`, `lad_set_part_colors`, `lad_measure`, `lad_validate`,
+`lad_get_part_colors`, `lad_set_part_colors`, `lad_get_part_materials`,
+`lad_set_part_materials`, `lad_measure`, `lad_validate`,
 `lad_render`, `lad_check_motion`, `lad_screenshot`, `lad_export_step` and `lad_import`.
 
 `agent-tools.json` is the canonical CAD tool schema catalog shared by this

@@ -53,6 +53,7 @@ final class CodexService {
     private var validatedMesh: PreviewMesh?
     private var validatedPrintMesh: PreviewMesh?
     private(set) var partColorChanges: [CADPartColorChange] = []
+    private(set) var partMaterialPatch = CADPartMaterialPatch()
 
     /// Hands the final request's validated geometry to its caller once. The
     /// service keeps no geometry after that handoff; callers take it as soon
@@ -78,6 +79,7 @@ final class CodexService {
         attachments: [SourceAttachment] = [],
         partLayout: PartLayout? = nil,
         partColors: [String: PartColor] = [:],
+        materials: CADPartMaterialContext = CADPartMaterialContext(),
         executable: String,
         model: String,
         reasoningEffort: CodexReasoningEffort = .defaultConfiguration,
@@ -93,7 +95,7 @@ final class CodexService {
         permissionController: AgentPermissionController? = nil
     ) async throws -> CodexProjectResult {
         guard activeJob == nil else { throw CodexError.failed("A design request is already running.") }
-        validatedModel = nil; validatedMesh = nil; partColorChanges = []
+        validatedModel = nil; validatedMesh = nil; partColorChanges = []; partMaterialPatch = CADPartMaterialPatch()
         let requestedExecutable = executable.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let executableURL = vendor.resolveExecutable(requestedExecutable) else {
             if vendor == .codex { throw CodexError.executableMissing(requestedExecutable) }
@@ -117,7 +119,7 @@ final class CodexService {
             current: current, currentPreview: currentPreview, engine: engine ?? EngineService(),
             viewport: viewport, hiddenSolids: hiddenSolids, solidColors: solidColors, onActivity: onActivity,
             referenceAssets: selectionModel?.inputAssets ?? [], versions: versions,
-            partLayout: partLayout, partColors: partColors, permissionController: permissionController)
+            partLayout: partLayout, partColors: partColors, materials: materials, permissionController: permissionController)
         activeBridge = bridge
         defer { bridge.stop(); if activeBridge === bridge { activeBridge = nil } }
         let selectedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -200,7 +202,10 @@ final class CodexService {
                 guard !message.isEmpty, message.utf8.count <= 1_000_000 else {
                     throw CodexError.invalidModel("A conversational response must include a message of at most 1 MB.")
                 }
-                if response.status == "message" { partColorChanges = bridge.tools.partColorChanges(for: nil) }
+                if response.status == "message" {
+                    partColorChanges = bridge.tools.partColorChanges(for: nil)
+                    partMaterialPatch = bridge.tools.partMaterialPatch(for: nil)
+                }
                 return .response(message)
             }
             guard var specification = response.model else { throw CodexError.invalidModel("No completed design was provided.") }
@@ -237,6 +242,7 @@ final class CodexService {
             validatedMesh = bridge.tools.validatedPreview(for: specification)
             validatedPrintMesh = bridge.tools.validatedPrintPreview(for: specification)
             partColorChanges = bridge.tools.partColorChanges(for: specification)
+            partMaterialPatch = bridge.tools.partMaterialPatch(for: specification)
             return .ready(specification)
         } catch let error as CodexError {
             throw error
@@ -408,6 +414,7 @@ final class CodexService {
 
     func cancel() {
         partColorChanges = []
+        partMaterialPatch = CADPartMaterialPatch()
         activeBridge?.stop()
         activeBridge = nil
         activeJob?.cancel()

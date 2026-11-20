@@ -93,6 +93,7 @@ enum CADMeasurementUnit: String, Codable, Sendable {
     case length = "mm"
     case area = "mm²"
     case volume = "mm³"
+    case mass = "g"
     case angle = "°"
     case scalar = ""
 }
@@ -306,6 +307,24 @@ enum CADMeasurements {
             }
         } else { title = "Measurements" }
         return CADMeasurementReport(title: title, metrics: metrics, features: features, solidIndices: solids.sorted(), closestPoints: closestPoints)
+    }
+
+    /// Part selections report the mass of their exact native volumes at each
+    /// part's material density. Unassigned parts contribute no mass.
+    static func addingMass(to report: CADMeasurementReport, topology: CADTopology?,
+                           densities: [Int: Double]) -> CADMeasurementReport {
+        guard !report.solidIndices.isEmpty, let topology else { return report }
+        let selected = Set(report.solidIndices)
+        let parts = topology.parts.filter { selected.contains($0.solidIndex) }
+        guard parts.count == selected.count else { return report }
+        let mass = parts.reduce(0) { $0 + PartMaterial.mass(volume: $1.volume, density: densities[$1.solidIndex] ?? 0) }
+        guard mass.isFinite else { return report }
+        var result = report
+        let metric = CADMeasurementMetric(id: "parts:mass", label: "Mass", values: [mass], unit: .mass)
+        result.metrics.removeAll { $0.id == metric.id }
+        let index = result.metrics.firstIndex { $0.id == "parts:volume" }.map { $0 + 1 } ?? result.metrics.endIndex
+        result.metrics.insert(metric, at: index)
+        return result
     }
 
     private static func subtract(_ a: [Double], _ b: [Double]) -> [Double] { zip(a, b).map(-) }

@@ -10,7 +10,7 @@ final class AgentToolCatalogTests: XCTestCase {
         let mesh = Set(catalog.tools.map(\.name).filter { $0.hasPrefix("lad_mesh_") })
         XCTAssertEqual(capabilities[.capture], ["lad_screenshot"])
         XCTAssertEqual(capabilities[.export], ["lad_export_step", "lad_mesh_export_step"])
-        XCTAssertEqual(capabilities[.build], Set(["lad_build", "lad_import", "lad_request_permission", "lad_set_part_colors"])
+        XCTAssertEqual(capabilities[.build], Set(["lad_build", "lad_import", "lad_request_permission", "lad_set_part_colors", "lad_set_part_materials"])
             .union(mesh).subtracting(["lad_mesh_export_step"]))
         XCTAssertNil(capabilities[.commit], "Only the external transport commits candidates.")
         XCTAssertNil(capabilities[.manageProjects])

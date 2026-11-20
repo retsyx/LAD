@@ -50,7 +50,8 @@ enum ProjectArchive {
                                printVersionView: project.printVersionView, printLayoutView: project.printLayoutView,
                                projectionMode: project.projectionMode, displayMode: project.displayMode,
                                partsPaneFraction: project.partsPaneFraction,
-                               recentPartColors: project.recentPartColors, taskAudits: taskAudits,
+                               recentPartColors: project.recentPartColors, projectMaterials: project.projectMaterials,
+                               taskAudits: taskAudits,
                                queuedRequests: queuedRequests, draftPrompt: project.draftPrompt,
                                draftAttachments: draftAttachments, queuePaused: project.queuePaused, assets: writer.assets)
         return archive
@@ -103,7 +104,7 @@ enum ProjectArchive {
                           printVersionView: archive.printVersionView, printLayoutView: archive.printLayoutView,
                           projectionMode: archive.projectionMode,
                           displayMode: archive.displayMode, recentPartColors: archive.recentPartColors,
-                          taskAudits: taskAudits, queuedRequests: queuedRequests,
+                          projectMaterials: archive.projectMaterials, taskAudits: taskAudits, queuedRequests: queuedRequests,
                           draftPrompt: archive.draftPrompt, draftAttachments: draftAttachments,
                           queuePaused: archive.queuePaused, partsPaneFraction: archive.partsPaneFraction ?? 0.75)
     }
@@ -123,6 +124,7 @@ enum ProjectArchive {
         var displayMode: ViewportDisplayMode?
         var partsPaneFraction: Double?
         var recentPartColors: [PartColor]?
+        var projectMaterials: [PartMaterial]?
         var taskAudits: [ArchivedTaskAudit]?
         var queuedRequests: [ArchivedQueuedRequest]?
         var draftPrompt: String?
@@ -503,12 +505,13 @@ enum ProjectArchive {
         }
     }
 
-    /// A revision's part organization, visibility, colors and assembly pose.
+    /// A revision's part organization, visibility, colors, materials and assembly pose.
     struct ArchivedParts: Codable, Equatable {
         var parts: [PartNode]?
         var partLayout: PartLayout?
         var hiddenSolids: [Int]?
         var partColors: [String: PartColor]?
+        var partMaterials: [String: PartMaterial]?
         var jointPositions: [String: Double]?
 
         init(_ revision: ProjectRevision) throws {
@@ -525,6 +528,7 @@ enum ProjectArchive {
             partLayout = revision.partLayout ?? parts.map { PartLayout(nodes: $0) }
             hiddenSolids = revision.hiddenSolids
             partColors = revision.partColors
+            partMaterials = revision.partMaterials
             jointPositions = revision.jointPositions
         }
     }
@@ -577,6 +581,7 @@ enum ProjectArchive {
             revision.userMessageID = recipe.userMessageID
             revision.responseMessageID = recipe.responseMessageID
             revision.partColors = parts.partColors
+            revision.partMaterials = parts.partMaterials
             revision.name = name
             revision.validatedHash = recipe.validatedHash
             revision.jointPositions = parts.jointPositions

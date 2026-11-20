@@ -6,6 +6,7 @@ struct ProjectAgentCandidate {
     let model: ModelSpec
     let preview: PreviewMesh
     let colorChanges: [CADPartColorChange]
+    var materials = CADPartMaterialPatch()
 }
 
 /// A native tool result for an external client. Its metadata names task files
@@ -52,7 +53,8 @@ final class ProjectAgentSession {
 
     init(id: UUID = UUID(), python: String, threads: Int, current: ModelSpec?, currentPreview: PreviewMesh?,
          versions: ProjectVersionContext = .empty, partLayout: PartLayout? = nil,
-         partColors: [String: PartColor] = [:], viewport: CADSceneView? = nil,
+         partColors: [String: PartColor] = [:], materials: CADPartMaterialContext = CADPartMaterialContext(),
+         viewport: CADSceneView? = nil,
          permissionWindow: NSWindow? = nil, hiddenSolids: Set<Int> = [],
          solidColors: [Int: PartColor] = [:],
          onActivity: @escaping @Sendable (ProjectActivityEvent) -> Void = { _ in }) throws {
@@ -67,7 +69,7 @@ final class ProjectAgentSession {
             tools = try CADAgentTools(directory: folder, python: python, threads: max(1, threads),
                 current: current, currentPreview: currentPreview, engine: EngineService(), viewport: viewport,
                 hiddenSolids: hiddenSolids, solidColors: solidColors, versions: versions,
-                partLayout: partLayout, partColors: partColors, permissionWindow: permissionWindow)
+                partLayout: partLayout, partColors: partColors, materials: materials, permissionWindow: permissionWindow)
         } catch {
             try? FileManager.default.removeItem(at: folder)
             throw error
@@ -167,7 +169,8 @@ final class ProjectAgentSession {
         isBusy = true
         defer { isBusy = false }
         let value = try await tools.committableCandidate(artifactID: artifactID)
-        return ProjectAgentCandidate(model: value.model, preview: value.preview, colorChanges: value.colorChanges)
+        return ProjectAgentCandidate(model: value.model, preview: value.preview, colorChanges: value.colorChanges,
+                                     materials: value.materials)
     }
 
     func bindPermissionWindow(_ window: NSWindow) throws {

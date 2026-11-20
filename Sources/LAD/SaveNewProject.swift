@@ -33,7 +33,7 @@ enum SaveNewProject {
                           projectName: original.projectName, showGrid: original.showGrid,
                           printVersionView: original.printVersionView, printLayoutView: original.printLayoutView,
                           projectionMode: original.projectionMode, displayMode: original.displayMode,
-                          recentPartColors: original.recentPartColors,
+                          recentPartColors: original.recentPartColors, projectMaterials: original.projectMaterials,
                           partsPaneFraction: original.partsPaneFraction,
                           thumbnailData: revision.id == original.selectedRevisionID ? original.thumbnailData : nil)
     }

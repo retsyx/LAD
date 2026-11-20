@@ -111,6 +111,9 @@ private struct PartTreeItem: View {
     @State private var showingColorPicker = false
     @State private var colorRevisionID: UUID?
     @State private var colorProjectID: UUID?
+    @State private var showingMaterialPicker = false
+    @State private var materialRevisionID: UUID?
+    @State private var materialProjectID: UUID?
     @FocusState private var renameFocused: Bool
 
     init(node: PartNode, state: AppState, collapsedFolderIDs: Set<String>, renamingNodeID: Binding<String?>,
@@ -170,12 +173,23 @@ private struct PartTreeItem: View {
                                 colorRevisionID = state.selectedRevisionID
                                 colorProjectID = state.projectEditingID
                                 showingColorPicker = true
+                            },
+                            onMaterial: { _ in
+                                onFinishRename(false)
+                                materialRevisionID = state.selectedRevisionID
+                                materialProjectID = state.projectEditingID
+                                showingMaterialPicker = true
                             })
         }
-        .onChange(of: state.selectedRevisionID) { _, _ in showingColorPicker = false }
-        .onChange(of: state.projectEditingID) { _, _ in showingColorPicker = false }
-        .onChange(of: state.selectedSolids) { _, _ in showingColorPicker = false }
-        .onChange(of: state.featureSelectedSolids) { _, _ in showingColorPicker = false }
+        .onChange(of: state.selectedRevisionID) { _, _ in closeEditors() }
+        .onChange(of: state.projectEditingID) { _, _ in closeEditors() }
+        .onChange(of: state.selectedSolids) { _, _ in closeEditors() }
+        .onChange(of: state.featureSelectedSolids) { _, _ in closeEditors() }
+    }
+
+    private func closeEditors() {
+        showingColorPicker = false
+        showingMaterialPicker = false
     }
 
     private var row: some View {
@@ -248,6 +262,20 @@ private struct PartTreeItem: View {
         .background(selection.isSelected ? Palette.accent.opacity(selection.isFull ? 0.13 : 0.07) : .clear,
                     in: RoundedRectangle(cornerRadius: 5))
         .popover(isPresented: $showingColorPicker, arrowEdge: .trailing) { colorPicker }
+        .background {
+            Color.clear.popover(isPresented: $showingMaterialPicker, arrowEdge: .trailing) { materialPicker }
+        }
+    }
+
+    private var materialPicker: some View {
+        PartMaterialPicker(assignment: state.partMaterial(for: node.id), designMaterials: state.designMaterials,
+                           library: .shared,
+                           onApply: { material in
+                               if materialRevisionID == state.selectedRevisionID, materialProjectID == state.projectEditingID {
+                                   state.setPartMaterial(material, for: node.id)
+                               }
+                               showingMaterialPicker = false
+                           }, onCancel: { showingMaterialPicker = false })
     }
 
     private var colorPicker: some View {
@@ -302,6 +330,7 @@ private struct PartActionsMenu: View {
     let onNewFolder: (String?) -> Void
     let onRename: (PartNode) -> Void
     var onColor: ((PartNode) -> Void)? = nil
+    var onMaterial: ((PartNode) -> Void)? = nil
 
     var body: some View {
         Section {
@@ -326,6 +355,10 @@ private struct PartActionsMenu: View {
             Section {
                 Button("Color…") { onColor(node) }
                     .disabled(node.allSolidIndices.isEmpty)
+                if let onMaterial {
+                    Button("Material…") { onMaterial(node) }
+                        .disabled(node.allSolidIndices.isEmpty)
+                }
             }
         }
         Section {

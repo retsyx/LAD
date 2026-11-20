@@ -11,6 +11,7 @@ struct ProjectAgentSnapshot {
     let versions: ProjectVersionContext
     let partLayout: PartLayout
     let partColors: [String: PartColor]
+    let materials: CADPartMaterialContext
     let hiddenSolids: Set<Int>
     let solidColors: [Int: PartColor]
 }

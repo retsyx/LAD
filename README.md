@@ -97,6 +97,7 @@ Drop a `.lad` file on a design window's title bar, viewer, parts tree or convers
 | Select a group of parts | Click a folder in the parts tree |
 | Toggle part or group visibility | Eye button in the parts tree |
 | Assign part or group colors | **Color…** in the parts tree context menu |
+| Assign part or group materials | **Material…** in the parts tree context menu |
 | Hide selected / show all parts | Context menu in the viewport or parts tree |
 | Move parts or folders | Drag onto a folder or the Parts header; or use **Move Selected To** in the tree context menu |
 | Create or rename folders and parts | Folder-plus button or tree context menu |
@@ -128,6 +129,8 @@ Moving assemblies can include mate connectors and fixed, revolute, and slider jo
 
 Choose **Color…** from a part or folder’s context menu for curated swatches, recent colors used in this design, and the full macOS color picker. A folder colors its contained parts; a context menu on a selected part applies to the selected parts. **Default Color** sets the neutral gray finish. Colors stay attached to stable part identities across hierarchy edits and matching Codex refinements, and are saved with each revision. Full-design and selected-part STEP exports include each exported part’s current RGB color, including the neutral finish. Recent choices belong to the design. Updating colors reuses the existing geometry; selected parts keep their selection highlight until deselected.
 
+Choose **Material…** from a part or folder’s context menu to assign a material, which gives the part a density for mass measurements. Parts start unassigned, with zero density. The searchable, alphabetical list contains common metals and plastics and your custom materials; **New Material…** adds a custom material with its density in g/cm³, and custom materials can be removed again. Custom materials are kept on this Mac for all designs. Like colors, a folder assigns its contained parts, a context menu on a selected part applies to the selected parts, and assignments stay attached to stable part identities across hierarchy edits and matching agent refinements. Each design saves the complete name and density of every assigned material, so its masses do not depend on the material list of the LAD installation that opens it. Materials an agent defines for a design are marked **Design** in the list; they stay with that design until you import one into your materials.
+
 The viewport supports shaded, shaded with analytic edges, translucent, and wireframe display. A separate Perspective / Isometric selector switches between perspective and parallel projection while preserving the camera pose. Both projections support rotation, panning, and cursor-relative zoom. The orientation cube follows the viewport camera. Click a labeled face to align the view, a gray face border to view from its opposite direction, or a corner for one of eight isometric directions. Each cube click smoothly turns to the chosen direction and centers and fits the complete design using the initial-view framing criteria while retaining the current projection. Reduce Motion skips these transitions; direct navigation remains immediate. Rotation uses the midpoint of the complete design’s bounding box, including all parts. Pan and cursor zoom keep that rotation pivot fixed. This view reference does not translate geometry or change CAD coordinates in part operations or STEP exports. Whole parts are selected in the hierarchy; viewport clicks toggle native vertices, edges/curves, and faces. Hover previews the clickable feature with a softer gold highlight without selecting it or changing measurements. Selected features use the same gold as selected whole parts. Their owning parts and folders are marked partially selected in the tree. Right-click preserves the current selection. Double-click empty viewport space clears both part and feature selections. The design details below the parts tree show dimensions, volume, CAD program, and a revision selector. Agent, model and reasoning choices are available only in the conversation composer's combined menu beside Send, including custom model IDs. Each `.lad` design retains its own agent, model, reasoning level, and remembered effort for each model. New designs start from the chosen agent’s installed configuration. Settings contains the default save location and CAD thread count. Conversation messages, errors, source text, and CAD programs have standard copy icons with confirmation feedback.
 
 Highlighted faces and parts receive the highlight color in the normal surface rendering. A separate overlay keeps highlighted vertices, edges, and curves visible through nearer geometry. Faces and parts receive only the outline of their viewport projection, so selecting a cube outlines its silhouette rather than every cube edge. Hover uses the same rendering with a softer color; picking still respects geometry visibility.
@@ -151,9 +154,9 @@ CAD edges keep a consistent width on screen through zoom, orbit and projection c
 | Face | Area, perimeter, surface centroid and surface type; plane normal or analytic radii/axis/cone half-angle where defined |
 | Two features or parts | Exact minimum distance, closest points and X/Y/Z deltas; acute line/plane/analytic-axis angles where defined |
 | Multiple edges or faces | Total edge length, face area and face perimeter |
-| Whole parts or folders | Part count, surface area, volume, bounding dimensions and limits, volume centroid |
+| Whole parts or folders | Part count, volume, mass, surface area, bounding dimensions and limits, volume centroid |
 
-General splines and curved surfaces do not have a single radius or normal. Mass is not inferred without material density. Measurement and topology metadata are regenerated for each native revision and are never embedded in `.lad` files.
+General splines and curved surfaces do not have a single radius or normal. Mass in grams uses each part’s assigned material density; unassigned parts contribute zero mass. Measurement and topology metadata are regenerated for each native revision and are never embedded in `.lad` files.
 
 Viewport illumination combines ambient light with camera-relative directional lights: a main light above-right and a softer fill above-left. Their directions remain fixed in the view as you orbit, pan, zoom, or switch projection. Curved surfaces produce highlights from their normals and material properties.
 
@@ -236,6 +239,8 @@ Every Codex design task has these LAD tools available by default, with instructi
 | `lad_inspect` | Inspect parts, vertices, edges/curves and faces, with paginated exact properties |
 | `lad_get_part_colors` | Read paginated part/folder IDs, current colors without rebuilding |
 | `lad_set_part_colors` | Stage atomic part/folder color assignments or neutral defaults for the current design or a candidate |
+| `lad_get_part_materials` | Read paginated part/folder IDs and assigned materials, with the design's materials and LAD's material list |
+| `lad_set_part_materials` | Define design-only materials and stage atomic part/folder material assignments for the current design or a candidate |
 | `lad_measure` | Measure native features or parts using the same exact geometry as the viewer |
 | `lad_validate` | Check the successfully built solid, dimensions, topology and preview |
 | `lad_render` | Return a PNG image to Codex from a chosen standard view, projection, shading and optional part subset |
@@ -245,6 +250,8 @@ Every Codex design task has these LAD tools available by default, with instructi
 | `lad_import` | Register validated pre-existing STEP/BREP or closed STL/OBJ reference inputs, with optional provenance snapshots |
 
 Codex can inspect and change current part colors without rebuilding geometry. Each part has one RGB value, regardless of who set it; the last successful assignment applies. Color tools use stable physical part IDs, support folder assignments and neutral default colors, and remain speculative until a successful final response. Current color-only changes use a normal conversational response; a geometry replacement uses its matching candidate's current colors. Other candidate and historical color changes remain isolated. New candidates retain existing current colors by stable ID, while historical replays use that saved version's current colors. `cq.Color(r,g,b)` assembly values supply initial colors for new parts.
+
+Agents can also read and change part materials. They assign materials by name from the design's materials or LAD's material list, and can define new materials with a density for the current design. Material assignments follow the same staging, commit and retention rules as colors. Agent-defined materials are saved only with the design; they never enter your materials unless you import them.
 
 Rendering uses LAD's camera, geometry, materials and lighting. Candidate renders do not move the user's camera or replace the open design; only the final validated result becomes a revision. Image data is delivered to Codex as an MCP image attachment, so it can review the result during the turn. Tool outputs use file references and concise geometry metadata, rather than complete source files or CAD programs.
 

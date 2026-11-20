@@ -19,6 +19,9 @@ final class CADAgentTools {
         var partLayout: PartLayout? = nil
         var partColors: [String: PartColor] = [:]
         var colorChanges: [CADPartColorChange] = []
+        /// Assigned materials by stable physical part ID; absent parts are unassigned.
+        var partMaterials: [String: PartMaterial] = [:]
+        var materialChanges: [CADPartMaterialChange] = []
         /// Built with `lad.print` true: the program's 3D printing version.
         var print = false
         /// Printing orientations found for this artifact's own native geometry.
@@ -39,6 +42,12 @@ final class CADAgentTools {
     private let hiddenSolids: Set<Int>
     private let partLayout: PartLayout?
     private let initialPartColors: [String: PartColor]
+    private let initialPartMaterials: [String: PartMaterial]
+    /// Materials the design defined before this task.
+    private let projectMaterials: [PartMaterial]
+    private let materialLibrary: [PartMaterial]
+    /// Materials defined for the design during this task; committed only on success.
+    private var definedMaterials: [PartMaterial] = []
     /// Candidate previews kept per task besides the current design's.
     static let retainedCandidatePreviews = 4
     private var artifacts: [String: Artifact] = [:]
@@ -67,6 +76,7 @@ final class CADAgentTools {
          solidColors: [Int: PartColor] = [:],
          referenceAssets: [CADInputAsset] = [], versions: ProjectVersionContext = .empty,
          partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:],
+         materials: CADPartMaterialContext = CADPartMaterialContext(),
          permissionController: AgentPermissionController? = nil, permissionWindow: NSWindow? = nil) throws {
         workspace = try CADAgentWorkspace(directory: directory)
         self.python = python
@@ -100,6 +110,16 @@ final class CADAgentTools {
             }
         }
         self.initialPartColors = currentColors
+        try PartMaterialState.validateDesignMaterials(materials.design)
+        guard materials.library.count <= PartMaterialLibrary.maximumCustomCount + PartMaterial.standard.count,
+              materials.library.allSatisfy(\.isValid),
+              materials.assignments.count <= PartMaterialState.maximumAssignments,
+              materials.assignments.allSatisfy({ physicalIDs.contains($0.key) && $0.value.isValid }) else {
+            throw LADError.message("The current design has invalid part materials.")
+        }
+        initialPartMaterials = materials.assignments
+        projectMaterials = materials.design
+        materialLibrary = materials.library.sorted(by: PartMaterial.alphabetical)
         runtime = currentPreview?.runtime
         for asset in current?.inputAssets ?? [] {
             guard inputs[asset.id] == nil else { throw LADError.message("Imported geometry has duplicate asset identities.") }
@@ -116,7 +136,8 @@ final class CADAgentTools {
             artifacts["current"] = Artifact(id: "current", model: current, preview: currentPreview,
                 programURL: programURL,
                 metadataURL: workspace.root.appendingPathComponent("artifacts/current/metadata.json"),
-                parts: currentParts, partLayout: partLayout, partColors: currentColors)
+                parts: currentParts, partLayout: partLayout, partColors: currentColors,
+                partMaterials: initialPartMaterials)
             if currentPreview != nil, let artifact = artifacts["current"] {
                 _ = try workspace.write(JSONSerialization.data(withJSONObject: summary(artifact), options: [.sortedKeys]),
                                         path: "artifacts/current/metadata.json")
@@ -202,7 +223,8 @@ final class CADAgentTools {
 
     /// Rebuilds a committable candidate whose display cache was evicted, then
     /// applies the same checks as `validatedCandidate`.
-    func committableCandidate(artifactID: String) async throws -> (model: ModelSpec, preview: PreviewMesh, colorChanges: [CADPartColorChange]) {
+    func committableCandidate(artifactID: String) async throws
+        -> (model: ModelSpec, preview: PreviewMesh, colorChanges: [CADPartColorChange], materials: CADPartMaterialPatch) {
         try checkCancellation()
         if let artifact = artifacts[artifactID], artifact.versionID == nil, !artifact.print,
            artifact.preview?.brepPath.map({ FileManager.default.fileExists(atPath: $0) }) != true {
@@ -221,7 +243,8 @@ final class CADAgentTools {
     /// External agents commit a named candidate, never arbitrary source paired
     /// with another candidate's geometry. This boundary applies the same final
     /// replay and reconstruction checks as an internal Codex response.
-    func validatedCandidate(artifactID: String) throws -> (model: ModelSpec, preview: PreviewMesh, colorChanges: [CADPartColorChange]) {
+    func validatedCandidate(artifactID: String) throws
+        -> (model: ModelSpec, preview: PreviewMesh, colorChanges: [CADPartColorChange], materials: CADPartMaterialPatch) {
         try checkCancellation()
         guard let artifact = artifacts[artifactID], let preview = artifact.preview,
               let nativePath = preview.brepPath, FileManager.default.fileExists(atPath: nativePath) else {
@@ -242,7 +265,8 @@ final class CADAgentTools {
         // Construction matching permits geometry reuse, but speculative color
         // patches belong to one exact artifact. A later matching candidate must
         // never replace the colors reviewed on the explicitly committed one.
-        return (model, preview, artifact.colorChanges)
+        return (model, preview, artifact.colorChanges,
+                CADPartMaterialPatch(changes: artifact.materialChanges, definitions: definedMaterials))
     }
 
     func finalDeliveryDisclosure(for model: ModelSpec) throws -> String? {
@@ -285,6 +309,32 @@ final class CADAgentTools {
             return changes.values.sorted { $0.partID < $1.partID }
         }
         return []
+    }
+
+    /// Material assignments follow the same artifact isolation as colors.
+    /// Materials defined for the design accompany any successful response.
+    func partMaterialPatch(for model: ModelSpec?) -> CADPartMaterialPatch {
+        guard !cancelled else { return CADPartMaterialPatch() }
+        var patch = CADPartMaterialPatch(definitions: definedMaterials)
+        guard let model else {
+            patch.changes = artifacts["current"]?.materialChanges ?? []
+            return patch
+        }
+        for id in Array(artifactOrder.reversed()) + ["current"] {
+            guard let artifact = artifacts[id], constructionMatches(artifact.model, model) else { continue }
+            guard artifact.versionID != nil else {
+                patch.changes = artifact.materialChanges
+                return patch
+            }
+            var changes: [String: CADPartMaterialChange] = [:]
+            for id in Self.physicalIDs(in: artifact.parts) where artifact.partMaterials[id] != initialPartMaterials[id] {
+                changes[id] = CADPartMaterialChange(partID: id, material: artifact.partMaterials[id])
+            }
+            for change in artifact.materialChanges { changes[change.partID] = change }
+            patch.changes = changes.values.sorted { $0.partID < $1.partID }
+            return patch
+        }
+        return patch
     }
 
     func cancel() {
@@ -499,6 +549,39 @@ final class CADAgentTools {
             info["changedPartCount"] = normalized.count
             info["nextStep"] = "Colors are staged for this artifact only. Use lad_render to review them when needed. A successful final response applies only the current design's patch or the final replacement program's matching artifact patch."
             return try result(info)
+        case "lad_get_part_materials":
+            try allowed(arguments, ["artifactID", "offset", "limit"])
+            let artifact = try materialArtifact(arguments)
+            let offset = try integer("offset", arguments, fallback: 0, range: 0...1_000_000)
+            let limit = try integer("limit", arguments, fallback: 100, range: 1...500)
+            return try result(materialPage(artifact, offset: offset, limit: limit))
+        case "lad_set_part_materials":
+            try allowed(arguments, ["artifactID", "materials", "changes"])
+            let definitions = try materialDefinitions(arguments)
+            guard !definitions.isEmpty || arguments["changes"] != nil else {
+                throw LADError.message("Provide materials to define, part material changes, or both.")
+            }
+            var info: [String: Any]
+            if arguments["changes"] != nil {
+                var artifact = try materialArtifact(arguments)
+                let changes = try materialChanges(arguments, known: designMaterials(for: artifact) + definitions)
+                let normalized = try PartMaterialState.normalized(changes: changes, in: artifact.parts)
+                artifact.partMaterials = try PartMaterialState.applyingPhysical(changes: normalized, to: artifact.partMaterials,
+                                                                               in: artifact.parts)
+                var staged = Dictionary(uniqueKeysWithValues: artifact.materialChanges.map { ($0.partID, $0) })
+                for change in normalized { staged[change.partID] = change }
+                artifact.materialChanges = staged.values.sorted { $0.partID < $1.partID }
+                artifacts[artifact.id] = artifact
+                definedMaterials += definitions
+                info = try materialPage(artifact, offset: 0, limit: 100)
+                info["changedPartCount"] = normalized.count
+            } else {
+                definedMaterials += definitions
+                info = materialCatalog(for: artifacts[(try string("artifactID", arguments)) ?? "current"])
+            }
+            info["definedMaterialCount"] = definitions.count
+            info["nextStep"] = "Material definitions and assignments are staged for this task. A successful final response saves the defined materials with this design only, and applies only the current design's assignments or the final replacement program's matching artifact assignments."
+            return try result(info)
         case "lad_inspect":
             try allowed(arguments, ["artifactID", "kind", "solidIndices", "offset", "limit"])
             let artifact = try await artifact(arguments)
@@ -543,6 +626,9 @@ final class CADAgentTools {
                     if let owner = nodes.first(where: { $0.solidIndices.contains(part.solidIndex) }) {
                         item["partID"] = owner.id; item["name"] = owner.name
                         item.merge(try colorInfo(owner, in: artifact)) { _, color in color }
+                        let material = artifact.partMaterials[owner.id]
+                        item["material"] = try material.map { try json($0) } ?? NSNull()
+                        item["mass"] = PartMaterial.mass(volume: part.volume, density: material?.density ?? 0)
                     }
                     return item
                 }
@@ -563,8 +649,10 @@ final class CADAgentTools {
             let raw = arguments["features"] ?? []
             let features = try JSONDecoder().decode([CADFeatureID].self, from: JSONSerialization.data(withJSONObject: raw))
             guard features.count <= 256 else { throw LADError.message("Measure at most 256 features at once.") }
-            let report = try await engine.measure(preview, features: features, solids: try indices(arguments, preview: preview, allowEmpty: true) ?? [],
-                                                  python: python, threads: threads)
+            let measured = try await engine.measure(preview, features: features, solids: try indices(arguments, preview: preview, allowEmpty: true) ?? [],
+                                                    python: python, threads: threads)
+            let report = CADMeasurements.addingMass(to: measured, topology: preview.topology,
+                densities: PartMaterialState.solidDensities(in: artifact.parts, materials: artifact.partMaterials))
             return try result(json(report))
         case "lad_validate":
             try allowed(arguments, ["artifactID"])
@@ -861,10 +949,15 @@ final class CADAgentTools {
             : artifacts["current"]?.partColors ?? initialPartColors)
         let physicalIDs = Self.physicalIDs(in: nodes)
         let patch = previous?.colorChanges ?? (versionID == nil ? artifacts["current"]?.colorChanges ?? [] : [])
+        let inheritedMaterials = previous?.partMaterials ?? (versionID != nil ? version?.partMaterials ?? [:]
+            : artifacts["current"]?.partMaterials ?? initialPartMaterials)
+        let materialPatch = previous?.materialChanges ?? (versionID == nil ? artifacts["current"]?.materialChanges ?? [] : [])
         let artifact = Artifact(id: id, model: model, preview: preview, programURL: programURL, metadataURL: metadataURL,
             versionID: versionID, parts: nodes, partLayout: resolvedLayout,
             partColors: Self.completePartColors(in: nodes, colors: inherited),
-            colorChanges: patch.filter { physicalIDs.contains($0.partID) }, print: print)
+            colorChanges: patch.filter { physicalIDs.contains($0.partID) },
+            partMaterials: inheritedMaterials.filter { physicalIDs.contains($0.key) && $0.value.isValid },
+            materialChanges: materialPatch.filter { physicalIDs.contains($0.partID) }, print: print)
         _ = try workspace.write(JSONSerialization.data(withJSONObject: summary(artifact), options: [.sortedKeys, .prettyPrinted]), path: "artifacts/\(id)/metadata.json")
         artifacts[id] = artifact
         if !artifactOrder.contains(id) { artifactOrder.append(id) }
@@ -938,6 +1031,15 @@ final class CADAgentTools {
         return artifact
     }
 
+    private func materialArtifact(_ arguments: [String: Any]) throws -> Artifact {
+        let id = try string("artifactID", arguments) ?? "current"
+        guard let artifact = artifacts[id] else {
+            throw LADError.message(id == "current" ? "There is no current design with parts to assign materials to."
+                : "The requested CAD artifact is unavailable in this task.")
+        }
+        return artifact
+    }
+
     private func colorChanges(_ arguments: [String: Any]) throws -> [CADPartColorChange] {
         guard let values = arguments["changes"] as? [[String: Any]], !values.isEmpty, values.count <= 256 else {
             throw LADError.message("Provide between 1 and 256 part color assignments.")
@@ -987,6 +1089,104 @@ final class CADAgentTools {
         }
         return ["artifactID": artifact.id, "offset": offset, "total": nodes.count, "items": page,
                 "hasMore": offset + page.count < nodes.count, "staged": !artifact.colorChanges.isEmpty]
+    }
+
+    /// Design materials take precedence over library materials of the same name.
+    private func designMaterials(for artifact: Artifact?) -> [PartMaterial] {
+        var seen = Set<PartMaterial>()
+        let assigned = (artifact?.partMaterials.values.map { $0 } ?? []) + initialPartMaterials.values
+        return (definedMaterials + projectMaterials + assigned.sorted(by: PartMaterial.alphabetical)).filter { seen.insert($0).inserted }
+    }
+
+    private func materialDefinitions(_ arguments: [String: Any]) throws -> [PartMaterial] {
+        guard let raw = arguments["materials"] else { return [] }
+        guard let values = raw as? [[String: Any]], !values.isEmpty, values.count <= 64 else {
+            throw LADError.message("Define between 1 and 64 materials at once.")
+        }
+        let existing = designMaterials(for: nil) + artifacts.values.flatMap { $0.partMaterials.values }
+        var result: [PartMaterial] = []
+        for value in values {
+            try allowed(value, ["name", "density"])
+            let name = try string("name", value, required: true)!
+            guard let number = value["density"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+                throw LADError.message("Each material requires a density in \(PartMaterial.densityUnit).")
+            }
+            let material = try PartMaterial.validated(name: name, density: number.doubleValue)
+            if let known = (existing + result).first(where: { $0.key == material.key }) {
+                guard known == material else {
+                    throw LADError.message("This design already has a material named ‘\(known.name)’ at \(known.density.formatted()) \(PartMaterial.densityUnit). Assign it by name or choose a distinct name.")
+                }
+                if !definedMaterials.contains(material) && !projectMaterials.contains(material) && !result.contains(material) {
+                    result.append(material)
+                }
+                continue
+            }
+            if let library = materialLibrary.first(where: { $0.key == material.key }), library != material {
+                throw LADError.message("LAD's material library has ‘\(library.name)’ at \(library.density.formatted()) \(PartMaterial.densityUnit). Assign it by name or choose a distinct name.")
+            }
+            result.append(material)
+        }
+        guard projectMaterials.count + definedMaterials.count + result.count <= PartMaterialState.maximumDesignMaterials else {
+            throw LADError.message("The design has too many materials.")
+        }
+        return result
+    }
+
+    private func materialChanges(_ arguments: [String: Any], known: [PartMaterial]) throws -> [CADPartMaterialChange] {
+        guard let values = arguments["changes"] as? [[String: Any]], !values.isEmpty, values.count <= 256 else {
+            throw LADError.message("Provide between 1 and 256 part material assignments.")
+        }
+        return try values.map { value in
+            try allowed(value, ["partID", "material"])
+            let id = try string("partID", value, required: true)!
+            guard let raw = value["material"] else {
+                throw LADError.message("Each part material assignment requires material, or null to leave the part unassigned.")
+            }
+            if raw is NSNull { return CADPartMaterialChange(partID: id, material: nil) }
+            guard let name = raw as? String else {
+                throw LADError.message("Assign a material by name, or null to leave the part unassigned.")
+            }
+            let key = PartMaterial.key(try PartMaterial.validatedName(name))
+            let design = Set(known.filter { $0.key == key })
+            guard design.count <= 1 else {
+                throw LADError.message("Several design materials are named ‘\(name)’. Define a material with a distinct name.")
+            }
+            guard let material = design.first ?? materialLibrary.first(where: { $0.key == key }) else {
+                throw LADError.message("No design or library material is named ‘\(name)’. Define it with materials first.")
+            }
+            return CADPartMaterialChange(partID: id, material: material)
+        }
+    }
+
+    private func materialCatalog(for artifact: Artifact?) -> [String: Any] {
+        let library = Set(materialLibrary)
+        func entries(_ materials: [PartMaterial]) -> [[String: Any]] {
+            materials.map { ["name": $0.name, "density": $0.density] }
+        }
+        return ["densityUnit": PartMaterial.densityUnit, "massUnit": "g",
+                "designMaterials": entries(designMaterials(for: artifact).filter { !library.contains($0) }),
+                "libraryMaterials": entries(materialLibrary)]
+    }
+
+    private func materialPage(_ artifact: Artifact, offset: Int, limit: Int) throws -> [String: Any] {
+        var nodes: [(PartNode, String?)] = []
+        func append(_ children: [PartNode], parent: String?) {
+            for node in children { nodes.append((node, parent)); append(node.children ?? [], parent: node.id) }
+        }
+        append(artifact.parts, parent: nil)
+        let page = try nodes.dropFirst(offset).prefix(limit).map { node, parent -> [String: Any] in
+            var item: [String: Any] = ["partID": node.id, "name": node.name, "isGroup": node.isGroup,
+                                      "solidIndices": node.solidIndices]
+            if let parent { item["parentID"] = parent }
+            if !node.solidIndices.isEmpty {
+                item["material"] = try artifact.partMaterials[node.id].map { try json($0) } ?? NSNull()
+            }
+            return item
+        }
+        var info = materialCatalog(for: artifact)
+        info.merge(["artifactID": artifact.id, "offset": offset, "total": nodes.count, "items": page,
+                    "hasMore": offset + page.count < nodes.count, "staged": !artifact.materialChanges.isEmpty]) { _, new in new }
+        return info
     }
 
     private func renderColors(for artifact: Artifact) -> [Int: PartColor] {

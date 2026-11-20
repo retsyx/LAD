@@ -212,6 +212,9 @@ struct ProjectRevision: Codable, Sendable, Identifiable {
     var responseMessageID: UUID? = nil
     /// User-selected opaque colors, addressed by stable individual part IDs.
     var partColors: [String: PartColor]? = nil
+    /// Complete material definitions, addressed by stable individual part IDs.
+    /// Absent parts are unassigned.
+    var partMaterials: [String: PartMaterial]? = nil
     /// Optional user label; unnamed revisions display their stable history position.
     var name: String? = nil
     /// Reuse expensive validation only while the exact replay inputs match.
@@ -264,6 +267,8 @@ struct LADProject: Codable, Sendable {
     var displayMode: ViewportDisplayMode? = nil
     /// Most recently chosen part colors, newest first, local to this design.
     var recentPartColors: [PartColor]? = nil
+    /// Materials defined for this design rather than LAD's material library.
+    var projectMaterials: [PartMaterial]? = nil
     /// Tool and command activity belongs to this project and survives reopening.
     var taskAudits: [ProjectTaskAudit]? = nil
     /// Pending turns and the current unsent composer travel with this project.
@@ -281,7 +286,7 @@ struct LADProject: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case formatVersion, messages, revisions, selectedRevisionID, projectID, codexSettings, projectName
-        case showGrid, printVersionView, printLayoutView, projectionMode, displayMode, recentPartColors, taskAudits, queuedRequests
+        case showGrid, printVersionView, printLayoutView, projectionMode, displayMode, recentPartColors, projectMaterials, taskAudits, queuedRequests
         case draftPrompt, draftAttachments, queuePaused, partsPaneFraction
     }
 }

@@ -29,6 +29,7 @@ final class CADAgentBridge {
          onActivity: @escaping @Sendable (ProjectActivityEvent) -> Void,
          referenceAssets: [CADInputAsset] = [], versions: ProjectVersionContext = .empty,
          partLayout: PartLayout? = nil, partColors: [String: PartColor] = [:],
+         materials: CADPartMaterialContext = CADPartMaterialContext(),
          permissionController: AgentPermissionController? = nil) throws {
         self.workspace = try EngineArtifact.canonicalDirectory(workspace)
         access = try CADAgentWorkspace(directory: self.workspace)
@@ -59,7 +60,7 @@ final class CADAgentBridge {
             tools = try CADAgentTools(directory: self.workspace, python: python, threads: threads, current: current,
                                       currentPreview: currentPreview, engine: engine, viewport: viewport,
                                       hiddenSolids: hiddenSolids, solidColors: solidColors,
-                                      referenceAssets: referenceAssets, versions: versions, partLayout: partLayout, partColors: partColors,
+                                      referenceAssets: referenceAssets, versions: versions, partLayout: partLayout, partColors: partColors, materials: materials,
                                       permissionController: permissionController)
         } catch {
             Darwin.close(controlFD); Darwin.close(responseFD); Darwin.close(eventFD)

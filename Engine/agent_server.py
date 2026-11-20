@@ -55,6 +55,8 @@ INSTRUCTIONS = (
     "Use lad_get_part_colors for effective sRGB colors and stable part IDs, and lad_set_part_colors to stage color assignments or null resets without rebuilding geometry. "
     "Colors on candidate artifacts remain speculative; only the current patch or the final program's matching artifact patch is committed on success. "
     "Part colors have one current RGB value; the last successful color assignment applies. CadQuery Assembly color=cq.Color(r,g,b) seeds colors for new parts. "
+    "Use lad_get_part_materials for assigned part materials, design materials and LAD's material library, and lad_set_part_materials to define design-only materials and stage assignments or null unassignments by name. "
+    "Material assignments and definitions are committed under the same rules as colors. "
     "For moving assemblies, return a cq.Assembly with stable physical part metadata lad_id and root metadata lad_motion={grounded,connectors,joints}. "
     "Grounded is a list of physical part IDs. Connectors are {id,part,origin:[x,y,z],xAxis:[x,y,z],zAxis:[x,y,z]} in the final built geometry's world coordinates, with unit perpendicular axes. "
     "Joints are {id,name,type,parent,child,position:0,limits:[lower,upper]} using connector IDs, with optional position/limits. "

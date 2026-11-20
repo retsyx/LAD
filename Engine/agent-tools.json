@@ -318,6 +318,121 @@
     }
   },
   {
+    "name": "lad_get_part_materials",
+    "description": "Read each physical part's assigned material (name and density in g/cm³, or null when unassigned), stable part and folder IDs, and parent relationships, plus this design's materials and LAD's material library. Paginated; current works from the saved parts layout even when its geometry preview is unavailable. Never rebuilds geometry or changes the design.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by lad_build/lad_import, or current for the existing design."
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 100
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "read"
+    }
+  },
+  {
+    "name": "lad_set_part_materials",
+    "description": "Define materials for this design and stage an atomic batch of part or folder material assignments for one artifact, without rebuilding geometry or changing the live design. Assign a material by name from this design's materials or LAD's library, or null to leave parts unassigned. Folder assignments expand to physical parts; conflicting overlaps are rejected. Defined materials stay with this design and never enter LAD's library. Only a successful final response commits them, with the current assignments or the final replacement program's matching artifact assignments.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifactID": {
+          "type": "string",
+          "description": "Artifact ID returned by lad_build/lad_import, or current for the existing design."
+        },
+        "materials": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "density": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 100,
+                "description": "Grams per cubic centimeter, greater than 0."
+              }
+            },
+            "required": [
+              "name",
+              "density"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "changes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "properties": {
+              "partID": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "material": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "partID",
+              "material"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "host": {
+      "capability": "build"
+    }
+  },
+  {
     "name": "lad_measure",
     "description": "Measure native vertices, edges, curves, faces or whole parts. Returns exact properties and OpenCascade minimum distances/closest points and supported analytic angles.",
     "inputSchema": {

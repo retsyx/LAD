@@ -433,7 +433,7 @@ final class ExternalAgentServer: ObservableObject {
                 let ownerWindow = viewport?.window ?? coordinator?.agentWindow(for: state)
                 let session = try ProjectAgentSession(id: id, python: python, threads: min(state.threads, max(1, ProcessInfo.processInfo.activeProcessorCount / 2)),
                     current: snapshot.current, currentPreview: snapshot.preview, versions: snapshot.versions,
-                    partLayout: snapshot.partLayout, partColors: snapshot.partColors, viewport: viewport,
+                    partLayout: snapshot.partLayout, partColors: snapshot.partColors, materials: snapshot.materials, viewport: viewport,
                     permissionWindow: ownerWindow, hiddenSolids: snapshot.hiddenSolids, solidColors: snapshot.solidColors,
                     onActivity: { [weak state] event in MainActor.assumeIsolated { state?.recordTaskEvent(event, taskID: id) } })
                 tasks[id] = AgentTask(session: session, snapshot: snapshot, clientID: current.id, state: state)

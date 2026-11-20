@@ -63,6 +63,8 @@ final class AppState {
         didSet { if projectName != oldValue { agentStateGeneration &+= 1 } }
     }
     private(set) var recentPartColors: [PartColor] = []
+    /// Materials defined for this design rather than LAD's material library.
+    private(set) var projectMaterials: [PartMaterial] = []
     private(set) var partsPaneFraction = 0.75
     var error: String?
     var displayMode: ViewportDisplayMode = .edges {
@@ -409,6 +411,11 @@ final class AppState {
         guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return [:] }
         return PartColorState.solidColors(in: partTree, overrides: revision.partColors ?? [:])
     }
+    /// Material assignments of the selected version, by stable part ID.
+    var partMaterials: [String: PartMaterial] {
+        revisions.first(where: { $0.id == selectedRevisionID })?.partMaterials ?? [:]
+    }
+    private var solidDensities: [Int: Double] { PartMaterialState.solidDensities(in: partTree, materials: partMaterials) }
     private var currentSolidCount: Int {
         guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return 0 }
         if let parts = revision.parts { return parts.flatMap { $0.allSolidIndices }.max().map { $0 + 1 } ?? 0 }
@@ -712,6 +719,7 @@ final class AppState {
         pendingProjectRename = false
         projectName = nil
         recentPartColors = []
+        projectMaterials = []
         partsPaneFraction = 0.75
         showGrid = true
         printVersionView = false
@@ -1124,6 +1132,7 @@ final class AppState {
         let sourceRevisionID = selectedRevisionID
         let previousColors = Self.completePartColors(in: previousLayout.nodes,
             stored: revisions.first(where: { $0.id == sourceRevisionID })?.partColors ?? [:])
+        let materialContext = agentMaterialContext
         let previousPreview = posedPreview
         let previousSolidColors = PartColorState.solidColors(in: previousLayout.nodes, overrides: previousColors)
         let previousHiddenSolids = hiddenSolids
@@ -1186,7 +1195,7 @@ final class AppState {
                 autosave()
                 guard vendor.resolveExecutable(path) != nil else { throw LADError.message(vendor.setupMessage) }
                 let result = try await codex.generate(vendor: vendor, prompt: text, current: previous, history: history, attachments: sources, partLayout: previousLayout, partColors: previousColors,
-                                                    executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
+                                                    materials: materialContext, executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
                                                     onMessage: { commentary("project", $0) }, onActivity: { toolActivity("project", $0) },
                                                     python: runtime, threads: cores, engine: engine, currentPreview: previousPreview,
                                                     viewport: viewportView, hiddenSolids: previousHiddenSolids, solidColors: previousSolidColors,
@@ -1211,6 +1220,9 @@ final class AppState {
                 case .response(let message):
                     try applyAgentPartColorChanges(codex.partColorChanges, to: sourceRevisionID,
                                                   matching: previous, startedWith: previousColors)
+                    try applyAgentPartMaterialChanges(codex.partMaterialPatch.changes, to: sourceRevisionID,
+                                                      matching: previous, startedWith: materialContext.assignments)
+                    addProjectMaterials(codex.partMaterialPatch.definitions)
                     finishConversationResponse(message)
                     return
                 }
@@ -1264,7 +1276,7 @@ final class AppState {
                     Preserve the intended shape and dimensions. Fix or simplify the failing operations and return the complete replacement design.
                     """
                     let repairResult = try await codex.generate(vendor: vendor, prompt: repairRequest, current: spec, history: messages, attachments: sources, partLayout: previousLayout, partColors: previousColors,
-                                                     executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
+                                                     materials: materialContext, executable: path, model: modelName, reasoningEffort: effort, onProgress: progress,
                                                      onMessage: { commentary("repair", $0) }, onActivity: { toolActivity("repair", $0) },
                                                      python: runtime, threads: cores, engine: engine, viewport: viewportView,
                                                      hiddenSolids: previousHiddenSolids, solidColors: previousSolidColors,
@@ -1285,6 +1297,9 @@ final class AppState {
                     case .response(let message):
                         try applyAgentPartColorChanges(codex.partColorChanges, to: sourceRevisionID,
                                                       matching: previous, startedWith: previousColors)
+                        try applyAgentPartMaterialChanges(codex.partMaterialPatch.changes, to: sourceRevisionID,
+                                                          matching: previous, startedWith: materialContext.assignments)
+                        addProjectMaterials(codex.partMaterialPatch.definitions)
                         finishConversationResponse(message)
                         return
                     }
@@ -1319,7 +1334,8 @@ final class AppState {
                 try commit(spec, preview: preview, previousLayout: liveLayout, previouslyHidden: hiddenIDs, userMessageID: userMessage.id,
                            previousColors: Self.completePartColors(in: liveLayout.nodes, stored: sourceRevision?.partColors ?? [:]),
                            colorChanges: codex.partColorChanges,
-                           startedColors: previousColors)
+                           startedColors: previousColors, materials: codex.partMaterialPatch,
+                           previousMaterials: sourceRevision?.partMaterials ?? [:], startedMaterials: materialContext.assignments)
             } catch is CancellationError {
                 if operationID == token {
                     queuePaused = true; queueCanAdvance = false
@@ -1360,11 +1376,15 @@ final class AppState {
         autosave()
     }
 
-    private func commit(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout? = nil, previouslyHidden: Set<String> = [], userMessageID: UUID, previousColors: [String: PartColor] = [:], colorChanges: [CADPartColorChange] = [], startedColors: [String: PartColor] = [:]) throws {
+    private func commit(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout? = nil, previouslyHidden: Set<String> = [], userMessageID: UUID, previousColors: [String: PartColor] = [:], colorChanges: [CADPartColorChange] = [], startedColors: [String: PartColor] = [:],
+                        materials: CADPartMaterialPatch = CADPartMaterialPatch(), previousMaterials: [String: PartMaterial] = [:],
+                        startedMaterials: [String: PartMaterial] = [:]) throws {
         let response = ChatMessage(role: "assistant", content: spec.summary + "\n\nDesign ready.", phase: "final_answer")
         _ = try appendValidatedRevision(spec, preview: preview, previousLayout: previousLayout,
             previouslyHidden: previouslyHidden, previousColors: previousColors, colorChanges: colorChanges,
-            startedColors: startedColors, date: response.date, userMessageID: userMessageID, responseMessageID: response.id)
+            startedColors: startedColors, materialChanges: materials.changes, previousMaterials: previousMaterials,
+            startedMaterials: startedMaterials, date: response.date, userMessageID: userMessageID, responseMessageID: response.id)
+        addProjectMaterials(materials.definitions)
         finishGenerationFeedback()
         finishTaskAudit(status: "completed")
         messages.append(response)
@@ -1380,18 +1400,22 @@ final class AppState {
     @discardableResult
     private func appendValidatedRevision(_ spec: ModelSpec, preview: PreviewMesh, previousLayout: PartLayout?,
         previouslyHidden: Set<String>, previousColors: [String: PartColor], colorChanges: [CADPartColorChange],
-        startedColors: [String: PartColor], date: Date = Date(), userMessageID: UUID? = nil,
-        responseMessageID: UUID? = nil) throws -> UUID {
+        startedColors: [String: PartColor], materialChanges: [CADPartMaterialChange] = [],
+        previousMaterials: [String: PartMaterial] = [:], startedMaterials: [String: PartMaterial] = [:],
+        date: Date = Date(), userMessageID: UUID? = nil, responseMessageID: UUID? = nil) throws -> UUID {
         let defaults = Self.defaultParts(for: preview)
         let layout = previousLayout?.reconciled(with: defaults, allowingPlacementChanges: Set(spec.reorganizePartIDs ?? [])) ?? PartLayout(nodes: defaults)
         try ProjectStore.validatePartHierarchy(layout.nodes, solidCount: preview.solids)
         let colors = try Self.partColors(applying: colorChanges, in: layout.nodes,
                                         current: previousColors, startedWith: startedColors)
+        let materials = try PartMaterialState.applyingAgentChanges(materialChanges, in: layout.nodes,
+                                                                   current: previousMaterials, startedWith: startedMaterials)
         let hidden = Set(layout.nodes.flatMap(\.flattened).filter { previouslyHidden.contains($0.id) }.flatMap(\.solidIndices))
-        let revision = ProjectRevision(model: spec, date: date, preview: preview, partLayout: layout, hiddenSolids: hidden.sorted(), parts: defaults, runtime: preview.runtime,
+        var revision = ProjectRevision(model: spec, date: date, preview: preview, partLayout: layout, hiddenSolids: hidden.sorted(), parts: defaults, runtime: preview.runtime,
                                       userMessageID: userMessageID, responseMessageID: responseMessageID,
                                       partColors: colors.isEmpty ? nil : colors, validatedHash: preview.validatedHash,
                                       jointPositions: preview.assemblyPose?.positions)
+        revision.partMaterials = materials.isEmpty ? nil : materials
         revisions.append(revision)
         selectedRevisionID = revision.id; builtRevisionID = revision.id
         mesh = preview; selectedSolids = []; selectedPartNodeIDs = []; hiddenSolids = hidden
@@ -1979,8 +2003,12 @@ final class AppState {
         let transforms = displayedSolidTransforms
         let key = MeasurementKey(previewPath: preview.stepPath, brepPath: preview.brepPath, features: features, solids: solids.sorted(),
                                  transforms: AssemblySolidTransform.records(transforms))
-        if let cached = measurementCache[key] { measurementReport = cached; return }
-        do { measurementReport = transforms.isEmpty ? try CADMeasurements.report(preview, features: features, solids: solids) : nil }
+        let densities = solidDensities
+        func withMass(_ report: CADMeasurementReport) -> CADMeasurementReport {
+            CADMeasurements.addingMass(to: report, topology: preview.topology, densities: densities)
+        }
+        if let cached = measurementCache[key] { measurementReport = withMass(cached); return }
+        do { measurementReport = transforms.isEmpty ? withMass(try CADMeasurements.report(preview, features: features, solids: solids)) : nil }
         catch { measurementReport = nil; measurementError = error.localizedDescription; return }
         let needsNativeDistance = features.count + solids.count == 2 &&
             !(solids.isEmpty && features.allSatisfy { $0.kind == .vertex })
@@ -1998,7 +2026,7 @@ final class AppState {
                       self.displayedMesh?.stepPath == preview.stepPath, !Task.isCancelled else { return }
                 if self.measurementCache.count >= 128 { self.measurementCache.removeAll() }
                 self.measurementCache[key] = report
-                self.measurementReport = report
+                self.measurementReport = CADMeasurements.addingMass(to: report, topology: preview.topology, densities: densities)
                 self.isMeasuring = false
                 self.measurementTask = nil
             } catch is CancellationError {
@@ -2011,7 +2039,8 @@ final class AppState {
         }
     }
 
-    private func colorTargets(for nodeID: String) -> [PartNode] {
+    /// A context menu on a selected part applies to every selected part.
+    private func physicalPartTargets(for nodeID: String) -> [PartNode] {
         let nodes = partTree.flatMap(\.flattened)
         guard let clicked = nodes.first(where: { $0.id == nodeID }) else { return [] }
         let clickedSolids = clicked.allSolidIndices
@@ -2021,7 +2050,7 @@ final class AppState {
 
     func partColor(for nodeID: String) -> PartColor? {
         guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return nil }
-        let targets = colorTargets(for: nodeID)
+        let targets = physicalPartTargets(for: nodeID)
         let colors = Self.completePartColors(in: partTree, stored: revision.partColors ?? [:])
         guard let first = targets.first, let color = colors[first.id],
               targets.allSatisfy({ colors[$0.id] == color }) else { return nil }
@@ -2031,7 +2060,7 @@ final class AppState {
     func setPartColor(_ color: PartColor?, for nodeID: String) {
         guard color?.isValid != false,
               let index = revisions.firstIndex(where: { $0.id == selectedRevisionID }) else { return }
-        let targets = colorTargets(for: nodeID)
+        let targets = physicalPartTargets(for: nodeID)
         guard !targets.isEmpty else { return }
         var colors = revisions[index].partColors ?? [:]
         for node in targets {
@@ -2048,6 +2077,65 @@ final class AppState {
         revisions[index].partColors = colors.isEmpty ? nil : colors
         recentPartColors = recent
         autosave()
+    }
+
+    func partMaterial(for nodeID: String) -> PartMaterialAssignment {
+        let targets = physicalPartTargets(for: nodeID)
+        guard let first = targets.first else { return .unassigned }
+        let materials = partMaterials
+        let material = materials[first.id]
+        guard targets.allSatisfy({ materials[$0.id] == material }) else { return .mixed }
+        return material.map(PartMaterialAssignment.material) ?? .unassigned
+    }
+
+    func setPartMaterial(_ material: PartMaterial?, for nodeID: String) {
+        guard material?.isValid != false,
+              let index = revisions.firstIndex(where: { $0.id == selectedRevisionID }) else { return }
+        let targets = physicalPartTargets(for: nodeID)
+        guard !targets.isEmpty else { return }
+        var materials = revisions[index].partMaterials ?? [:]
+        for node in targets { materials[node.id] = material }
+        guard materials != (revisions[index].partMaterials ?? [:]) else { return }
+        revisions[index].partMaterials = materials.isEmpty ? nil : materials
+        refreshMeasurements()
+        autosave()
+    }
+
+    /// Materials this design defines or the selected version assigns, whether
+    /// or not the installation's library also has them.
+    var designMaterials: [PartMaterial] {
+        var seen = Set<PartMaterial>()
+        return (projectMaterials + partMaterials.values.sorted(by: PartMaterial.alphabetical)).filter { seen.insert($0).inserted }
+    }
+
+    /// Apply a successful turn's staged material edits to its captured source
+    /// revision, as for colors.
+    func applyAgentPartMaterialChanges(_ changes: [CADPartMaterialChange], to sourceRevisionID: UUID?,
+                                       matching source: ModelSpec?, startedWith snapshot: [String: PartMaterial]) throws {
+        guard !changes.isEmpty else { return }
+        guard let sourceRevisionID, let source,
+              let index = revisions.firstIndex(where: { $0.id == sourceRevisionID }),
+              revisions[index].model == source else {
+            throw LADError.message("The original design version changed before its materials could be applied.")
+        }
+        let revision = revisions[index]
+        let nodes = revision.partLayout?.nodes ?? revision.parts ?? revision.preview.map(Self.defaultParts(for:)) ?? []
+        let materials = try PartMaterialState.applyingAgentChanges(changes, in: nodes, current: revision.partMaterials ?? [:],
+                                                                   startedWith: snapshot)
+        revisions[index].partMaterials = materials.isEmpty ? nil : materials
+        if revision.id == selectedRevisionID { refreshMeasurements() }
+    }
+
+    /// Agent-defined materials belong to this design only.
+    func addProjectMaterials(_ definitions: [PartMaterial]) {
+        let merged = PartMaterialState.merging(definitions, into: projectMaterials)
+        if merged != projectMaterials { projectMaterials = merged }
+    }
+
+    /// The material state a new agent task starts from.
+    var agentMaterialContext: CADPartMaterialContext {
+        CADPartMaterialContext(assignments: partMaterials, design: projectMaterials,
+                               library: PartMaterialLibrary.shared.materials)
     }
 
     /// Apply only a successful turn's staged display edits to its captured
@@ -2252,6 +2340,8 @@ final class AppState {
                     revisions[index].partLayout = layout
                     revisions[index].partColors = Self.retainedPartColors(revisions[index].partColors ?? [:], in: layout.nodes,
                                                                           remappingGenericFrom: oldNodes)
+                    revisions[index].partMaterials = PartMaterialState.retained(revisions[index].partMaterials ?? [:],
+                                                                                in: layout.nodes, remappingGenericFrom: oldNodes)
                     hiddenSolids = Set(layout.nodes.flatMap(\.flattened).filter { hiddenIDs.contains($0.id) }.flatMap(\.solidIndices))
                     revisions[index].hiddenSolids = hiddenSolids.sorted()
                 }
@@ -2632,6 +2722,7 @@ final class AppState {
         pendingProjectRename = false
         projectName = project.projectName
         recentPartColors = project.recentPartColors ?? []
+        projectMaterials = project.projectMaterials ?? []
         partsPaneFraction = project.partsPaneFraction
         projectActivity.restore(project.taskAudits ?? [])
         showGrid = project.showGrid ?? true
@@ -2954,6 +3045,7 @@ final class AppState {
                    printVersionView: printVersionView ? true : nil, printLayoutView: printLayoutView ? true : nil,
                    projectionMode: projectionMode, displayMode: displayMode,
                    recentPartColors: recentPartColors.isEmpty ? nil : recentPartColors,
+                   projectMaterials: projectMaterials.isEmpty ? nil : projectMaterials,
                    taskAudits: taskAudits.isEmpty ? nil : taskAudits,
                    queuedRequests: queuedRequests.isEmpty ? nil : queuedRequests,
                    draftPrompt: draftPrompt.isEmpty ? nil : draftPrompt,
@@ -3094,7 +3186,7 @@ extension AppState {
             current: current, preview: builtRevisionID == selectedRevisionID ? posedPreview : nil,
             versions: ProjectVersionContext(revisions: revisions, selectedRevisionID: selectedRevisionID),
             partLayout: selectedPartLayout, partColors: revisions.first(where: { $0.id == selectedRevisionID })?.partColors ?? [:],
-            hiddenSolids: hiddenSolids, solidColors: solidColors)
+            materials: agentMaterialContext, hiddenSolids: hiddenSolids, solidColors: solidColors)
     }
 
     func beginExternalAgentAudit(id: UUID, client: ProjectExternalAgentIdentity, request: String,
@@ -3130,13 +3222,18 @@ extension AppState {
         if artifactID == "current", let selectedRevisionID, current == candidate.model {
             try applyAgentPartColorChanges(candidate.colorChanges, to: selectedRevisionID,
                 matching: current, startedWith: snapshot.partColors)
+            try applyAgentPartMaterialChanges(candidate.materials.changes, to: selectedRevisionID,
+                matching: current, startedWith: snapshot.materials.assignments)
             revisionID = selectedRevisionID
         } else {
             revisionID = try appendValidatedRevision(candidate.model, preview: candidate.preview,
                 previousLayout: selectedPartLayout, previouslyHidden: hiddenPartIDs,
                 previousColors: Self.completePartColors(in: partTree, stored: revisions.first(where: { $0.id == selectedRevisionID })?.partColors ?? [:]),
-                colorChanges: candidate.colorChanges, startedColors: snapshot.partColors)
+                colorChanges: candidate.colorChanges, startedColors: snapshot.partColors,
+                materialChanges: candidate.materials.changes, previousMaterials: partMaterials,
+                startedMaterials: snapshot.materials.assignments)
         }
+        addProjectMaterials(candidate.materials.definitions)
         projectActivity.recordExternalCommit(taskID: taskID, revisionID: revisionID, key: key, artifactID: artifactID)
         error = nil
         autosave()
