@@ -85,6 +85,8 @@ struct CADViewport: NSViewRepresentable {
     /// Replacing the mesh under the same key keeps the camera.
     var cameraKey: String? = nil
     var sectionEnabled = false
+    var canSection = true
+    var onSectionFromFace: (() -> Void)? = nil
     var onSelectionChanged: ((Set<Int>) -> Void)? = nil
     var onFeatureSelectionChanged: (([CADFeatureID]) -> Void)? = nil
     var onDeselectAll: (() -> Void)? = nil
@@ -110,6 +112,8 @@ struct CADViewport: NSViewRepresentable {
         view.onDeselectAll = onDeselectAll
         view.onHideSelected = onHideSelected
         view.onShowAll = onShowAll
+        view.canSection = canSection
+        view.onSectionFromFace = onSectionFromFace
         view.canExport = canExport
         view.onExportSelectedPartsSTEP = onExportSelectedPartsSTEP
         view.onExportFaceDXF = onExportFaceDXF
@@ -242,6 +246,11 @@ final class CADSceneView: NSView {
     private var sectionMesh: CADViewportPreparedMesh?
     private let sectionCaps = CADViewportSectionCaps()
     private var sectionManipulator: CADSectionManipulator?
+    private struct SectionFaceTarget {
+        let face: CADFeatureID
+        let meshPath: String?
+        let nativePath: String?
+    }
     private var faceIDsBySolid = [Int: [CADFeatureID?]]()
     private var faceIndices = [CADFeatureID: [Int32]]()
     private var faceBounds = [CADFeatureID: CADSilhouetteBatching.Bounds]()
@@ -391,6 +400,8 @@ final class CADSceneView: NSView {
     var onDeselectAll: (() -> Void)?
     var onHideSelected: (() -> Void)?
     var onShowAll: (() -> Void)?
+    var canSection = true
+    var onSectionFromFace: (() -> Void)?
     /// Whether the design can currently be exported; menu state only.
     var canExport = false
     var onExportSelectedPartsSTEP: (() -> Void)?
@@ -516,9 +527,9 @@ final class CADSceneView: NSView {
         let visibilityChanged = self.hiddenSolids != hiddenSolids
         let modeChanged = self.mode != mode
         let sectionStyleChanged = (self.mode == .wireframe) != (mode == .wireframe)
-        self.sectionEnabled = sectionEnabled
+        self.sectionEnabled = canSection && sectionEnabled
         if meshChanged { retainedSectionPlane = nil }
-        if meshChanged || !sectionEnabled { setSectionPlane(nil) }
+        if meshChanged || !self.sectionEnabled { setSectionPlane(nil) }
         if meshChanged || projectionChanged {
             cancelAssemblyGrab()
             cancelCameraTransition()
@@ -607,7 +618,20 @@ final class CADSceneView: NSView {
 
     private func openSectionIfRequested() {
         guard sectionEnabled, hasModel, sectionPlane == nil else { return }
-        setSectionPlane(retainedSectionPlane ?? CADSectionPlane(bounds: meshBounds, toward: rig.backward, cameraRight: rig.right))
+        let faces = selectedFeatures.filter { $0.kind == .face }
+        let selectedPlane = faces.count == 1 ? sectionPlane(for: faces[0]) : nil
+        setSectionPlane(selectedPlane ?? retainedSectionPlane
+                        ?? CADSectionPlane(bounds: meshBounds, toward: rig.backward, cameraRight: rig.right))
+    }
+
+    private func sectionPlane(for id: CADFeatureID) -> CADSectionPlane? {
+        guard !hiddenSolids.contains(id.solidIndex), let face = topology?.face(for: id), face.type == "PLANE",
+              let normal = face.normal, validFeaturePoint(normal), validFeaturePoint(face.center) else { return nil }
+        let transform = solidMatrices[id.solidIndex] ?? matrix_identity_double4x4
+        let center = transform * SIMD4(face.center[0], face.center[1], face.center[2], 1)
+        let direction = transform * SIMD4(normal[0], normal[1], normal[2], 0)
+        return CADSectionPlane(point: SIMD3(center.x, center.y, center.z),
+                               normal: SIMD3(direction.x, direction.y, direction.z), cameraRight: rig.right)
     }
 
     private func setSectionPlane(_ plane: CADSectionPlane?) {
@@ -2048,10 +2072,11 @@ final class CADSceneView: NSView {
         // Opening a context menu preserves both part and feature selections.
         let menu = NSMenu(title: "Viewport")
         let selectedFace = selectedFeatures.count == 1 ? selectedFeatures.first : nil
-        if !selectedSolids.isEmpty || selectedFace?.kind == .face,
+        if canSection || !selectedSolids.isEmpty || selectedFace?.kind == .face,
            let hit = visibleHit(at: convert(event.locationInWindow, from: nil)),
            let solid = solidIndex(of: hit.node) {
-            if let face = selectedFace, face.kind == .face, self.face(for: hit, solid: solid) == face {
+            let clickedFace = face(for: hit, solid: solid)
+            if let face = selectedFace, clickedFace == face {
                 let export = menu.addItem(withTitle: "Export DXF…", action: #selector(menuExportFaceDXF(_:)), keyEquivalent: "")
                 export.target = self
                 export.representedObject = face
@@ -2062,6 +2087,11 @@ final class CADSceneView: NSView {
                 let export = menu.addItem(withTitle: "Export STEP…", action: #selector(menuExportSelectedPartsSTEP), keyEquivalent: "")
                 export.target = self
                 export.isEnabled = canExport
+            }
+            if canSection, let clickedFace, sectionPlane(for: clickedFace) != nil {
+                let section = menu.addItem(withTitle: "Section from This Face", action: #selector(menuSectionFromFace(_:)), keyEquivalent: "")
+                section.target = self
+                section.representedObject = SectionFaceTarget(face: clickedFace, meshPath: loadedPath, nativePath: loadedNativePath)
             }
             if menu.numberOfItems > 0 { menu.addItem(.separator()) }
         }
@@ -2101,6 +2131,15 @@ final class CADSceneView: NSView {
     @objc private func menuHideSelected() { onHideSelected?() }
     @objc private func menuShowAll() { onShowAll?() }
     @objc private func menuExportSelectedPartsSTEP() { onExportSelectedPartsSTEP?() }
+    @objc private func menuSectionFromFace(_ sender: NSMenuItem) {
+        guard canSection, !isPreparingResources, let target = sender.representedObject as? SectionFaceTarget,
+              target.meshPath == loadedPath, target.nativePath == loadedNativePath,
+              let plane = sectionPlane(for: target.face) else { return }
+        sectionManipulator?.cancelInteraction()
+        sectionEnabled = true
+        setSectionPlane(plane)
+        onSectionFromFace?()
+    }
     @objc private func menuExportFaceDXF(_ sender: NSMenuItem) {
         guard let face = sender.representedObject as? CADFeatureID else { return }
         onExportFaceDXF?(face)

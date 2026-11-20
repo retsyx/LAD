@@ -11,7 +11,11 @@ enum CADViewportSectionRendering {
     float4 cadSectionPlane;
     #pragma body
     float4 cadWorldPosition = scn_frame.inverseViewTransform * float4(_surface.position, 1.0);
-    if (dot(cadSectionPlane, cadWorldPosition) > 0.0) {
+    // A face that seeds the cut lies on its boundary. Allow roundoff from
+    // reconstructing the world position as well as from the plane equation.
+    float3 cadScale = abs(cadWorldPosition.xyz) + abs(_surface.position);
+    float cadMagnitude = max(max(cadScale.x, cadScale.y), max(cadScale.z, abs(cadSectionPlane.w)));
+    if (dot(cadSectionPlane, cadWorldPosition) > \(CADSectionPlane.renderRoundoff) * max(1.0, cadMagnitude)) {
         discard_fragment();
     }
     """

@@ -6,6 +6,38 @@ import XCTest
 
 final class ViewportSectionRenderingTests: XCTestCase {
     @MainActor
+    func testSectionStartedOnAnObliqueFaceKeepsItsSurfaceVisibleAndPickable() async throws {
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 320))
+        let face = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0)
+        let bounds: [Double] = [7.25, -7.5, -1.25, 27.25, 12.5, 8.75]
+        var preview = PreviewMesh(positions: [7.25, -7.5, -1.25, 27.25, -7.5, 8.75,
+                                              27.25, 12.5, 8.75, 7.25, 12.5, -1.25],
+            triangleIndices: [0, 1, 2, 0, 2, 3], bounds: bounds, volume: 0, area: 400,
+            solids: 1, faces: 1, buildSeconds: 0, threads: 1, stepPath: "section-from-oblique-face")
+        preview.topology = CADTopology(vertices: [], edges: [], faces: [
+            CADFace(id: face, type: "PLANE", area: 200 * sqrt(5), center: [17.25, 2.5, 3.75],
+                    normal: [-1 / sqrt(5), 0, 2 / sqrt(5)])
+        ], parts: [])
+        preview.triangleFaces = [0, 0]
+        view.update(mesh: preview, mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [], hiddenSolids: [], selectedFeatures: [face])
+        let original = try await capture(view)
+        view.update(mesh: preview, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [], selectedFeatures: [face], sectionEnabled: true)
+        let section = try await capture(view)
+        XCTAssertEqual(view.sectionPlane?.value(for: .offset), 0)
+        for x in [12.25, 17.25, 22.25] {
+            let sample = SCNVector3(x, 3.5, (x - 17.25) * 0.5 + 3.75)
+            let before = try pixelBlock(view, original, around: sample, radius: 2).map(\.redComponent)
+            let after = try pixelBlock(view, section, around: sample, radius: 2).map(\.redComponent)
+            XCTAssertGreaterThan(try XCTUnwrap(before.min()), 0.25)
+            for (first, second) in zip(before, after) { XCTAssertEqual(first, second, accuracy: 0.025) }
+            let point = view.projectPoint(sample)
+            XCTAssertEqual(view.feature(at: NSPoint(x: CGFloat(point.x), y: CGFloat(point.y))), face)
+        }
+    }
+
+    @MainActor
     func testLiveCaptureClipsFacesOrdinaryEdgesAndPartOutlines() async throws {
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 400, height: 320))
         let preview = PreviewMesh(positions: [-10, -10, 0, 10, -10, 0, 10, 10, 0, -10, 10, 0],

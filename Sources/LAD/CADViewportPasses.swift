@@ -816,12 +816,18 @@ final class CADViewportPasses: @unchecked Sendable {
         return clip;
     }
 
+    float cad_mask_section_distance(float3 point, float4 plane) {
+        float4 position = float4(point, 1.0);
+        float magnitude = dot(abs(position), abs(plane));
+        return dot(position, plane) - \(CADSectionPlane.renderRoundoff) * max(1.0, magnitude);
+    }
+
     vertex CADMaskOut cad_mask_vertex(const device packed_float3 *positions [[buffer(0)]],
                                       constant CADMaskUniforms &u [[buffer(1)]], uint vid [[vertex_id]]) {
         CADMaskOut out;
         float3 point = float3(positions[vid]);
         out.position = cad_mask_clip(point, u);
-        out.sectionDistance = dot(float4(point, 1.0), u.localSectionPlane);
+        out.sectionDistance = cad_mask_section_distance(point, u.localSectionPlane);
         return out;
     }
 
@@ -831,7 +837,7 @@ final class CADViewportPasses: @unchecked Sendable {
         float3 point = float3(positions[vid]);
         out.position = cad_mask_clip(point, u);
         out.size = 1.0f;
-        out.sectionDistance = dot(float4(point, 1.0), u.localSectionPlane);
+        out.sectionDistance = cad_mask_section_distance(point, u.localSectionPlane);
         return out;
     }
 

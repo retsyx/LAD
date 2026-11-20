@@ -6,15 +6,18 @@ enum CADSectionHandle: CaseIterable, Hashable {
 }
 
 /// A viewport-only cut in world CAD coordinates. The normal points into the
-/// removed half-space. Angles are relative to the initial centered YZ cut.
+/// removed half-space. Angles are relative to the initial section basis.
 struct CADSectionPlane: Equatable, Sendable {
+    static let renderRoundoff = 8 * Float.ulpOfOne
+
     let center: SIMD3<Double>
     let origin: SIMD3<Double>
     let normal: SIMD3<Double>
     let horizontal: SIMD3<Double>
     let vertical: SIMD3<Double>
 
-    private let initialSide: Double
+    private let initialNormal: SIMD3<Double>
+    private let initialHorizontal: SIMD3<Double>
     private let offset: Double
     private let tilt: Double
     private let swing: Double
@@ -42,22 +45,46 @@ struct CADSectionPlane: Equatable, Sendable {
                 origin[axis] = towardHigh ? high[axis] : low[axis]
             }
         }
-        self.init(center: center, origin: origin, initialSide: side, offset: 0, tilt: 0, swing: 0)
+        self.init(center: center, origin: origin, initialNormal: SIMD3(side, 0, 0),
+                  initialHorizontal: SIMD3(0, side, 0), offset: 0, tilt: 0, swing: 0)
     }
 
-    private init(center: SIMD3<Double>, origin: SIMD3<Double>, initialSide: Double,
+    /// Align to an exact planar face, retaining material behind its outward normal.
+    init?(point: SIMD3<Double>, normal: SIMD3<Double>, cameraRight: SIMD3<Double>) {
+        let normalLength = simd_length(normal)
+        guard (0..<3).allSatisfy({ Float(point[$0]).isFinite && cameraRight[$0].isFinite }),
+              normalLength.isFinite, normalLength > 1e-12 else { return nil }
+        let unitNormal = normal / normalLength
+        let rightInPlane = cameraRight - unitNormal * simd_dot(cameraRight, unitNormal)
+        let rightLength = simd_length(rightInPlane)
+        let horizontal: SIMD3<Double>
+        if rightLength.isFinite, rightLength > 1e-6 {
+            horizontal = rightInPlane / rightLength
+        } else {
+            // An edge-on face can have no component of camera right in its plane.
+            let up = abs(unitNormal.z) < 0.9 ? SIMD3(0.0, 0, 1) : SIMD3(0.0, 1, 0)
+            horizontal = simd_normalize(simd_cross(up, unitNormal))
+        }
+        self.init(center: point, origin: point, initialNormal: unitNormal,
+                  initialHorizontal: horizontal, offset: 0, tilt: 0, swing: 0)
+        guard equation.w.isFinite else { return nil }
+    }
+
+    private init(center: SIMD3<Double>, origin: SIMD3<Double>, initialNormal: SIMD3<Double>, initialHorizontal: SIMD3<Double>,
                  offset: Double? = nil, tilt: Double, swing: Double) {
         self.center = center
         self.origin = origin
-        self.initialSide = initialSide
+        self.initialNormal = initialNormal
+        self.initialHorizontal = initialHorizontal
         self.tilt = tilt
         self.swing = swing
 
         let pitch = tilt.remainder(dividingBy: 360) * .pi / 180
         let yaw = swing.remainder(dividingBy: 360) * .pi / 180
-        let baseline = SIMD3(cos(yaw) * initialSide, sin(yaw) * initialSide, 0)
-        normal = baseline * cos(pitch) + SIMD3(0, 0, sin(pitch))
-        horizontal = SIMD3(-baseline.y, baseline.x, 0)
+        let yawNormal = cos(yaw) * initialNormal + sin(yaw) * initialHorizontal
+        let initialVertical = simd_cross(initialNormal, initialHorizontal)
+        normal = cos(pitch) * yawNormal + sin(pitch) * initialVertical
+        horizontal = cos(yaw) * initialHorizontal - sin(yaw) * initialNormal
         vertical = simd_cross(normal, horizontal)
         self.offset = offset ?? simd_dot(origin - center, normal)
     }
@@ -74,7 +101,8 @@ struct CADSectionPlane: Equatable, Sendable {
         guard value.isFinite else { return nil }
         if value == self.value(for: handle) { return self }
         let nextOrigin = handle == .offset ? origin + normal * (value - offset) : origin
-        let plane = CADSectionPlane(center: center, origin: nextOrigin, initialSide: initialSide,
+        let plane = CADSectionPlane(center: center, origin: nextOrigin, initialNormal: initialNormal,
+                                    initialHorizontal: initialHorizontal,
                                     offset: handle == .offset ? value : nil,
                                     tilt: handle == .vertical ? value : tilt,
                                     swing: handle == .horizontal ? value : swing)

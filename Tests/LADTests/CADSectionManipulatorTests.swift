@@ -29,9 +29,9 @@ final class CADSectionManipulatorTests: XCTestCase {
         let initialHandles = try handles(in: manipulator)
         XCTAssertEqual(simd_distance(initialHandles.hub, initialProjection.project(plane.origin).screen), 0, accuracy: 0.01)
         let initialLengths = initialHandles.lengths
-        XCTAssertLessThan(initialLengths[0], 64)
-        XCTAssertLessThan(initialLengths[1], 35)
-        XCTAssertLessThan(initialLengths[2], 35)
+        XCTAssertEqual(initialLengths[0], 50, accuracy: 0.01)
+        XCTAssertEqual(initialLengths[1], 27, accuracy: 0.01)
+        XCTAssertEqual(initialLengths[2], 27, accuracy: 0.01)
 
         for orthographic in [false, true] {
             rig.usesOrthographicProjection = orthographic
@@ -47,7 +47,7 @@ final class CADSectionManipulatorTests: XCTestCase {
                 XCTAssertEqual(current, initial, accuracy: 0.01)
             }
             for tip in currentHandles.tips {
-                let point = tip + 11 * simd_normalize(tip - center)
+                let point = tip + 13.5 * simd_normalize(tip - center)
                 XCTAssertTrue(manipulator.hitTest(NSPoint(x: point.x, y: point.y)) === manipulator)
             }
         }

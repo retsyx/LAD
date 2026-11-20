@@ -89,6 +89,97 @@ final class ViewportSectionPickingTests: XCTestCase {
     }
 
     @MainActor
+    func testEnablingSectionStartsOnTheOnlySelectedFaceInItsCurrentPose() async throws {
+        let view = try makeView()
+        let mesh = preview()
+        let pose: [Double] = [1, 0, 0, 17, 0, 0, -1, -3, 0, 1, 0, 9, 0, 0, 0, 1]
+        view.update(mesh: mesh, mode: .edges, grid: false, command: ViewportCommand(.front),
+                    selectedSolids: [], hiddenSolids: [], solidTransforms: [0: pose], sectionEnabled: true)
+        try await ready(view)
+        XCTAssertEqual(abs(try XCTUnwrap(view.sectionPlane).normal.x), 1, accuracy: 1e-12)
+
+        let camera = try XCTUnwrap(view.pointOfView)
+        let before = camera.simdTransform
+        let selection = [top, frontEdge]
+        view.update(mesh: mesh, mode: .edges, grid: false, command: nil, selectedSolids: [0], hiddenSolids: [],
+                    selectedFeatures: selection, solidTransforms: [0: pose])
+        view.update(mesh: mesh, mode: .edges, grid: false, command: nil, selectedSolids: [0], hiddenSolids: [],
+                    selectedFeatures: selection, solidTransforms: [0: pose], sectionEnabled: true)
+
+        let plane = try XCTUnwrap(view.sectionPlane)
+        XCTAssertEqual(plane.signedDistance(to: SIMD3(17, -7, 9)), 0, accuracy: 1e-12)
+        XCTAssertEqual(plane.normal.x, 0, accuracy: 1e-12)
+        XCTAssertEqual(plane.normal.y, -1, accuracy: 1e-12)
+        XCTAssertEqual(plane.normal.z, 0, accuracy: 1e-12)
+        XCTAssertEqual(plane.value(for: .offset), 0, accuracy: 1e-12)
+        for column in 0..<4 { XCTAssertEqual(camera.simdTransform[column], before[column]) }
+        try await ready(view)
+    }
+
+    @MainActor
+    func testContextMenuSectionsTheClickedFaceWithoutChangingSelection() async throws {
+        let view = try makeView()
+        let mesh = preview()
+        let otherFace = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0)
+        view.update(mesh: mesh, mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [], hiddenSolids: [], projection: .isometric)
+        try await ready(view)
+        var sectionRequests = 0
+        var featureChanges = [[CADFeatureID]]()
+        var partChanges = [Set<Int>]()
+        view.onSectionFromFace = { sectionRequests += 1 }
+        view.onFeatureSelectionChanged = { featureChanges.append($0) }
+        view.onSelectionChanged = { partChanges.append($0) }
+
+        let target = point(at: SCNVector3(0, -4.8, 4), in: view)
+        XCTAssertEqual(view.feature(at: target), frontEdge, "A context click can target the face next to an edge.")
+        XCTAssertEqual(try sectionItem(at: target, in: view)?.isEnabled, true)
+        XCTAssertNil(try sectionItem(at: NSPoint(x: 4, y: 4), in: view))
+        view.update(mesh: mesh, mode: .edges, grid: false, command: nil,
+                    selectedSolids: [], hiddenSolids: [], projection: .isometric, selectedFeatures: [otherFace])
+        let item = try XCTUnwrap(sectionItem(at: target, in: view))
+        XCTAssertTrue(item.isEnabled)
+        XCTAssertNil(view.sectionPlane)
+        _ = (item.target as? NSObject)?.perform(try XCTUnwrap(item.action), with: item)
+
+        let plane = try XCTUnwrap(view.sectionPlane)
+        XCTAssertEqual(plane.normal, SIMD3(0, 0, 1))
+        XCTAssertEqual(plane.signedDistance(to: SIMD3(0, 0, 4)), 0, accuracy: 1e-12)
+        XCTAssertEqual(sectionRequests, 1)
+        XCTAssertTrue(featureChanges.isEmpty)
+        XCTAssertTrue(partChanges.isEmpty)
+        try await ready(view)
+
+        view.canSection = false
+        XCTAssertNotEqual(try sectionItem(at: target, in: view)?.isEnabled, true)
+    }
+
+    @MainActor
+    func testMultiFaceAndCurvedSelectionsUseTheDefaultSection() async throws {
+        let right = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 3)
+        var curved = preview()
+        curved.stepPath += "-curved"
+        curved.topology?.faces[1].type = "CYLINDER"
+        curved.topology?.faces[1].normal = nil
+
+        for (mesh, selection) in [(preview(), [top, right]), (curved, [top])] {
+            let view = try makeView()
+            view.update(mesh: mesh, mode: .edges, grid: false, command: ViewportCommand(.top),
+                        selectedSolids: [], hiddenSolids: [], selectedFeatures: selection)
+            try await ready(view)
+            if selection.count == 1 {
+                let target = point(at: SCNVector3(0, 0, 4), in: view)
+                XCTAssertNotEqual(try sectionItem(at: target, in: view)?.isEnabled, true)
+            }
+            view.update(mesh: mesh, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [],
+                        selectedFeatures: selection, sectionEnabled: true)
+            let plane = try XCTUnwrap(view.sectionPlane)
+            XCTAssertEqual(abs(plane.normal.x), 1, accuracy: 1e-12)
+            XCTAssertEqual(plane.signedDistance(to: .zero), 0, accuracy: 1e-12)
+        }
+    }
+
+    @MainActor
     private func makeView() throws -> CADSceneView {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
@@ -107,6 +198,13 @@ final class ViewportSectionPickingTests: XCTestCase {
     private func point(at world: SCNVector3, in view: CADSceneView) -> NSPoint {
         let projected = view.projectPoint(world)
         return NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+    }
+
+    @MainActor
+    private func sectionItem(at point: NSPoint, in view: CADSceneView) throws -> NSMenuItem? {
+        let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: point,
+            modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+        return view.menu(for: event)?.item(withTitle: "Section from This Face")
     }
 
     private func preview(withInterior: Bool = false) -> PreviewMesh {

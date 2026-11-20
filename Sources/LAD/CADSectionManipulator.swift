@@ -12,9 +12,9 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
 
         func line(for handle: CADSectionHandle) -> (start: SIMD2<Double>, end: SIMD2<Double>) {
             switch handle {
-            case .offset: return (center, center + 44 * direction)
-            case .vertical: return (center - SIMD2(0, 15), center + SIMD2(0, 23))
-            case .horizontal: return (center + SIMD2(15, 0), center - SIMD2(23, 0))
+            case .offset: return (center, center + 50 * direction)
+            case .vertical: return (center - SIMD2(0, 18), center + SIMD2(0, 27))
+            case .horizontal: return (center + SIMD2(18, 0), center - SIMD2(27, 0))
             }
         }
 
@@ -183,10 +183,10 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         guard let handles else { return nil }
         // A foreshortened normal can project on top of a rotation bar.
         // Give the visible rotation grips their own reliable targets.
-        for bar in [CADSectionHandle.vertical, .horizontal] where simd_distance(point, handles.line(for: bar).end) <= 13 {
+        for bar in [CADSectionHandle.vertical, .horizontal] where simd_distance(point, handles.line(for: bar).end) <= 14 {
             return bar
         }
-        var nearest = 13.0
+        var nearest = 14.0
         var target: CADSectionHandle?
         for handle in CADSectionHandle.allCases {
             let line = handles.line(for: handle)
@@ -211,8 +211,8 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
             color.setFill()
             let shaft = NSBezierPath()
             shaft.move(to: NSPoint(line.start))
-            shaft.line(to: NSPoint(handle == .offset ? line.end - 11 * handles.direction : line.end))
-            shaft.lineWidth = handle == .offset ? 5 : 3
+            shaft.line(to: NSPoint(handle == .offset ? line.end - 12 * handles.direction : line.end))
+            shaft.lineWidth = handle == .offset ? 6 : 4
             shaft.lineCapStyle = .round
             shaft.stroke()
             if handle == .offset {
@@ -220,15 +220,15 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
                 let tangent = SIMD2(-direction.y, direction.x)
                 let arrow = NSBezierPath()
                 arrow.move(to: NSPoint(line.end))
-                arrow.line(to: NSPoint(line.end - 14 * direction + 9 * tangent))
-                arrow.line(to: NSPoint(line.end - 14 * direction - 9 * tangent))
+                arrow.line(to: NSPoint(line.end - 16 * direction + 11 * tangent))
+                arrow.line(to: NSPoint(line.end - 16 * direction - 11 * tangent))
                 arrow.close()
                 arrow.fill()
             } else {
                 let grip = handle == .vertical
-                    ? NSRect(x: line.end.x - 5, y: line.end.y - 8, width: 10, height: 16)
-                    : NSRect(x: line.end.x - 8, y: line.end.y - 5, width: 16, height: 10)
-                NSBezierPath(roundedRect: grip, xRadius: 5, yRadius: 5).fill()
+                    ? NSRect(x: line.end.x - 6, y: line.end.y - 9, width: 12, height: 18)
+                    : NSRect(x: line.end.x - 9, y: line.end.y - 6, width: 18, height: 12)
+                NSBezierPath(roundedRect: grip, xRadius: 6, yRadius: 6).fill()
             }
         }
         gold.setFill()
@@ -349,7 +349,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
 
     fileprivate func accessibilityRect(for handle: CADSectionHandle) -> NSRect {
         guard let point = handles?.line(for: handle).end else { return .zero }
-        let rect = NSRect(x: point.x - 7, y: point.y - 7, width: 14, height: 14)
+        let rect = NSRect(x: point.x - 10, y: point.y - 10, width: 20, height: 20)
         let windowRect = convert(rect, to: nil)
         return window?.convertToScreen(windowRect) ?? windowRect
     }

@@ -62,4 +62,36 @@ final class CADSectionPlaneTests: XCTestCase {
         let centered = try XCTUnwrap(moved.setting(0, for: .offset))
         XCTAssertEqual(centered.signedDistance(to: centered.center), 0, accuracy: 1e-12)
     }
+
+    func testSectionFromFaceUsesTheExactPlaneAndRelativeHandleAngles() throws {
+        let point = SIMD3<Double>(7, -11, 13)
+        let outwardNormal = SIMD3<Double>(1, 2, 2)
+        let cameraRight = SIMD3<Double>(2, -1, 0)
+        let initial = try XCTUnwrap(CADSectionPlane(point: point, normal: outwardNormal, cameraRight: cameraRight))
+        XCTAssertEqual(initial.origin, point)
+        XCTAssertEqual(initial.normal, outwardNormal / 3)
+        XCTAssertTrue(initial.contains(point - outwardNormal))
+        XCTAssertFalse(initial.contains(point + outwardNormal))
+        XCTAssertEqual(initial.signedDistance(to: point + 2 * cameraRight), 0, accuracy: 1e-12)
+        for handle in CADSectionHandle.allCases { XCTAssertEqual(initial.value(for: handle), 0) }
+
+        let swung = try XCTUnwrap(initial.setting(90, for: .horizontal))
+        let tilted = try XCTUnwrap(swung.setting(30, for: .vertical))
+        XCTAssertEqual(tilted.origin, point)
+        let expectedNormal = sqrt(3) / 2 * initial.horizontal + 0.5 * initial.vertical
+        XCTAssertEqual(simd_distance(tilted.normal, expectedNormal), 0, accuracy: 1e-12)
+        let moved = try XCTUnwrap(tilted.setting(-3, for: .offset))
+        XCTAssertEqual(simd_distance(moved.origin, point - 3 * expectedNormal), 0, accuracy: 1e-12)
+    }
+
+    func testFaceAlignedSectionHandlesAnEdgeOnCameraAndRejectsInvalidGeometry() throws {
+        let normal = SIMD3<Double>(0, 0, -1)
+        let plane = try XCTUnwrap(CADSectionPlane(point: .zero, normal: normal, cameraRight: normal))
+        XCTAssertEqual(plane.normal, normal)
+        XCTAssertEqual(simd_length(plane.horizontal), 1, accuracy: 1e-12)
+        XCTAssertEqual(simd_length(plane.vertical), 1, accuracy: 1e-12)
+        XCTAssertEqual(simd_dot(plane.horizontal, plane.vertical), 0, accuracy: 1e-12)
+        XCTAssertNil(CADSectionPlane(point: .zero, normal: .zero, cameraRight: normal))
+        XCTAssertNil(CADSectionPlane(point: SIMD3(.infinity, 0, 0), normal: normal, cameraRight: normal))
+    }
 }
