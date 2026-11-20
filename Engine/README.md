@@ -105,6 +105,12 @@ on per-face maps, while retaining CadQuery's subshape order, orientations,
 locations and degenerate-edge filtering. The installed CadQuery API and saved
 construction programs are unchanged.
 
+Each meshing pass reads every face's native mesh, then accepts faces with no
+inward cell and complete trim coverage in one array pass over all of them. Only
+the remaining faces take per-face retriangulation and coverage repair, in their
+original order with the same limits and errors, so the preview is identical to
+auditing each face separately.
+
 Exact area/volume and centroid queries share one native integral. Part bounds
 are computed once from analytic geometry and reused for whole-design bounds
 and meshing deflection. Final validation hands its statistics directly to the

@@ -8,6 +8,7 @@ from unittest import mock
 
 import cadquery as cq
 import numpy as np
+import OCP.BRepMesh as worker_mesh
 from scipy.spatial import cKDTree
 from OCP.BRep import BRep_Tool
 from OCP.BRepGProp import BRepGProp_Face
@@ -229,16 +230,19 @@ class PreviewTrimmedSurfaceTests(unittest.TestCase):
 
     def test_inward_native_candidates_fail_with_a_scoped_face_diagnostic(self):
         shape = cq.Solid.makeBox(2, 3, 4)
-        audit = worker._preview_face_triangles
+        mesher = worker_mesh.BRepMesh_IncrementalMesh
 
-        def poisoned(face, poly, location, points, normals, edges, *configuration):
-            bad = Poly_Triangulation(poly)
-            for index in range(1, bad.NbTriangles() + 1):
-                a, b, c = bad.Triangle(index).Get()
-                bad.SetTriangle(index, Poly_Triangle(a, c, b))
-            return audit(face, bad, location, points, normals, edges, *configuration)
+        def poisoned(native, parameters):
+            # Every native candidate is wound against its exact surface normals.
+            result = mesher(native, parameters)
+            for face in worker._shape_entities(cq.Shape.cast(native), 'Face'):
+                poly = BRep_Tool.Triangulation_s(face.wrapped, TopLoc_Location())
+                for index in range(1, poly.NbTriangles() + 1):
+                    a, b, c = poly.Triangle(index).Get()
+                    poly.SetTriangle(index, Poly_Triangle(a, c, b))
+            return result
 
-        with mock.patch.object(worker, '_preview_face_triangles', side_effect=poisoned) as candidates:
+        with mock.patch.object(worker_mesh, 'BRepMesh_IncrementalMesh', side_effect=poisoned) as candidates:
             with self.assertRaises(worker.ModelError) as caught:
                 worker.make_preview(shape)
         self.assertGreater(candidates.call_count, 1, 'A failed display candidate must permit a bounded native retry.')

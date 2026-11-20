@@ -1148,6 +1148,48 @@ def _preview_seam_vertices(solid, seams):
     return hidden
 
 
+def _preview_native_normals(poly, transform, reverse):
+    """Native lighting normals as `_preview_face_normals` reads them, or None.
+
+    gp_Dir.Transformed leaves directions unchanged for identity and translated
+    placements, so those read every node in one pass with the same values:
+    None for a non-finite normal, negated on a reversed face. Other placements,
+    and a node whose stored normal cannot form a direction, use the per-node
+    reading instead.
+    """
+    from OCP.gp import gp_TrsfForm
+    if transform.Form() not in (gp_TrsfForm.gp_Identity, gp_TrsfForm.gp_Translation):
+        return None
+    try:
+        coordinates = [poly.Normal(index).Coord() for index in range(1, poly.NbNodes() + 1)]
+    except Exception:
+        return None
+    if reverse:
+        return [[-x, -y, -z] if math.isfinite(x) and math.isfinite(y) and math.isfinite(z) else None
+                for x, y, z in coordinates]
+    return [[x, y, z] if math.isfinite(x) and math.isfinite(y) and math.isfinite(z) else None
+            for x, y, z in coordinates]
+
+
+def _preview_face_points(poly, location):
+    """A face's triangulation nodes in design coordinates.
+
+    gp_Pnt.Transformed leaves coordinates unchanged for an identity placement
+    and adds the offset for a translation, so those skip a native call per
+    node with identical results. Other placements transform each node natively.
+    """
+    from OCP.gp import gp_TrsfForm
+    transform = location.Transformation()
+    form = transform.Form()
+    nodes = range(1, poly.NbNodes() + 1)
+    if form == gp_TrsfForm.gp_Identity:
+        return [list(poly.Node(index).Coord()) for index in nodes]
+    if form == gp_TrsfForm.gp_Translation:
+        x, y, z = transform.TranslationPart().Coord()
+        return [[a + x, b + y, c + z] for a, b, c in (poly.Node(index).Coord() for index in nodes)]
+    return [list(poly.Node(index).Transformed(transform).Coord()) for index in nodes]
+
+
 def _preview_face_normals(face, poly, location):
     """Return outward lighting normals from the exact face, not mesh facets.
 
@@ -1172,14 +1214,18 @@ def _preview_face_normals(face, poly, location):
             pass
     normals = [None] * poly.NbNodes()
     if poly.HasNormals():
-        for index in range(1, poly.NbNodes() + 1):
-            try:
-                normal = poly.Normal(index).Transformed(transform)
-                coordinates = list(normal.Coord())
-                if all(math.isfinite(value) for value in coordinates):
-                    normals[index - 1] = [-value for value in coordinates] if reverse else coordinates
-            except Exception:
-                pass
+        read = _preview_native_normals(poly, transform, reverse)
+        if read is not None:
+            normals = read
+        else:
+            for index in range(1, poly.NbNodes() + 1):
+                try:
+                    normal = poly.Normal(index).Transformed(transform)
+                    coordinates = list(normal.Coord())
+                    if all(math.isfinite(value) for value in coordinates):
+                        normals[index - 1] = [-value for value in coordinates] if reverse else coordinates
+                except Exception:
+                    pass
     missing = [index for index, normal in enumerate(normals) if normal is None]
     if not missing:
         return normals
@@ -1471,6 +1517,17 @@ def _preview_metric_triangles(points, normals, uv, triangles, boundary, sign):
     return indices
 
 
+def _preview_cell_orientation(xyz, exact, cells):
+    """Each cell's facet normal against its mean exact normal, and its doubled area."""
+    import numpy as np
+    corners = xyz[cells]
+    planes = np.cross(corners[..., 1, :] - corners[..., 0, :], corners[..., 2, :] - corners[..., 0, :])
+    lengths = np.linalg.norm(planes, axis=-1)
+    dots = np.divide((planes * exact[cells].mean(axis=-2)).sum(axis=-1), lengths,
+                     out=np.zeros_like(lengths), where=lengths > 1e-20)
+    return dots, lengths
+
+
 def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary, tolerance, uv_nodes=None):
     """Improve folded native cells without moving or adding mesh nodes.
 
@@ -1493,12 +1550,7 @@ def _preview_retriangulate_face(face, poly, points, normals, triangles, boundary
     orientation_cache = {}
 
     def raw_audit(cells):
-        corners = xyz[cells]
-        planes = np.cross(corners[..., 1, :] - corners[..., 0, :], corners[..., 2, :] - corners[..., 0, :])
-        lengths = np.linalg.norm(planes, axis=-1)
-        dots = np.divide((planes * exact[cells].mean(axis=-2)).sum(axis=-1), lengths,
-                         out=np.zeros_like(lengths), where=lengths > 1e-20)
-        return dots, lengths
+        return _preview_cell_orientation(xyz, exact, cells)
 
     def audit(cells):
         nonlocal uv, surface, projector
@@ -1911,10 +1963,8 @@ def _preview_refine_face(face, poly, location, points, normals, triangles, bound
 
 def _preview_face_triangles(face, poly, location, points, normals, edges, tolerance, refine_surface=False):
     """Audit native coverage and complete small gaps at curved trim corners."""
-    from collections import Counter, defaultdict
-    from OCP.BRep import BRep_Tool
+    import numpy as np
     from OCP.TopAbs import TopAbs_Orientation
-    from OCP.TopoDS import TopoDS
     reverse = face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
     triangles = [[a - 1, (c if reverse else b) - 1, (b if reverse else c) - 1]
                  for a, b, c in (poly.Triangle(index).Get() for index in range(1, poly.NbTriangles() + 1))]
@@ -1924,11 +1974,169 @@ def _preview_face_triangles(face, poly, location, points, normals, edges, tolera
         return _preview_boundary_edges(edges, poly, location)
     if refine_surface:
         triangles = _preview_refine_face(face, poly, location, points, normals, triangles, boundary(), tolerance)
+        xyz = np.asarray(points)
     else:
-        triangles = _preview_retriangulate_face(face, poly, points, normals, triangles, boundary, tolerance)
+        # Retriangulation adds no nodes, so it and the coverage audit share
+        # one array conversion of the face's nodes.
+        xyz = np.asarray(points)
+        triangles = _preview_retriangulate_face(face, poly, xyz, np.asarray(normals), triangles, boundary, tolerance)
     if len(points) == 3 and len(triangles) == 1:
         return triangles  # Common faceted imports need no boundary graph.
+    boundary_pairs, seam_pairs = _preview_trim_pairs(edges, poly, location)
+    if not _preview_coverage_defects(points, xyz, np.asarray(triangles, dtype=np.int64).reshape(-1, 3),
+                                     np.array([0, len(points)]), [boundary_pairs], [seam_pairs])[0]:
+        return triangles
+    return _preview_repair_coverage(face, poly, location, points, normals, triangles, edges, tolerance)
 
+
+def _preview_trim_pairs(edges, poly, location):
+    """Native trim polygon segments on a face's triangulation, and those on seams."""
+    from OCP.BRep import BRep_Tool
+    from OCP.TopoDS import TopoDS
+    boundary_pairs, seam_pairs = [], []
+    for edge in edges:
+        seam = BRep_Tool.IsClosed_s(edge.wrapped, poly, location)
+        for wrapped in (edge.wrapped, TopoDS.Edge(edge.wrapped.Reversed())):
+            polygon = BRep_Tool.PolygonOnTriangulation_s(wrapped, poly, location)
+            if polygon is None:
+                continue
+            nodes = polygon.Nodes()
+            indices = [nodes.Value(index) - 1 for index in range(nodes.Lower(), nodes.Upper() + 1)]
+            pairs = list(zip(indices, indices[1:]))
+            boundary_pairs += pairs
+            if seam:
+                seam_pairs += pairs
+    return boundary_pairs, seam_pairs
+
+
+def _preview_coverage_defects(points, xyz, cells, offsets, boundary_pairs, seam_pairs):
+    """For each face, whether `_preview_repair_coverage` would change or reject it.
+
+    The same audit in array operations over faces whose nodes occupy
+    consecutive `offsets` ranges of `points`/`xyz`. `cells` index those
+    combined nodes; each face's trim pairs use its own node numbers.
+    Zero-length edges collapse their endpoints, and every native trim segment
+    must bound exactly one oriented facet (two for seams) with no other open
+    or overlapping edge. Only collapse classes matter, not their
+    representatives.
+    """
+    import numpy as np
+    total, faces = int(offsets[-1]), len(offsets) - 1
+    starts = offsets[:-1]
+
+    def global_pairs(per_face):
+        lengths = [len(pairs) for pairs in per_face]
+        pairs = np.asarray([pair for face in per_face for pair in face], dtype=np.int64).reshape(-1, 2)
+        return pairs + np.repeat(starts, lengths)[:, None]
+    native_pairs, seam_pairs = global_pairs(boundary_pairs), global_pairs(seam_pairs)
+    cell_edges = np.stack((cells, np.roll(cells, -1, axis=1)), axis=-1).reshape(-1, 2)
+    keys = np.arange(total, dtype=np.int64)
+    candidates = np.concatenate((cell_edges, native_pairs))
+    delta = xyz[candidates[:, 0]] - xyz[candidates[:, 1]]
+    # A superset of math.dist <= 1e-12; the exact test decides each candidate.
+    near = candidates[np.einsum("ij,ij->i", delta, delta) <= 4e-24].tolist()
+    if near:
+        parents = {}
+
+        def root(index):
+            while parents.get(index, index) != index:
+                parents[index] = parents.get(parents[index], parents[index])
+                index = parents[index]
+            return index
+        for a, b in near:
+            if math.dist(points[a], points[b]) <= 1e-12:
+                parents[root(b)] = root(a)
+        for index in list(parents):
+            keys[index] = root(index)
+
+    def pair_keys(pairs):
+        left, right = keys[pairs[:, 0]], keys[pairs[:, 1]]
+        distinct = left != right
+        return (np.minimum(left, right) * total + np.maximum(left, right))[distinct], left, right, distinct
+
+    corner_keys = keys[cells]
+    facets = ((corner_keys[:, 0] != corner_keys[:, 1]) & (corner_keys[:, 1] != corner_keys[:, 2])
+              & (corner_keys[:, 0] != corner_keys[:, 2]))
+    edge_keys, left, right, distinct = pair_keys(cell_edges)
+    used = np.repeat(facets, 3)[distinct]
+    edge_keys, signs = edge_keys[used], np.where(left < right, 1, -1)[distinct][used]
+    unique, inverse, counts = np.unique(edge_keys, return_inverse=True, return_counts=True)
+    balance = np.bincount(inverse, weights=signs, minlength=len(unique))
+    native = np.unique(pair_keys(native_pairs)[0])
+    seams = np.unique(pair_keys(seam_pairs)[0])
+    in_native, in_seams = np.isin(unique, native), np.isin(unique, seams)
+    wrong = ((counts > 2) | ((counts == 2) & (balance != 0)) | (in_native & (counts != 1) & ~in_seams)
+             | ((counts == 1) & ~in_native))
+    missing = native[~np.isin(native, unique)]
+    defective = np.zeros(faces, dtype=bool)
+    for flagged in (unique[wrong], missing):
+        defective[np.searchsorted(offsets, flagged // total, side="right") - 1] = True
+    return defective
+
+
+def _preview_accept_faces(entries, accepted):
+    """Read faces' native meshes in order and accept the healthy ones together.
+
+    Returns {key: (poly, location, points, normals, triangles)} for a prefix of
+    `entries` (key, face, edges). `triangles` is the native list when
+    `_preview_face_triangles` would return it unchanged: no inward cell for
+    retriangulation and no coverage defect. Otherwise it is None, and that face
+    takes the per-face audit. Reading stops at a face without triangles,
+    where native sizes alone exceed the preview limits, or whose reading
+    fails; the caller reads that face again in order and reports its error
+    there. Valid only when no face is being refined, since refinement
+    rewrites triangulations that located instances share.
+    """
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_Orientation
+    from OCP.TopLoc import TopLoc_Location
+    nodes, cells = accepted
+    read = []
+    for key, face, edges in entries:
+        location = TopLoc_Location()
+        poly = BRep_Tool.Triangulation_s(face.wrapped, location)
+        if poly is None or not poly.NbTriangles():
+            break
+        nodes, cells = nodes + poly.NbNodes(), cells + poly.NbTriangles()
+        if nodes > MAX_VERTICES or cells > MAX_TRIANGLES:
+            break
+        try:
+            points = _preview_face_points(poly, location)
+            normals = _preview_face_normals(face, poly, location)
+            reverse = face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
+            triangles = [[a - 1, (c if reverse else b) - 1, (b if reverse else c) - 1]
+                         for a, b, c in (poly.Triangle(index).Get() for index in range(1, poly.NbTriangles() + 1))]
+            trims = _preview_trim_pairs(edges, poly, location)
+        except Exception:
+            break
+        read.append((key, poly, location, points, normals, triangles, *trims))
+    if not read:
+        return {}
+    sizes = [len(item[3]) for item in read]
+    offsets = np.concatenate(([0], np.cumsum(sizes))).astype(np.int64)
+    points = [point for item in read for point in item[3]]
+    xyz, exact = np.asarray(points), np.asarray([normal for item in read for normal in item[4]])
+    cell_counts = [len(item[5]) for item in read]
+    cells = (np.asarray([cell for item in read for cell in item[5]], dtype=np.int64).reshape(-1, 3)
+             + np.repeat(offsets[:-1], cell_counts)[:, None])
+    # Retriangulation leaves a face unchanged without inward cells.
+    dots, lengths = _preview_cell_orientation(xyz, exact, cells)
+    inward = np.zeros(len(read), dtype=bool)
+    inward[np.repeat(np.arange(len(read)), cell_counts)[(lengths > 1e-12) & (dots < -1e-8 / 3)]] = True
+    # A single native triangle needs no boundary graph.
+    trivial = (np.asarray(sizes) == 3) & (np.asarray(cell_counts) == 1)
+    defective = _preview_coverage_defects(points, xyz, cells, offsets, [item[6] for item in read],
+                                          [item[7] for item in read])
+    healthy = ~inward & (trivial | ~defective)
+    return {item[0]: (item[1], item[2], item[3], item[4], item[5] if ok else None) for item, ok in zip(read, healthy)}
+
+
+def _preview_repair_coverage(face, poly, location, points, normals, triangles, edges, tolerance):
+    """The complete coverage audit, completing small gaps at curved trim corners."""
+    from collections import Counter, defaultdict
+    from OCP.BRep import BRep_Tool
+    from OCP.TopoDS import TopoDS
     # Collapse only endpoints of native zero-length mesh/pole edges for the
     # audit. Nearby nodes on unrelated trim curves retain distinct identities.
     parents = list(range(len(points)))
@@ -2115,22 +2323,32 @@ def _preview_mesh(shape, solids, tolerance):
             group["failure"] = "OpenCascade did not complete triangulation"
             return False
         total_nodes, total_triangles = accepted
+        # Accept the group's healthy faces in one array pass; the loop keeps
+        # each face's order, size limits and errors.
+        read = {} if refine_surface else _preview_accept_faces(
+            [((solid_index, local_index), face, edges) for solid_index in group["solids"]
+             for local_index, (face, edges) in enumerate(faces[solid_index])], accepted)
         meshes = {}
         try:
             for solid_index in group["solids"]:
                 chunks = []
                 for local_index, (face, edges) in enumerate(faces[solid_index]):
-                    location = TopLoc_Location()
-                    poly = BRep_Tool.Triangulation_s(face.wrapped, location)
+                    known = read.get((solid_index, local_index))
+                    if known is None:
+                        location = TopLoc_Location()
+                        poly = BRep_Tool.Triangulation_s(face.wrapped, location)
+                    else:
+                        poly, location, points, normals, triangles = known
                     if poly is None or not poly.NbTriangles():
                         raise _PreviewMeshError("OpenCascade returned no surface triangles")
                     if total_nodes + poly.NbNodes() > MAX_VERTICES or total_triangles + poly.NbTriangles() > MAX_TRIANGLES:
                         raise ModelError("Preview exceeds the mesh size limit; simplify the design.")
-                    transform = location.Transformation()
-                    points = [list(poly.Node(index).Transformed(transform).Coord()) for index in range(1, poly.NbNodes() + 1)]
-                    normals = _preview_face_normals(face, poly, location)
-                    triangles = _preview_face_triangles(face, poly, location, points, normals, edges,
-                                                        linear_deflection, refine_surface)
+                    if known is None:
+                        points = _preview_face_points(poly, location)
+                        normals = _preview_face_normals(face, poly, location)
+                    if known is None or triangles is None:
+                        triangles = _preview_face_triangles(face, poly, location, points, normals, edges,
+                                                            linear_deflection, refine_surface)
                     total_nodes += len(points)
                     total_triangles += len(triangles)
                     if total_nodes > MAX_VERTICES or total_triangles > MAX_TRIANGLES:
@@ -2309,12 +2527,29 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left, pro
             pass  # A singular or unavailable sample cannot justify a split.
         return (math.nan,) * 6
 
-    def probe(key):
-        if key not in samples:
-            if len(samples) >= samples_left:
-                return (math.nan,) * 6
-            samples[key] = evaluate(uv[list(key)].mean(axis=0))
-        return samples[key]
+    def probe(keys):
+        """Exact samples at the UV midpoints of node tuples, in request order.
+
+        New tuples are evaluated in order of first request until the sample
+        budget is spent; later new ones are unavailable (NaN). Midpoints add
+        the sorted nodes' UVs in order and divide once, as NumPy's mean does.
+        Evaluation keeps request order: a surface adaptor's span cache can
+        round a sample on a span boundary differently after another span.
+        """
+        unavailable = (math.nan,) * 6
+        new = list(dict.fromkeys(key for key in keys if key not in samples))[:max(0, samples_left - len(samples))]
+        midpoints = {}
+        for size in (2, 3):
+            group = [key for key in new if len(key) == size]
+            if group:
+                nodes = np.asarray(group, dtype=np.int64)
+                total = uv[nodes[:, 0]]
+                for column in range(1, size):
+                    total = total + uv[nodes[:, column]]
+                midpoints.update(zip(group, total / size))
+        for key in new:
+            samples[key] = evaluate(midpoints[key])
+        return [samples.get(key, unavailable) for key in keys]
 
     def project(key, adjacent):
         nonlocal exact_surface
@@ -2359,8 +2594,9 @@ def _refine_preview_shading_face(chunk, tolerance, samples_left, nodes_left, pro
             candidates = candidates[priority]
         directed = np.stack((cells, np.roll(cells, -1, axis=1)), axis=-1)
         edge_keys = np.sort(directed, axis=-1)
-        sampled = np.asarray([[probe(tuple(sorted(cell))), *(probe(tuple(pair)) for pair in keys)]
-                              for cell, keys in zip(cells[candidates].tolist(), edge_keys[candidates].tolist())])
+        requests = [key for cell, keys in zip(np.sort(cells[candidates], axis=1).tolist(), edge_keys[candidates].tolist())
+                    for key in (tuple(cell), *(tuple(pair) for pair in keys))]
+        sampled = np.asarray(probe(requests)).reshape(len(candidates), 4, 6)
         dots = _preview_shading_dots(corners[candidates], exact[cells[candidates]], sampled)
         worst = dots.min(axis=1)
         failing = np.flatnonzero(worst < PREVIEW_SHADING_NORMAL_DOT)

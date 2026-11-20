@@ -7,7 +7,10 @@ from unittest import mock
 
 import cadquery as cq
 import OCP.BRepMesh as BRepMesh
+from OCP.BRep import BRep_Tool
 from OCP.IMeshTools import IMeshTools_MeshAlgoType
+from OCP.Poly import Poly_Triangle
+from OCP.TopLoc import TopLoc_Location
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import worker
@@ -18,24 +21,31 @@ DELABELLA = IMeshTools_MeshAlgoType.IMeshTools_MeshAlgoType_Delabella
 
 class PreviewMeshRetryTests(unittest.TestCase):
     def preview_failing_once(self, shape, fails):
-        """Fail the first candidate of faces selected by `fails`; record meshing and audits."""
-        audit, mesher = worker._preview_face_triangles, BRepMesh.BRepMesh_IncrementalMesh
-        failed, audited, meshed = set(), Counter(), []
+        """Turn the first native mesh of faces selected by `fails` inward; record
+        meshing and each face's candidate reads (one per meshing pass)."""
+        read, mesher = worker._preview_face_normals, BRepMesh.BRepMesh_IncrementalMesh
+        audited, meshed = Counter(), []
 
-        def candidate(face, poly, *rest):
-            key = tuple(round(value, 6) for value in face.Center().toTuple())
-            audited[key] += 1
-            if fails(face) and not failed:
-                failed.add(key)
-                raise worker._PreviewMeshError("the triangulation contains inward surface triangles")
-            return audit(face, poly, *rest)
+        def candidate(face, poly, location):
+            audited[tuple(round(value, 6) for value in face.Center().toTuple())] += 1
+            return read(face, poly, location)
 
         def capture(native, parameters):
             meshed.append((len(worker._shape_entities(cq.Shape.cast(native), "Solid")),
                            parameters.MeshAlgo, parameters.Angle, parameters.Deflection))
-            return mesher(native, parameters)
+            result = mesher(native, parameters)
+            if len(meshed) == 1:
+                # Reversed winding faces the exact surface normals: a genuinely
+                # inward candidate for both batch acceptance and per-face audit.
+                for face in worker._shape_entities(cq.Shape.cast(native), "Face"):
+                    if fails(face):
+                        poly = BRep_Tool.Triangulation_s(face.wrapped, TopLoc_Location())
+                        for index in range(1, poly.NbTriangles() + 1):
+                            a, b, c = poly.Triangle(index).Get()
+                            poly.SetTriangle(index, Poly_Triangle(a, c, b))
+            return result
 
-        with (mock.patch.object(worker, "_preview_face_triangles", side_effect=candidate),
+        with (mock.patch.object(worker, "_preview_face_normals", side_effect=candidate),
               mock.patch.object(BRepMesh, "BRepMesh_IncrementalMesh", side_effect=capture)):
             preview = worker.make_preview(shape)
         return preview, audited, meshed
