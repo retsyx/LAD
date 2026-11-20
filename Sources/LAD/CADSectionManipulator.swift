@@ -82,6 +82,8 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
     private var plane: CADSectionPlane?
     private var handles: Layout?
     private var edit: Edit?
+    private var hoverTrackingArea: NSTrackingArea?
+    private(set) var hoveredHandle: CADSectionHandle?
     private let editor = NSView()
     private let valueField = NSTextField()
     private let unitLabel = NSTextField(labelWithString: "")
@@ -132,29 +134,76 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
     func update(plane: CADSectionPlane?, projection: CameraRig.Projection) {
         self.plane = plane
         guard let plane, let layout = Layout.make(plane: plane, projection: projection) else {
+            setHoveredHandle(nil)
             finishEdit()
             handles = nil
             isHidden = true
             return
         }
         isHidden = false
-        if handles != layout {
+        let layoutChanged = handles != layout
+        if layoutChanged {
             invalidateHandles()
             handles = layout
             invalidateHandles()
         }
         updateEditorPosition()
+        if layoutChanged {
+            if let window, window.isKeyWindow, NSEvent.pressedMouseButtons == 0 {
+                updateHover(at: window.mouseLocationOutsideOfEventStream)
+            } else {
+                setHoveredHandle(nil)
+            }
+        }
     }
 
     func cancelInteraction() {
+        defer { setHoveredHandle(nil) }
         guard let edit else { return }
         finishEdit()
         if edit.dragging { onChange(edit.startingPlane) }
     }
 
     override func viewWillMove(toSuperview newSuperview: NSView?) {
-        if newSuperview == nil { finishEdit() }
+        if newSuperview == nil {
+            setHoveredHandle(nil)
+            finishEdit()
+        }
         super.viewWillMove(toSuperview: newSuperview)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        guard hoverTrackingArea == nil else { return }
+        let area = NSTrackingArea(rect: .zero, options: [.inVisibleRect, .activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { updateHover(at: event.locationInWindow) }
+    override func mouseMoved(with event: NSEvent) { updateHover(at: event.locationInWindow) }
+    override func mouseExited(with event: NSEvent) { setHoveredHandle(nil) }
+
+    private func updateHover(at pointInWindow: NSPoint) {
+        let point = convert(pointInWindow, from: nil)
+        guard edit?.dragging != true, let handle = handle(at: SIMD2(point.x, point.y)) else {
+            setHoveredHandle(nil)
+            return
+        }
+        // Tracking spans the viewport, including locations covered by its
+        // controls. Highlight a handle only when it would receive the click.
+        if let content = window?.contentView, content.hitTest(convert(point, to: content.superview)) !== self {
+            setHoveredHandle(nil)
+            return
+        }
+        setHoveredHandle(handle)
+    }
+
+    private func setHoveredHandle(_ handle: CADSectionHandle?) {
+        guard handle != hoveredHandle else { return }
+        hoveredHandle = handle
+        invalidateHandles()
     }
 
     private func invalidateHandles() {
@@ -184,6 +233,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
     override func mouseUp(with event: NSEvent) {
         moveHandle(to: pointer(event))
         edit?.dragging = false
+        updateHover(at: event.locationInWindow)
     }
 
     private func pointer(_ event: NSEvent) -> SIMD2<Double> {
@@ -192,7 +242,9 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
     }
 
     private func handle(at point: SIMD2<Double>) -> CADSectionHandle? {
-        guard let handles else { return nil }
+        let location = NSPoint(point)
+        guard !isHidden, bounds.contains(location), editor.isHidden || !editor.frame.contains(location),
+              let handles else { return nil }
         // Resolve overlapping tip targets before testing the shafts.
         var nearest = 14.0
         var target: CADSectionHandle?
@@ -226,7 +278,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
             let line = handles.line(for: handle)
             guard line.start != line.end else { continue }
             let arrowScale = handle == .offset ? simd_distance(line.start, line.end) / Layout.fullArrowLength : 1
-            let color = gold.withAlphaComponent(edit == nil || edit?.handle == handle ? 1 : 0.53)
+            let color = handleColor(handle, gold: gold)
             color.setStroke()
             color.setFill()
             let shaft = NSBezierPath()
@@ -252,7 +304,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
             }
         }
         if case let .depth(towardViewer) = handles.offsetShape {
-            drawDepthHandle(at: handles.center, towardViewer: towardViewer, color: gold)
+            drawDepthHandle(at: handles.center, towardViewer: towardViewer, color: handleColor(.offset, gold: gold))
         } else {
             gold.setFill()
             NSBezierPath(ovalIn: NSRect(x: handles.center.x - 6, y: handles.center.y - 6,
@@ -260,16 +312,20 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         }
     }
 
+    private func handleColor(_ handle: CADSectionHandle, gold: NSColor) -> NSColor {
+        if hoveredHandle == handle { return gold.blended(withFraction: 0.4, of: .white) ?? gold }
+        return gold.withAlphaComponent(edit == nil || edit?.handle == handle ? 1 : 0.53)
+    }
+
     private func drawDepthHandle(at center: SIMD2<Double>, towardViewer: Bool, color: NSColor) {
-        let tint = color.withAlphaComponent(edit == nil || edit?.handle == .offset ? 1 : 0.53)
         let ring = NSBezierPath(ovalIn: NSRect(x: center.x - 9, y: center.y - 9, width: 18, height: 18))
         NSColor(Palette.panel).setFill()
         ring.fill()
-        tint.setStroke()
+        color.setStroke()
         ring.lineWidth = 2
         ring.stroke()
         if towardViewer {
-            tint.setFill()
+            color.setFill()
             NSBezierPath(ovalIn: NSRect(x: center.x - 2, y: center.y - 2, width: 4, height: 4)).fill()
         } else {
             let cross = NSBezierPath()
@@ -290,6 +346,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         onBegin()
         edit = Edit(handle: handle, startingPlane: plane, mouseStart: mouseStart,
                     layout: handles, dragging: mouseStart != nil)
+        setHoveredHandle(nil)
         unitLabel.stringValue = handle == .offset ? "mm" : "°"
         valueField.setAccessibilityLabel(handle.editorLabel)
         valueField.stringValue = display(plane.value(for: handle))

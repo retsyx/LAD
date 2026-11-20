@@ -146,6 +146,8 @@ final class CADSectionManipulatorTests: XCTestCase {
             XCTAssertEqual(simd_distance(currentHandles.arrow, currentHandles.hub), 0, accuracy: 0.01)
             let point = CGPoint(x: currentHandles.hub.x, y: currentHandles.hub.y)
             let end = CGPoint(x: point.x, y: point.y + dragPoints)
+            manipulator.mouseMoved(with: try mouse(.mouseMoved, at: point, in: window))
+            XCTAssertEqual(manipulator.hoveredHandle, .offset)
             manipulator.mouseDown(with: try mouse(.leftMouseDown, at: point, in: window))
             manipulator.mouseDragged(with: try mouse(.leftMouseDragged, at: end, in: window))
             XCTAssertEqual(plane.value(for: .offset), expectedOffset, accuracy: 1e-8)
@@ -238,6 +240,10 @@ final class CADSectionManipulatorTests: XCTestCase {
             let point = CGPoint(x: frame.midX, y: frame.midY)
             XCTAssertTrue(manipulator.hitTest(point) === manipulator)
             let before = plane
+            manipulator.mouseMoved(with: try mouse(.mouseMoved, at: point, in: window))
+            XCTAssertEqual(manipulator.hoveredHandle, handle)
+            XCTAssertEqual(manipulator.accessibilityChildren()?.count, CADSectionHandle.allCases.count)
+            XCTAssertEqual(plane, before)
             manipulator.mouseDown(with: try mouse(.leftMouseDown, at: point, in: window))
             let editor = try XCTUnwrap(window.firstResponder as? NSTextView)
             XCTAssertEqual(editor.selectedRange(), NSRange(location: 0, length: editor.string.utf16.count))
@@ -259,11 +265,31 @@ final class CADSectionManipulatorTests: XCTestCase {
             manipulator.mouseUp(with: try mouse(.leftMouseUp, at: moved, in: window))
             XCTAssertEqual(plane.value(for: handle), Double(index + 1))
         }
+
+        let tip = try handles(in: manipulator).horizontal
+        let point = manipulator.convert(CGPoint(x: tip.x, y: tip.y), to: nil)
+        let emptyPoint = CGPoint(x: 12, y: 12)
+        manipulator.mouseEntered(with: try mouse(.mouseEntered, at: point, in: window))
+        XCTAssertEqual(manipulator.hoveredHandle, .horizontal)
+        manipulator.mouseMoved(with: try mouse(.mouseMoved, at: emptyPoint, in: window))
+        XCTAssertNil(manipulator.hoveredHandle)
+        manipulator.mouseMoved(with: try mouse(.mouseMoved, at: point, in: window))
+        XCTAssertEqual(manipulator.hoveredHandle, .horizontal)
+        manipulator.mouseExited(with: try mouse(.mouseExited, at: emptyPoint, in: window))
+        XCTAssertNil(manipulator.hoveredHandle)
+        manipulator.mouseMoved(with: try mouse(.mouseMoved, at: point, in: window))
+        XCTAssertEqual(manipulator.hoveredHandle, .horizontal)
+        manipulator.cancelInteraction()
+        XCTAssertNil(manipulator.hoveredHandle)
     }
 
     @MainActor
     private func mouse(_ type: NSEvent.EventType, at point: CGPoint, in window: NSWindow) throws -> NSEvent {
-        try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+        if type == .mouseEntered || type == .mouseExited {
+            return try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil))
+        }
+        return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
             windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
     }
 
