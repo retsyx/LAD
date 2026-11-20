@@ -13,8 +13,8 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         func line(for handle: CADSectionHandle) -> (start: SIMD2<Double>, end: SIMD2<Double>) {
             switch handle {
             case .offset: return (center, center + 50 * direction)
-            case .vertical: return (center - SIMD2(0, 18), center + SIMD2(0, 27))
-            case .horizontal: return (center + SIMD2(18, 0), center - SIMD2(27, 0))
+            case .vertical: return (center - SIMD2(0, 28), center + SIMD2(0, 37))
+            case .horizontal: return (center + SIMD2(28, 0), center - SIMD2(37, 0))
             }
         }
 
@@ -181,13 +181,17 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
 
     private func handle(at point: SIMD2<Double>) -> CADSectionHandle? {
         guard let handles else { return nil }
-        // A foreshortened normal can project on top of a rotation bar.
-        // Give the visible rotation grips their own reliable targets.
-        for bar in [CADSectionHandle.vertical, .horizontal] where simd_distance(point, handles.line(for: bar).end) <= 14 {
-            return bar
-        }
+        // Resolve overlapping tip targets before testing the shafts.
         var nearest = 14.0
         var target: CADSectionHandle?
+        for handle in CADSectionHandle.allCases {
+            let distance = simd_distance(point, handles.line(for: handle).end)
+            if distance <= nearest {
+                target = handle
+                nearest = distance
+            }
+        }
+        if let target { return target }
         for handle in CADSectionHandle.allCases {
             let line = handles.line(for: handle)
             let delta = line.end - line.start

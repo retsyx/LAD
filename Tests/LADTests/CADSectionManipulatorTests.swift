@@ -30,8 +30,8 @@ final class CADSectionManipulatorTests: XCTestCase {
         XCTAssertEqual(simd_distance(initialHandles.hub, initialProjection.project(plane.origin).screen), 0, accuracy: 0.01)
         let initialLengths = initialHandles.lengths
         XCTAssertEqual(initialLengths[0], 50, accuracy: 0.01)
-        XCTAssertEqual(initialLengths[1], 27, accuracy: 0.01)
-        XCTAssertEqual(initialLengths[2], 27, accuracy: 0.01)
+        XCTAssertEqual(initialLengths[1], 37, accuracy: 0.01)
+        XCTAssertEqual(initialLengths[2], 37, accuracy: 0.01)
 
         for orthographic in [false, true] {
             rig.usesOrthographicProjection = orthographic
@@ -111,7 +111,8 @@ final class CADSectionManipulatorTests: XCTestCase {
         var rig = CameraRig()
         rig.fit(bounds: meshBounds, width: viewport.width, height: viewport.height)
         let projection = rig.projection(width: viewport.width, height: viewport.height)
-        var plane = try XCTUnwrap(CADSectionPlane(bounds: meshBounds, toward: rig.backward))
+        // Align the arrow with the horizontal bar so their tip targets overlap.
+        var plane = try XCTUnwrap(CADSectionPlane(point: rig.target, normal: -rig.right, cameraRight: rig.right))
         weak var overlay: CADSectionManipulator?
         let manipulator = CADSectionManipulator(onBegin: {}, onChange: { next in
             plane = next
