@@ -17,6 +17,11 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         let pointsPerMillimeter: Double
         let relativeDepthChange: Double
         let offsetShape: OffsetShape
+        let offsetInFront: Bool
+
+        var drawingOrder: [CADSectionHandle] {
+            offsetInFront ? [.horizontal, .vertical, .offset] : [.offset, .horizontal, .vertical]
+        }
 
         func line(for handle: CADSectionHandle) -> (start: SIMD2<Double>, end: SIMD2<Double>) {
             switch handle {
@@ -48,7 +53,8 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
             let unitsPerPoint = 2 * extent / projection.height
             guard unitsPerPoint.isFinite, unitsPerPoint > 0 else { return nil }
 
-            let depthChange = projection.orthographic ? 0 : -simd_dot(plane.normal, projection.backward) / hub.depth
+            let facing = simd_dot(plane.normal, projection.backward)
+            let depthChange = projection.orthographic ? 0 : -facing / hub.depth
             let screenCenter = SIMD2(projection.width, projection.height) / 2
             let normalInView = SIMD2(simd_dot(plane.normal, projection.right), simd_dot(plane.normal, projection.up))
             let velocity = normalInView / unitsPerPoint - (hub.screen - screenCenter) * depthChange
@@ -60,11 +66,64 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
                 // Show its depth direction and use vertical motion for offset.
                 return Self(center: hub.screen, direction: SIMD2(0, 1),
                             pointsPerMillimeter: 1 / unitsPerPoint, relativeDepthChange: 0,
-                            offsetShape: .depth(towardViewer: simd_dot(plane.normal, projection.backward) > 0))
+                            offsetShape: .depth(towardViewer: facing > 0), offsetInFront: true)
             }
+            // The rotation bars lie at the hub's depth. Preserve their order
+            // when the arrow lies in that same screen plane.
             return Self(center: hub.screen, direction: velocity / speed,
                         pointsPerMillimeter: speed, relativeDepthChange: depthChange,
-                        offsetShape: .arrow(length: fullArrowLength * min(1, projectedGain / 0.48)))
+                        offsetShape: .arrow(length: fullArrowLength * min(1, projectedGain / 0.48)),
+                        offsetInFront: facing > 1e-9)
+        }
+    }
+
+    @MainActor private struct HandleGeometry {
+        let handle: CADSectionHandle
+        let shaft: NSBezierPath?
+        let grip: NSBezierPath
+        private let shaftOutline: CGPath?
+
+        init(_ handle: CADSectionHandle, layout: Layout) {
+            self.handle = handle
+            let line = layout.line(for: handle)
+            guard line.start != line.end else {
+                shaft = nil
+                shaftOutline = nil
+                // The depth handle's ring has an 18-point centerline and a
+                // two-point stroke. Its filled interior also receives clicks.
+                grip = NSBezierPath(ovalIn: NSRect(x: line.end.x - 10, y: line.end.y - 10, width: 20, height: 20))
+                return
+            }
+
+            let arrowScale = handle == .offset ? simd_distance(line.start, line.end) / Layout.fullArrowLength : 1
+            let shaft = NSBezierPath()
+            shaft.move(to: NSPoint(line.start))
+            shaft.line(to: NSPoint(handle == .offset ? line.end - 12 * arrowScale * layout.direction : line.end))
+            shaft.lineWidth = handle == .offset ? max(3, 6 * arrowScale) : 4
+            shaft.lineCapStyle = .round
+            self.shaft = shaft
+            shaftOutline = shaft.cgPath.copy(strokingWithWidth: shaft.lineWidth, lineCap: .round,
+                                             lineJoin: .miter, miterLimit: shaft.miterLimit)
+
+            if handle == .offset {
+                let direction = layout.direction
+                let tangent = SIMD2(-direction.y, direction.x)
+                let arrow = NSBezierPath()
+                arrow.move(to: NSPoint(line.end))
+                arrow.line(to: NSPoint(line.end + arrowScale * (-16 * direction + 11 * tangent)))
+                arrow.line(to: NSPoint(line.end + arrowScale * (-16 * direction - 11 * tangent)))
+                arrow.close()
+                grip = arrow
+            } else {
+                let rect = handle == .vertical
+                    ? NSRect(x: line.end.x - 6, y: line.end.y - 9, width: 12, height: 18)
+                    : NSRect(x: line.end.x - 9, y: line.end.y - 6, width: 18, height: 12)
+                grip = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+            }
+        }
+
+        func contains(_ point: NSPoint) -> Bool {
+            grip.contains(point) || shaftOutline?.contains(point) == true
         }
     }
 
@@ -81,6 +140,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
     private let onChange: (CADSectionPlane) -> Void
     private var plane: CADSectionPlane?
     private var handles: Layout?
+    private var handleGeometry: [HandleGeometry] = []
     private var edit: Edit?
     private var hoverTrackingArea: NSTrackingArea?
     private(set) var hoveredHandle: CADSectionHandle?
@@ -137,6 +197,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
             setHoveredHandle(nil)
             finishEdit()
             handles = nil
+            handleGeometry = []
             isHidden = true
             return
         }
@@ -145,6 +206,7 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         if layoutChanged {
             invalidateHandles()
             handles = layout
+            handleGeometry = layout.drawingOrder.map { HandleGeometry($0, layout: layout) }
             invalidateHandles()
         }
         updateEditorPosition()
@@ -245,8 +307,12 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
         let location = NSPoint(point)
         guard !isHidden, bounds.contains(location), editor.isHidden || !editor.frame.contains(location),
               let handles else { return nil }
-        // Resolve overlapping tip targets before testing the shafts.
-        var nearest = 14.0
+        let hitRadius = 14.0
+        let reach = Layout.fullArrowLength + hitRadius
+        guard simd_length_squared(point - handles.center) <= reach * reach else { return nil }
+        // Match the pixels under the pointer before using the larger targets.
+        if let visible = handleGeometry.reversed().first(where: { $0.contains(location) }) { return visible.handle }
+        var nearest = hitRadius
         var target: CADSectionHandle?
         for handle in CADSectionHandle.allCases {
             let distance = simd_distance(point, handles.line(for: handle).end)
@@ -274,34 +340,13 @@ final class CADSectionManipulator: NSView, NSTextFieldDelegate {
     override func draw(_ dirtyRect: NSRect) {
         guard let handles else { return }
         let gold = NSColor(Palette.accent)
-        for handle in [CADSectionHandle.offset, .horizontal, .vertical] {
-            let line = handles.line(for: handle)
-            guard line.start != line.end else { continue }
-            let arrowScale = handle == .offset ? simd_distance(line.start, line.end) / Layout.fullArrowLength : 1
-            let color = handleColor(handle, gold: gold)
+        for geometry in handleGeometry {
+            guard let shaft = geometry.shaft else { continue }
+            let color = handleColor(geometry.handle, gold: gold)
             color.setStroke()
             color.setFill()
-            let shaft = NSBezierPath()
-            shaft.move(to: NSPoint(line.start))
-            shaft.line(to: NSPoint(handle == .offset ? line.end - 12 * arrowScale * handles.direction : line.end))
-            shaft.lineWidth = handle == .offset ? max(3, 6 * arrowScale) : 4
-            shaft.lineCapStyle = .round
             shaft.stroke()
-            if handle == .offset {
-                let direction = handles.direction
-                let tangent = SIMD2(-direction.y, direction.x)
-                let arrow = NSBezierPath()
-                arrow.move(to: NSPoint(line.end))
-                arrow.line(to: NSPoint(line.end + arrowScale * (-16 * direction + 11 * tangent)))
-                arrow.line(to: NSPoint(line.end + arrowScale * (-16 * direction - 11 * tangent)))
-                arrow.close()
-                arrow.fill()
-            } else {
-                let grip = handle == .vertical
-                    ? NSRect(x: line.end.x - 6, y: line.end.y - 9, width: 12, height: 18)
-                    : NSRect(x: line.end.x - 9, y: line.end.y - 6, width: 18, height: 12)
-                NSBezierPath(roundedRect: grip, xRadius: 6, yRadius: 6).fill()
-            }
+            geometry.grip.fill()
         }
         if case let .depth(towardViewer) = handles.offsetShape {
             drawDepthHandle(at: handles.center, towardViewer: towardViewer, color: handleColor(.offset, gold: gold))

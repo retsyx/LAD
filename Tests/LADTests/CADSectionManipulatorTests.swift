@@ -202,6 +202,59 @@ final class CADSectionManipulatorTests: XCTestCase {
     }
 
     @MainActor
+    func testHoverAndClickFollowVisibleGeometryWhenTheArrowOverlapsAnAngleBar() throws {
+        _ = NSApplication.shared
+        let viewport = NSRect(x: 0, y: 0, width: 640, height: 480)
+        let window = NSWindow(contentRect: viewport, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let content = FocusableViewport(frame: viewport)
+        window.contentView = content
+        let manipulator = CADSectionManipulator(onBegin: {}, onChange: { _ in
+            XCTFail("A click without a drag must not move the section plane")
+        })
+        manipulator.frame = viewport
+        content.addSubview(manipulator)
+
+        func checkTarget(_ expected: CADSectionHandle, at position: SIMD2<Double>) throws {
+            let point = manipulator.convert(CGPoint(x: position.x, y: position.y), to: nil)
+            let index = try XCTUnwrap(CADSectionHandle.allCases.firstIndex(of: expected))
+            let control = try XCTUnwrap(manipulator.accessibilityChildren()?[index] as? NSAccessibilityElement)
+            manipulator.mouseMoved(with: try mouse(.mouseMoved, at: point, in: window))
+            XCTAssertEqual(manipulator.hoveredHandle, expected)
+            manipulator.mouseDown(with: try mouse(.leftMouseDown, at: point, in: window))
+            let field = try XCTUnwrap(manipulator.accessibilityChildren()?.last as? NSTextField)
+            XCTAssertEqual(try XCTUnwrap(field.accessibilityLabel()), try XCTUnwrap(control.accessibilityLabel()))
+            manipulator.mouseUp(with: try mouse(.leftMouseUp, at: point, in: window))
+            manipulator.cancelInteraction()
+        }
+
+        var rig = CameraRig()
+        rig.yaw = 0
+        rig.elevation = 0
+        for orthographic in [false, true] {
+            rig.usesOrthographicProjection = orthographic
+            let projection = rig.projection(width: viewport.width, height: viewport.height)
+            for depth in [1.0, 0.0, -1.0] {
+                let plane = try XCTUnwrap(CADSectionPlane(point: .zero, normal: depth * rig.backward - rig.right, cameraRight: rig.right))
+                manipulator.update(plane: plane, projection: projection)
+                let grip = try handles(in: manipulator).horizontal
+                try checkTarget(depth > 0 ? .offset : .horizontal, at: grip)
+                try checkTarget(.offset, at: grip + SIMD2(0, 7.5))
+                try checkTarget(.horizontal, at: grip + SIMD2(5, 4))
+            }
+
+            // The arrow shaft here is visible beside the vertical grip but
+            // inside the grip's padded hit area.
+            let diagonal = 0.25 * rig.right + rig.up - 0.6 * rig.backward
+            let plane = try XCTUnwrap(CADSectionPlane(point: .zero, normal: diagonal, cameraRight: rig.right))
+            manipulator.update(plane: plane, projection: projection)
+            let hub = try handles(in: manipulator).hub
+            try checkTarget(.offset, at: hub + SIMD2(7.5, 30))
+        }
+    }
+
+    @MainActor
     func testEachHandleUpdatesSelectedReadoutAndAcceptsTypingDuringDrag() throws {
         _ = NSApplication.shared
         let viewport = NSRect(x: 0, y: 0, width: 640, height: 480)
@@ -214,8 +267,7 @@ final class CADSectionManipulatorTests: XCTestCase {
         var rig = CameraRig()
         rig.fit(bounds: meshBounds, width: viewport.width, height: viewport.height)
         let projection = rig.projection(width: viewport.width, height: viewport.height)
-        // Align the arrow with the horizontal bar so their tip targets overlap.
-        var plane = try XCTUnwrap(CADSectionPlane(point: rig.target, normal: -rig.right, cameraRight: rig.right))
+        var plane = try XCTUnwrap(CADSectionPlane(bounds: meshBounds, toward: rig.backward))
         weak var overlay: CADSectionManipulator?
         let manipulator = CADSectionManipulator(onBegin: {}, onChange: { next in
             plane = next
