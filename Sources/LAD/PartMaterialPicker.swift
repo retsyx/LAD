@@ -85,11 +85,11 @@ struct PartMaterialPicker: View {
                 LazyVStack(alignment: .leading, spacing: 1) {
                     if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         row(id: Self.unassignedID, name: "Unassigned", density: 0, origin: nil,
-                            isCurrent: assignment == .unassigned) { onApply(nil) }
+                            isCurrent: assignment.contains(nil)) { onApply(nil) }
                     }
                     ForEach(entries) { entry in
                         row(id: entry.id, name: entry.material.name, density: entry.material.density, origin: entry.origin,
-                            isCurrent: assignment == .material(entry.material)) { onApply(entry.material) }
+                            isCurrent: assignment.contains(entry.material)) { onApply(entry.material) }
                     }
                     if entries.isEmpty {
                         Text("No Matching Materials").font(.system(size: 11)).foregroundStyle(Palette.muted)
@@ -105,6 +105,13 @@ struct PartMaterialPicker: View {
                 guard let id else { return }
                 withAnimation { proxy.scrollTo(id, anchor: .center) }
             }
+            .onAppear {
+                // Show the first of the parts' current materials in list order.
+                let current = (assignment.includesUnassigned ? [Self.unassignedID] : [])
+                    + entries.filter { assignment.contains($0.material) }.map(\.id)
+                guard let first = current.first else { return }
+                DispatchQueue.main.async { proxy.scrollTo(first, anchor: .center) }
+            }
         }
     }
 
@@ -118,7 +125,7 @@ struct PartMaterialPicker: View {
                         .foregroundStyle(Palette.accent).opacity(isCurrent ? 1 : 0)
                         .frame(width: 12)
                     Text(name).font(.system(size: 11)).lineLimit(1).truncationMode(.middle)
-                        .foregroundStyle(origin == nil ? Palette.muted : Color.white.opacity(0.88))
+                        .foregroundStyle(isCurrent ? Palette.accent : origin == nil ? Palette.muted : Color.white.opacity(0.88))
                     if origin == .design {
                         Text("Design").font(.system(size: 8, weight: .semibold)).tracking(0.4)
                             .foregroundStyle(Palette.accent)
@@ -157,7 +164,7 @@ struct PartMaterialPicker: View {
             .frame(width: 20, height: 20)
         }
         .padding(.trailing, 4)
-        .background((hoveredID == id || revealedID == id) ? Palette.accent.opacity(revealedID == id ? 0.16 : 0.09) : .clear,
+        .background(Palette.accent.opacity(Self.highlight(current: isCurrent, revealed: revealedID == id, hovered: hoveredID == id)),
                     in: RoundedRectangle(cornerRadius: 4))
         .onHover { inside in
             if inside { hoveredID = id } else if hoveredID == id { hoveredID = nil }
@@ -235,6 +242,11 @@ struct PartMaterialPicker: View {
         revealedID = nil
         DispatchQueue.main.async { revealedID = id }
         focus = .search
+    }
+
+    /// Current materials keep the parts tree's selection tint; hover adds to it.
+    private static func highlight(current: Bool, revealed: Bool, hovered: Bool) -> Double {
+        (current || revealed ? 0.14 : 0) + (hovered ? 0.08 : 0)
     }
 
     static func densityLabel(_ density: Double) -> String {

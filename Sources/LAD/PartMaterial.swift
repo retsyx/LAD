@@ -116,11 +116,16 @@ struct CADPartMaterialPatch: Sendable, Equatable {
     var definitions: [PartMaterial] = []
 }
 
-/// The current material of one or more target parts.
-enum PartMaterialAssignment: Equatable {
-    case unassigned
-    case material(PartMaterial)
-    case mixed
+/// The current materials of one or more target parts.
+struct PartMaterialAssignment: Equatable {
+    var materials: Set<PartMaterial> = []
+    /// At least one target part has no material.
+    var includesUnassigned = false
+
+    static let unassigned = PartMaterialAssignment(includesUnassigned: true)
+    static func material(_ material: PartMaterial) -> PartMaterialAssignment { PartMaterialAssignment(materials: [material]) }
+
+    func contains(_ material: PartMaterial?) -> Bool { material.map(materials.contains) ?? includesUnassigned }
 }
 
 enum PartMaterialState {

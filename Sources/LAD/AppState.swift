@@ -2079,13 +2079,15 @@ final class AppState {
         autosave()
     }
 
+    /// Every material the context menu's target parts currently have.
     func partMaterial(for nodeID: String) -> PartMaterialAssignment {
-        let targets = physicalPartTargets(for: nodeID)
-        guard let first = targets.first else { return .unassigned }
         let materials = partMaterials
-        let material = materials[first.id]
-        guard targets.allSatisfy({ materials[$0.id] == material }) else { return .mixed }
-        return material.map(PartMaterialAssignment.material) ?? .unassigned
+        var assignment = PartMaterialAssignment()
+        for target in physicalPartTargets(for: nodeID) {
+            if let material = materials[target.id] { assignment.materials.insert(material) }
+            else { assignment.includesUnassigned = true }
+        }
+        return assignment
     }
 
     func setPartMaterial(_ material: PartMaterial?, for nodeID: String) {
