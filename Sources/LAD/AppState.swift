@@ -20,10 +20,22 @@ final class AppState {
         didSet {
             if selectedRevisionID != oldValue {
                 cancelAssemblyGrab()
+                if pendingRequestSelection?.revisionID != selectedRevisionID { pendingRequestSelection = nil }
                 agentStateGeneration &+= 1; scheduleProjectThumbnail()
             }
         }
     }
+    /// A request the conversation keeps in view after version navigation,
+    /// rather than following later activity to the bottom.
+    struct ConversationFocus: Equatable {
+        var id = UUID()
+        var messageID: UUID
+        /// Scroll to and briefly highlight the request.
+        var reveals: Bool
+    }
+    private(set) var conversationFocus: ConversationFocus?
+    /// A shown request's selection, applied once its version's geometry is displayed.
+    @ObservationIgnored private var pendingRequestSelection: ProjectSelectionContext?
     var mesh: PreviewMesh? {
         didSet {
             projectThumbnailMeshModel = mesh == nil ? nil : current
@@ -89,7 +101,9 @@ final class AppState {
     /// with its print-only features, in built coordinates.
     var printVersionView = false {
         didSet {
-            if printVersionView != oldValue { printViewChanged(layoutChanged: false); autosave() }
+            guard printVersionView != oldValue else { return }
+            if !printVersionView, pendingRequestSelection?.printVersion == true { pendingRequestSelection = nil }
+            printViewChanged(layoutChanged: false); autosave()
         }
     }
     /// The 3D printing layout view orients each displayed part and packs the
@@ -736,6 +750,7 @@ final class AppState {
         displayMode = .edges
         codexSettings = normalizedCodexSettings(CodexProjectSettings(vendor: AgentVendorPreference.defaultVendor))
         messages = []; revisions = []; selectedRevisionID = nil; recentPreviewRevisionIDs = []
+        conversationFocus = nil; pendingRequestSelection = nil
         projectActivity.restore()
         resetQueueWork()
         queuedRequests = []; queuePaused = false
@@ -767,7 +782,8 @@ final class AppState {
         do { try selection?.validate() }
         catch { self.error = error.localizedDescription; return }
         let request = ProjectQueuedRequest(content: enteredText, attachments: pendingAttachments.isEmpty ? nil : pendingAttachments,
-                                           codexSettings: settings, selection: selection)
+                                           codexSettings: settings, selection: selection,
+                                           originRevisionID: selection?.revisionID ?? selectedRevisionID)
         // A submitted request starts persistence, even if it is later canceled
         // or fails. Drafts and settings alone must not create an empty file.
         projectSavingEnabled = true
@@ -946,7 +962,7 @@ final class AppState {
                 // Keep the item in the queue until this acknowledgement. A
                 // final result may arrive while the steering RPC is in flight.
                 let message = ChatMessage(role: "user", content: content, date: request.date, attachments: request.attachments,
-                                          selection: request.selection)
+                                          selection: request.selection, originRevisionID: request.originRevisionID)
                 if let audit = self.projectActivity.task(id: auditID), let userMessageID = audit.userMessageID,
                    let revision = self.revisions.last(where: { $0.userMessageID == userMessageID }),
                    let responseID = revision.responseMessageID,
@@ -1149,7 +1165,7 @@ final class AppState {
         let history = messages
         let attached = request.attachments ?? []
         let userMessage = ChatMessage(role: "user", content: text, attachments: attached.isEmpty ? nil : attached,
-                                      selection: request.selection)
+                                      selection: request.selection, originRevisionID: request.originRevisionID)
         messages.append(userMessage)
         error = nil; notice = nil; isWorking = true; activity = "Designing…"
         let token = UUID(); operationID = token
@@ -1547,12 +1563,14 @@ final class AppState {
     }
 
     func selectParts(_ solids: Set<Int>, extending: Bool = false) {
+        pendingRequestSelection = nil
         let valid = solids.intersection(Set(0..<currentSolidCount))
         selectedSolids = extending ? selectedSolids.symmetricDifference(valid) : valid
         selectedPartNodeIDs = PartSelection.nodeIDs(for: selectedSolids, keeping: [], in: partTree)
     }
 
     func selectPartNodes(_ ids: Set<String>, extending: Bool = false) {
+        pendingRequestSelection = nil
         let nodes = partTree.flatMap(\.flattened)
         let valid = ids.intersection(Set(nodes.map(\.id)))
         let clickedSolids = Set(nodes.filter { valid.contains($0.id) }.flatMap { $0.allSolidIndices })
@@ -1569,6 +1587,7 @@ final class AppState {
     }
 
     func togglePartNode(_ id: String, extendingRange: Bool = false) {
+        pendingRequestSelection = nil
         guard extendingRange else { selectPartNodes([id], extending: true); return }
         let tree = partTree
         let range = PartSelection.range(toggling: id, in: tree,
@@ -1589,6 +1608,7 @@ final class AppState {
     }
 
     func selectFeatures(_ features: [CADFeatureID]) {
+        pendingRequestSelection = nil
         guard let preview = displayedMesh, let topology = preview.topology else { return }
         var seen = Set<CADFeatureID>()
         let valid = features.filter {
@@ -1601,6 +1621,7 @@ final class AppState {
     }
 
     func clearSelections() {
+        pendingRequestSelection = nil
         selectedSolids = []
         selectedPartNodeIDs = []
         featureSelectionOrigin = nil
@@ -1938,6 +1959,7 @@ final class AppState {
         printViewGeometry = geometry
         isPreparingPrintView = false
         showFeatureSelection()
+        applyPendingRequestSelection()
         if fitsPrintViewWhenShown {
             fitsPrintViewWhenShown = false
             viewportCommand = ViewportCommand(.fit)
@@ -2333,6 +2355,89 @@ final class AppState {
         autosave()
     }
 
+    /// The version menu also brings the request that produced the version
+    /// into view in the conversation.
+    func selectRevisionRevealingRequest(_ id: UUID) {
+        guard !isWorking, let revision = revisions.first(where: { $0.id == id }) else { return }
+        selectRevision(id)
+        if let messageID = revision.userMessageID, messages.contains(where: { $0.id == messageID }) {
+            conversationFocus = ConversationFocus(messageID: messageID, reveals: true)
+        }
+    }
+
+    func canShowRequestRevision(_ message: ChatMessage) -> Bool {
+        guard message.role == "user", let id = message.requestRevisionID else { return false }
+        return revisions.contains { $0.id == id }
+    }
+
+    /// Show the version a request was made on, through the same history
+    /// selection as the version menu, with the request's captured selection.
+    func showRequestRevision(messageID: UUID) {
+        guard !isWorking, let message = messages.first(where: { $0.id == messageID }), canShowRequestRevision(message),
+              let revisionID = message.requestRevisionID else { return }
+        conversationFocus = ConversationFocus(messageID: messageID, reveals: false)
+        selectRevision(revisionID)
+        clearSelections()
+        guard let selection = message.selection, selection.revisionID == revisionID else { return }
+        if selection.printVersion == true { printVersionView = true }
+        pendingRequestSelection = selection
+        applyPendingRequestSelection()
+    }
+
+    /// Captured native indices belong to the version's design or printing
+    /// version geometry. Stable part IDs locate solids a replay enumerated in
+    /// another order; features that no longer match their captured kind and
+    /// type are not shown.
+    private func applyPendingRequestSelection() {
+        guard let selection = pendingRequestSelection else { return }
+        let printing = selection.printVersion == true
+        guard selectedRevisionID == selection.revisionID, !printing || printVersionView else {
+            pendingRequestSelection = nil; return
+        }
+        guard builtRevisionID == selection.revisionID, let mesh else { return }
+        let geometry: FeatureSelectionGeometry
+        if printing {
+            guard let shown = displayedMesh else { return }
+            geometry = FeatureSelectionGeometry(preview: shown, printVersion: true)
+        } else {
+            geometry = FeatureSelectionGeometry(preview: mesh, printVersion: false)
+        }
+        pendingRequestSelection = nil
+
+        var owners: [String: [Int]] = [:]
+        for node in partTree.flatMap(\.flattened) where !node.solidIndices.isEmpty { owners[node.id] = node.solidIndices }
+        func solid(_ index: Int, partID: String?) -> Int? {
+            guard let partID, let owned = owners[partID] else { return index }
+            if owned.contains(index) { return index }
+            return owned.count == 1 ? owned[0] : nil
+        }
+        selectParts(Set(selection.parts.compactMap { solid($0.solidIndex, partID: $0.partID) }))
+
+        let candidates = selection.features.compactMap { feature -> (id: CADFeatureID, type: String?)? in
+            guard let index = solid(feature.id.solidIndex, partID: feature.partID) else { return nil }
+            var id = feature.id
+            id.solidIndex = index
+            return (id, feature.anchor?.geometryType)
+        }
+        let wanted = Set(candidates.map(\.id))
+        var types: [CADFeatureID: String] = [:]
+        if let topology = geometry.preview.topology {
+            for vertex in topology.vertices where wanted.contains(vertex.id) { types[vertex.id] = "vertex" }
+            for edge in topology.edges where wanted.contains(edge.id) { types[edge.id] = edge.type }
+            for face in topology.faces where wanted.contains(face.id) { types[face.id] = face.type }
+        }
+        var seen = Set<CADFeatureID>()
+        let features = candidates.filter { candidate in
+            guard let type = types[candidate.id], candidate.type.map({ $0 == type }) ?? true else { return false }
+            return seen.insert(candidate.id).inserted
+        }.map(\.id)
+        featureSelectionOrigin = features.isEmpty ? nil : FeatureSelectionOrigin(geometry: geometry, features: features)
+        selectedFeaturesGeometry = geometry
+        selectedFeatures = features.filter { !hiddenSolids.contains($0.solidIndex) }
+        // A design selection shown in the printing version view selects its counterparts there.
+        showFeatureSelection()
+    }
+
     func rebuild() { if let current { cancel(); buildExisting(current) } }
 
     private func buildExisting(_ spec: ModelSpec) {
@@ -2371,6 +2476,7 @@ final class AppState {
                 mesh = preview; builtRevisionID = revisionID; selectedSolids = []; selectedPartNodeIDs = []
                 viewportCommand = ViewportCommand(.fit)
                 isWorking = false; activity = "Ready"; operation = nil
+                applyPendingRequestSelection()
                 autosave()
                 storeViewportGeometry(preview, for: spec)
                 if let revisionID { verifyReplay(preview, revisionID: revisionID) }
@@ -2747,6 +2853,7 @@ final class AppState {
         displayMode = project.displayMode ?? .edges
         codexSettings = normalizedCodexSettings(project.codexSettings ?? CodexProjectSettings())
         messages = project.messages; revisions = project.revisions; recentPreviewRevisionIDs = []
+        conversationFocus = nil; pendingRequestSelection = nil
         selectedRevisionID = project.selectedRevisionID ?? revisions.last?.id
         mesh = nil; builtRevisionID = nil
         // Set after the previous design's geometry is gone, so it never
@@ -2930,6 +3037,7 @@ final class AppState {
                 if revisions[index].validatedHash != receipt { autosave() }
                 viewportCommand = ViewportCommand(.fit)
                 activity = "Ready"; isWorking = false; operation = nil
+                applyPendingRequestSelection()
                 if cached == nil { storeViewportGeometry(preview, for: revision.model) }
                 verifyReplay(preview, revisionID: revision.id)
             } catch is CancellationError {

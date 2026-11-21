@@ -79,7 +79,12 @@ enum ProjectStore {
                 }
                 if let attachments = request.attachments { try validateAttachments(attachments, verifiedPayloads: &verifiedAttachmentPayloads) }
                 if let settings = request.codexSettings { try validateCodexSettings(settings) }
-                if let selection = request.selection { try selection.validate() }
+                if let selection = request.selection {
+                    try selection.validate()
+                    guard request.originRevisionID.map({ $0 == selection.revisionID }) ?? true else {
+                        throw invalid("A queued request's selection belongs to another version.")
+                    }
+                }
                 if let captured = request.capturedSourcePaths {
                     let referenced = Set(SourceImport.referencedURLs(in: request.content).map { $0.standardizedFileURL.path })
                     guard captured.count <= 10_000, Set(captured).count == captured.count,
@@ -120,6 +125,12 @@ enum ProjectStore {
             if let selection = message.selection {
                 guard message.role == "user" else { throw invalid("Only user requests may contain selection references.") }
                 try selection.validate()
+                guard message.originRevisionID.map({ $0 == selection.revisionID }) ?? true else {
+                    throw invalid("A request's selection belongs to another version.")
+                }
+            }
+            if message.originRevisionID != nil, message.role != "user" {
+                throw invalid("Only user requests may reference the version they were made on.")
             }
             if let phase = message.phase {
                 guard message.role == "assistant", ["commentary", "response", "final_answer"].contains(phase) else {

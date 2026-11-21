@@ -214,6 +214,7 @@ enum ProjectArchive {
         var codexSettings: CodexProjectSettings?
         var capturedSourcePaths: [String]?
         var selection: ProjectSelectionContext?
+        var originRevisionID: UUID?
 
         /// Unchanged attachments keep their stored assets without hashing them again.
         init(_ request: ProjectQueuedRequest, reusing old: (request: ProjectQueuedRequest, record: ArchivedQueuedRequest)? = nil,
@@ -224,6 +225,7 @@ enum ProjectArchive {
             codexSettings = request.codexSettings
             capturedSourcePaths = request.capturedSourcePaths
             selection = request.selection
+            originRevisionID = request.originRevisionID
         }
 
         var assetKeys: [String] { attachments?.map(\.contentAsset) ?? [] }
@@ -231,7 +233,7 @@ enum ProjectArchive {
         func restored(reader: inout AssetReader) throws -> ProjectQueuedRequest {
             ProjectQueuedRequest(id: id, content: content, date: date,
                 attachments: try attachments?.map { try $0.restored(reader: &reader) }, codexSettings: codexSettings,
-                capturedSourcePaths: capturedSourcePaths, selection: selection)
+                capturedSourcePaths: capturedSourcePaths, selection: selection, originRevisionID: originRevisionID)
         }
     }
 
@@ -355,6 +357,7 @@ enum ProjectArchive {
         var attachments: [ArchivedAttachment]?
         var phase: String?
         var selection: ProjectSelectionContext?
+        var originRevisionID: UUID?
 
         /// Unchanged attachments keep their stored assets without hashing them again.
         init(_ message: ChatMessage, reusing old: (message: ChatMessage, record: ArchivedMessage)? = nil,
@@ -367,13 +370,15 @@ enum ProjectArchive {
             else { attachments = try message.attachments?.map { try ArchivedAttachment($0, writer: &writer) } }
             phase = message.phase
             selection = message.selection
+            originRevisionID = message.originRevisionID
         }
 
         var assetKeys: [String] { attachments?.map(\.contentAsset) ?? [] }
 
         func restored(reader: inout AssetReader) throws -> ChatMessage {
             let sources = try attachments?.map { try $0.restored(reader: &reader) }
-            return ChatMessage(id: id, role: role, content: content, date: date, attachments: sources, phase: phase, selection: selection)
+            return ChatMessage(id: id, role: role, content: content, date: date, attachments: sources, phase: phase, selection: selection,
+                               originRevisionID: originRevisionID)
         }
     }
 

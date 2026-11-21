@@ -31,7 +31,7 @@ struct ProjectRevisionPicker: View {
         .popover(isPresented: $isPresented, arrowEdge: .top) {
             ProjectRevisionPickerList(state: state, onSelect: { id in
                 isPresented = false
-                state.selectRevision(id)
+                state.selectRevisionRevealingRequest(id)
             }, onDismiss: { isPresented = false })
         }
         .onChange(of: state.projectEditingID) { _, _ in isPresented = false }

@@ -179,6 +179,11 @@ struct ChatMessage: Codable, Sendable, Identifiable, Equatable {
     var phase: String? = nil
     /// Immutable user selection captured when this request was submitted.
     var selection: ProjectSelectionContext? = nil
+    /// The version displayed when this request was submitted, which its
+    /// selection belongs to.
+    var originRevisionID: UUID? = nil
+
+    var requestRevisionID: UUID? { originRevisionID ?? selection?.revisionID }
 }
 
 /// A submitted follow-up awaiting its own turn; distinct from sent chat history.
@@ -194,6 +199,8 @@ struct ProjectQueuedRequest: Codable, Sendable, Identifiable, Equatable {
     var capturedSourcePaths: [String]? = nil
     /// Retained while queued, edited or sent as same-turn information.
     var selection: ProjectSelectionContext? = nil
+    /// The version displayed at submission, not the one current at dispatch.
+    var originRevisionID: UUID? = nil
 }
 
 struct ProjectRevision: Codable, Sendable, Identifiable {

@@ -468,6 +468,11 @@ private struct WorkspaceMessageList: View {
     let search: ConversationSearchController
     let onPreview: (SourceAttachment) -> Void
     @State private var textWidth = ConversationTextWidth()
+    /// Version navigation keeps its request in place instead of following
+    /// replay activity to the bottom, until the conversation changes.
+    @State private var heldMessageID: UUID?
+    @State private var highlightedFocus: AppState.ConversationFocus?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private static let textFontSize: CGFloat = 12
     private static let textLineSpacing: CGFloat = 5
@@ -513,13 +518,26 @@ private struct WorkspaceMessageList: View {
             }
             // Keep a found match in place while the conversation continues.
             .onChange(of: state.messages.count) { _, _ in
+                heldMessageID = nil
                 if !search.isActive { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
             .onChange(of: state.messages.last?.content) { _, _ in
-                if state.isWorking, !search.isActive { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+                if state.isWorking, !search.isActive, heldMessageID == nil { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
             .onChange(of: state.isWorking) { _, _ in
-                if !search.isActive { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+                if !search.isActive, heldMessageID == nil { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
+            }
+            .onChange(of: state.conversationFocus) { _, focus in
+                guard let focus else { return }
+                heldMessageID = focus.messageID
+                guard focus.reveals else { return }
+                withAnimation(reduceMotion ? nil : .default) { proxy.scrollTo(focus.messageID, anchor: .top) }
+                highlightedFocus = focus
+                Task {
+                    try? await Task.sleep(for: .seconds(2))
+                    guard highlightedFocus?.id == focus.id else { return }
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.6)) { highlightedFocus = nil }
+                }
             }
             .onChange(of: matches.count, initial: true) { _, count in search.matchCount = count }
             .onChange(of: search.query) { _, _ in revealMatch(0, proxy: proxy) }
@@ -574,6 +592,7 @@ private struct WorkspaceMessageList: View {
                      message.phase == "commentary" ? "UPDATE" : message.phase == "final_answer" ? "COMPLETE" : "LAD")
                     .font(.system(size: 9, weight: .semibold)).tracking(1.1).foregroundStyle(Palette.muted)
                 Spacer()
+                if message.role == "user" { RequestRevisionButton(state: state, message: message) }
                 Text(message.date, style: .time).font(.system(size: 9)).foregroundStyle(Palette.muted.opacity(0.6))
                 CopyButton(text: message.content, label: "Copy message")
             }
@@ -612,6 +631,41 @@ private struct WorkspaceMessageList: View {
         }
         .padding(message.role == "user" ? Self.userMessagePadding : 0)
         .background(message.role == "user" ? Palette.raised.opacity(0.65) : .clear, in: RoundedRectangle(cornerRadius: 9))
+        .overlay {
+            if highlightedFocus?.messageID == message.id {
+                RoundedRectangle(cornerRadius: 9).strokeBorder(Palette.accent, lineWidth: 1.5)
+            }
+        }
+    }
+}
+
+/// Shows the design version a request was made on, with the request's selection.
+private struct RequestRevisionButton: View {
+    let state: AppState
+    let message: ChatMessage
+
+    var body: some View {
+        if state.canShowRequestRevision(message), let id = message.requestRevisionID {
+            let name = state.revisionName(for: id)
+            let hasSelection = message.selection?.revisionID == id
+            Button { state.showRequestRevision(messageID: message.id) } label: {
+                HStack(spacing: 3) {
+                    if hasSelection { Image(systemName: "scope").font(.system(size: 8, weight: .semibold)) }
+                    Text(name).lineLimit(1).truncationMode(.middle)
+                }
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(Palette.accent)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Palette.accent.opacity(0.1), in: Capsule())
+                .frame(maxWidth: 140)
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(state.isWorking)
+            .opacity(state.isWorking ? 0.5 : 1)
+            .help(hasSelection ? "Show \(name) with this request's selection" : "Show \(name)")
+            .accessibilityLabel(hasSelection ? "Show version \(name) with selection" : "Show version \(name)")
+        }
     }
 }
 
