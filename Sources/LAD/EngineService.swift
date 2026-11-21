@@ -212,15 +212,17 @@ final class EngineService {
         try await buildModel(spec, python: python, threads: threads, deferSTEP: false)
     }
 
-    /// Validate new or changed inputs, or reuse a matching saved validation hash.
+    /// Validate the result, or reuse a matching saved validation hash.
     /// Retain the original native solid without keeping generated STEP bytes.
     /// `print` builds the program's 3D printing version (`lad.print`).
     /// `verifyLater` returns a displayable preview before its exact checks and
-    /// STEP verification; accept it only through `verified`.
+    /// STEP verification; accept it only through `verified`. Inputs are
+    /// validated only with `validateInputs`, when importing them into a design.
     func buildPreview(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int,
-                      validatedHash: String? = nil, verifyLater: Bool = false) async throws -> PreviewMesh {
+                      validatedHash: String? = nil, verifyLater: Bool = false,
+                      validateInputs: Bool = false) async throws -> PreviewMesh {
         try await buildModel(spec, print: print, python: python, threads: threads, deferSTEP: true, validatedHash: validatedHash,
-                             verifyLater: verifyLater)
+                             verifyLater: verifyLater, validateInputs: validateInputs)
     }
 
     /// Start the checks a preview deferred, unless they already started.
@@ -282,7 +284,8 @@ final class EngineService {
     }
 
     private func buildModel(_ spec: ModelSpec, print: Bool = false, python: String, threads: Int, deferSTEP: Bool,
-                            validatedHash: String? = nil, verifyLater: Bool = false) async throws -> PreviewMesh {
+                            validatedHash: String? = nil, verifyLater: Bool = false,
+                            validateInputs: Bool = false) async throws -> PreviewMesh {
         let copies = ValidatedInputCopies(cache: inputCache, runtime: python)
         let output = try await run(python: python, threads: threads, scriptMode: true, deferSTEP: deferSTEP, validatedHash: validatedHash,
                                    verifyLater: verifyLater, afterExit: { copies.keep(from: $0) }) { folder in
@@ -312,7 +315,7 @@ final class EngineService {
             }
             try EngineWorkerRequest.build(title: spec.title, summary: spec.summary, units: spec.units, script: spec.script,
                                           sourceAsset: sourceAsset, inputAssets: staged, print: print,
-                                          sourceValidatedBREP: sourceCopy).write(to: folder)
+                                          sourceValidatedBREP: sourceCopy, validateInputs: validateInputs).write(to: folder)
         }
         return try await readPreview(output, deferSTEP: deferSTEP)
     }

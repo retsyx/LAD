@@ -1,12 +1,11 @@
 import CryptoKit
 import Foundation
 
-/// Session copies of imported geometry inputs that a build worker already
-/// imported and validated, keyed by the input's exact bytes, its format and
-/// the CAD runtime. A later build stages the copy beside the unchanged
-/// original, so the worker neither translates nor exactly validates that
-/// input again. Copies are temporary, never saved, and their leased scratch
-/// directory is removed once LAD exits.
+/// Session copies of a design's validated geometry inputs that a build worker
+/// already imported, keyed by the input's exact bytes, its format and the CAD
+/// runtime. A later build stages the copy beside the unchanged original, so
+/// the worker does not translate that input again. Copies are temporary,
+/// never saved, and their leased scratch directory is removed once LAD exits.
 final class CADValidatedInputCache: @unchecked Sendable {
     struct Key: Hashable, Sendable {
         var digest: String

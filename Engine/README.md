@@ -300,13 +300,20 @@ as cavities. These are required recipe inputs, stored once in the design's share
 asset table. Arbitrary paths, links, open/invalid meshes and unsupported kinds
 are rejected. This does not allow generated replay programs to read user files.
 
+Inputs are validated once, by the build that imports them into a design
+(`validateInputs`, as `lad_import` requests). A design's saved inputs are
+trusted: other builds translate them with only the structural solid checks and
+the same boundary tolerance validation applies, so programs receive identical
+shapes. Mesh conversion still rejects meshes it cannot convert. The program's
+result is validated as before.
+
 Before the program runs, each build writes `<input>.validated.brep`, a native
-copy of every input it imported and validated (`source` for `sourceAsset`,
-`input-000` and so on). The app keeps these for the session, keyed by the input's
-exact bytes, format and runtime, and stages a copy beside the unchanged original
-(`validatedBREP` per input, `sourceValidatedBREP`) so later builds neither
-translate nor validate that input again. An unreadable copy falls back to the
-original. Copies are never saved.
+copy of every input it imported (`source` for `sourceAsset`, `input-000` and so
+on). The app keeps these for the session, keyed by the input's exact bytes,
+format and runtime, and stages a copy beside the unchanged original
+(`validatedBREP` per input, `sourceValidatedBREP`) so later builds do not
+translate that input again. A validating build ignores staged copies. An
+unreadable copy falls back to the original. Copies are never saved.
 
 ## Agent tool interface
 

@@ -78,6 +78,50 @@ class ValidatedInputCopyTests(unittest.TestCase):
                 worker.validate_spec(value)
         worker.validate_spec(spec(COMBINED, source_copy=True, asset_copy=True))
 
+    def test_only_the_importing_build_validates_inputs(self):
+        original = worker.validate_shape
+        validated = []
+
+        def counting(shape, *args, **kwargs):
+            validated.append(shape)
+            return original(shape, *args, **kwargs)
+
+        with mock.patch.object(worker, "validate_shape", side_effect=counting):
+            worker.build_shape(spec(COMBINED), 1, self.folder)
+        self.assertEqual(len(validated), 1, "A design's saved inputs are trusted; only the result is validated.")
+        validated.clear()
+        with mock.patch.object(worker, "validate_shape", side_effect=counting):
+            worker.build_shape({**spec(COMBINED), "validateInputs": True}, 1, self.folder)
+        self.assertEqual(len(validated), 3, "Importing validates the source STEP, the input and the result.")
+
+    def test_trusted_inputs_reach_programs_exactly_as_validated_inputs(self):
+        from OCP.ShapeAnalysis import ShapeAnalysis_ShapeTolerance
+        from OCP.TopAbs import TopAbs_EDGE
+        for name, value in (("trusted", spec(COMBINED)), ("validated", {**spec(COMBINED), "validateInputs": True})):
+            (self.folder / name).mkdir()
+            worker.build_shape(value, 1, self.folder, validated_copies=self.folder / name)
+        for stem in ("source", "input-000"):
+            trusted = self.folder / "trusted" / f"{stem}{worker.VALIDATED_COPY_SUFFIX}"
+            self.assertEqual(trusted.read_bytes(),
+                             (self.folder / "validated" / f"{stem}{worker.VALIDATED_COPY_SUFFIX}").read_bytes())
+            shape = worker.read_validated_copy(trusted, cq)
+            self.assertGreaterEqual(ShapeAnalysis_ShapeTolerance().Tolerance(shape.wrapped, -1, TopAbs_EDGE),
+                                    worker.GEOMETRY_TOLERANCE_MM * (1 - 1e-9),
+                                    "Trusted inputs keep validation's boundary tolerance.")
+
+    def test_importing_builds_validate_instead_of_reading_staged_copies(self):
+        worker.build_shape(spec(COMBINED), 1, self.folder, validated_copies=self.folder)
+        with mock.patch.object(worker, "read_validated_copy", side_effect=AssertionError("Staged copy read")):
+            shape = worker.build_shape({**spec(COMBINED, source_copy=True, asset_copy=True), "validateInputs": True},
+                                       1, self.folder)
+        self.assertAlmostEqual(shape.Volume(), 24 + 2 * math.pi, places=6)
+
+    def test_input_validation_option_must_be_true_when_present(self):
+        worker.validate_spec({**spec(COMBINED), "validateInputs": True})
+        for value in (False, 1, "true"):
+            with self.assertRaises(worker.ModelError):
+                worker.validate_spec({**spec(COMBINED), "validateInputs": value})
+
     def test_build_requests_keep_copies_in_their_output_folder(self):
         (self.folder / "request.json").write_text(json.dumps(spec(COMBINED)))
         output = self.folder / "output"

@@ -158,6 +158,52 @@ final class CADAgentToolsTests: XCTestCase {
     }
 
     @MainActor
+    func testOnlyImportValidatesInputsAndDesignsTrustTheirSavedInputs() async throws {
+        guard ProcessInfo.processInfo.environment["LAD_RUN_ENGINE_TESTS"] == "1" else {
+            throw XCTSkip("Set LAD_RUN_ENGINE_TESTS=1 to exercise native input validation.")
+        }
+        let root = temporary()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A box with intact geometry whose edge representation on one face is
+        // displaced: only exact validation rejects it.
+        let path = root.appendingPathComponent("reference.brep")
+        let script = """
+        import sys
+        import cadquery as cq
+        from OCP.BRep import BRep_Builder, BRep_Tool
+        from OCP.gp import gp_Vec2d
+        box = cq.Solid.makeBox(2, 3, 4)
+        face = box.Faces()[0]
+        edge = face.Edges()[0]
+        curve = BRep_Tool.CurveOnSurface_s(edge.wrapped, face.wrapped, 0., 0.)
+        BRep_Builder().UpdateEdge(edge.wrapped, curve.Translated(gp_Vec2d(1e-3, 0)), face.wrapped, 1e-7)
+        box.exportBrep(sys.argv[1])
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: EngineService.defaultPython)
+        process.arguments = ["-c", script, path.path]
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        let engine = EngineService()
+        let tools = try CADAgentTools(directory: root, python: EngineService.defaultPython, threads: 2,
+                                      current: nil, currentPreview: nil, engine: engine)
+        do {
+            _ = try await tools.handle(name: "lad_import", arguments: ["path": path.path])
+            XCTFail("Importing must validate the input")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("input_asset"), error.localizedDescription)
+        }
+        let data = try Data(contentsOf: path)
+        let asset = CADInputAsset(id: "asset-reference", name: "reference.brep", format: "brep", data: data)
+        let saved = ModelSpec(title: "Saved input", summary: "A design's saved input.", units: "mm",
+                              script: "assert imported_assets['asset-reference'].Volume() > 0\nresult = cq.Solid.makeBox(1, 1, 1)",
+                              inputAssets: [asset])
+        let preview = try await engine.buildPreview(saved, python: EngineService.defaultPython, threads: 2)
+        XCTAssertEqual(preview.volume, 1, accuracy: 1e-9, "A design's saved inputs are not validated again.")
+    }
+
+    @MainActor
     func testAgentImportsSTLAndReplaysWithoutOriginalFile() async throws {
         guard ProcessInfo.processInfo.environment["LAD_RUN_ENGINE_TESTS"] == "1" else {
             throw XCTSkip("Set LAD_RUN_ENGINE_TESTS=1 to exercise native STL import.")

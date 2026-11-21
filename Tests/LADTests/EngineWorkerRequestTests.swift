@@ -34,6 +34,10 @@ final class EngineWorkerRequestTests: XCTestCase {
                                                  sourceAsset: nil, inputAssets: [], print: true)
         XCTAssertEqual(try object(printing), ["title": "Box", "summary": "A box.", "units": "mm", "script": "result = 1\n",
                                               "print": true])
+        let importing = EngineWorkerRequest.build(title: "Box", summary: "A box.", units: "mm", script: "result = 1\n",
+                                                  sourceAsset: nil, inputAssets: [], validateInputs: true)
+        XCTAssertEqual(try object(importing), ["title": "Box", "summary": "A box.", "units": "mm", "script": "result = 1\n",
+                                               "validateInputs": true])
         XCTAssertEqual(try object(.runtime), ["operation": "runtime"])
     }
 

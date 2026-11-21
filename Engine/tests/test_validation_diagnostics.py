@@ -193,7 +193,8 @@ class ValidationDiagnosticTests(unittest.TestCase):
             asset = {'id': 'external-reference', 'name': 'External reference.brep',
                      'format': 'brep', 'path': path.name}
             spec = {'title': 'Reference scope', 'summary': 'An invalid imported reference.', 'units': 'mm',
-                    'script': "raise AssertionError('Candidate program must not execute')", 'inputAssets': [asset]}
+                    'script': "raise AssertionError('Candidate program must not execute')", 'inputAssets': [asset],
+                    'validateInputs': True}
             with self.assertRaises(worker.ModelError) as staged:
                 worker.build_shape(spec, 2, folder)
             diagnostic = staged.exception.diagnostic
@@ -210,6 +211,13 @@ class ValidationDiagnosticTests(unittest.TestCase):
                 worker.validate_shape(invalid)
             self.assertEqual(native.exception.diagnostic['geometryScope'], 'native_candidate')
             self.assertNotIn('inputAsset', native.exception.diagnostic)
+
+            # Only the build importing an input validates it; a design's saved
+            # inputs are trusted by every later build.
+            trusted = {**spec, 'script': "assert imported_assets['external-reference'].Volume() > 0\n"
+                                         "result = cq.Solid.makeBox(1, 1, 1)"}
+            del trusted['validateInputs']
+            self.assertAlmostEqual(worker.build_shape(trusted, 2, folder).Volume(), 1, places=9)
             shape = slot_shape(3).scale(1000)
             step = folder / 'candidate.step'
             worker.write_step(worker._shape_entities(shape, 'Solid'), step, cq)

@@ -142,10 +142,12 @@ def step_precision(direction):
 def validate_spec(spec):
     """Validate the complete request before importing or calling the CAD kernel."""
     if (not isinstance(spec, dict) or not ROOT_KEYS <= set(spec)
-            or set(spec) - ROOT_KEYS - {"sourceAsset", "sourceValidatedBREP", "inputAssets", "print"}):
+            or set(spec) - ROOT_KEYS - {"sourceAsset", "sourceValidatedBREP", "inputAssets", "print", "validateInputs"}):
         raise ModelError("Design must contain title, summary, units and a complete Python script.")
     if "print" in spec and spec["print"] is not True:
         raise ModelError("The 3D printing build option must be true when present.")
+    if "validateInputs" in spec and spec["validateInputs"] is not True:
+        raise ModelError("The input validation build option must be true when present.")
     for name, maximum in (("title", 160), ("summary", 6000)):
         if not isinstance(spec[name], str) or not 1 <= len(spec[name]) <= maximum:
             raise ModelError(f"{name} must be a nonempty string of at most {maximum} characters.")
@@ -818,14 +820,16 @@ class LADBuildMode:
 
 
 def build_script(script, cq, source_asset=None, input_assets=None, preview_stats=None, printing=False,
-                 validated_inputs=None, exact=True):
+                 validated_inputs=None, exact=True, validate_inputs=False):
     """Run ordinary Python with the installed CadQuery/OpenCascade APIs.
 
     This is intentionally not a Python-language security boundary. The native
     app applies a macOS process sandbox restricting files, subprocesses and
     networking. CLI callers must apply equivalent isolation for untrusted code.
-    `validated_inputs` reads and keeps validated copies of imported inputs;
+    `validated_inputs` reads and keeps native copies of imported inputs;
     `exact` False defers the result's exact checks (see validate_shape).
+    `validate_inputs` validates the inputs, as the build importing them into a
+    design does; otherwise they are a design's trusted inputs (trusted_input).
     """
     import resource
     # Bound individual files (including stderr) before generated Python runs.
@@ -843,7 +847,8 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
     for asset, path in input_assets or []:
         with validation_scope("input_asset", {"id": asset["id"], "name": asset["name"], "format": asset["format"]}):
             namespace["imported_assets"][asset["id"]] = validated_inputs.load(
-                path.stem, cq, lambda path=path, asset=asset: import_input_asset(path, asset["format"], cq))
+                path.stem, cq, lambda path=path, asset=asset: import_input_asset(path, asset["format"], cq,
+                                                                                  validate=validate_inputs))
     if source_asset is not None:
         import stat
         try:
@@ -851,7 +856,8 @@ def build_script(script, cq, source_asset=None, input_assets=None, preview_stats
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
                 raise ModelError("The imported STEP asset must be a regular private file of at most 512 MB.")
             with validation_scope("source_step", {"name": source_asset.name, "format": "step"}):
-                imported = validated_inputs.load("source", cq, lambda: import_step(source_asset, cq))
+                imported = validated_inputs.load("source", cq, lambda: import_step(source_asset, cq,
+                                                                                  validate=validate_inputs))
             namespace["imported_model"] = imported
         except ModelError:
             raise
@@ -924,24 +930,27 @@ def build_shape(spec, threads=1, asset_directory=None, preview_stats=None, valid
     if inputs and asset_directory is None:
         raise ModelError("The imported geometry asset directory is unavailable.")
     staged = [(asset, Path(asset_directory) / asset["path"]) for asset in inputs]
-    copies = {Path(name).name.removesuffix(VALIDATED_COPY_SUFFIX): Path(asset_directory) / name
-              for name in [spec.get("sourceValidatedBREP")] + [asset.get("validatedBREP") for asset in inputs] if name}
+    validate_inputs = spec.get("validateInputs", False)
+    # A build importing inputs into a design validates them itself.
+    copies = {} if validate_inputs else {
+        Path(name).name.removesuffix(VALIDATED_COPY_SUFFIX): Path(asset_directory) / name
+        for name in [spec.get("sourceValidatedBREP")] + [asset.get("validatedBREP") for asset in inputs] if name}
     return build_script(spec["script"], cq, source_asset, staged, preview_stats=preview_stats,
                         printing=spec.get("print", False),
                         validated_inputs=ValidatedInputs(copies, None if validated_copies is None else Path(validated_copies)),
-                        exact=exact)
+                        exact=exact, validate_inputs=validate_inputs)
 
 
 VALIDATED_COPY_SUFFIX = ".validated.brep"
 
 
 class ValidatedInputs:
-    """Session copies of imported inputs, as this worker imported and validated them.
+    """Session copies of a design's validated inputs, as this worker imported them.
 
-    Translating and exactly validating an unchanged STEP or mesh input again in
-    every build of a task repeats the same work. The app stages a native copy
-    of each input that an earlier build of this worker and runtime validated,
-    beside its unchanged original bytes, and keeps each new copy written here.
+    Translating an unchanged STEP or mesh input again in every build of a task
+    repeats the same work. The app stages a native copy of each input that an
+    earlier build of this worker and runtime imported, beside its unchanged
+    original bytes, and keeps each new copy written here.
     Copies are written before the program runs, so they hold the shapes a
     program receives rather than anything it changes afterwards. A copy that
     cannot be read falls back to importing the original.
@@ -2924,7 +2933,7 @@ def validate_parts(parts, solid_count):
     return parts
 
 
-def import_step(path, cq, preview_stats=None):
+def import_step(path, cq, preview_stats=None, validate=True):
     # A STEP can have multiple transfer roots. Workplane.val() silently keeps
     # only the first one; combine every imported root in its stored order.
     with step_precision("read"):
@@ -2932,15 +2941,30 @@ def import_step(path, cq, preview_stats=None):
     if not values or any(not isinstance(value, cq.Shape) for value in values):
         raise ModelError("The saved STEP contains no solid geometry.")
     shape = values[0] if len(values) == 1 else cq.Compound.makeCompound(values)
-    return validate_shape(shape, preview_stats=preview_stats)
+    return validate_shape(shape, preview_stats=preview_stats) if validate else trusted_input(shape)
 
 
-def import_input_asset(path, format, cq):
-    """Read an app-staged recipe input, never an arbitrary program path."""
+def trusted_input(shape):
+    """A design's saved input, validated once when it was imported into the design.
+
+    Only that import validates an input. Later builds keep the structural
+    checks every input needs and apply the same boundary tolerance as
+    validation, so programs receive identical shapes.
+    """
+    if shape.isNull() or not _only_solids(shape) or not 0 < len(_shape_entities(shape, "Solid")) <= 4_096:
+        raise ModelError("The imported geometry does not contain closed solids.")
+    return apply_geometry_tolerance(shape)
+
+
+def import_input_asset(path, format, cq, validate=True):
+    """Read an app-staged recipe input, never an arbitrary program path.
+
+    `validate` False reads a design's trusted input (see trusted_input).
+    """
     input_asset = _validation_input.get() or {"name": path.name, "format": format}
     with validation_scope("input_asset", input_asset):
         try:
-            return _read_input_asset(path, format, cq)
+            return _read_input_asset(path, format, cq, validate)
         except ModelError as error:
             if error.diagnostic is None:
                 error.diagnostic = {"stage": "input_import", "geometryScope": "input_asset", "inputAsset": input_asset}
@@ -2951,17 +2975,18 @@ def import_input_asset(path, format, cq):
                                          "inputAsset": input_asset}) from error
 
 
-def _read_input_asset(path, format, cq):
+def _read_input_asset(path, format, cq, validate=True):
     import stat
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not 0 < info.st_size <= MAX_GEOMETRY_BYTES:
         raise ModelError("Imported geometry must be a regular private file of at most 512 MB.")
     if format in {"step", "stp"}:
-        return import_step(path, cq)
+        return import_step(path, cq, validate=validate)
     if format == "brep":
-        return validate_shape(_read_brep_file(path, cq, "imported BREP asset"))
+        shape = _read_brep_file(path, cq, "imported BREP asset")
+        return validate_shape(shape) if validate else trusted_input(shape)
     if format in {"stl", "obj"}:
-        return mesh_to_solid(read_mesh(path, format), cq)
+        return mesh_to_solid(read_mesh(path, format), cq, validate=validate)
     raise ModelError("Unsupported imported geometry format.")
 
 
@@ -3041,7 +3066,7 @@ def read_mesh(path, format):
     return triangles
 
 
-def mesh_to_solid(polygons, cq):
+def mesh_to_solid(polygons, cq, validate=True):
     """Sew closed faceted surfaces into exact BRep faces, retaining voids."""
     from OCP.BRep import BRep_Tool
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
@@ -3096,7 +3121,7 @@ def mesh_to_solid(polygons, cq):
             voids = [other for j, other in enumerate(solids) if depths[j] == depths[index] + 1 and index in containers[j]]
             bodies.append(solid.cut(*voids) if voids else solid)
         result = bodies[0] if len(bodies) == 1 else cq.Compound.makeCompound(bodies)
-        return validate_shape(result)
+        return validate_shape(result) if validate else trusted_input(result)
     except ModelError:
         raise
     except Exception as error:

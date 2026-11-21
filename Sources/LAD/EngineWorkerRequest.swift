@@ -37,9 +37,11 @@ enum EngineWorkerRequest: Encodable, Sendable {
     }
 
     /// Replay a CAD program. Imported geometry is staged beside the request.
-    /// `print` builds the program's 3D printing version.
+    /// `print` builds the program's 3D printing version. `validateInputs`
+    /// validates the inputs, as only the build importing them into a design
+    /// does; a design's saved inputs are trusted.
     case build(title: String, summary: String, units: String, script: String, sourceAsset: String?, inputAssets: [InputAsset],
-               print: Bool = false, sourceValidatedBREP: String? = nil)
+               print: Bool = false, sourceValidatedBREP: String? = nil, validateInputs: Bool = false)
     case runtime
     case export(NativeSource, Export)
     /// One planar face as a 2D DXF drawing, seen from outside its solid.
@@ -62,7 +64,7 @@ enum EngineWorkerRequest: Encodable, Sendable {
     }
 
     private enum Key: String, CodingKey {
-        case operation, title, summary, units, script, sourceAsset, sourceValidatedBREP, inputAssets, print, brepAsset,
+        case operation, title, summary, units, script, sourceAsset, sourceValidatedBREP, inputAssets, print, validateInputs, brepAsset,
              nativeIdentity, validatedNative,
              solidIndices, solidTransforms, solidColors, individualParts, feature, features, pairs, poses, printDown,
              expectedParts
@@ -77,7 +79,7 @@ enum EngineWorkerRequest: Encodable, Sendable {
             try values.encode(source.validated, forKey: .validatedNative)
         }
         switch self {
-        case let .build(title, summary, units, script, sourceAsset, inputAssets, print, sourceValidatedBREP):
+        case let .build(title, summary, units, script, sourceAsset, inputAssets, print, sourceValidatedBREP, validateInputs):
             try values.encode(title, forKey: .title)
             try values.encode(summary, forKey: .summary)
             try values.encode(units, forKey: .units)
@@ -86,6 +88,7 @@ enum EngineWorkerRequest: Encodable, Sendable {
             try values.encodeIfPresent(sourceValidatedBREP, forKey: .sourceValidatedBREP)
             if !inputAssets.isEmpty { try values.encode(inputAssets, forKey: .inputAssets) }
             if print { try values.encode(true, forKey: .print) }
+            if validateInputs { try values.encode(true, forKey: .validateInputs) }
         case .runtime:
             try values.encode("runtime", forKey: .operation)
         case let .export(source, export):

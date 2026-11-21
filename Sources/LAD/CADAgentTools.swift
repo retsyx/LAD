@@ -511,7 +511,8 @@ final class CADAgentTools {
             let model = ModelSpec(title: "Imported geometry", summary: "Validated \(format.uppercased()) input geometry.", units: "mm",
                                   script: "result = imported_assets[\(String(data: try JSONEncoder().encode(id), encoding: .utf8)!)]\n",
                                   inputAssets: [asset])
-            let artifact = try await build(model)
+            // The only validation an input receives: designs' saved inputs are trusted.
+            let artifact = try await build(model, validateInputs: true)
             inputs[id] = asset
             var info = verificationStatus(summary(artifact), artifact)
             info["assetID"] = id
@@ -913,12 +914,13 @@ final class CADAgentTools {
     }
 
     private func build(_ model: ModelSpec, id: String? = nil, versionID: UUID? = nil, preparedPreview: PreviewMesh? = nil,
-                       print: Bool = false) async throws -> Artifact {
+                       print: Bool = false, validateInputs: Bool = false) async throws -> Artifact {
         let id = id ?? UUID().uuidString
         var preview: PreviewMesh
         if let preparedPreview { preview = preparedPreview }
         else if let cached = validatedPreview(for: model, print: print) { preview = cached }
-        else { preview = try await engine.buildPreview(model, print: print, python: python, threads: threads, verifyLater: true) }
+        else { preview = try await engine.buildPreview(model, print: print, python: python, threads: threads, verifyLater: true,
+                                                       validateInputs: validateInputs) }
         try checkCancellation()
         if print {
             // The printing version must keep the ordinary build's parts.
