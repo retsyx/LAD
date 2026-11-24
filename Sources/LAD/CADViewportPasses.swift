@@ -21,16 +21,34 @@ enum CADViewportCategory {
     static let featureAccumulation = 64
     /// Section material and cut contours are separate from native features.
     static let sectionCaps = 128
+    /// Shaded and edge displays draw parts whose color alpha is below 1 over
+    /// the opaque scene: their faces, edges, and highlighted face fills.
+    static let partialFaces = 256
+    static let partialDecorations = 512
+    /// A partially opaque part's highlighted face fill, which no pass draws:
+    /// its accumulation copies replace the face's share of the part's color.
+    static let partialFeatureFaces = 1_024
+    static let partialFeatureAccumulation = 2_048
+    /// Depth-only copies of opaque solids and section caps, which occlude
+    /// partially opaque faces and edges.
+    static let opaqueVisibility = 4_096
 
     static let opaqueScene = faces | decorations | featureFaces | probe | sectionCaps
     static let translucentDecorations = visibility | decorations | probe | sectionCaps
     static let translucentAccumulation = faces | featureAccumulation
     static let translucentRevealage = revealage
+    static let partialDecorationScene = visibility | opaqueVisibility | partialDecorations | probe
+    static let partialAccumulation = partialFaces | partialFeatureAccumulation | opaqueVisibility
+    static let partialRevealage = revealage | opaqueVisibility
+    /// Surfaces that hit testing can pick.
+    static let pickableFaces = faces | partialFaces
 }
 
 /// Translucent faces keep this fraction of their complete shaded color.
 enum CADTranslucency {
     static let alpha: Float = 0.28
+    /// Draws opaque depth before anything that reads it in the same pass.
+    static let opaqueDepthRenderingOrder = -1_000_000
 }
 
 /// Linear highlight colors and the scene background used by the compositor.
@@ -163,6 +181,10 @@ struct CADViewportFrame: @unchecked Sendable {
     var verticesEnabled = false
     /// World clipping equation. A zero equation retains the entire design.
     var sectionPlane: SIMD4<Float> = .zero
+    /// Shaded and edge displays composite parts whose color alpha is below 1
+    /// over the opaque scene, with those parts' edges when `partialEdges`.
+    var partialOpacity = false
+    var partialEdges = false
 
     var hasHighlights: Bool { !seeds.isEmpty || !batches.isEmpty }
 
@@ -183,6 +205,9 @@ final class CADViewportSceneSource: @unchecked Sendable {
     static let decorationsCameraName = "ladTranslucentDecorationsCamera"
     static let accumulationCameraName = "ladTranslucentAccumulationCamera"
     static let revealageCameraName = "ladTranslucentRevealageCamera"
+    static let partialDecorationsCameraName = "ladPartialDecorationsCamera"
+    static let partialAccumulationCameraName = "ladPartialAccumulationCamera"
+    static let partialRevealageCameraName = "ladPartialRevealageCamera"
     static let probeName = "ladFrameProbe"
 
     let scene: SCNScene
@@ -191,19 +216,38 @@ final class CADViewportSceneSource: @unchecked Sendable {
     let decorationsCamera: SCNNode
     let accumulationCamera: SCNNode
     let revealageCamera: SCNNode
+    let partialDecorationsCamera: SCNNode
+    let partialAccumulationCamera: SCNNode
+    let partialRevealageCamera: SCNNode
     private let probeNode: SCNNode
     let probe = CADViewportFrameProbe()
 
-    private init(scene: SCNScene, camera: SCNNode, decorationsCamera: SCNNode, accumulationCamera: SCNNode,
-                 revealageCamera: SCNNode, probeNode: SCNNode) {
+    private var passCameras: [SCNNode] {
+        [decorationsCamera, accumulationCamera, revealageCamera,
+         partialDecorationsCamera, partialAccumulationCamera, partialRevealageCamera]
+    }
+
+    private init(scene: SCNScene, camera: SCNNode, cameras: [SCNNode], probeNode: SCNNode) {
         self.scene = scene
         self.camera = camera
-        self.decorationsCamera = decorationsCamera
-        self.accumulationCamera = accumulationCamera
-        self.revealageCamera = revealageCamera
+        decorationsCamera = cameras[0]
+        accumulationCamera = cameras[1]
+        revealageCamera = cameras[2]
+        partialDecorationsCamera = cameras[3]
+        partialAccumulationCamera = cameras[4]
+        partialRevealageCamera = cameras[5]
         self.probeNode = probeNode
         probeNode.rendererDelegate = probe
     }
+
+    private static let passCameraMasks = [
+        (decorationsCameraName, CADViewportCategory.translucentDecorations),
+        (accumulationCameraName, CADViewportCategory.translucentAccumulation),
+        (revealageCameraName, CADViewportCategory.translucentRevealage),
+        (partialDecorationsCameraName, CADViewportCategory.partialDecorationScene),
+        (partialAccumulationCameraName, CADViewportCategory.partialAccumulation),
+        (partialRevealageCameraName, CADViewportCategory.partialRevealage)
+    ]
 
     deinit {
         // SceneKit updates scene culling when unregistering a delegate. Do this
@@ -230,12 +274,9 @@ final class CADViewportSceneSource: @unchecked Sendable {
         probeNode.name = probeName
         probeNode.categoryBitMask = CADViewportCategory.probe
         probeNode.renderingOrder = 1_000_000
-        let source = CADViewportSceneSource(
-            scene: scene, camera: camera,
-            decorationsCamera: passCamera(decorationsCameraName, mask: CADViewportCategory.translucentDecorations),
-            accumulationCamera: passCamera(accumulationCameraName, mask: CADViewportCategory.translucentAccumulation),
-            revealageCamera: passCamera(revealageCameraName, mask: CADViewportCategory.translucentRevealage),
-            probeNode: probeNode)
+        let source = CADViewportSceneSource(scene: scene, camera: camera,
+                                            cameras: passCameraMasks.map { passCamera($0.0, mask: $0.1) },
+                                            probeNode: probeNode)
         // Attach the geometry-free node with its delegate already registered so SceneKit draws it.
         scene.rootNode.addChildNode(probeNode)
         source.synchronizeCameras()
@@ -245,18 +286,16 @@ final class CADViewportSceneSource: @unchecked Sendable {
     /// Finds the pass cameras and probe in a cloned scene graph, attaching a
     /// fresh probe so the copy never reports into the original.
     static func adopt(scene: SCNScene, camera: SCNNode) -> CADViewportSceneSource? {
-        guard let decorations = camera.childNode(withName: decorationsCameraName, recursively: false),
-              let accumulation = camera.childNode(withName: accumulationCameraName, recursively: false),
-              let revealage = camera.childNode(withName: revealageCameraName, recursively: false),
+        let cameras = passCameraMasks.compactMap { camera.childNode(withName: $0.0, recursively: false) }
+        guard cameras.count == passCameraMasks.count,
               let probeNode = scene.rootNode.childNode(withName: probeName, recursively: true) else { return nil }
-        return CADViewportSceneSource(scene: scene, camera: camera, decorationsCamera: decorations,
-                                      accumulationCamera: accumulation, revealageCamera: revealage, probeNode: probeNode)
+        return CADViewportSceneSource(scene: scene, camera: camera, cameras: cameras, probeNode: probeNode)
     }
 
     /// Copies the design camera's projection into each pass camera.
     func synchronizeCameras() {
         guard let source = camera.camera else { return }
-        for node in [decorationsCamera, accumulationCamera, revealageCamera] {
+        for node in passCameras {
             guard let target = node.camera else { continue }
             if target.fieldOfView != source.fieldOfView { target.fieldOfView = source.fieldOfView }
             if target.projectionDirection != source.projectionDirection { target.projectionDirection = source.projectionDirection }
@@ -322,6 +361,7 @@ final class CADViewportPasses: @unchecked Sendable {
         let viewport = CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
         source.probe.reset()
         var translucentTargets: (decorations: any MTLTexture, accumulated: any MTLTexture, revealage: any MTLTexture)?
+        var partialTargets: (decorations: (any MTLTexture)?, accumulated: any MTLTexture, revealage: any MTLTexture)?
         if frame.translucent {
             guard let decorations = targets.decorations(), let accumulated = targets.accumulated(),
                   let revealage = targets.revealage(), let half4 = targets.multisampleHalf4(),
@@ -336,12 +376,35 @@ final class CADViewportPasses: @unchecked Sendable {
                         depth: targets.multisampleDepth)
             translucentTargets = (decorations, accumulated, revealage)
         } else {
+            // SceneKit starts at most three renders before an earlier render's
+            // command buffer completes. Partially opaque parts need up to four,
+            // so the opaque scene and their edges go first in a buffer of their own.
+            let partial = frame.partialOpacity ? targets.partialTargets(edges: frame.partialEdges) : nil
+            let early = partial == nil ? nil : commandBuffer.commandQueue.makeCommandBuffer()
+            early?.label = "\(commandBuffer.label ?? "LAD frame") opaque scene"
             let background = frame.palette.background
-            renderScene(renderer, camera: source.camera, viewport: viewport, commandBuffer: commandBuffer,
+            renderScene(renderer, camera: source.camera, viewport: viewport, commandBuffer: early ?? commandBuffer,
                         color: targets.multisampleColor, resolve: target,
                         clear: MTLClearColor(red: Double(background.x), green: Double(background.y),
                                              blue: Double(background.z), alpha: Double(background.w)),
                         depth: targets.multisampleDepth)
+            // Partially opaque parts accumulate like translucent mode, but
+            // only where no opaque solid or section cap is nearer.
+            if let partial {
+                if let early, let decorations = partial.decorations {
+                    renderScene(renderer, camera: source.partialDecorationsCamera, viewport: viewport,
+                                commandBuffer: early, color: targets.multisampleColor, resolve: decorations,
+                                clear: MTLClearColor(), depth: targets.multisampleDepth)
+                }
+                early?.commit()
+                renderScene(renderer, camera: source.partialAccumulationCamera, viewport: viewport, commandBuffer: commandBuffer,
+                            color: partial.half4, resolve: partial.accumulated, clear: MTLClearColor(),
+                            depth: targets.multisampleDepth)
+                renderScene(renderer, camera: source.partialRevealageCamera, viewport: viewport, commandBuffer: commandBuffer,
+                            color: partial.half1, resolve: partial.revealage,
+                            clear: MTLClearColor(red: 1, green: 1, blue: 1, alpha: 1), depth: targets.multisampleDepth)
+                partialTargets = (early == nil ? nil : partial.decorations, partial.accumulated, partial.revealage)
+            }
         }
         let viewProjection = source.probe.take()
         var uniforms = HighlightUniforms(frame: frame)
@@ -368,6 +431,25 @@ final class CADViewportPasses: @unchecked Sendable {
             encoder.setFragmentTexture(translucentTargets.decorations, index: 2)
             encoder.setFragmentTexture(horizontal ?? pipelines.empty, index: 3)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<HighlightUniforms>.stride, index: 0)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            encoder.endEncoding()
+        } else if let partialTargets {
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = target
+            pass.colorAttachments[0].loadAction = .load
+            pass.colorAttachments[0].storeAction = .store
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+            encoder.label = "LAD partial opacity composite"
+            encoder.setRenderPipelineState(pipelines.partialComposite)
+            var rect = SIMD4<Float>(-1, -1, 1, 1)
+            encoder.setVertexBytes(&rect, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            encoder.setFragmentTexture(partialTargets.accumulated, index: 0)
+            encoder.setFragmentTexture(partialTargets.revealage, index: 1)
+            encoder.setFragmentTexture(partialTargets.decorations ?? pipelines.empty, index: 2)
+            encoder.setFragmentTexture(horizontal ?? pipelines.empty, index: 3)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<HighlightUniforms>.stride, index: 0)
+            var decorated: UInt32 = partialTargets.decorations == nil ? 0 : 1
+            encoder.setFragmentBytes(&decorated, length: MemoryLayout<UInt32>.stride, index: 1)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             encoder.endEncoding()
         } else if let horizontal {
@@ -601,6 +683,15 @@ final class CADViewportPasses: @unchecked Sendable {
             multisampleDepth = depth
         }
 
+        /// The accumulation targets for partially opaque parts, and their
+        /// edges' target when `edges`.
+        func partialTargets(edges: Bool) -> (accumulated: any MTLTexture, revealage: any MTLTexture, half4: any MTLTexture,
+                                             half1: any MTLTexture, decorations: (any MTLTexture)?)? {
+            guard let accumulated = accumulated(), let revealage = revealage(),
+                  let half4 = multisampleHalf4(), let half1 = multisampleHalf1() else { return nil }
+            return (accumulated, revealage, half4, half1, edges ? decorations() : nil)
+        }
+
         func multisampleHalf4() -> (any MTLTexture)? { texture("ms.rgba16f", .rgba16Float, multisample: true) }
         func multisampleHalf1() -> (any MTLTexture)? { texture("ms.r16f", .r16Float, multisample: true) }
         func multisampleMask() -> (any MTLTexture)? { texture("ms.mask", .rgba8Unorm, multisample: true) }
@@ -693,6 +784,7 @@ final class CADViewportPasses: @unchecked Sendable {
         let horizontal: any MTLRenderPipelineState
         let overlay: any MTLRenderPipelineState
         let translucentComposite: any MTLRenderPipelineState
+        let partialComposite: any MTLRenderPipelineState
         let empty: any MTLTexture
 
         private static let lock = NSLock()
@@ -743,8 +835,8 @@ final class CADViewportPasses: @unchecked Sendable {
             mask = try pipeline("cad_mask_vertex", "cad_mask_fragment", format: .rgba8Unorm, samples: samples, blend: maximum)
             contour = try pipeline("cad_quad", "cad_contour", format: .rgba8Unorm, blend: maximum)
             horizontal = try pipeline("cad_quad", "cad_highlight_horizontal", format: .rgba16Float)
-            // Premultiplied highlight layers over the resolved scene.
-            overlay = try pipeline("cad_quad", "cad_highlight_overlay", format: CADViewportPasses.colorFormat) { attachment in
+            // Premultiplied layers over the resolved scene.
+            let over: (MTLRenderPipelineColorAttachmentDescriptor) -> Void = { attachment in
                 attachment.isBlendingEnabled = true
                 attachment.rgbBlendOperation = .add
                 attachment.alphaBlendOperation = .add
@@ -753,7 +845,9 @@ final class CADViewportPasses: @unchecked Sendable {
                 attachment.sourceAlphaBlendFactor = .one
                 attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             }
+            overlay = try pipeline("cad_quad", "cad_highlight_overlay", format: CADViewportPasses.colorFormat, blend: over)
             translucentComposite = try pipeline("cad_quad", "cad_translucent_composite", format: CADViewportPasses.colorFormat)
+            partialComposite = try pipeline("cad_quad", "cad_partial_composite", format: CADViewportPasses.colorFormat, blend: over)
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1, mipmapped: false)
             descriptor.usage = .shaderRead
             descriptor.storageMode = .private
@@ -968,6 +1062,31 @@ final class CADViewportPasses: @unchecked Sendable {
             float scale = cad_scale(u);
             float4 highlight = cad_highlight(cad_distances(center - u.highlightArea.xy, horizontal, scale, u), scale, u);
             result = float4(highlight.rgb + result.rgb * (1.0f - highlight.a), result.a);
+        }
+        return result;
+    }
+
+    // Partially opaque faces, their edges and the highlights, premultiplied
+    // over the opaque scene already resolved into the target.
+    fragment float4 cad_partial_composite(CADQuadOut in [[stage_in]],
+                                          texture2d<float, access::read> accumulated [[texture(0)]],
+                                          texture2d<float, access::read> revealage [[texture(1)]],
+                                          texture2d<float, access::read> decorations [[texture(2)]],
+                                          texture2d<float, access::read> horizontal [[texture(3)]],
+                                          constant CADHighlightUniforms &u [[buffer(0)]],
+                                          constant uint &decorated [[buffer(1)]]) {
+        int2 center = int2(in.position.xy);
+        float4 sum = accumulated.read(uint2(center));
+        float coverage = 1.0f - saturate(revealage.read(uint2(center)).r);
+        float4 result = float4(sum.rgb / max(sum.a, 1.0e-5f) * coverage, coverage);
+        if (decorated != 0u) {
+            float4 decoration = decorations.read(uint2(center));
+            result = decoration + result * (1.0f - saturate(decoration.a));
+        }
+        if (u.hasHighlights > 0.5f && all(center >= u.highlightArea.xy) && all(center <= u.highlightArea.zw)) {
+            float scale = cad_scale(u);
+            float4 highlight = cad_highlight(cad_distances(center - u.highlightArea.xy, horizontal, scale, u), scale, u);
+            result = highlight + result * (1.0f - highlight.a);
         }
         return result;
     }

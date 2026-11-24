@@ -1,4 +1,4 @@
-"""Opaque sRGB colors remain semantic part metadata."""
+"""sRGB colors and their opacity remain semantic part metadata."""
 import copy
 import json
 import math
@@ -81,25 +81,37 @@ result.add(folder)
         srgb = tuple(12.92 * value if value <= 0.0031308 else 1.055 * value ** (1 / 2.4) - 0.055 for value in linear)
         self.assert_color({'color': assembly_part_color(cq.Color(*linear, 1, False))}, srgb)
 
-    def test_nonopaque_assembly_colors_are_rejected_with_actionable_error(self):
-        for alpha in (0, 0.5, 0.999):
-            source = f"result=cq.Assembly(cq.Solid.makeBox(1,2,3),color=cq.Color(0.2,0.4,0.6,{alpha}))"
-            with self.subTest(alpha=alpha), self.assertRaisesRegex(ModelError, 'only opaque.*alpha to 1'):
-                build_shape(spec(source), 2)
+    def test_assembly_color_alpha_is_inherited_opacity_metadata(self):
+        source = """
+result = cq.Assembly(name='Product', color=cq.Color(0.2,0.4,0.6,0.25), metadata={'lad_id':'product'})
+result.add(cq.Solid.makeBox(2,3,4), name='Body', metadata={'lad_id':'body'})
+result.add(cq.Solid.makeBox(1,2,3), name='Window', loc=cq.Location((10,0,0)), color=cq.Color(0.8,0.1,0.4,0), metadata={'lad_id':'window'})
+result.add(cq.Solid.makeBox(1,1,1), name='Post', loc=cq.Location((0,10,0)), color=cq.Color(0.1,0.2,0.3), metadata={'lad_id':'post'})
+"""
+        nodes = {node['id']: node for node in flatten(build_shape(spec(source), 2)._lad_parts)}
+        self.assertEqual(set(nodes['body']['color']), {'red', 'green', 'blue', 'alpha'})
+        for key, rgb, alpha in (('body', (0.2, 0.4, 0.6), 0.25), ('window', (0.8, 0.1, 0.4), 0)):
+            for channel, value in zip(('red', 'green', 'blue'), rgb):
+                self.assertAlmostEqual(nodes[key]['color'][channel], value, places=6)
+            self.assertAlmostEqual(nodes[key]['color']['alpha'], alpha, places=6)
+        self.assert_color(nodes['post'], (0.1, 0.2, 0.3))
         import cadquery as cq
-        for rgba in ((math.nan, 0, 0, 1), (0, 0, 1.1, 1), (0, 0, 0, math.nan)):
+        for rgba in ((math.nan, 0, 0, 1), (0, 0, 1.1, 1), (0, 0, 0, math.nan), (0, 0, 0, 1.5), (0, 0, 0, -0.1)):
             with self.subTest(rgba=rgba), mock.patch.object(cq.Color, 'toTuple', return_value=rgba), self.assertRaises(ModelError):
                 assembly_part_color(cq.Color(0.1, 0.2, 0.3))
 
     def test_saved_color_schema_is_optional_strict_and_finite(self):
         part = {'id': 'body', 'name': 'Body', 'solidIndices': [0], 'children': None}
         self.assertEqual(validate_parts([part], 1), [part])
-        for color in (None, {'red': 0.1, 'green': 0.2, 'blue': 0.3}):
+        for color in (None, {'red': 0.1, 'green': 0.2, 'blue': 0.3}, {'red': 0.1, 'green': 0.2, 'blue': 0.3, 'alpha': 0.5},
+                      {'red': 0, 'green': 0, 'blue': 0, 'alpha': 0}):
             candidate = {**part, 'color': color}
             self.assertEqual(validate_parts([candidate], 1), [candidate])
-        invalid = [[], 'red', {}, {'red': 0, 'green': 0}, {'red': 0, 'green': 0, 'blue': 0, 'alpha': 0.5}]
+        invalid = [[], 'red', {}, {'red': 0, 'green': 0}, {'red': 0, 'green': 0, 'alpha': 0.5},
+                   {'red': 0, 'green': 0, 'blue': 0, 'opacity': 0.5}]
         for value in (-0.01, 1.01, 10 ** 1000, math.nan, math.inf, True, '0.5', None):
             invalid.append({'red': value, 'green': 0.2, 'blue': 0.3})
+            invalid.append({'red': 0.1, 'green': 0.2, 'blue': 0.3, 'alpha': value})
         for color in invalid:
             with self.subTest(color=color), self.assertRaisesRegex(ModelError, 'finite sRGB'):
                 validate_parts([{**part, 'color': color}], 1)

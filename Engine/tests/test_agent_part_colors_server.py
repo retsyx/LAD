@@ -38,12 +38,14 @@ class PartColorMCPToolTests(unittest.TestCase):
         self.assertEqual(reset, {"type": "null"})
         self.assertFalse(rgb["additionalProperties"])
         self.assertEqual(set(rgb["required"]), {"red", "green", "blue"})
+        self.assertEqual(set(rgb["properties"]), {"red", "green", "blue", "alpha"})
         for component in rgb["properties"].values():
             self.assertEqual(component, {"type": "number", "minimum": 0, "maximum": 1})
-        for phrase in ("atomic batch", "conflicting overlaps", "color:null", "matching artifact patch"):
+        for phrase in ("atomic batch", "conflicting overlaps", "color:null", "matching artifact patch", "alpha", "opaque"):
             self.assertIn(phrase, description)
         self.assertIn("without rebuilding geometry", INSTRUCTIONS)
-        self.assertIn("one current RGB value", INSTRUCTIONS)
+        self.assertIn("one current RGBA value", INSTRUCTIONS)
+        self.assertIn("Alpha defaults to 1", INSTRUCTIONS)
         self.assertIn("last successful color assignment", INSTRUCTIONS)
         self.assertNotIn("authored/override", description)
 

@@ -2,19 +2,23 @@ import AppKit
 import SwiftUI
 
 struct PartColorPicker: View {
-    let initialColor: PartColor?
+    let selection: PartColorSelection
     let recentColors: [PartColor]
-    let onApply: (PartColor?) -> Void
+    let onApply: (PartColorChoice) -> Void
     let onCancel: () -> Void
     @State private var customColor: Color
+    @State private var customColorChanged = false
+    @State private var opacity: Double
+    @State private var opacityChanged = false
 
-    init(initialColor: PartColor?, recentColors: [PartColor],
-         onApply: @escaping (PartColor?) -> Void, onCancel: @escaping () -> Void) {
-        self.initialColor = initialColor
+    init(selection: PartColorSelection, recentColors: [PartColor],
+         onApply: @escaping (PartColorChoice) -> Void, onCancel: @escaping () -> Void) {
+        self.selection = selection
         self.recentColors = recentColors
         self.onApply = onApply
         self.onCancel = onCancel
-        _customColor = State(initialValue: (initialColor ?? PartColorState.defaultFinish).swatchColor)
+        _customColor = State(initialValue: (selection.hue ?? PartColorState.defaultFinish).swatchColor)
+        _opacity = State(initialValue: selection.opacity ?? 1)
     }
 
     var body: some View {
@@ -31,15 +35,35 @@ struct PartColorPicker: View {
             HStack {
                 Text("Custom Color").font(.subheadline)
                 Spacer()
-                AnchoredPartColorWell(color: $customColor).frame(width: 44, height: 24)
+                AnchoredPartColorWell(color: Binding(get: { customColor }, set: {
+                    customColor = $0
+                    customColorChanged = true
+                }))
+                .frame(width: 44, height: 24)
+            }
+            HStack(spacing: 10) {
+                Text("Opacity").font(.subheadline)
+                Slider(value: Binding(get: { opacity }, set: {
+                    opacity = ($0 * 100).rounded() / 100
+                    opacityChanged = true
+                }), in: 0...1)
+                .controlSize(.small)
+                .accessibilityLabel("Opacity")
+                .accessibilityValue(opacityLabel)
+                Text(opacityLabel)
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40, alignment: .trailing)
+                    .accessibilityHidden(true)
             }
             HStack(spacing: 8) {
-                Button("Default Color") { onApply(nil) }
+                Button("Default Color") { onApply(PartColorChoice(hue: PartColorState.defaultFinish, opacity: chosenOpacity)) }
                     .buttonStyle(.link)
                 Spacer(minLength: 0)
                 Button("Cancel", action: onCancel).keyboardShortcut(.cancelAction)
                 Button("Apply") {
-                    if let color = PartColor.fromPicker(customColor) { onApply(color) }
+                    onApply(PartColorChoice(hue: customColorChanged ? PartColor.fromPicker(customColor) : nil,
+                                            opacity: chosenOpacity))
                 }
                 .keyboardShortcut(.defaultAction)
             }
@@ -51,10 +75,18 @@ struct PartColorPicker: View {
         .tint(Palette.accent)
     }
 
+    /// An untouched slider keeps each target part's own opacity.
+    private var chosenOpacity: Double? { opacityChanged ? opacity : nil }
+
+    private var opacityLabel: String {
+        opacityChanged || selection.opacity != nil ? "\(Int((opacity * 100).rounded()))%" : "Mixed"
+    }
+
     private func swatches(_ colors: [PartColor]) -> some View {
         LazyVGrid(columns: Array(repeating: GridItem(.fixed(36), spacing: 10), count: 6), alignment: .leading, spacing: 10) {
             ForEach(Array(colors.enumerated()), id: \.offset) { _, color in
-                Button { onApply(color) } label: {
+                let isCurrent = color.opaque == selection.hue
+                Button { onApply(PartColorChoice(hue: color.opaque, opacity: chosenOpacity)) } label: {
                     RoundedRectangle(cornerRadius: 5)
                         .fill(color.swatchColor)
                         .frame(width: 32, height: 32)
@@ -62,7 +94,7 @@ struct PartColorPicker: View {
                             RoundedRectangle(cornerRadius: 5).strokeBorder(.white.opacity(0.22), lineWidth: 1)
                         }
                         .overlay {
-                            if color == initialColor {
+                            if isCurrent {
                                 Image(systemName: "checkmark").font(.system(size: 11, weight: .bold))
                                     .foregroundStyle(color.isLight ? Color.black.opacity(0.8) : Color.white)
                             }
@@ -70,13 +102,13 @@ struct PartColorPicker: View {
                         .padding(2)
                         .overlay {
                             RoundedRectangle(cornerRadius: 7)
-                                .strokeBorder(color == initialColor ? Palette.accent : .clear, lineWidth: 2)
+                                .strokeBorder(isCurrent ? Palette.accent : .clear, lineWidth: 2)
                         }
                 }
                 .buttonStyle(.plain)
                 .help(color.hexLabel)
                 .accessibilityLabel("Use color \(color.hexLabel)")
-                .accessibilityAddTraits(color == initialColor ? .isSelected : [])
+                .accessibilityAddTraits(isCurrent ? .isSelected : [])
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

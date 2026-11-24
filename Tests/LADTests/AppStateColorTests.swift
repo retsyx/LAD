@@ -24,6 +24,44 @@ final class AppStateColorTests: XCTestCase {
     }
 
     @MainActor
+    func testPickerChannelsKeepEachPartsUnchangedHueOrOpacity() {
+        let state = state()
+        state.setPartColor(red, for: "base")
+        state.setPartColor(blue, for: "lid")
+        state.selectPartNodes(["base", "lid", "board"])
+        XCTAssertEqual(state.partColorSelection(for: "base"), PartColorSelection(hue: nil, opacity: 1))
+
+        state.setPartColor(PartColorChoice(hue: nil, opacity: 0.4), for: "base")
+        XCTAssertEqual(state.solidColors, [0: PartColor(red: 0.8, green: 0.3, blue: 0.25, alpha: 0.4),
+                                           1: PartColor(red: 0.25, green: 0.5, blue: 0.8, alpha: 0.4),
+                                           2: PartColor(red: 0.70, green: 0.75, blue: 0.80, alpha: 0.4)],
+                       "An opacity choice keeps every target part's own hue, including the neutral finish.")
+        XCTAssertEqual(state.partColorSelection(for: "lid"), PartColorSelection(hue: nil, opacity: 0.4))
+        XCTAssertEqual(state.recentPartColors, [blue, red], "Opacity alone is not a recent hue.")
+
+        state.setPartColor(PartColorChoice(hue: PartColor.curated[4].opaque, opacity: nil), for: "board")
+        XCTAssertEqual(state.solidColors.values.map(\.alpha), [0.4, 0.4, 0.4], "A hue choice keeps each part's opacity.")
+        XCTAssertEqual(state.partColorSelection(for: "board"), PartColorSelection(hue: PartColor.curated[4], opacity: 0.4))
+        XCTAssertEqual(state.recentPartColors.first, PartColor.curated[4])
+
+        state.selectPartNodes([])
+        state.setPartColor(PartColorChoice(hue: nil, opacity: 1), for: "lid")
+        state.setPartColor(PartColorChoice(hue: PartColorState.defaultFinish, opacity: nil), for: "base")
+        XCTAssertEqual(state.solidColors[0], PartColor(red: 0.70, green: 0.75, blue: 0.80, alpha: 0.4),
+                       "Default Color restores the neutral hue and keeps an unchanged opacity.")
+        XCTAssertEqual(state.solidColors[1]?.alpha, 1)
+        XCTAssertEqual(state.recentPartColors.first, PartColor.curated[4], "The neutral finish is not recorded as recent.")
+
+        state.setPartColor(PartColorChoice(hue: PartColorState.defaultFinish, opacity: 1), for: "base")
+        XCTAssertNil(state.revisions[0].partColors?["base"], "An opaque neutral finish needs no stored color.")
+        let saved = state.revisions[0].partColors
+        state.setPartColor(PartColorChoice(hue: nil, opacity: nil), for: "lid")
+        state.setPartColor(PartColorChoice(hue: nil, opacity: 1.5), for: "lid")
+        state.setPartColor(PartColorChoice(hue: PartColor(red: .nan, green: 0, blue: 0), opacity: nil), for: "lid")
+        XCTAssertEqual(state.revisions[0].partColors, saved, "Empty and invalid choices change nothing.")
+    }
+
+    @MainActor
     func testFolderColorIncludesItsOwnGeometryAndDescendantsAndSurvivesOrganization() {
         let state = state()
         state.setPartColor(blue, for: "case")

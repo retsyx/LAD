@@ -576,11 +576,12 @@ def validate_step_roundtrip(shape, cq, step_path, preview_stats=None):
 
 
 def validate_part_color(color):
-    """Validate the opaque sRGB metadata shared by previews and saved parts."""
-    if (not isinstance(color, dict) or set(color) != {"red", "green", "blue"}
+    """Validate the sRGB color and optional alpha opacity shared by previews and saved parts."""
+    if (not isinstance(color, dict) or not {"red", "green", "blue"} <= set(color) <= {"red", "green", "blue", "alpha"}
             or any(isinstance(value, bool) or not isinstance(value, (int, float))
                    or not 0 <= value <= 1 or not math.isfinite(value) for value in color.values())):
-        raise ModelError("Part colors must contain finite sRGB red, green and blue values between 0 and 1.")
+        raise ModelError("Part colors must contain finite sRGB red, green and blue values, "
+                         "with an optional alpha, between 0 and 1.")
     return color
 
 
@@ -592,9 +593,11 @@ def assembly_part_color(color):
         raise ModelError("Assembly colors must be CadQuery Color values.")
     # CadQuery returns Quantity_TOC_sRGB from toTuple, not OCCT's linear RGB.
     red, green, blue, alpha = color.toTuple()
-    if not math.isfinite(alpha) or alpha != 1:
-        raise ModelError("LAD supports only opaque assembly colors; set alpha to 1.")
-    return validate_part_color({"red": red, "green": green, "blue": blue})
+    # Opaque colors keep their three-component metadata.
+    values = {"red": red, "green": green, "blue": blue}
+    if alpha != 1:
+        values["alpha"] = alpha
+    return validate_part_color(values)
 
 
 def print_down_direction(value):
@@ -3237,6 +3240,9 @@ def export_solid_colors(records, solid_count):
         index = record["solidIndex"]
         if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < solid_count or index in colors:
             raise ModelError("STEP colors contain invalid or duplicate solid indices.")
+        # STEP colors are RGB; opacity belongs to LAD's display.
+        if isinstance(record["color"], dict) and "alpha" in record["color"]:
+            raise ModelError("STEP colors contain only sRGB red, green and blue values.")
         colors[index] = validate_part_color(record["color"])
     return colors
 

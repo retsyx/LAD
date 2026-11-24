@@ -59,7 +59,7 @@ struct PartNode: Codable, Sendable, Identifiable, Equatable {
     var name: String
     var solidIndices: [Int]
     var children: [PartNode]? = nil
-    /// Opaque sRGB color for this node's own solids.
+    /// sRGB color and opacity for this node's own solids.
     var color: PartColor? = nil
 
     var isGroup: Bool { children != nil }
@@ -217,7 +217,7 @@ struct ProjectRevision: Codable, Sendable, Identifiable {
     /// The successful conversation turn that produced this validated model.
     var userMessageID: UUID? = nil
     var responseMessageID: UUID? = nil
-    /// User-selected opaque colors, addressed by stable individual part IDs.
+    /// User-selected colors and opacities, addressed by stable individual part IDs.
     var partColors: [String: PartColor]? = nil
     /// Complete material definitions, addressed by stable individual part IDs.
     /// Absent parts are unassigned.

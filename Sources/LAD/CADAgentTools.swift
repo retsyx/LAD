@@ -1053,18 +1053,20 @@ final class CADAgentTools {
             let id = try string("partID", value, required: true)!
             guard let raw = value["color"] else { throw LADError.message("Each part color assignment requires color, or null to use the neutral default finish.") }
             if raw is NSNull { return CADPartColorChange(partID: id, color: nil) }
-            guard let components = raw as? [String: Any], Set(components.keys) == ["red", "green", "blue"] else {
-                throw LADError.message("Part colors require red, green and blue sRGB components between 0 and 1.")
+            guard let components = raw as? [String: Any],
+                  Set(components.keys).subtracting(["alpha"]) == ["red", "green", "blue"] else {
+                throw LADError.message("Part colors require red, green and blue sRGB components between 0 and 1, with optional alpha.")
             }
             func component(_ name: String) throws -> Double {
                 guard let number = components[name] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
                       number.doubleValue.isFinite, (0...1).contains(number.doubleValue) else {
-                    throw LADError.message("Part color components must be finite sRGB numbers between 0 and 1.")
+                    throw LADError.message("Part color components must be finite numbers between 0 and 1.")
                 }
                 return number.doubleValue
             }
             return CADPartColorChange(partID: id, color: PartColor(red: try component("red"),
-                green: try component("green"), blue: try component("blue")))
+                green: try component("green"), blue: try component("blue"),
+                alpha: components["alpha"] == nil ? 1 : try component("alpha")))
         }
     }
 
@@ -1074,8 +1076,10 @@ final class CADAgentTools {
         })
     }
 
+    /// Agents always see the complete color, including full opacity.
     private func colorInfo(_ node: PartNode, in artifact: Artifact) throws -> [String: Any] {
-        ["color": try json(artifact.partColors[node.id] ?? PartColorState.defaultFinish)]
+        let color = artifact.partColors[node.id] ?? PartColorState.defaultFinish
+        return ["color": ["red": color.red, "green": color.green, "blue": color.blue, "alpha": color.alpha]]
     }
 
     private func colorPage(_ artifact: Artifact, offset: Int, limit: Int) throws -> [String: Any] {

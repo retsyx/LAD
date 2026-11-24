@@ -61,6 +61,36 @@ final class CADAgentPartColorTests: XCTestCase {
     }
 
     @MainActor
+    func testAlphaIsReportedForEveryPartAndStagedWithItsColor() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let translucentGreen = PartColor(red: 0.1, green: 0.8, blue: 0.2, alpha: 0.35)
+        let tools = try fixture.tools(includePreview: false, partColors: ["lid": translucentGreen])
+        var page = try await colors(tools)
+        XCTAssertEqual(try item("base", in: page)["color"] as? [String: Double],
+                       ["red": 0.1, "green": 0.2, "blue": 0.8, "alpha": 1], "Opaque colors report their full opacity.")
+        XCTAssertEqual(try color("lid", in: page), translucentGreen)
+        let translucentRed = PartColor(red: 0.9, green: 0.1, blue: 0.1, alpha: 0)
+        _ = try await set(tools, changes: [["partID": "case", "color": ["red": 0.9, "green": 0.1, "blue": 0.1, "alpha": 0]]])
+        page = try await colors(tools)
+        XCTAssertEqual(try color("base", in: page), translucentRed)
+        XCTAssertEqual(try color("lid", in: page), translucentRed)
+        XCTAssertEqual(tools.partColorChanges(for: nil), [CADPartColorChange(partID: "base", color: translucentRed),
+                                                          CADPartColorChange(partID: "lid", color: translucentRed)])
+        _ = try await set(tools, changes: [assignment("base", blue), assignment("lid", nil)])
+        page = try await colors(tools)
+        XCTAssertEqual(try color("base", in: page), blue, "An omitted alpha assigns an opaque color.")
+        XCTAssertEqual(try color("lid", in: page), PartColorState.defaultFinish, "Null resets to the opaque neutral finish.")
+        do {
+            _ = try await set(tools, changes: [["partID": "base", "color": ["red": 0.9, "green": 0.1, "blue": 0.1, "alpha": 0.5]],
+                                               ["partID": "case", "color": ["red": 0.9, "green": 0.1, "blue": 0.1]]])
+            XCTFail("Overlapping targets with different opacities must conflict.")
+        } catch {}
+        let unchanged = try await colors(tools)
+        XCTAssertEqual(try color("base", in: unchanged), blue)
+    }
+
+    @MainActor
     func testSequentialGroupAndChildColorsKeepAnOwningAssemblyBodySeparate() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
@@ -90,7 +120,12 @@ final class CADAgentPartColorTests: XCTestCase {
             ["changes": [["partID": "base", "color": ["red": true, "green": 0, "blue": 0]]]],
             ["changes": [["partID": "base", "color": ["red": Double.infinity, "green": 0, "blue": 0]]]],
             ["changes": [["partID": "base", "color": ["red": -0.1, "green": 0, "blue": 0]]]],
-            ["changes": [["partID": "base", "color": ["red": 0, "green": 0, "blue": 0, "alpha": 1]]]],
+            ["changes": [["partID": "base", "color": ["red": 0, "green": 0, "blue": 0, "alpha": 1.01]]]],
+            ["changes": [["partID": "base", "color": ["red": 0, "green": 0, "blue": 0, "alpha": -0.01]]]],
+            ["changes": [["partID": "base", "color": ["red": 0, "green": 0, "blue": 0, "alpha": true]]]],
+            ["changes": [["partID": "base", "color": ["red": 0, "green": 0, "blue": 0, "alpha": Double.nan]]]],
+            ["changes": [["partID": "base", "color": ["red": 0, "green": 0, "blue": 0, "opacity": 0.5]]]],
+            ["changes": [["partID": "base", "color": ["red": 0, "green": 0, "alpha": 0.5]]]],
             ["changes": [assignment("base", red), assignment("base", red)]],
             ["changes": [assignment("missing", red)]], ["changes": [assignment("base", red)], "unexpected": true]
         ]

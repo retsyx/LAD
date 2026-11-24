@@ -393,6 +393,7 @@ final class EngineService {
 
     /// Export an already built native solid, with no program replay or meshing.
     /// Repeated exports reuse bytes only for the same geometry, subset, RGB and placement.
+    /// STEP colors are RGB; display opacity is not exported.
     func exportSTEP(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, solidColors: [Int: PartColor] = [:],
                     solidTransforms: [Int: [Double]]? = nil,
                     python: String, threads: Int) async throws -> Data {
@@ -409,7 +410,7 @@ final class EngineService {
             throw LADError.message("The export colors must refer to available parts and use finite sRGB components between 0 and 1.")
         }
         let selection: [Int]? = solidIndices.flatMap { $0.count == preview.solids ? nil : $0.sorted() }
-        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
+        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!.opaque) }
         // Raw bytes retain their original coordinates and carry no requested display colors.
         // Placement and current RGB must be written from native geometry.
         if transforms.isEmpty, selection == nil, colors.isEmpty, let artifacts = preview.buildArtifacts, artifacts.containsSTEP,
@@ -465,7 +466,7 @@ final class EngineService {
         }
         let parts = parts.map { $0.sorted() }
         let selection = indices.count == preview.solids ? nil : indices.sorted()
-        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
+        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!.opaque) }
         guard let path = preview.brepPath, let artifacts = preview.buildArtifacts,
               path == artifacts.folder.appendingPathComponent("model.brep").path else {
             throw EngineExportError.nativeArtifactUnavailable

@@ -1,9 +1,47 @@
 import Foundation
 
-/// An explicit, stable-part assignment. A nil color selects the neutral finish.
+/// An explicit, stable-part assignment. A nil color selects the opaque neutral finish.
 struct CADPartColorChange: Codable, Sendable, Equatable {
     var partID: String
     var color: PartColor?
+}
+
+/// A color picker choice for its target parts. A nil channel keeps each
+/// target part's current value, so differently colored parts can share a
+/// new opacity and keep their hues, or the reverse.
+struct PartColorChoice: Equatable {
+    /// The new hue; its alpha is ignored.
+    var hue: PartColor?
+    /// The new opacity, from 0 (transparent) to 1 (opaque).
+    var opacity: Double?
+
+    var isValid: Bool {
+        hue?.isValid != false && opacity.map { $0.isFinite && (0...1).contains($0) } != false
+    }
+
+    func applied(to color: PartColor) -> PartColor {
+        PartColor(red: hue?.red ?? color.red, green: hue?.green ?? color.green, blue: hue?.blue ?? color.blue,
+                  alpha: opacity ?? color.alpha)
+    }
+}
+
+/// The hue and opacity that all of a color picker's target parts share.
+struct PartColorSelection: Equatable {
+    /// The shared hue at full opacity, or nil when the targets differ.
+    var hue: PartColor?
+    /// The shared opacity, or nil when the targets differ.
+    var opacity: Double?
+
+    init(hue: PartColor? = nil, opacity: Double? = nil) {
+        self.hue = hue
+        self.opacity = opacity
+    }
+
+    init(_ colors: [PartColor]) {
+        let hues = Set(colors.map(\.opaque)), opacities = Set(colors.map(\.alpha))
+        hue = hues.count == 1 ? hues.first : nil
+        opacity = opacities.count == 1 ? opacities.first : nil
+    }
 }
 
 enum PartColorState {
@@ -45,7 +83,7 @@ enum PartColorState {
         var targets = Set<String>()
         for change in changes {
             guard change.color?.isValid != false else {
-                throw LADError.message("Part colors must have finite sRGB components between 0 and 1.")
+                throw LADError.message("Part colors must have finite sRGB and alpha components between 0 and 1.")
             }
             guard targets.insert(change.partID).inserted else {
                 throw LADError.message("Choose each part or folder only once in a color change.")
@@ -84,7 +122,7 @@ enum PartColorState {
                 throw LADError.message("Color changes must address distinct physical parts in this design.")
             }
             guard change.color?.isValid != false else {
-                throw LADError.message("Part colors must have finite sRGB components between 0 and 1.")
+                throw LADError.message("Part colors must have finite sRGB and alpha components between 0 and 1.")
             }
         }
         var result = colors.filter { ids.contains($0.key) && $0.value.isValid }
@@ -92,7 +130,7 @@ enum PartColorState {
         return result
     }
 
-    /// Staged metadata describes current RGB values without changing saved
+    /// Staged metadata describes current colors without changing saved
     /// hierarchy or the original build-provided values in document state.
     static func nodesWithCurrentColors(_ nodes: [PartNode], stored: [String: PartColor]) -> [PartNode] {
         let colors = resolved(in: nodes, overrides: stored)

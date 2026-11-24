@@ -207,7 +207,7 @@
   },
   {
     "name": "lad_get_part_colors",
-    "description": "Read current opaque sRGB colors, stable part and folder IDs, and parent relationships. Paginated; current works from the saved parts layout even when its geometry preview is unavailable. Never rebuilds geometry or changes the design.",
+    "description": "Read current sRGB colors with alpha opacity, stable part and folder IDs, and parent relationships. Paginated; current works from the saved parts layout even when its geometry preview is unavailable. Never rebuilds geometry or changes the design.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -241,7 +241,7 @@
   },
   {
     "name": "lad_set_part_colors",
-    "description": "Stage an atomic batch of part or folder color assignments for one artifact without rebuilding geometry or changing the live design. Folder assignments expand to physical parts; conflicting overlaps are rejected. Use color:null to set the neutral default finish. Only a successful final response commits the current patch or the final replacement program's matching artifact patch.",
+    "description": "Stage an atomic batch of part or folder color assignments for one artifact without rebuilding geometry or changing the live design. Folder assignments expand to physical parts; conflicting overlaps are rejected. Optional alpha sets opacity from 0 (transparent) to 1 (opaque, the default); parts below 1 render translucent in the shaded and edges displays. Use color:null to set the opaque neutral default finish. Only a successful final response commits the current patch or the final replacement program's matching artifact patch.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -277,6 +277,11 @@
                         "maximum": 1
                       },
                       "blue": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "alpha": {
                         "type": "number",
                         "minimum": 0,
                         "maximum": 1
@@ -650,7 +655,8 @@
             "edges",
             "translucent",
             "wireframe"
-          ]
+          ],
+          "description": "Shaded and edges show each part's color alpha; translucent shows every part equally translucent, and wireframe ignores alpha."
         },
         "width": {
           "type": "integer",

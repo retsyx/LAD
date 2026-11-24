@@ -88,11 +88,28 @@ final class CADViewportSectionCaps {
     }
 
     let node = SCNNode()
+    /// A depth-only copy of the cap, which occludes partially opaque parts
+    /// behind it in shaded and edge displays.
+    private let depthNode = SCNNode()
+    private var preparedDepth: (cap: SCNGeometry, depth: SCNGeometry?)?
     private var task: Task<Void, Never>?
     private var pending: Request?
     var isPreparing: Bool { task != nil }
 
-    init() { node.categoryBitMask = CADViewportCategory.sectionCaps }
+    init() {
+        node.categoryBitMask = CADViewportCategory.sectionCaps
+        depthNode.categoryBitMask = CADViewportCategory.opaqueVisibility
+        depthNode.renderingOrder = CADTranslucency.opaqueDepthRenderingOrder
+        node.addChildNode(depthNode)
+    }
+
+    /// Shows a cap this instance prepared, or none.
+    func show(_ cap: SCNGeometry?) {
+        node.geometry = cap
+        if let cap, preparedDepth?.cap !== cap { preparedDepth = (cap, Self.depthCopy(of: cap)) }
+        if cap == nil { preparedDepth = nil }
+        depthNode.geometry = preparedDepth?.depth
+    }
 
     deinit { task?.cancel() }
 
@@ -125,19 +142,36 @@ final class CADViewportSectionCaps {
             let geometry: SCNGeometry? = result.flatMap {
                 $0.positions.isEmpty && $0.interferencePositions.isEmpty ? nil : Self.geometry($0, wire: request.wire)
             }
+            let depth = geometry.flatMap(Self.depthCopy)
             let ready: Bool
             if let geometry, let renderer = request.renderer {
                 ready = await withCheckedContinuation { continuation in
-                    renderer.prepare([geometry]) { continuation.resume(returning: $0) }
+                    renderer.prepare([geometry] + (depth.map { [$0] } ?? [])) { continuation.resume(returning: $0) }
                 }
             } else {
                 ready = geometry != nil
             }
             guard !Task.isCancelled, let self else { return }
             self.task = nil
+            if let geometry { self.preparedDepth = (geometry, depth) }
             self.startNext()
             request.present(request.plane, ready ? geometry : nil)
         }
+    }
+
+    /// Filled caps share their buffers with a copy that writes depth only.
+    private static func depthCopy(of cap: SCNGeometry) -> SCNGeometry? {
+        let elements = cap.elements.filter { $0.primitiveType == .triangles }
+        guard !elements.isEmpty else { return nil }
+        let copy = SCNGeometry(sources: cap.sources, elements: elements)
+        let material = SCNMaterial()
+        material.lightingModel = .constant
+        material.colorBufferWriteMask = []
+        material.isDoubleSided = true
+        material.writesToDepthBuffer = true
+        material.readsFromDepthBuffer = true
+        copy.materials = [material]
+        return copy
     }
 
     private static func geometry(_ cap: CADSectionCapMesh, wire: Bool) -> SCNGeometry {

@@ -2096,20 +2096,38 @@ final class AppState {
         return color
     }
 
+    /// The hue and opacity the context menu's target parts share.
+    func partColorSelection(for nodeID: String) -> PartColorSelection {
+        guard let revision = revisions.first(where: { $0.id == selectedRevisionID }) else { return PartColorSelection() }
+        let colors = Self.completePartColors(in: partTree, stored: revision.partColors ?? [:])
+        return PartColorSelection(physicalPartTargets(for: nodeID).compactMap { colors[$0.id] })
+    }
+
+    /// Replaces the target parts' complete colors. A nil color selects the
+    /// opaque neutral finish.
     func setPartColor(_ color: PartColor?, for nodeID: String) {
-        guard color?.isValid != false,
-              let index = revisions.firstIndex(where: { $0.id == selectedRevisionID }) else { return }
+        guard color?.isValid != false else { return }
+        setPartColor(PartColorChoice(hue: color ?? PartColorState.defaultFinish, opacity: color?.alpha ?? 1), for: nodeID)
+    }
+
+    /// Applies a color picker choice to every target part, keeping each part's
+    /// current value of a channel the choice leaves unchanged.
+    func setPartColor(_ choice: PartColorChoice, for nodeID: String) {
+        guard choice.isValid, let index = revisions.firstIndex(where: { $0.id == selectedRevisionID }) else { return }
         let targets = physicalPartTargets(for: nodeID)
         guard !targets.isEmpty else { return }
+        let current = Self.completePartColors(in: partTree, stored: revisions[index].partColors ?? [:])
         var colors = revisions[index].partColors ?? [:]
         for node in targets {
-            colors[node.id] = color ?? (node.color == nil ? nil : PartColorState.defaultFinish)
+            let color = choice.applied(to: current[node.id] ?? PartColorState.defaultFinish)
+            colors[node.id] = color == PartColorState.defaultFinish && node.color == nil ? nil : color
         }
         let changed = colors != (revisions[index].partColors ?? [:])
         var recent = recentPartColors
-        if let color {
-            recent.removeAll { $0 == color }
-            recent.insert(color, at: 0)
+        // Recent colors are hues; the neutral finish always has its own button.
+        if let hue = choice.hue?.opaque, hue != PartColorState.defaultFinish {
+            recent.removeAll { $0 == hue }
+            recent.insert(hue, at: 0)
             recent = Array(recent.prefix(PartColor.maximumRecentCount))
         }
         guard changed || recent != recentPartColors else { return }
@@ -2211,7 +2229,7 @@ final class AppState {
         return result
     }
 
-    /// Capture every physical part's current RGB, including the neutral finish.
+    /// Capture every physical part's current color, including the neutral finish.
     /// Stable IDs retain these values when a later build supplies new parts.
     static func completePartColors(in nodes: [PartNode], stored: [String: PartColor]) -> [String: PartColor] {
         let colors = PartColorState.resolved(in: nodes, overrides: stored)

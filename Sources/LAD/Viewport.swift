@@ -132,12 +132,17 @@ struct CADViewport: NSViewRepresentable {
 }
 
 final class CADSceneView: NSView {
+    /// The shader argument holding a translucent face's opacity: the display's
+    /// fixed translucency, or a part's color alpha in shaded and edge displays.
+    static let opacityKey = "cadOpacity"
     // CAD translucency fades the whole lit face, including PBR specular
     // reflections, as premultiplied color accumulated without depth testing.
     private static let translucentFragment = """
     #pragma opaque
+    #pragma arguments
+    float cadOpacity;
     #pragma body
-    _output.color *= \(CADTranslucency.alpha);
+    _output.color *= cadOpacity;
     """
     private static let opaqueFragment = """
     #pragma opaque
@@ -147,14 +152,20 @@ final class CADSceneView: NSView {
     /// Removes exactly what `translucentFragment` adds for the same shading.
     private static let translucentRemovalFragment = """
     #pragma opaque
+    #pragma arguments
+    float cadOpacity;
     #pragma body
-    _output.color *= \(-CADTranslucency.alpha);
+    _output.color *= -cadOpacity;
     """
     /// Each translucent face layer multiplies the remaining transmittance.
     private static let revealageFragment = """
+    #pragma arguments
+    float cadOpacity;
     #pragma body
-    _output.color = float4(\(1 - CADTranslucency.alpha));
+    _output.color = float4(1.0 - cadOpacity);
     """
+    private static let visibilityCopyName = "visibility"
+    private static let revealageCopyName = "revealage"
     private static let selectionColor = NSColor(srgbRed: 0.92, green: 0.61, blue: 0.24, alpha: 1)
     private static let edgeInk = NSColor(srgbRed: 0.025, green: 0.035, blue: 0.05, alpha: 1)
     private static let hoveredFeatureColor = selectionColor.blended(withFraction: 0.25, of: .white) ?? selectionColor
@@ -284,10 +295,26 @@ final class CADSceneView: NSView {
     private var projectedFeatures: ProjectedFeatures?
     private var projectionSize = NSSize.zero
     private struct RenderStyle: Equatable {
-        var mode: ViewportDisplayMode
-        var selected: Set<Int>
-        var hidden: Set<Int>
-        var colors: [Int: PartColor]
+        let mode: ViewportDisplayMode
+        let selected: Set<Int>
+        let hidden: Set<Int>
+        let colors: [Int: PartColor]
+        /// Solids whose color alpha is below 1. Shaded and edge displays draw
+        /// them over the opaque scene; the other displays ignore alpha.
+        let partialSolids: Set<Int>
+        /// Whether a visible solid is partially opaque.
+        let composesPartialOpacity: Bool
+
+        init(mode: ViewportDisplayMode, selected: Set<Int>, hidden: Set<Int>, colors: [Int: PartColor]) {
+            self.mode = mode
+            self.selected = selected
+            self.hidden = hidden
+            self.colors = colors
+            partialSolids = mode == .shaded || mode == .edges ? Set(colors.compactMap { $0.value.alpha < 1 ? $0.key : nil }) : []
+            composesPartialOpacity = !partialSolids.subtracting(hidden).isEmpty
+        }
+
+        func opacity(of solid: Int) -> Double { colors[solid]?.alpha ?? 1 }
     }
     private var appliedStyle: RenderStyle?
     private var resourcePreparationID = UUID()
@@ -674,7 +701,7 @@ final class CADSceneView: NSView {
         } else {
             setHoveredFeature(nil)
         }
-        sectionCaps.node.geometry = cap
+        sectionCaps.show(cap)
         if changed {
             for node in edgeNode.childNodes {
                 if let geometry = node.geometry { CADStrokeGeometry.setSectionPlane(plane, on: geometry) }
@@ -877,30 +904,59 @@ final class CADSceneView: NSView {
     }
 
     /// A depth-only or transmittance copy of a solid's faces, sharing its
-    /// geometry buffers. Shown only in translucent mode.
+    /// geometry buffers. Shown in translucent mode, and while shaded and edge
+    /// displays draw partially opaque solids over the opaque scene.
     static func translucentCopy(of geometry: SCNGeometry, category: Int, visible: Bool) -> SCNNode {
         let copy = SCNGeometry(sources: geometry.sources, elements: geometry.elements)
         let material = SCNMaterial()
         material.lightingModel = .constant
         material.isDoubleSided = true
-        if category == CADViewportCategory.visibility {
-            // Nearest solid depth belongs only to ordinary decorations.
+        let visibility = category == CADViewportCategory.visibility
+        if visibility {
+            // Nearest solid depth belongs only to ordinary decorations, and
+            // to partially opaque faces behind opaque solids.
             material.colorBufferWriteMask = []
             material.writesToDepthBuffer = true
             material.readsFromDepthBuffer = true
         } else {
             // Multiplicative transmittance is independent of draw order and
-            // never rejected by depth.
+            // never rejected by another translucent face's depth.
             material.shaderModifiers = [.fragment: Self.revealageFragment]
+            material.setValue(NSNumber(value: CADTranslucency.alpha), forKey: opacityKey)
             material.blendMode = .multiply
             material.writesToDepthBuffer = false
             material.readsFromDepthBuffer = false
         }
         copy.materials = [material]
         let node = SCNNode(geometry: copy)
+        node.name = visibility ? visibilityCopyName : revealageCopyName
         node.categoryBitMask = category
         node.isHidden = !visible
         return node
+    }
+
+    /// Translucent mode shows every solid's copies with its fixed opacity.
+    /// Shaded and edge displays use a partially opaque solid's copies with its
+    /// color alpha, depth tested against opaque solids, whose visibility
+    /// copies then draw their depth first in each of those passes.
+    private static func styleCopies(of node: SCNNode, translucent: Bool, partial: Bool, layered: Bool, opacity: Float) {
+        for copy in node.childNodes {
+            switch copy.name {
+            case visibilityCopyName:
+                let opaqueDepth = layered && !partial
+                if copy.isHidden == (translucent || layered) { copy.isHidden = !(translucent || layered) }
+                copy.categoryBitMask = opaqueDepth ? CADViewportCategory.opaqueVisibility : CADViewportCategory.visibility
+                copy.renderingOrder = opaqueDepth ? CADTranslucency.opaqueDepthRenderingOrder : 0
+            case revealageCopyName:
+                if copy.isHidden == (translucent || partial) { copy.isHidden = !(translucent || partial) }
+                if let material = copy.geometry?.firstMaterial {
+                    material.setValue(NSNumber(value: opacity), forKey: opacityKey)
+                    material.readsFromDepthBuffer = partial
+                }
+            default:
+                break
+            }
+        }
     }
 
     private static let translucentFillName = "translucentFill"
@@ -927,16 +983,20 @@ final class CADSceneView: NSView {
     /// Switches a solid's face material between opaque shading and additive
     /// translucent accumulation. Convex-only dual-layer sorting changes with
     /// the view on CAD shells. Translucent faces instead add premultiplied
-    /// color without depth testing, so every contribution is independent of
-    /// object and triangle submission order; depth-only and transmittance
-    /// copies supply decoration occlusion and coverage.
-    static func configureFaceMaterial(_ material: SCNMaterial, translucent: Bool) {
+    /// color without testing each other's depth, so every contribution is
+    /// independent of object and triangle submission order; depth-only and
+    /// transmittance copies supply decoration occlusion and coverage.
+    /// Partially opaque faces in shaded and edge displays read the depth of
+    /// opaque solids, which their accumulation pass draws first.
+    static func configureFaceMaterial(_ material: SCNMaterial, translucent: Bool,
+                                      opacity: Float = CADTranslucency.alpha, readsDepth: Bool = false) {
         material.transparency = 1
         material.shaderModifiers = [.fragment: translucent ? translucentFragment : opaqueFragment]
+        if translucent { material.setValue(NSNumber(value: opacity), forKey: opacityKey) }
         material.transparencyMode = .aOne
         material.blendMode = translucent ? .add : .alpha
         material.writesToDepthBuffer = !translucent
-        material.readsFromDepthBuffer = !translucent
+        material.readsFromDepthBuffer = !translucent || readsDepth
         material.isDoubleSided = translucent
     }
 
@@ -1077,6 +1137,7 @@ final class CADSceneView: NSView {
                     node.addChildNode(Self.translucentFeatureCopy(of: geometry, shadedAs: overlay, removal: false))
                     node.addChildNode(Self.translucentFeatureCopy(of: geometry, shadedAs: part, removal: true))
                 }
+                styleFeature(node, solid: feature.solidIndex)
                 if let plane = presentedSectionPlane {
                     for surface in [node] + node.childNodes {
                         surface.geometry?.materials.forEach { CADViewportSectionRendering.apply(plane, to: $0) }
@@ -1220,6 +1281,10 @@ final class CADSceneView: NSView {
                                      translucent: mode == .translucent, palette: Self.highlightPalette)
         guard hasModel, !isPreparingResources, width > 0, height > 0 else { return frame }
         frame.sectionPlane = presentedSectionPlane?.equation ?? .zero
+        if let style = appliedStyle, style.composesPartialOpacity {
+            frame.partialOpacity = true
+            frame.partialEdges = style.mode == .edges && hasOwnedEdges
+        }
         let projection = assemblyGrabProjection(viewportSize: CGSize(width: width, height: height))
         let pixels = SIMD2(Double(width), Double(height))
         var area: CADSilhouetteBatching.Rect?
@@ -1298,20 +1363,27 @@ final class CADSceneView: NSView {
         let previous = appliedStyle
         appliedStyle = style
         let translucent = mode == .translucent
+        // Partially opaque solids are drawn over the opaque scene, which
+        // then supplies their occluding depth.
+        let partialSolids = style.partialSolids, layered = style.composesPartialOpacity
+        let previousPartial = previous?.partialSolids ?? [], previousLayered = previous?.composesPartialOpacity ?? false
         let coloredLegacyWire = !hasOwnedEdges && mode == .wireframe && !solidColors.isEmpty
         let selectionColor = Self.selectionColor
         for node in edgeNode.childNodes {
             let solid = solidIndex(of: node, prefix: "edges:")
             let hidden = solid.map { hiddenSolids.contains($0) } ?? (!hiddenSolids.isEmpty || coloredLegacyWire)
+            let partial = solid.map(partialSolids.contains) ?? false
             if let previous, previous.mode == mode,
                (solid.map { previous.hidden.contains($0) } ?? (!previous.hidden.isEmpty ||
                     (!hasOwnedEdges && previous.mode == .wireframe && !previous.colors.isEmpty))) == hidden,
-               mode != .wireframe || solid.map({ previous.colors[$0] == solidColors[$0] }) != false {
+               (solid.map(previousPartial.contains) ?? false) == partial,
+               mode != .wireframe || solid.map({ previous.colors[$0]?.opaque == solidColors[$0]?.opaque }) != false {
                 continue
             }
             // Older projects have one combined edge buffer. Never keep that
             // buffer visible after hiding a part, since its lines include it.
             node.isHidden = hidden
+            node.categoryBitMask = partial ? CADViewportCategory.partialDecorations : CADViewportCategory.decorations
             node.geometry?.firstMaterial?.diffuse.contents = mode == .wireframe ? solid.flatMap { assignedColor(for: $0) } ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
                 : Self.edgeInk
             node.geometry?.firstMaterial?.readsFromDepthBuffer = mode != .wireframe
@@ -1324,10 +1396,12 @@ final class CADSceneView: NSView {
         for node in modelNode.childNodes {
             guard let solid = solidIndex(of: node) else { continue }
             let selected = selectedSolids.contains(solid)
+            let partial = partialSolids.contains(solid)
             if let previous, previous.mode == mode,
                previous.selected.contains(solid) == selected,
                previous.hidden.contains(solid) == hiddenSolids.contains(solid),
-               selected || previous.colors[solid] == solidColors[solid],
+               previousPartial.contains(solid) == partial, previousLayered == layered,
+               previous.colors[solid] == solidColors[solid] || (selected && previous.opacity(of: solid) == style.opacity(of: solid)),
                hasOwnedEdges || (previous.hidden.isEmpty == hiddenSolids.isEmpty && previous.colors.isEmpty == solidColors.isEmpty) {
                 continue
             }
@@ -1337,14 +1411,16 @@ final class CADSceneView: NSView {
             let needsTriangleWire = hasOwnedEdges ? !ownedEdgeSolids.contains(solid)
                 : !hiddenSolids.isEmpty || coloredLegacyWire || edgeNode.childNodes.isEmpty
             node.isHidden = hiddenSolids.contains(solid) || (mode == .wireframe && !needsTriangleWire)
+            node.categoryBitMask = partial ? CADViewportCategory.partialFaces : CADViewportCategory.faces
             node.geometry?.firstMaterial?.fillMode = mode == .wireframe ? .lines : .fill
             // Let interior parts show through the filled surfaces. Restore
             // depth writing and opaque materials when leaving this mode.
+            let opacity = translucent ? CADTranslucency.alpha : Float(style.opacity(of: solid))
             if let material = node.geometry?.firstMaterial {
-                Self.configureFaceMaterial(material, translucent: translucent)
+                Self.configureFaceMaterial(material, translucent: translucent || partial, opacity: opacity, readsDepth: partial)
                 if let plane = presentedSectionPlane { CADViewportSectionRendering.apply(plane, to: material) }
             }
-            for copy in node.childNodes where copy.isHidden == translucent { copy.isHidden = !translucent }
+            Self.styleCopies(of: node, translucent: translucent, partial: partial, layered: layered, opacity: opacity)
             node.geometry?.firstMaterial?.diffuse.contents = selected && mode != .wireframe
                 ? selectionColor
                 : assignedColor(for: solid) ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
@@ -1354,6 +1430,7 @@ final class CADSceneView: NSView {
         }
         // A translucent fill removes exactly its part's current shading.
         for (feature, node) in featureNodes where restyled.contains(feature.solidIndex) {
+            styleFeature(node, solid: feature.solidIndex)
             guard let part = solidNodes[feature.solidIndex]?.geometry?.firstMaterial,
                   let removal = node.childNode(withName: Self.translucentRemovalName, recursively: false)?.geometry?.firstMaterial
             else { continue }
@@ -1361,6 +1438,22 @@ final class CADSceneView: NSView {
             removal.emission.contents = part.emission.contents
         }
         return true
+    }
+
+    /// Translucent mode fills highlighted faces in the accumulation pass;
+    /// so do shaded and edge displays on a partially opaque solid, with its
+    /// color alpha. Elsewhere the opaque highlight fill draws.
+    private func styleFeature(_ node: SCNNode, solid: Int) {
+        guard let style = appliedStyle else { return }
+        let partial = style.partialSolids.contains(solid)
+        let opacity = style.mode == .translucent ? CADTranslucency.alpha : Float(style.opacity(of: solid))
+        node.categoryBitMask = partial ? CADViewportCategory.partialFeatureFaces : CADViewportCategory.featureFaces
+        for copy in node.childNodes {
+            copy.categoryBitMask = partial ? CADViewportCategory.partialFeatureAccumulation : CADViewportCategory.featureAccumulation
+            guard let material = copy.geometry?.firstMaterial else { continue }
+            material.setValue(NSNumber(value: opacity), forKey: Self.opacityKey)
+            material.readsFromDepthBuffer = partial
+        }
     }
 
     private func assignedColor(for solid: Int) -> NSColor? {
@@ -2317,7 +2410,7 @@ final class CADSceneView: NSView {
         }
         // The deprecated sortResults option overrides nearest-hit ordering,
         // even with searchMode.closest, and can return a farther solid first.
-        var options: [SCNHitTestOption: Any] = [.categoryBitMask: CADViewportCategory.faces | caps, .ignoreHiddenNodes: false]
+        var options: [SCNHitTestOption: Any] = [.categoryBitMask: CADViewportCategory.pickableFaces | caps, .ignoreHiddenNodes: false]
         if hiddenSolids.isEmpty {
             options[.searchMode] = SCNHitTestSearchMode.closest.rawValue
             guard let hit = nativeHits(along: ray, options: options).first else { return nil }

@@ -35,6 +35,25 @@ final class PartColorStorageTests: XCTestCase {
         XCTAssertEqual(assets, uncoloredAssets, "Colors are document metadata and must not add file assets")
     }
 
+    func testOpacityRoundTripsAndOpaqueColorsKeepTheirThreeComponentEncoding() throws {
+        let opaque = try JSONSerialization.jsonObject(with: JSONEncoder().encode(PartColor.curated[0])) as? [String: Any]
+        XCTAssertEqual(Set(try XCTUnwrap(opaque).keys), ["red", "green", "blue"])
+        let translucent = PartColor(red: 0.2, green: 0.4, blue: 0.6, alpha: 0.25)
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(translucent)) as? [String: Double]
+        XCTAssertEqual(encoded, ["red": 0.2, "green": 0.4, "blue": 0.6, "alpha": 0.25])
+        XCTAssertEqual(try JSONDecoder().decode(PartColor.self, from: Data(#"{"red":0.2,"green":0.4,"blue":0.6}"#.utf8)).alpha, 1)
+
+        var value = project()
+        value.revisions[0].partColors = ["case": translucent, "lid": PartColor(red: 1, green: 0, blue: 0, alpha: 0)]
+        let restored = try ProjectStore.decode(ProjectStore.encode(value))
+        XCTAssertEqual(restored.revisions[0].partColors, value.revisions[0].partColors)
+        for alpha in [-0.01, 1.01, Double.nan, Double.infinity] {
+            var invalid = project()
+            invalid.revisions[0].partColors = ["case": PartColor(red: 0.2, green: 0.4, blue: 0.6, alpha: alpha)]
+            XCTAssertThrowsError(try ProjectStore.encode(invalid), "Alpha \(alpha) must not be saved")
+        }
+    }
+
     func testColorsMustReferToExistingNodesWithTheirOwnGeometry() throws {
         let invalidIDs = ["missing-part", "custom-folder"]
         for id in invalidIDs {

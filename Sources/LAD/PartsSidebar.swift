@@ -302,10 +302,10 @@ private struct PartTreeItem: View {
     }
 
     private var colorPicker: some View {
-        PartColorPicker(initialColor: state.partColor(for: node.id), recentColors: state.recentPartColors,
-                        onApply: { color in
+        PartColorPicker(selection: state.partColorSelection(for: node.id), recentColors: state.recentPartColors,
+                        onApply: { choice in
                             if colorRevisionID == state.selectedRevisionID, colorProjectID == state.projectEditingID {
-                                state.setPartColor(color, for: node.id)
+                                state.setPartColor(choice, for: node.id)
                             }
                             showingColorPicker = false
                         }, onCancel: { showingColorPicker = false })
