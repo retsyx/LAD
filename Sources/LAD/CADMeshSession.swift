@@ -182,7 +182,9 @@ final class CADMeshSession {
                 assets["comparison.json"] = reportData; request["comparisonAsset"] = "comparison.json"
                 let colors: [[String: Any]] = solidColors.keys.sorted().map { index in
                     let color = solidColors[index]!
-                    return ["solidIndex": index, "color": ["red": color.red, "green": color.green, "blue": color.blue]]
+                    var value: [String: Any] = ["red": color.red, "green": color.green, "blue": color.blue]
+                    if color.alpha != 1 { value["alpha"] = color.alpha }
+                    return ["solidIndex": index, "color": value]
                 }
                 assets["colors.json"] = try json(colors); request["colorsAsset"] = "colors.json"
             default: throw LADError.message("The reconstruction command is unavailable.")

@@ -148,6 +148,14 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         try assertPart(at: [1, 1.5, 2], volume: 24, bounds: [0, 0, 0, 2, 3, 4], color: blue, in: exported)
         try assertPart(at: [22.5, 8, 10.5], volume: 30, bounds: [20, 7, 9, 25, 9, 12], color: green, in: exported)
 
+        fixture.state.setPartColor(PartColorChoice(hue: nil, opacity: 0.4), for: "first")
+        let translucent = fixture.directory.appendingPathComponent("translucent.step")
+        try await export(fixture.state, to: translucent)
+        exported = try await readParts(translucent)
+        try assertPart(at: [1, 1.5, 2], volume: 24, bounds: [0, 0, 0, 2, 3, 4],
+                       color: PartColor(red: blue.red, green: blue.green, blue: blue.blue, alpha: 0.4), in: exported)
+        try assertPart(at: [22.5, 8, 10.5], volume: 30, bounds: [20, 7, 9, 25, 9, 12], color: green, in: exported)
+
         fixture.state.setPartColor(nil, for: "first")
         let neutral = fixture.directory.appendingPathComponent("neutral.step")
         try await export(fixture.state, to: neutral)
@@ -344,9 +352,9 @@ final class AppStateSTEPColorExportTests: XCTestCase {
         for (actual, expected) in zip(part.center, center) { XCTAssertEqual(actual, expected, accuracy: 1e-6, file: file, line: line) }
         for (actual, expected) in zip(part.bounds, bounds) { XCTAssertEqual(actual, expected, accuracy: 1e-6, file: file, line: line) }
         XCTAssertEqual(part.volume, volume, accuracy: 1e-6, file: file, line: line)
-        let rgb = try XCTUnwrap(part.color, "The exported placed body must have an XDE color.", file: file, line: line)
-        XCTAssertEqual(rgb.count, 3, file: file, line: line)
-        for (actual, expected) in zip(rgb, [color.red, color.green, color.blue]) {
+        let rgba = try XCTUnwrap(part.color, "The exported placed body must have an XDE color.", file: file, line: line)
+        XCTAssertEqual(rgba.count, 4, file: file, line: line)
+        for (actual, expected) in zip(rgba, [color.red, color.green, color.blue, color.alpha]) {
             XCTAssertEqual(actual, expected, accuracy: 1e-6, file: file, line: line)
         }
     }

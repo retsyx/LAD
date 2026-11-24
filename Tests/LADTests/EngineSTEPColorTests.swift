@@ -11,13 +11,14 @@ final class EngineSTEPColorTests: XCTestCase {
     func testInvalidExportColorsFailBeforeReadingGeometryOrStartingPython() async throws {
         let preview = unavailablePreview()
         for colors in [[-1: red], [2: red], [0: PartColor(red: -0.1, green: 0, blue: 0)],
-                       [0: PartColor(red: .infinity, green: 0, blue: 0)], [0: PartColor(red: .nan, green: 0, blue: 0)]] {
+                       [0: PartColor(red: .infinity, green: 0, blue: 0)], [0: PartColor(red: .nan, green: 0, blue: 0)],
+                       [0: PartColor(red: 0, green: 0, blue: 0, alpha: 1.5)], [0: PartColor(red: 0, green: 0, blue: 0, alpha: .nan)]] {
             do {
                 _ = try await EngineService().exportSTEP(preview, solidColors: colors, python: "/missing/python", threads: 1)
-                XCTFail("Invalid current RGB must not start an export.")
+                XCTFail("Invalid current colors must not start an export.")
             } catch {
                 XCTAssertEqual(error.localizedDescription,
-                    "The export colors must refer to available parts and use finite sRGB components between 0 and 1.")
+                    "The export colors must refer to available parts and use finite sRGB and alpha components between 0 and 1.")
             }
         }
         do {
@@ -75,6 +76,30 @@ final class EngineSTEPColorTests: XCTestCase {
         let subsetCached = try await service.exportSTEP(preview, solidIndices: [1], solidColors: [1: blue, 0: red],
                                                         python: "/missing/python", threads: 1)
         XCTAssertEqual(subsetCached, subset)
+    }
+
+    @MainActor
+    func testPartOpacityExportsAsSTEPTransparencyAndKeysTheCache() async throws {
+        try requireRuntime()
+        let service = EngineService()
+        let preview = try await service.buildPreview(assembly(), python: EngineService.defaultPython, threads: 2)
+        let native = URL(fileURLWithPath: try XCTUnwrap(preview.brepPath))
+        defer { try? FileManager.default.removeItem(at: native.deletingLastPathComponent()) }
+        let glass = PartColor(red: 0.2, green: 0.4, blue: 0.6, alpha: 0.35)
+        let translucent = try await service.exportSTEP(preview, solidColors: [0: glass, 1: blue],
+                                                       python: EngineService.defaultPython, threads: 2)
+        let translucentPalette = try await palette(translucent)
+        assertContains(glass, in: translucentPalette)
+        assertContains(blue, in: translucentPalette)
+        let opaque = try await service.exportSTEP(preview, solidColors: [0: glass.opaque, 1: blue],
+                                                  python: EngineService.defaultPython, threads: 2)
+        XCTAssertNotEqual(opaque, translucent, "An opacity change must not return the cached STEP of the other opacity.")
+        let opaquePalette = try await palette(opaque)
+        assertContains(glass.opaque, in: opaquePalette)
+        XCTAssertFalse(contains(glass, in: opaquePalette))
+        let individual = try await service.exportSTEPParts(preview, parts: [[0]], solidColors: [0: glass, 1: blue],
+                                                           python: EngineService.defaultPython, threads: 2)
+        assertContains(glass, in: try await palette(try XCTUnwrap(individual.first)))
     }
 
     @MainActor
@@ -223,11 +248,12 @@ final class EngineSTEPColorTests: XCTestCase {
     }
 
     private func contains(_ expected: PartColor, in palette: [PartColor]) -> Bool {
-        palette.contains { abs($0.red - expected.red) < 1e-5 && abs($0.green - expected.green) < 1e-5 && abs($0.blue - expected.blue) < 1e-5 }
+        palette.contains { abs($0.red - expected.red) < 1e-5 && abs($0.green - expected.green) < 1e-5 && abs($0.blue - expected.blue) < 1e-5
+            && abs($0.alpha - expected.alpha) < 1e-5 }
     }
 
     private func assertContains(_ expected: PartColor, in palette: [PartColor], file: StaticString = #filePath, line: UInt = #line) {
-        XCTAssertTrue(contains(expected, in: palette), "Missing sRGB color \(expected) in independent STEPCAF palette \(palette).", file: file, line: line)
+        XCTAssertTrue(contains(expected, in: palette), "Missing color \(expected) in independent STEPCAF palette \(palette).", file: file, line: line)
     }
 
     @MainActor
@@ -247,7 +273,7 @@ final class EngineSTEPColorTests: XCTestCase {
             from OCP.TCollection import TCollection_ExtendedString
             from OCP.TDF import TDF_LabelSequence
             from OCP.XCAFDoc import XCAFDoc_DocumentTool,XCAFDoc_ColorTool
-            from OCP.Quantity import Quantity_Color,Quantity_TOC_sRGB
+            from OCP.Quantity import Quantity_ColorRGBA,Quantity_TOC_sRGB
             doc=TDocStd_Document(TCollection_ExtendedString('colors'))
             reader=STEPCAFControl_Reader(); reader.SetColorMode(True)
             assert reader.ReadFile(sys.argv[1]) == IFSelect_RetDone
@@ -256,10 +282,10 @@ final class EngineSTEPColorTests: XCTestCase {
             labels=TDF_LabelSequence(); tool.GetColors(labels)
             colors=[]
             for index in range(1,labels.Length()+1):
-                color=Quantity_Color()
+                color=Quantity_ColorRGBA()
                 assert XCAFDoc_ColorTool.GetColor_s(labels.Value(index),color)
-                r,g,b=color.Values(Quantity_TOC_sRGB)
-                colors.append({'red':r,'green':g,'blue':b})
+                r,g,b=color.GetRGB().Values(Quantity_TOC_sRGB)
+                colors.append({'red':r,'green':g,'blue':b,'alpha':color.Alpha()})
             print('LAD_STEP_COLORS='+json.dumps(colors))
             """
             let process = Process()
@@ -274,7 +300,7 @@ final class EngineSTEPColorTests: XCTestCase {
             process.waitUntilExit()
             guard process.terminationStatus == 0 else { throw LADError.message("STEPCAF verification failed: " + String(decoding: diagnostic, as: UTF8.self)) }
             guard let line = String(decoding: data, as: UTF8.self).split(separator: "\n").last(where: { $0.hasPrefix("LAD_STEP_COLORS=") }) else {
-                throw LADError.message("STEPCAF verification returned no RGB palette.")
+                throw LADError.message("STEPCAF verification returned no color palette.")
             }
             return try JSONDecoder().decode([PartColor].self, from: Data(line.dropFirst("LAD_STEP_COLORS=".count).utf8))
         }.value

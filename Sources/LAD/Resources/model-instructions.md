@@ -18,7 +18,7 @@ Use lad_set_part_colors with {"artifactID":"current","changes":[{"partID":"case-
 
 When constructing new parts, CadQuery's color=cq.Color(red,green,blue) or cq.Color(red,green,blue,alpha) on an Assembly or .add(...) supplies their initial color. Components are sRGB values and an opacity in [0,1]. Descendants inherit the nearest assembly color unless they specify their own. New refinements retain existing current colors by stable physical part ID and seed only new parts from the program's supplied colors or the neutral default. Replayed historical artifacts use that saved version's current colors. Color operations behave the same for every part.
 
-lad_export_step includes the chosen artifact's current RGB colors, including staged assignments and neutral resets, for all exported solids or the requested subset. Alpha affects only LAD's display and is not exported. Exported solids retain their original coordinates and remain separate. Exporting leaves the live design unchanged.
+lad_export_step includes the chosen artifact's current colors, including staged assignments and neutral resets, for all exported solids or the requested subset. Alpha below 1 is exported as STEP surface transparency. Exported solids retain their original coordinates and remain separate. Exporting leaves the live design unchanged.
 
 PART MATERIALS
 A physical part may have one assigned material, a name and density in g/cm³; unassigned parts have zero density and therefore zero mass. Use lad_get_part_materials to read each part's current material by stable part ID, this design's materials and LAD's material library. lad_inspect kind:"parts" also includes each part's material and mass in grams, and lad_measure reports the mass of measured whole parts.

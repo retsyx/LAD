@@ -1,4 +1,4 @@
-"""Exact STEP assembly export with current opaque sRGB part colors."""
+"""Exact STEP assembly export with current sRGB part colors and transparency."""
 import json
 import math
 from pathlib import Path
@@ -12,10 +12,10 @@ from worker import ModelError, run, write_brep
 
 
 def read_xde_parts(path):
-    """Read each placed STEP leaf and its actual XDE color, rather than STEP text."""
+    """Read each placed STEP leaf and its actual XDE color and alpha, rather than STEP text."""
     import cadquery as cq
     from OCP.IFSelect import IFSelect_RetDone
-    from OCP.Quantity import Quantity_Color, Quantity_TOC_sRGB
+    from OCP.Quantity import Quantity_ColorRGBA, Quantity_TOC_sRGB
     from OCP.STEPCAFControl import STEPCAFControl_Reader
     from OCP.TCollection import TCollection_ExtendedString
     from OCP.TDF import TDF_Label, TDF_LabelSequence
@@ -31,11 +31,14 @@ def read_xde_parts(path):
     colors = XCAFDoc_DocumentTool.ColorTool_s(document.Main())
     result = []
 
+    def rgba(color):
+        return [*color.GetRGB().Values(Quantity_TOC_sRGB), color.Alpha()]
+
     def color_at(label):
         for kind in (XCAFDoc_ColorType.XCAFDoc_ColorSurf, XCAFDoc_ColorType.XCAFDoc_ColorGen):
-            color = Quantity_Color()
+            color = Quantity_ColorRGBA()
             if XCAFDoc_ColorTool.GetColor_s(label, kind, color):
-                return list(color.Values(Quantity_TOC_sRGB))
+                return rgba(color)
         return None
 
     def visit(label, parent_location, inherited=None):
@@ -58,9 +61,9 @@ def read_xde_parts(path):
             rgb = color or color_at(actual)
             if rgb is None:
                 for kind in (XCAFDoc_ColorType.XCAFDoc_ColorSurf, XCAFDoc_ColorType.XCAFDoc_ColorGen):
-                    value = Quantity_Color()
+                    value = Quantity_ColorRGBA()
                     if colors.GetColor(native, kind, value):
-                        rgb = list(value.Values(Quantity_TOC_sRGB))
+                        rgb = rgba(value)
                         break
             for solid in placed.Solids():
                 result.append({'shape': solid, 'color': rgb})
@@ -88,7 +91,7 @@ class STEPColorTests(unittest.TestCase):
         # Deliberately different from source-index order; mapping is explicit.
         return [{'solidIndex': 2, 'color': {'red': 0.65, 'green': 0.65, 'blue': 0.65}},
                 {'solidIndex': 0, 'color': {'red': 0.2, 'green': 0.4, 'blue': 0.6}},
-                {'solidIndex': 1, 'color': {'red': 0.9, 'green': 0.15, 'blue': 0.25}}]
+                {'solidIndex': 1, 'color': {'red': 0.9, 'green': 0.15, 'blue': 0.25, 'alpha': 0.35}}]
 
     def export(self, folder, shape, **fields):
         write_brep(shape, folder / 'source.brep')
@@ -124,6 +127,8 @@ class STEPColorTests(unittest.TestCase):
             self.assertIsNotNone(part['color'], 'Every requested color, including neutral, must survive STEPCAF')
             for actual, name in zip(part['color'], ('red', 'green', 'blue')):
                 self.assertAlmostEqual(actual, colors[index][name], places=6)
+            self.assertAlmostEqual(part['color'][3], colors[index].get('alpha', 1), places=6,
+                                   msg='Alpha below 1 must survive as STEP transparency; opaque parts stay opaque')
 
     def test_full_export_roundtrips_current_srgb_colors_and_nested_original_placements(self):
         shape = self.fixture()
@@ -164,11 +169,12 @@ class STEPColorTests(unittest.TestCase):
                    [valid, valid], self.colors() + [valid]]
         for index in (True, False, -1, 3, 0.0, '0', None):
             invalid.append([{**valid, 'solidIndex': index}])
-        for color in (None, {}, 'red', {'red': 0.1, 'green': 0.2},
-                      {'red': 0.1, 'green': 0.2, 'blue': 0.3, 'alpha': 1}):
+        for color in (None, {}, 'red', {'red': 0.1, 'green': 0.2}, {'red': 0.1, 'green': 0.2, 'alpha': 0.5},
+                      {'red': 0.1, 'green': 0.2, 'blue': 0.3, 'opacity': 0.5}):
             invalid.append([{**valid, 'color': color}])
         for value in (True, -0.1, 1.1, math.nan, math.inf, 10 ** 1000, '0.2'):
             invalid.append([{**valid, 'color': {'red': value, 'green': 0.2, 'blue': 0.3}}])
+            invalid.append([{**valid, 'color': {'red': 0.1, 'green': 0.2, 'blue': 0.3, 'alpha': value}}])
         for records in invalid:
             with self.subTest(records=records), tempfile.TemporaryDirectory() as directory:
                 folder = Path(directory)

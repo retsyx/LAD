@@ -790,7 +790,7 @@
   },
   {
     "name": "lad_export_step",
-    "description": "Export exact whole or selected artifact geometry with its current part RGB colors as STEP into the task workspace. Includes staged colors and neutral finishes; preserves separate solids and original coordinates. Returns a file reference without sending the file bytes as text.",
+    "description": "Export exact whole or selected artifact geometry with its current part colors as STEP into the task workspace; alpha below 1 becomes STEP surface transparency. Includes staged colors and neutral finishes; preserves separate solids and original coordinates. Returns a file reference without sending the file bytes as text.",
     "inputSchema": {
       "type": "object",
       "properties": {

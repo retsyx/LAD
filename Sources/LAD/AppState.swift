@@ -2648,7 +2648,7 @@ final class AppState {
     }
 
     /// Export the captured geometry and current colors. The engine caches
-    /// session bytes by geometry, selected solids, RGB assignments and placement.
+    /// session bytes by geometry, selected solids, color assignments and placement.
     /// For 3D printing, export the printing version with the 3D printing
     /// view's orientations, packing only the exported parts.
     func exportSTEP(to url: URL, solidIndices: Set<Int>? = nil, for3DPrinting: Bool = false,

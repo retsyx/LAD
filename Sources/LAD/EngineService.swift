@@ -392,8 +392,8 @@ final class EngineService {
     }
 
     /// Export an already built native solid, with no program replay or meshing.
-    /// Repeated exports reuse bytes only for the same geometry, subset, RGB and placement.
-    /// STEP colors are RGB; display opacity is not exported.
+    /// Alpha below 1 is written as STEP surface transparency. Repeated exports
+    /// reuse bytes only for the same geometry, subset, colors and placement.
     func exportSTEP(_ preview: PreviewMesh, solidIndices: Set<Int>? = nil, solidColors: [Int: PartColor] = [:],
                     solidTransforms: [Int: [Double]]? = nil,
                     python: String, threads: Int) async throws -> Data {
@@ -407,12 +407,12 @@ final class EngineService {
         }
         guard solidColors.count <= preview.solids,
               solidColors.allSatisfy({ (0..<preview.solids).contains($0.key) && $0.value.isValid }) else {
-            throw LADError.message("The export colors must refer to available parts and use finite sRGB components between 0 and 1.")
+            throw LADError.message("The export colors must refer to available parts and use finite sRGB and alpha components between 0 and 1.")
         }
         let selection: [Int]? = solidIndices.flatMap { $0.count == preview.solids ? nil : $0.sorted() }
-        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!.opaque) }
+        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
         // Raw bytes retain their original coordinates and carry no requested display colors.
-        // Placement and current RGB must be written from native geometry.
+        // Placement and current colors must be written from native geometry.
         if transforms.isEmpty, selection == nil, colors.isEmpty, let artifacts = preview.buildArtifacts, artifacts.containsSTEP,
            preview.stepPath == artifacts.folder.appendingPathComponent("model.step").path {
             let source = URL(fileURLWithPath: preview.stepPath)
@@ -462,11 +462,11 @@ final class EngineService {
         }
         guard solidColors.count <= preview.solids,
               solidColors.allSatisfy({ (0..<preview.solids).contains($0.key) && $0.value.isValid }) else {
-            throw LADError.message("The export colors must refer to available parts and use finite sRGB components between 0 and 1.")
+            throw LADError.message("The export colors must refer to available parts and use finite sRGB and alpha components between 0 and 1.")
         }
         let parts = parts.map { $0.sorted() }
         let selection = indices.count == preview.solids ? nil : indices.sorted()
-        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!.opaque) }
+        let colors = solidColors.keys.sorted().map { STEPExportColor(solidIndex: $0, color: solidColors[$0]!) }
         guard let path = preview.brepPath, let artifacts = preview.buildArtifacts,
               path == artifacts.folder.appendingPathComponent("model.brep").path else {
             throw EngineExportError.nativeArtifactUnavailable

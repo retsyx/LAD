@@ -3236,13 +3236,10 @@ def export_solid_colors(records, solid_count):
     colors = {}
     for record in records:
         if not isinstance(record, dict) or set(record) != {"solidIndex", "color"}:
-            raise ModelError("Each STEP color must contain a solidIndex and an RGB color.")
+            raise ModelError("Each STEP color must contain a solidIndex and a color.")
         index = record["solidIndex"]
         if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < solid_count or index in colors:
             raise ModelError("STEP colors contain invalid or duplicate solid indices.")
-        # STEP colors are RGB; opacity belongs to LAD's display.
-        if isinstance(record["color"], dict) and "alpha" in record["color"]:
-            raise ModelError("STEP colors contain only sRGB red, green and blue values.")
         colors[index] = validate_part_color(record["color"])
     return colors
 
@@ -3253,8 +3250,10 @@ def write_step(solids, path, cq, colors=None, indices=None):
     assembly = cq.Assembly(name="Parts")
     for index in range(len(solids)) if indices is None else indices:
         apply_geometry_tolerance(solids[index])
-        rgb = (colors or {}).get(index)
-        color = cq.Color(rgb["red"], rgb["green"], rgb["blue"], 1) if rgb is not None else None
+        value = (colors or {}).get(index)
+        # The STEP writer stores alpha below 1 as surface transparency.
+        color = (cq.Color(value["red"], value["green"], value["blue"], value.get("alpha", 1))
+                 if value is not None else None)
         assembly.add(solids[index], name=f"Part {index + 1}", color=color)
     try:
         with step_precision("write"):
