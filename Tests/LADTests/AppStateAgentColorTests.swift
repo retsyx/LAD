@@ -235,8 +235,9 @@ private struct AgentColorTurnFixture {
         identity=str(uuid.uuid4())
         control=pathlib.Path('.lad-tools')
         request={'id':identity,'name':'lad_set_part_colors','arguments':{'changes':config['changes']}}
-        target=control/'requests'/f'{identity}.json'
-        target.write_text(json.dumps(request))
+        pending=control/'requests'/f'{identity}.tmp'
+        pending.write_text(json.dumps(request))
+        pending.replace(pending.with_suffix('.json'))
         response=control/'responses'/f'{identity}.json'
         deadline=time.monotonic()+5
         while not response.exists() and time.monotonic()<deadline: time.sleep(0.01)
