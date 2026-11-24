@@ -92,6 +92,13 @@ final class CADViewportSectionCaps {
     /// behind it in shaded and edge displays.
     private let depthNode = SCNNode()
     private var preparedDepth: (cap: SCNGeometry, depth: SCNGeometry?)?
+    /// How far the depth copy sits behind the cap; see `CADTranslucency.depthRecess`.
+    var depthRecess: Float = 0.01 {
+        didSet {
+            guard depthRecess != oldValue, let material = depthNode.geometry?.firstMaterial else { return }
+            CADTranslucency.recess(material, by: depthRecess)
+        }
+    }
     private var task: Task<Void, Never>?
     private var pending: Request?
     var isPreparing: Bool { task != nil }
@@ -106,7 +113,7 @@ final class CADViewportSectionCaps {
     /// Shows a cap this instance prepared, or none.
     func show(_ cap: SCNGeometry?) {
         node.geometry = cap
-        if let cap, preparedDepth?.cap !== cap { preparedDepth = (cap, Self.depthCopy(of: cap)) }
+        if let cap, preparedDepth?.cap !== cap { preparedDepth = (cap, Self.depthCopy(of: cap, recess: depthRecess)) }
         if cap == nil { preparedDepth = nil }
         depthNode.geometry = preparedDepth?.depth
     }
@@ -142,7 +149,8 @@ final class CADViewportSectionCaps {
             let geometry: SCNGeometry? = result.flatMap {
                 $0.positions.isEmpty && $0.interferencePositions.isEmpty ? nil : Self.geometry($0, wire: request.wire)
             }
-            let depth = geometry.flatMap(Self.depthCopy)
+            let recess = self?.depthRecess ?? 0.01
+            let depth = geometry.flatMap { Self.depthCopy(of: $0, recess: recess) }
             let ready: Bool
             if let geometry, let renderer = request.renderer {
                 ready = await withCheckedContinuation { continuation in
@@ -160,7 +168,7 @@ final class CADViewportSectionCaps {
     }
 
     /// Filled caps share their buffers with a copy that writes depth only.
-    private static func depthCopy(of cap: SCNGeometry) -> SCNGeometry? {
+    private static func depthCopy(of cap: SCNGeometry, recess: Float) -> SCNGeometry? {
         let elements = cap.elements.filter { $0.primitiveType == .triangles }
         guard !elements.isEmpty else { return nil }
         let copy = SCNGeometry(sources: cap.sources, elements: elements)
@@ -170,6 +178,7 @@ final class CADViewportSectionCaps {
         material.isDoubleSided = true
         material.writesToDepthBuffer = true
         material.readsFromDepthBuffer = true
+        CADTranslucency.recess(material, by: recess)
         copy.materials = [material]
         return copy
     }

@@ -223,6 +223,8 @@ final class CADSceneView: NSView {
     private var hoveredFeature: CADFeatureID?
     private var hiddenSolids = Set<Int>() { didSet { resumeCaptureWaitersIfReady() } }
     private var solidColors: [Int: PartColor] = [:]
+    /// How far opaque depth copies sit behind their surfaces in partial opacity passes.
+    private var depthRecess: Float = 0.01
     private var ownedEdgeSolids = Set<Int>()
     private var hasOwnedEdges = false
     private struct RightMouseGesture {
@@ -860,6 +862,8 @@ final class CADSceneView: NSView {
         }
         solidBounds = prepared.solidBounds
         originalMeshBounds = mesh.bounds
+        depthRecess = CADTranslucency.depthRecess(bounds: mesh.bounds)
+        sectionCaps.depthRecess = depthRecess
         installEdges(prepared)
         edgeNode.renderingOrder = 1
         meshBounds = mesh.bounds
@@ -939,7 +943,8 @@ final class CADSceneView: NSView {
     /// Shaded and edge displays use a partially opaque solid's copies with its
     /// color alpha, depth tested against opaque solids, whose visibility
     /// copies then draw their depth first in each of those passes.
-    private static func styleCopies(of node: SCNNode, translucent: Bool, partial: Bool, layered: Bool, opacity: Float) {
+    private static func styleCopies(of node: SCNNode, translucent: Bool, partial: Bool, layered: Bool, opacity: Float,
+                                    recess: Float) {
         for copy in node.childNodes {
             switch copy.name {
             case visibilityCopyName:
@@ -947,6 +952,9 @@ final class CADSceneView: NSView {
                 if copy.isHidden == (translucent || layered) { copy.isHidden = !(translucent || layered) }
                 copy.categoryBitMask = opaqueDepth ? CADViewportCategory.opaqueVisibility : CADViewportCategory.visibility
                 copy.renderingOrder = opaqueDepth ? CADTranslucency.opaqueDepthRenderingOrder : 0
+                if let material = copy.geometry?.firstMaterial {
+                    CADTranslucency.recess(material, by: opaqueDepth ? recess : nil)
+                }
             case revealageCopyName:
                 if copy.isHidden == (translucent || partial) { copy.isHidden = !(translucent || partial) }
                 if let material = copy.geometry?.firstMaterial {
@@ -1420,7 +1428,8 @@ final class CADSceneView: NSView {
                 Self.configureFaceMaterial(material, translucent: translucent || partial, opacity: opacity, readsDepth: partial)
                 if let plane = presentedSectionPlane { CADViewportSectionRendering.apply(plane, to: material) }
             }
-            Self.styleCopies(of: node, translucent: translucent, partial: partial, layered: layered, opacity: opacity)
+            Self.styleCopies(of: node, translucent: translucent, partial: partial, layered: layered, opacity: opacity,
+                             recess: depthRecess)
             node.geometry?.firstMaterial?.diffuse.contents = selected && mode != .wireframe
                 ? selectionColor
                 : assignedColor(for: solid) ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)

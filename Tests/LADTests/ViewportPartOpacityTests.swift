@@ -129,6 +129,41 @@ final class ViewportPartOpacityTests: XCTestCase {
         XCTAssertLessThan(difference(opaque, partial), 0.01, "A section cap must hide the partially opaque faces behind it.")
     }
 
+    /// A partially opaque face that shares an opaque face's surface, as a
+    /// window pane flush with its frame, consistently draws over it. Their
+    /// separate tessellations must not fight for depth.
+    @MainActor
+    func testCoincidentPartiallyOpaqueFaceConsistentlyCoversOpaqueFace() async throws {
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 480, height: 360))
+        let colors = [0: red, 1: blue.with(alpha: 0.5)]
+        func capture(_ preview: PreviewMesh, hidden: Set<Int> = []) async throws -> NSBitmapImageRep {
+            view.update(mesh: preview, mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: hidden,
+                        solidColors: colors)
+            let camera = try XCTUnwrap(view.pointOfView)
+            camera.position = SCNVector3(2.2, -3.6, 2.4)
+            camera.look(at: SCNVector3Zero, up: SCNVector3(0, 0, 1), localFront: SCNVector3(0, 0, -1))
+            return try await captureImage(view)
+        }
+        let coincident = try await capture(coplanarPlates(lift: 0))
+        let lifted = try await capture(coplanarPlates(lift: 0.05))
+        let bare = try await capture(coplanarPlates(lift: 0), hidden: [1])
+        var samples = 0, unlike = 0, untinted = 0
+        for v in stride(from: -1.6, through: 1.6, by: 0.08) {
+            for u in stride(from: -1.6, through: 1.6, by: 0.08) {
+                let point = view.projectPoint(SCNVector3(u, v, 0))
+                let x = Int(CGFloat(point.x) * CGFloat(coincident.pixelsWide) / view.bounds.width)
+                let y = coincident.pixelsHigh - 1 - Int(CGFloat(point.y) * CGFloat(coincident.pixelsHigh) / view.bounds.height)
+                samples += 1
+                let color = try color(coincident, x, y)
+                if difference(color, try self.color(lifted, x, y)) > 0.03 { unlike += 1 }
+                if difference(color, try self.color(bare, x, y)) < 0.05 { untinted += 1 }
+            }
+        }
+        XCTAssertGreaterThan(samples, 1_000)
+        XCTAssertEqual(unlike, 0, "A coincident partially opaque face must look as if it lay just in front of the opaque face.")
+        XCTAssertEqual(untinted, 0, "The coincident partially opaque face must tint the opaque face everywhere.")
+    }
+
     @MainActor
     func testHighlightedFaceOfPartiallyOpaquePartStaysTranslucent() async throws {
         let face = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0)
@@ -368,6 +403,33 @@ final class ViewportPartOpacityTests: XCTestCase {
                     bounds: [-2, -2, 0, 2, 2, 1], volume: 1, area: 32, solids: 2, faces: 2,
                     buildSeconds: 0, threads: 1, stepPath: "/tmp/viewport-part-opacity-plates.step",
                     triangleSolids: [0, 0, 1, 1])
+    }
+
+    /// An opaque plate (solid 0) and a partially opaque plate (solid 1) on the
+    /// same square, with different triangulations, the second raised by `lift`.
+    private func coplanarPlates(lift: Double) -> PreviewMesh {
+        var vertices = [[Double]](), triangles = [[Int]](), solids = [Int]()
+        func plate(divisions: Int, z: Double, solid: Int, flipped: Bool) {
+            let first = vertices.count
+            for row in 0...divisions {
+                for column in 0...divisions {
+                    vertices.append([-2 + 4 * Double(column) / Double(divisions), -2 + 4 * Double(row) / Double(divisions), z])
+                }
+            }
+            for row in 0..<divisions {
+                for column in 0..<divisions {
+                    let corner = first + row * (divisions + 1) + column, above = corner + divisions + 1
+                    triangles += flipped ? [[corner, corner + 1, above], [corner + 1, above + 1, above]]
+                        : [[corner, corner + 1, above + 1], [corner, above + 1, above]]
+                    solids += [solid, solid]
+                }
+            }
+        }
+        plate(divisions: 13, z: 0, solid: 0, flipped: false)
+        plate(divisions: 7, z: lift, solid: 1, flipped: true)
+        return PreviewMesh(vertices: vertices, triangles: triangles, edges: [], bounds: [-2, -2, 0, 2, 2, lift],
+                           volume: 1, area: 32, solids: 2, faces: 2, buildSeconds: 0, threads: 1,
+                           stepPath: "/tmp/viewport-part-opacity-coplanar-\(lift).step", triangleSolids: solids)
     }
 
     /// A finely triangulated plate whose halves are two planar faces, over a

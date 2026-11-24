@@ -49,6 +49,47 @@ enum CADTranslucency {
     static let alpha: Float = 0.28
     /// Draws opaque depth before anything that reads it in the same pass.
     static let opaqueDepthRenderingOrder = -1_000_000
+    static let depthRecessKey = "cadDepthRecess"
+    /// Opaque depth occludes partially opaque faces from slightly behind its
+    /// surface, away from the eye, so a coincident partially opaque face
+    /// consistently draws over it instead of fighting its depth.
+    private static let recessedDepthGeometry = """
+    #pragma arguments
+    float cadDepthRecess;
+    #pragma body
+    float4 cadView = scn_node.modelViewTransform * _geometry.position;
+    if (scn_frame.projectionTransform[3][3] > 0.5) {
+        cadView.z -= cadDepthRecess;
+    } else {
+        float cadDistance = length(cadView.xyz);
+        if (cadDistance > 0.0) { cadView.xyz *= 1.0 + cadDepthRecess / cadDistance; }
+    }
+    _geometry.position = scn_node.inverseModelViewTransform * cadView;
+    """
+
+    /// Separate display tessellations of one surface can differ by twice the
+    /// worker's linear deflection, `max(0.005, min(0.25, diagonal / 1000))` mm.
+    static func depthRecess(bounds: [Double]) -> Float {
+        guard bounds.count == 6, bounds.allSatisfy(\.isFinite) else { return 0.01 }
+        let diagonal = (0..<3).map { (bounds[$0 + 3] - bounds[$0]) * (bounds[$0 + 3] - bounds[$0]) }.reduce(0, +).squareRoot()
+        return Float(2 * max(0.005, min(0.25, diagonal / 1_000)))
+    }
+
+    /// Recesses a depth-only material by `distance`, or restores it, keeping
+    /// its other shader modifiers such as section clipping.
+    static func recess(_ material: SCNMaterial, by distance: Float?) {
+        var modifiers = material.shaderModifiers ?? [:]
+        if let distance {
+            if modifiers[.geometry] != recessedDepthGeometry {
+                modifiers[.geometry] = recessedDepthGeometry
+                material.shaderModifiers = modifiers
+            }
+            material.setValue(NSNumber(value: distance), forKey: depthRecessKey)
+        } else if modifiers[.geometry] != nil {
+            modifiers.removeValue(forKey: .geometry)
+            material.shaderModifiers = modifiers.isEmpty ? nil : modifiers
+        }
+    }
 }
 
 /// Linear highlight colors and the scene background used by the compositor.
