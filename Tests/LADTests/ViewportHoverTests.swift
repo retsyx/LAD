@@ -212,6 +212,84 @@ final class ViewportHoverTests: XCTestCase {
     }
 
     @MainActor
+    func testOptionPreviewsThePartAnOptionClickTogglesWithoutChangingSelection() async throws {
+        let view = try makeView()
+        view.update(mesh: parts(), mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [], hiddenSolids: [])
+        try await waitForPreparation(view)
+        var selections = [Set<Int>](), featureChanges = 0
+        view.onSelectionChanged = { selections.append($0) }
+        view.onFeatureSelectionChanged = { _ in featureChanges += 1 }
+        let left = point([-11, 0, 0], in: view), right = point([11, 0, 0], in: view)
+        let leftFace = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0)
+        let rightFace = CADFeatureID(kind: .face, solidIndex: 1, localIndex: 0)
+        let finish = try partColor(0, in: view)
+        let palette = CADSceneView.highlightPalette
+
+        view.mouseMoved(with: try event(.mouseMoved, at: left))
+        let faceHover = try node(leftFace, in: view)
+        try await waitForHighlight(faceHover)
+        let overlays = view.cachedFeatureHighlightCount
+        view.flagsChanged(with: try flags(.option))
+        XCTAssertTrue(faceHover.isHidden, "Option replaces the feature preview with the part an Option-click toggles.")
+        assertEqualColor(try partColor(0, in: view), palette.hover)
+        assertEqualColor(try partColor(1, in: view), finish)
+        XCTAssertEqual(partMasks(in: view), [false], "The hovered part projects a hover outline.")
+
+        view.mouseMoved(with: try event(.mouseMoved, at: right, modifiers: .option))
+        assertEqualColor(try partColor(0, in: view), finish)
+        assertEqualColor(try partColor(1, in: view), palette.hover)
+        XCTAssertEqual(partMasks(in: view), [false])
+        XCTAssertEqual(view.cachedFeatureHighlightCount, overlays, "Part hover reuses the part's own geometry.")
+        XCTAssertEqual(selections, [])
+
+        view.mouseDown(with: try event(.leftMouseDown, at: right, modifiers: .option, clickCount: 1))
+        view.mouseUp(with: try event(.leftMouseUp, at: right, modifiers: .option, clickCount: 1))
+        XCTAssertEqual(selections, [[1]])
+        assertEqualColor(try partColor(1, in: view), palette.selected)
+        XCTAssertEqual(partMasks(in: view), [true], "Selection takes precedence over the part hover.")
+        view.mouseDown(with: try event(.leftMouseDown, at: right, modifiers: .option, clickCount: 1))
+        view.mouseUp(with: try event(.leftMouseUp, at: right, modifiers: .option, clickCount: 1))
+        XCTAssertEqual(selections, [[1], []])
+        assertEqualColor(try partColor(1, in: view), palette.hover)
+        XCTAssertEqual(partMasks(in: view), [false], "A deselected part under a held Option shows its preview again.")
+
+        view.mouseMoved(with: try event(.mouseMoved, at: NSPoint(x: 2, y: 2), modifiers: .option))
+        assertEqualColor(try partColor(1, in: view), finish)
+        XCTAssertEqual(partMasks(in: view), [])
+
+        view.mouseMoved(with: try event(.mouseMoved, at: right, modifiers: .option))
+        view.flagsChanged(with: try flags([]))
+        assertEqualColor(try partColor(1, in: view), finish)
+        XCTAssertEqual(partMasks(in: view), [])
+        try await waitForHighlight(try node(rightFace, in: view))
+
+        view.flagsChanged(with: try flags(.option))
+        assertEqualColor(try partColor(1, in: view), palette.hover)
+        view.update(mesh: parts(), mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [1])
+        XCTAssertEqual(partMasks(in: view), [])
+        view.update(mesh: parts(), mode: .edges, grid: false, command: nil, selectedSolids: [], hiddenSolids: [])
+        assertEqualColor(try partColor(1, in: view), finish)
+        XCTAssertEqual(partMasks(in: view), [], "Showing a part must not restore an old part hover.")
+
+        view.mouseMoved(with: try event(.mouseMoved, at: left, modifiers: .option))
+        XCTAssertEqual(partMasks(in: view), [false])
+        view.update(mesh: parts(), mode: .edges, grid: false, command: ViewportCommand(.front),
+                    selectedSolids: [], hiddenSolids: [])
+        assertEqualColor(try partColor(0, in: view), finish)
+        XCTAssertEqual(partMasks(in: view), [], "Camera changes clear the part hover.")
+        view.update(mesh: parts(), mode: .edges, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [], hiddenSolids: [])
+        view.mouseMoved(with: try event(.mouseMoved, at: left, modifiers: .option))
+        XCTAssertEqual(partMasks(in: view), [false])
+        view.mouseExited(with: try event(.mouseExited, at: NSPoint(x: -1, y: -1), modifiers: .option))
+        assertEqualColor(try partColor(0, in: view), finish)
+        XCTAssertEqual(partMasks(in: view), [])
+        XCTAssertEqual(selections, [[1], []])
+        XCTAssertEqual(featureChanges, 0)
+    }
+
+    @MainActor
     private func readyView() async throws -> CADSceneView {
         let view = try makeView()
         view.update(mesh: mesh(), mode: .edges, grid: false, command: ViewportCommand(.top),
@@ -235,13 +313,37 @@ final class ViewportHoverTests: XCTestCase {
     }
 
     @MainActor
-    private func event(_ type: NSEvent.EventType, at point: NSPoint) throws -> NSEvent {
+    private func event(_ type: NSEvent.EventType, at point: NSPoint, modifiers: NSEvent.ModifierFlags = [],
+                       clickCount: Int = 0) throws -> NSEvent {
         if type == .mouseEntered || type == .mouseExited {
-            return try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+            return try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: point, modifierFlags: modifiers, timestamp: 0,
                 windowNumber: 0, context: nil, eventNumber: 1, trackingNumber: 0, userData: nil))
         }
-        return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
-            windowNumber: 0, context: nil, eventNumber: 1, clickCount: 0, pressure: 0))
+        return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: modifiers, timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 1, clickCount: clickCount, pressure: 0))
+    }
+
+    @MainActor
+    private func flags(_ modifiers: NSEvent.ModifierFlags) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: modifiers, timestamp: 0,
+            windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 58))
+    }
+
+    /// Whether each whole-part outline mask in the next frame is selected.
+    @MainActor
+    private func partMasks(in view: CADSceneView) -> [Bool] {
+        view.makeFrame(width: 640, height: 480).batches.flatMap(\.masks).map(\.selected)
+    }
+
+    @MainActor
+    private func partColor(_ solid: Int, in view: CADSceneView) throws -> SIMD4<Float> {
+        let material = try XCTUnwrap(view.scene.rootNode.childNode(withName: "solid:\(solid)", recursively: true)?.geometry?.firstMaterial)
+        return CADHighlightPalette.linear(try color(material.diffuse.contents))
+    }
+
+    private func assertEqualColor(_ actual: SIMD4<Float>, _ expected: SIMD4<Float>,
+                                  file: StaticString = #filePath, line: UInt = #line) {
+        for channel in 0..<3 { XCTAssertEqual(actual[channel], expected[channel], accuracy: 1e-5, file: file, line: line) }
     }
 
     @MainActor
@@ -281,6 +383,24 @@ final class ViewportHoverTests: XCTestCase {
         XCTAssertEqual(actual.redComponent, expected.redComponent, accuracy: 1e-6, file: file, line: line)
         XCTAssertEqual(actual.greenComponent, expected.greenComponent, accuracy: 1e-6, file: file, line: line)
         XCTAssertEqual(actual.blueComponent, expected.blueComponent, accuracy: 1e-6, file: file, line: line)
+    }
+
+    /// Two separate one-face parts, side by side in the top view.
+    private func parts() -> PreviewMesh {
+        var preview = PreviewMesh(vertices: [[-20, -10, 0], [-2, -10, 0], [-2, 10, 0], [-20, 10, 0],
+                                             [2, -10, 0], [20, -10, 0], [20, 10, 0], [2, 10, 0]],
+                                  triangles: [[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]], edges: [],
+                                  bounds: [-20, -10, 0, 20, 10, 0], volume: 1, area: 720, solids: 2, faces: 2,
+                                  buildSeconds: 0, threads: 1, stepPath: "/tmp/viewport-hover-parts",
+                                  triangleSolids: [0, 0, 1, 1], edgeSolids: [])
+        preview.topology = CADTopology(vertices: [], edges: [], faces: [
+            CADFace(id: CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0), type: "PLANE", area: 360,
+                    center: [-11, 0, 0], normal: [0, 0, 1]),
+            CADFace(id: CADFeatureID(kind: .face, solidIndex: 1, localIndex: 0), type: "PLANE", area: 360,
+                    center: [11, 0, 0], normal: [0, 0, 1])
+        ], parts: [])
+        preview.triangleFaces = [0, 0, 1, 1]
+        return preview
     }
 
     private func mesh() -> PreviewMesh {

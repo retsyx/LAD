@@ -221,6 +221,8 @@ final class CADSceneView: NSView {
     private var selectedSolids = Set<Int>()
     private var selectedFeatures = [CADFeatureID]()
     private var hoveredFeature: CADFeatureID?
+    /// The part an Option-click would toggle, previewed while Option is held.
+    private var hoveredSolid: Int?
     private var hiddenSolids = Set<Int>() { didSet { resumeCaptureWaitersIfReady() } }
     private var solidColors: [Int: PartColor] = [:]
     /// How far opaque depth copies sit behind their surfaces in partial opacity passes.
@@ -243,6 +245,7 @@ final class CADSceneView: NSView {
     private var assemblyGrab: AssemblyGrabGesture?
     private var pointerPoint: NSPoint?
     private var commandPressed = false
+    private var optionPressed = false
     private var commandCursorSet = false
     private var modifierMonitor: Any?
     var isGrabbingAssembly: Bool { assemblyGrab != nil }
@@ -299,6 +302,8 @@ final class CADSceneView: NSView {
     private struct RenderStyle: Equatable {
         let mode: ViewportDisplayMode
         let selected: Set<Int>
+        /// A visible, unselected part under an Option hover.
+        let hovered: Int?
         let hidden: Set<Int>
         let colors: [Int: PartColor]
         /// Solids whose color alpha is below 1. Shaded and edge displays draw
@@ -307,9 +312,10 @@ final class CADSceneView: NSView {
         /// Whether a visible solid is partially opaque.
         let composesPartialOpacity: Bool
 
-        init(mode: ViewportDisplayMode, selected: Set<Int>, hidden: Set<Int>, colors: [Int: PartColor]) {
+        init(mode: ViewportDisplayMode, selected: Set<Int>, hovered: Int?, hidden: Set<Int>, colors: [Int: PartColor]) {
             self.mode = mode
             self.selected = selected
+            self.hovered = hovered.flatMap { selected.contains($0) || hidden.contains($0) ? nil : $0 }
             self.hidden = hidden
             self.colors = colors
             partialSolids = mode == .shaded || mode == .edges ? Set(colors.compactMap { $0.value.alpha < 1 ? $0.key : nil }) : []
@@ -582,6 +588,7 @@ final class CADSceneView: NSView {
         if visibilityChanged {
             projectedFeatures = nil
             hoveredFeature = nil
+            hoveredSolid = nil
         }
         var finishes = PartColorState.solidColors(in: mesh?.parts ?? [], overrides: [:])
         finishes.merge(solidColors.filter { (0..<4_096).contains($0.key) && $0.value.isValid },
@@ -699,9 +706,10 @@ final class CADSceneView: NSView {
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
         if let pose, applySolidPose(pose, reinstalling: false) {
+            _ = applyStyle()
             _ = updateFeatureHighlights()
         } else {
-            setHoveredFeature(nil)
+            clearHover()
         }
         sectionCaps.show(cap)
         if changed {
@@ -792,6 +800,7 @@ final class CADSceneView: NSView {
         solidMatrices = pose.matrices
         projectedFeatures = nil
         hoveredFeature = nil
+        hoveredSolid = nil
         zoomAnchor = nil
         let sceneMatrices = solidMatrices.mapValues(ViewportRigidTransform.sceneMatrix)
         func apply(_ node: SCNNode, solid: Int) {
@@ -1100,6 +1109,7 @@ final class CADSceneView: NSView {
     private func resetFeatureResources() {
         featurePreparationID = UUID()
         hoveredFeature = nil
+        hoveredSolid = nil
         projectedFeatures = nil
         featureNode.childNodes.forEach { $0.removeFromParentNode() }
         featureNodes.removeAll()
@@ -1319,10 +1329,11 @@ final class CADSceneView: NSView {
             frame.seeds.append(.init(buffer: seeds, channel: channel, model: transform))
         }
         var masks = [CADViewportFrame.Mask](), rectangles = [CADSilhouetteBatching.Rect?]()
-        for solid in selectedSolids.sorted() where !hiddenSolids.contains(solid) {
+        let hoveredPart = hoveredSolid.flatMap { selectedSolids.contains($0) ? nil : [$0] } ?? []
+        for solid in selectedSolids.sorted() + hoveredPart where !hiddenSolids.contains(solid) {
             guard let mask = partMask(solid) else { continue }
             let transform = model(solid)
-            masks.append(.init(buffer: mask, selected: true, model: transform))
+            masks.append(.init(buffer: mask, selected: selectedSolids.contains(solid), model: transform))
             rectangles.append(project(solidBounds[solid] ?? originalMeshBounds, transform))
         }
         for feature in highlightedFeatures where feature.kind == .face && !hiddenSolids.contains(feature.solidIndex) {
@@ -1366,7 +1377,7 @@ final class CADSceneView: NSView {
 
     @discardableResult
     private func applyStyle() -> Bool {
-        let style = RenderStyle(mode: mode, selected: selectedSolids, hidden: hiddenSolids, colors: solidColors)
+        let style = RenderStyle(mode: mode, selected: selectedSolids, hovered: hoveredSolid, hidden: hiddenSolids, colors: solidColors)
         guard appliedStyle != style else { return false }
         let previous = appliedStyle
         appliedStyle = style
@@ -1376,7 +1387,6 @@ final class CADSceneView: NSView {
         let partialSolids = style.partialSolids, layered = style.composesPartialOpacity
         let previousPartial = previous?.partialSolids ?? [], previousLayered = previous?.composesPartialOpacity ?? false
         let coloredLegacyWire = !hasOwnedEdges && mode == .wireframe && !solidColors.isEmpty
-        let selectionColor = Self.selectionColor
         for node in edgeNode.childNodes {
             let solid = solidIndex(of: node, prefix: "edges:")
             let hidden = solid.map { hiddenSolids.contains($0) } ?? (!hiddenSolids.isEmpty || coloredLegacyWire)
@@ -1404,13 +1414,22 @@ final class CADSceneView: NSView {
         for node in modelNode.childNodes {
             guard let solid = solidIndex(of: node) else { continue }
             let selected = selectedSolids.contains(solid)
+            let hovered = style.hovered == solid
+            let highlight = partHighlight(selected: selected, hovered: hovered)
             let partial = partialSolids.contains(solid)
             if let previous, previous.mode == mode,
                previous.selected.contains(solid) == selected,
                previous.hidden.contains(solid) == hiddenSolids.contains(solid),
                previousPartial.contains(solid) == partial, previousLayered == layered,
-               previous.colors[solid] == solidColors[solid] || (selected && previous.opacity(of: solid) == style.opacity(of: solid)),
+               previous.colors[solid] == solidColors[solid] || ((selected || hovered || previous.hovered == solid)
+                    && previous.opacity(of: solid) == style.opacity(of: solid)),
                hasOwnedEdges || (previous.hidden.isEmpty == hiddenSolids.isEmpty && previous.colors.isEmpty == solidColors.isEmpty) {
+                // A part hover only retints the existing material.
+                if partHighlight(selected: selected, hovered: previous.hovered == solid) != highlight
+                    || (highlight == nil && previous.colors[solid] != solidColors[solid]) {
+                    tint(node.geometry?.firstMaterial, solid: solid, highlight: highlight)
+                    restyled.insert(solid)
+                }
                 continue
             }
             // Native analytic wire edges are preferred. Fall back to each
@@ -1430,11 +1449,7 @@ final class CADSceneView: NSView {
             }
             Self.styleCopies(of: node, translucent: translucent, partial: partial, layered: layered, opacity: opacity,
                              recess: depthRecess)
-            node.geometry?.firstMaterial?.diffuse.contents = selected && mode != .wireframe
-                ? selectionColor
-                : assignedColor(for: solid) ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
-            node.geometry?.firstMaterial?.emission.contents = selected && mode != .wireframe
-                ? NSColor(srgbRed: 0.12, green: 0.05, blue: 0.005, alpha: 1) : NSColor.black
+            tint(node.geometry?.firstMaterial, solid: solid, highlight: highlight)
             restyled.insert(solid)
         }
         // A translucent fill removes exactly its part's current shading.
@@ -1447,6 +1462,18 @@ final class CADSceneView: NSView {
             removal.emission.contents = part.emission.contents
         }
         return true
+    }
+
+    /// A selected or hovered part's color in place of its finish. Wireframe
+    /// outlines highlighted parts only.
+    private func partHighlight(selected: Bool, hovered: Bool) -> NSColor? {
+        mode == .wireframe ? nil : selected ? Self.selectionColor : hovered ? Self.hoveredFeatureColor : nil
+    }
+
+    private func tint(_ material: SCNMaterial?, solid: Int, highlight: NSColor?) {
+        material?.diffuse.contents = highlight
+            ?? assignedColor(for: solid) ?? NSColor(srgbRed: 0.70, green: 0.75, blue: 0.80, alpha: 1)
+        material?.emission.contents = highlight != nil ? NSColor(srgbRed: 0.12, green: 0.05, blue: 0.005, alpha: 1) : NSColor.black
     }
 
     /// Translucent mode fills highlighted faces in the accumulation pass;
@@ -1677,7 +1704,7 @@ final class CADSceneView: NSView {
         rig = pose.rig
         needsInitialFit = false
         projectedFeatures = nil
-        setHoveredFeature(nil)
+        clearHover()
         SCNTransaction.begin()
         SCNTransaction.animationDuration = 0
         SCNTransaction.disableActions = true
@@ -1696,7 +1723,7 @@ final class CADSceneView: NSView {
     private func applyCamera() {
         cancelAssemblyGrab()
         projectedFeatures = nil
-        setHoveredFeature(nil)
+        clearHover()
         let right = SIMD3<Float>(rig.right)
         let up = SIMD3<Float>(rig.up)
         let backward = SIMD3<Float>(rig.backward)
@@ -1729,7 +1756,7 @@ final class CADSceneView: NSView {
             cancelCameraTransition()
             projectionSize = bounds.size
             projectedFeatures = nil
-            setHoveredFeature(nil)
+            clearHover()
             updateStrokeViewportHeight()
         }
         if needsInitialFit, bounds.width >= 10, bounds.height >= 10 {
@@ -1831,7 +1858,7 @@ final class CADSceneView: NSView {
     }
     override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
-        if resigned { cancelAssemblyGrab(); setHoveredFeature(nil) }
+        if resigned { cancelAssemblyGrab(); clearHover() }
         return resigned
     }
     override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -1849,7 +1876,7 @@ final class CADSceneView: NSView {
         NSWorkspace.shared.notificationCenter.removeObserver(self, name: NSWorkspace.didWakeNotification, object: nil)
         NSWorkspace.shared.notificationCenter.removeObserver(self, name: NSWorkspace.screensDidWakeNotification, object: nil)
         windowVisibilityObservation = nil
-        setHoveredFeature(nil)
+        clearHover()
         resetNavigationGesture()
         cancelCameraTransition()
         if newWindow == nil {
@@ -1912,7 +1939,7 @@ final class CADSceneView: NSView {
         clearPointerFeedback()
         cancelAssemblyGrab()
         cancelCameraTransition()
-        setHoveredFeature(nil)
+        clearHover()
         resetNavigationGesture()
     }
     @objc private func windowBecameKey() {
@@ -1956,24 +1983,24 @@ final class CADSceneView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         pointerPoint = ownsPointer(point) ? point : nil
         commandPressed = event.modifierFlags.contains(.command)
+        optionPressed = event.modifierFlags.contains(.option)
     }
 
     private func updateModifiers(with event: NSEvent) {
+        let command = event.modifierFlags.contains(.command), option = event.modifierFlags.contains(.option)
         if let window {
             guard window.isKeyWindow, NSApp.isActive, event.window == nil || event.window === window else { return }
             // A key event's location can be stale. Query the pointer and hit
             // target so overlays and the composer retain their own cursors.
             let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
             let owned = ownsPointer(point) ? point : nil
-            let pressed = event.modifierFlags.contains(.command)
-            guard pressed != commandPressed || owned != pointerPoint else { return }
-            commandPressed = pressed
+            guard command != commandPressed || option != optionPressed || owned != pointerPoint else { return }
             pointerPoint = owned
         } else {
-            let pressed = event.modifierFlags.contains(.command)
-            guard pressed != commandPressed else { return }
-            commandPressed = pressed
+            guard command != commandPressed || option != optionPressed else { return }
         }
+        commandPressed = command
+        optionPressed = option
         refreshPointerFeedback()
     }
 
@@ -1994,11 +2021,12 @@ final class CADSceneView: NSView {
     private func clearPointerFeedback() {
         pointerPoint = nil
         commandPressed = false
+        optionPressed = false
         if (commandCursorSet || rightGesture?.isDragging == true || otherDragPoint != nil), NSCursor.current === NSCursor.closedHand {
             NSCursor.arrow.set()
         }
         commandCursorSet = false
-        setHoveredFeature(nil)
+        clearHover()
     }
 
     private func refreshPointerFeedback() {
@@ -2006,10 +2034,14 @@ final class CADSceneView: NSView {
         guard let point = pointerPoint, !(assemblyGrabbingEnabled && commandPressed),
               !commandGrabGesture, !isAnimatingCamera, rightGesture == nil,
               NSEvent.pressedMouseButtons == 0 else {
-            setHoveredFeature(nil)
+            clearHover()
             return
         }
-        setHoveredFeature(feature(at: point))
+        if optionPressed {
+            setHover(solid: part(at: point))
+        } else {
+            setHover(feature: feature(at: point))
+        }
     }
 
     private func updateHover(with event: NSEvent) {
@@ -2017,10 +2049,17 @@ final class CADSceneView: NSView {
         refreshPointerFeedback()
     }
 
-    private func setHoveredFeature(_ feature: CADFeatureID?) {
-        guard hoveredFeature != feature else { return }
+    private func clearHover() { setHover() }
+
+    /// Hover previews either a native feature or, with Option, a whole part.
+    private func setHover(feature: CADFeatureID? = nil, solid: Int? = nil) {
+        guard hoveredFeature != feature || hoveredSolid != solid else { return }
+        let solidChanged = hoveredSolid != solid
         hoveredFeature = feature
-        if updateFeatureHighlights() { requestRedraw() }
+        hoveredSolid = solid
+        // A part's hover tint changes its existing material, like selection.
+        let styleChanged = solidChanged && applyStyle()
+        if updateFeatureHighlights() || styleChanged { requestRedraw() }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -2032,7 +2071,7 @@ final class CADSceneView: NSView {
         if assemblyGrabbingEnabled, event.modifierFlags.contains(.command) {
             commandGrabGesture = true
             resetNavigationGesture()
-            setHoveredFeature(nil)
+            clearHover()
             updatePointerCursor()
             guard bounds.contains(point), let hit = visibleHit(at: point),
                   let solid = solidIndex(of: hit.node), let projection = assemblyGrabProjection() else { return }
@@ -2043,19 +2082,17 @@ final class CADSceneView: NSView {
             return
         }
         if event.modifierFlags.contains(.option) {
-            setHoveredFeature(nil)
-            let hit = bounds.contains(point) ? visibleHit(at: point) : nil
+            let solid = part(at: point)
+            setHover(solid: solid)
             if event.clickCount >= 2 {
-                if hit == nil { deselectAll() }
+                if solid == nil { deselectAll() }
                 return
             }
-            if let hit, let solid = solidIndex(of: hit.node) {
-                select(selectedSolids.symmetricDifference([solid]))
-            }
+            if let solid { select(selectedSolids.symmetricDifference([solid])) }
             return
         }
         let feature = feature(at: point)
-        setHoveredFeature(feature)
+        setHover(feature: feature)
         if event.clickCount >= 2 {
             if feature == nil && visibleHit(at: point) == nil { deselectAll() }
             return
@@ -2076,14 +2113,14 @@ final class CADSceneView: NSView {
     override func mouseDragged(with event: NSEvent) {
         trackPointer(with: event)
         updatePointerCursor()
-        setHoveredFeature(nil)
+        clearHover()
         if commandGrabGesture { deliverAssemblyGrab(at: convert(event.locationInWindow, from: nil)) }
     }
     override func rightMouseDown(with event: NSEvent) {
         guard !commandGrabGesture else { return }
         cancelCameraTransition()
         window?.makeFirstResponder(self)
-        setHoveredFeature(nil)
+        clearHover()
         let point = convert(event.locationInWindow, from: nil)
         rightGesture = RightMouseGesture(start: point, previous: point)
     }
@@ -2123,7 +2160,7 @@ final class CADSceneView: NSView {
         guard !commandGrabGesture else { return }
         cancelCameraTransition()
         window?.makeFirstResponder(self)
-        setHoveredFeature(nil)
+        clearHover()
         otherDragPoint = convert(event.locationInWindow, from: nil)
         NSCursor.closedHand.set()
     }
@@ -2210,7 +2247,7 @@ final class CADSceneView: NSView {
     }
 
     private func deselectAll() {
-        setHoveredFeature(nil)
+        clearHover()
         select([])
         selectFeatures([])
         onDeselectAll?()
@@ -2330,6 +2367,12 @@ final class CADSceneView: NSView {
             let unitsPerPoint = 2 * rig.orthographicScale / max(bounds.height, 1)
             return simd_dot(hitWorld - world, rig.backward) <= max(rig.radius * 1e-5, unitsPerPoint * 1.5)
         })
+    }
+
+    /// The visible part an Option-click at `point` toggles.
+    private func part(at point: NSPoint) -> Int? {
+        guard bounds.contains(point), let hit = visibleHit(at: point) else { return nil }
+        return solidIndex(of: hit.node)
     }
 
     /// The nearest visible native face, ignoring nearby vertices and edges.

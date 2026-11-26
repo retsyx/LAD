@@ -186,6 +186,61 @@ final class ViewportSilhouetteTests: XCTestCase {
     }
 
     @MainActor
+    func testOptionHoverTintsAndOutlinesTheWholePartInCaptures() async throws {
+        _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        var preview = squares()
+        preview.vertices = [[-2, -1, 0], [-0.25, -1, 0], [-0.25, 1, 0], [-2, 1, 0],
+                            [0.25, -1, 0], [2, -1, 0], [2, 1, 0], [0.25, 1, 0]]
+        preview.bounds = [-2, -1, 0, 2, 1, 0]
+        preview.stepPath = "/tmp/viewport-silhouette-option-hover"
+        // The left part's lower-right and upper-left triangles are separate faces.
+        let lowerRight = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 0)
+        let upperLeft = CADFeatureID(kind: .face, solidIndex: 0, localIndex: 1)
+        let right = CADFeatureID(kind: .face, solidIndex: 1, localIndex: 0)
+        preview.topology?.faces = [
+            CADFace(id: lowerRight, type: "PLANE", area: 1.75, center: [-0.8, -0.3, 0], normal: [0, 0, 1]),
+            CADFace(id: upperLeft, type: "PLANE", area: 1.75, center: [-1.4, 0.3, 0], normal: [0, 0, 1]),
+            CADFace(id: right, type: "PLANE", area: 3.5, center: [1.125, 0, 0], normal: [0, 0, 1])
+        ]
+        preview.triangleFaces = [0, 1, 2, 2]
+        view.update(mesh: preview, mode: .shaded, grid: false, command: ViewportCommand(.top),
+                    selectedSolids: [], hiddenSolids: [], projection: .isometric)
+        try await ready(view)
+        let projected = view.projectPoint(SCNVector3(-0.6, -0.6, 0))
+        let cursor = NSPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+        XCTAssertEqual(view.feature(at: cursor), lowerRight)
+        let farEdge = SCNVector3(-1.125, 1, 0), farFace = SCNVector3(-1.6, 0.6, 0), otherPart = SCNVector3(1.125, 1, 0)
+        func warmth(_ image: NSBitmapImageRep) throws -> CGFloat {
+            let point = view.projectPoint(farFace)
+            let x = Int((CGFloat(point.x) * CGFloat(image.pixelsWide) / view.bounds.width).rounded())
+            let y = image.pixelsHigh - Int((CGFloat(point.y) * CGFloat(image.pixelsHigh) / view.bounds.height).rounded())
+            let color = try XCTUnwrap(image.colorAt(x: x, y: y))
+            return color.redComponent - color.blueComponent
+        }
+
+        view.mouseMoved(with: try event(.mouseMoved, at: cursor))
+        try await ready(view)
+        let face = try await bitmap(view)
+        XCTAssertFalse(hasGold(face, around: farEdge, in: view, hover: true),
+            "A plain hover outlines only the face under the pointer.")
+
+        view.mouseMoved(with: try event(.mouseMoved, at: cursor, modifiers: .option))
+        try await ready(view)
+        let part = try await bitmap(view)
+        XCTAssertTrue(hasGold(part, around: farEdge, in: view, hover: true),
+            "Option hover outlines the whole part an Option-click toggles.")
+        XCTAssertFalse(hasGold(part, around: otherPart, in: view, hover: true))
+        XCTAssertGreaterThan(try warmth(part) - warmth(face), 0.15,
+            "The hovered part's other faces receive the hover color in the normal pass.")
+
+        view.mouseExited(with: try event(.mouseExited, at: NSPoint(x: -1, y: -1), modifiers: .option))
+        let cleared = try await bitmap(view)
+        XCTAssertFalse(hasGold(cleared, around: farEdge, in: view, hover: true))
+        XCTAssertLessThan(abs(try warmth(cleared) - warmth(face)), 0.02)
+    }
+
+    @MainActor
     func testSelectedPlanarFaceRetainsItsLineProjectionWhenViewedEdgeOn() async throws {
         _ = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         let view = CADSceneView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
@@ -221,12 +276,13 @@ final class ViewportSilhouetteTests: XCTestCase {
     }
 
     @MainActor
-    private func event(_ type: NSEvent.EventType, at point: NSPoint) throws -> NSEvent {
+    private func event(_ type: NSEvent.EventType, at point: NSPoint,
+                       modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
         if type == .mouseExited {
-            return try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+            return try XCTUnwrap(NSEvent.enterExitEvent(with: type, location: point, modifierFlags: modifiers, timestamp: 0,
                 windowNumber: 0, context: nil, eventNumber: 1, trackingNumber: 0, userData: nil))
         }
-        return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+        return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: modifiers, timestamp: 0,
             windowNumber: 0, context: nil, eventNumber: 1, clickCount: 0, pressure: 0))
     }
 
