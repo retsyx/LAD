@@ -18,6 +18,82 @@ final class WorkspaceHeaderTests: XCTestCase {
     }
 
     @MainActor
+    func testFullScreenLeavesTitleBarToAppKitAndRestoresHeader() async throws {
+        guard !NSScreen.screens.isEmpty else { throw XCTSkip("A window server is required for the design header.") }
+        let application = NSApplication.shared
+        let previousPolicy = application.activationPolicy()
+        _ = application.setActivationPolicy(.regular)
+        application.finishLaunching()
+        // Only the header chrome, whose title bar layout full screen exercises.
+        let host = NSHostingView(rootView: VStack(spacing: 0) {
+            Color.clear.frame(height: WindowHeaderChrome.height).background(WindowHeaderChrome())
+            Spacer(minLength: 0)
+        })
+        host.sizingOptions = []
+        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 1280, height: 800),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                              backing: .buffered, defer: false)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.collectionBehavior.insert(.fullScreenPrimary)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer {
+            window.orderOut(nil)
+            window.contentView = nil
+            window.close()
+            _ = application.setActivationPolicy(previousPolicy)
+        }
+        try await Self.assertWindowButtonsCentered(in: window)
+        // AppKit tiles the title bar for full screen while it is still in the
+        // window, before moving it to the menu bar reveal window.
+        await toggleFullScreen(window)
+        XCTAssertTrue(window.styleMask.contains(.fullScreen))
+        await toggleFullScreen(window)
+        XCTAssertFalse(window.styleMask.contains(.fullScreen))
+        try await Self.assertWindowButtonsCentered(in: window)
+    }
+
+    /// Enters or leaves full screen and waits for the transition to finish.
+    @MainActor
+    private func toggleFullScreen(_ window: NSWindow) async {
+        let finished = expectation(forNotification: window.styleMask.contains(.fullScreen)
+            ? NSWindow.didExitFullScreenNotification : NSWindow.didEnterFullScreenNotification, object: window)
+        window.toggleFullScreen(nil)
+        await fulfillment(of: [finished], timeout: 10)
+    }
+
+    @MainActor
+    private static func assertWindowButtonsCentered(in window: NSWindow, file: StaticString = #filePath, line: UInt = #line) async throws {
+        // SwiftUI creates the header's AppKit view on its first update.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            window.contentView?.layoutSubtreeIfNeeded()
+            let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].compactMap { window.standardWindowButton($0) }
+            if buttons.count == 3, buttons.allSatisfy({
+                abs(window.frame.height - $0.convert($0.bounds, to: nil).midY - WindowHeaderChrome.height / 2) < 0.5
+            }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            let button = try XCTUnwrap(window.standardWindowButton(kind), file: file, line: line)
+            let frame = button.convert(button.bounds, to: nil)
+            XCTAssertEqual(window.frame.height - frame.midY, WindowHeaderChrome.height / 2, accuracy: 0.5,
+                           "Window buttons are vertically centered in the header: \(kind.rawValue) \(frame) container \(button.superview?.superview?.frame ?? .zero) window \(window.frame)", file: file, line: line)
+            XCTAssertLessThanOrEqual(frame.maxX, WindowHeaderChrome.windowButtonsWidth, file: file, line: line)
+            if kind == .closeButton {
+                XCTAssertEqual(frame.minX, window.frame.height - frame.maxY, accuracy: 0.5,
+                               "Window buttons have equal top and leading margins.", file: file, line: line)
+            }
+            let hit = try XCTUnwrap(window.contentView?.superview?.hitTest(
+                button.superview!.convert(NSPoint(x: button.frame.midX, y: button.frame.midY), to: window.contentView?.superview)),
+                file: file, line: line)
+            XCTAssertTrue(hit === button || hit.isDescendant(of: button), "Window buttons remain clickable.", file: file, line: line)
+        }
+    }
+
+    @MainActor
     func testLongDesignNameStaysCenteredClearOfActionsAndWhileRenaming() async throws {
         let name = "Enclosure " + String(repeating: "with a very long descriptive design name ", count: 5)
             .trimmingCharacters(in: .whitespaces)
@@ -99,31 +175,7 @@ final class WorkspaceHeaderTests: XCTestCase {
         }
 
         func assertWindowButtonsCentered(file: StaticString = #filePath, line: UInt = #line) async throws {
-            // SwiftUI creates the header's AppKit view on its first update.
-            let deadline = ContinuousClock.now + .seconds(5)
-            while ContinuousClock.now < deadline {
-                host.layoutSubtreeIfNeeded()
-                let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].compactMap { window.standardWindowButton($0) }
-                if buttons.count == 3, buttons.allSatisfy({
-                    abs(window.frame.height - $0.convert($0.bounds, to: nil).midY - WindowHeaderChrome.height / 2) < 0.5
-                }) { break }
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-                let button = try XCTUnwrap(window.standardWindowButton(kind), file: file, line: line)
-                let frame = button.convert(button.bounds, to: nil)
-                XCTAssertEqual(window.frame.height - frame.midY, WindowHeaderChrome.height / 2, accuracy: 0.5,
-                               "Window buttons are vertically centered in the header: \(kind.rawValue) \(frame) container \(button.superview?.superview?.frame ?? .zero) window \(window.frame)", file: file, line: line)
-                XCTAssertLessThanOrEqual(frame.maxX, WindowHeaderChrome.windowButtonsWidth, file: file, line: line)
-                if kind == .closeButton {
-                    XCTAssertEqual(frame.minX, window.frame.height - frame.maxY, accuracy: 0.5,
-                                   "Window buttons have equal top and leading margins.", file: file, line: line)
-                }
-                let hit = try XCTUnwrap(window.contentView?.superview?.hitTest(
-                    button.superview!.convert(NSPoint(x: button.frame.midX, y: button.frame.midY), to: window.contentView?.superview)),
-                    file: file, line: line)
-                XCTAssertTrue(hit === button || hit.isDescendant(of: button), "Window buttons remain clickable.", file: file, line: line)
-            }
+            try await WorkspaceHeaderTests.assertWindowButtonsCentered(in: window, file: file, line: line)
         }
 
         /// The vertical center of the header in the host's coordinates.

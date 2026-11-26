@@ -132,8 +132,11 @@ final class WindowHeaderChromeView: NSView {
 
     private func layOutWindowControls() {
         guard !isLayingOutControls, let window = observedWindow, let spacing = nativeButtonSpacing,
+              // AppKit owns the full screen title bar, which later moves to the
+              // menu bar reveal window. Restoring the header frame while AppKit
+              // tiles it for full screen makes AppKit tile it again, endlessly.
+              !window.styleMask.contains(.fullScreen),
               let controls = WindowControls(window),
-              // In full screen the title bar moves to the menu bar reveal window.
               let frameView = window.contentView?.superview, controls.container.superview === frameView else { return }
         isLayingOutControls = true
         defer { isLayingOutControls = false }
