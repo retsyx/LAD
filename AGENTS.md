@@ -6,7 +6,7 @@
 - LAD supports Apple Silicon (`arm64`) only. Build, package and test that architecture exclusively; do not add support for other architectures.
 - This project is in early development. There is no need for backward compatibility with prior revisions of the software. This remains true as long as this instruction is in this file. When the software is more mature, this instruction will be replaced with an instruction to ensure backward compatibility between software revisions.
 - When working on a feature, don't change ancillary items that are not directly related to the feature. If in doubt, ask.
-- Don't babble in documents. Only update documents with information that is pertinent to the long term understanding of Amity's architecture and codebase.
+- Don't babble in documents. Only update documents with information that is pertinent to the long term understanding of LAD's architecture and codebase.
 - Identify the actual invariant before “fixing” a race. Not every possible ordering is a bug.
 - Do not put internal protocol or build-profile terminology or descriptions into the UI or the top README.md.
 - When restarting LAD, do not save open designs. Files are autosaved already.
